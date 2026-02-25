@@ -1,0 +1,544 @@
+import unittest
+import tempfile
+from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+
+from analysis.signals import TradeSignal
+from execution.mt5_executor import MT5Executor
+from learning.mt5_adaptive_trade_planner import AdaptiveExecutionPlan
+
+
+def make_signal(symbol: str = "XAUUSD", confidence: float = 80.0, direction: str = "long") -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        direction=direction,
+        confidence=confidence,
+        entry=100.0,
+        stop_loss=99.0 if direction == "long" else 101.0,
+        take_profit_1=101.0 if direction == "long" else 99.0,
+        take_profit_2=102.0 if direction == "long" else 98.0,
+        take_profit_3=103.0 if direction == "long" else 97.0,
+        risk_reward=2.0,
+        timeframe="1h",
+        session="new_york",
+        trend="bullish",
+        rsi=55.0,
+        atr=1.0,
+        pattern="TEST",
+        reasons=[],
+        warnings=[],
+        raw_scores={"edge": 20},
+    )
+
+
+class MT5ExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self._whitelist_path_patch = patch(
+            "execution.mt5_executor.config.MT5_MICRO_WHITELIST_PATH",
+            f"{self._td.name}\\mt5_micro_whitelist_test.json",
+        )
+        self._whitelist_path_patch.start()
+        self.exec = MT5Executor()
+        # Keep tests independent from live .env allow/block symbol settings.
+        self.exec._allow_symbols = set()
+        self.exec._block_symbols = set()
+
+    def tearDown(self):
+        try:
+            self._whitelist_path_patch.stop()
+        finally:
+            self._td.cleanup()
+
+    def test_resolve_symbol_uses_explicit_mapping(self):
+        self.exec._symbol_map = {"XAUUSD": "XAUUSDM"}
+        self.exec._symbols_cache = ["XAUUSD", "XAUUSDM", "EURUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            resolved = self.exec.resolve_symbol("XAUUSD")
+        self.assertEqual(resolved, "XAUUSDM")
+
+    def test_resolve_symbol_handles_usdt_pair(self):
+        self.exec._symbol_map = {}
+        self.exec._symbols_cache = ["BTCUSD", "ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            resolved = self.exec.resolve_symbol("BTC/USDT")
+        self.assertEqual(resolved, "BTCUSD")
+
+    def test_execute_signal_skips_when_disabled(self):
+        sig = make_signal("XAUUSD")
+        with patch("execution.mt5_executor.config.MT5_ENABLED", False):
+            result = self.exec.execute_signal(sig, source="test")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "disabled")
+
+    def test_execute_signal_respects_mt5_confidence_threshold(self):
+        sig = make_signal("XAUUSD", confidence=60.0)
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 75):
+            result = self.exec.execute_signal(sig, source="test")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "skipped")
+
+    def test_suggest_symbol_map_generates_env_line(self):
+        self.exec._symbol_map = {}
+        self.exec._symbols_cache = ["XAUUSDm", "BTCUSD", "ETHUSD", "EURUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            report = self.exec.suggest_symbol_map(
+                signal_symbols=["XAUUSD", "BTC/USDT", "ETH/USDT", "EURUSD"]
+            )
+        self.assertTrue(report["connected"])
+        self.assertEqual(report["suggested_map"]["XAUUSD"], "XAUUSDm")
+        self.assertEqual(report["suggested_map"]["BTC/USDT"], "BTCUSD")
+        self.assertEqual(report["suggested_map"]["ETH/USDT"], "ETHUSD")
+        self.assertIn("EURUSD", report["passthrough"])
+        self.assertIn("MT5_SYMBOL_MAP=", report["env_line"])
+        self.assertEqual(report["unresolved"], [])
+
+    def test_suggest_symbol_map_tracks_unresolved(self):
+        self.exec._symbol_map = {}
+        self.exec._symbols_cache = ["XAUUSDm"]
+        self.exec._symbols_cache_ts = 9e9
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            report = self.exec.suggest_symbol_map(signal_symbols=["DOGE/USDT"])
+        self.assertEqual(report["resolved_count"], 0)
+        self.assertIn("DOGE/USDT", report["unresolved"])
+
+    def test_execute_signal_skips_on_margin_guard(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="long")
+        sig.stop_loss = 5000.0
+        sig.take_profit_2 = 5200.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.account_info.return_value = MagicMock(margin_free=3.41)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5100.0, bid=5099.9)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.22  # > allowed
+
+        self.exec._conn = MagicMock()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MICRO_MODE_ENABLED", False), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 35), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1):
+            res = self.exec.execute_signal(sig, source="test")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("margin guard", res.message.lower())
+
+    def test_execute_signal_rejected_shows_retcode_hint(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="long")
+        sig.stop_loss = 5000.0
+        sig.take_profit_2 = 5200.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.TRADE_RETCODE_PLACED = 10008
+        fake_mt5.TRADE_RETCODE_DONE_PARTIAL = 10010
+        fake_mt5.account_info.return_value = MagicMock(margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5100.0, bid=5099.9)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+        fake_mt5.order_send.return_value = MagicMock(retcode=10027, order=None, deal=None)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1):
+            res = self.exec.execute_signal(sig, source="test")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "rejected")
+        self.assertIn("retcode=10027", res.message)
+        self.assertIn("autotrading", res.message.lower())
+
+    def test_closed_trades_snapshot_aggregates_recent_exit_deals(self):
+        fake_mt5 = MagicMock()
+        fake_mt5.account_info.return_value = MagicMock(login=123456, server="TEST-MT5")
+        fake_mt5.DEAL_ENTRY_OUT = 1
+        fake_mt5.DEAL_REASON_TP = 5
+        fake_mt5.DEAL_REASON_SL = 4
+        fake_mt5.DEAL_REASON_CLIENT = 0
+        fake_mt5.DEAL_TYPE_SELL = 1
+        fake_mt5.DEAL_TYPE_BUY = 0
+        fake_mt5.history_deals_get.return_value = [
+            SimpleNamespace(
+                entry=1,
+                reason=5,
+                type=1,
+                position_id=777,
+                ticket=1001,
+                symbol="ETHUSD",
+                time=1700000000,
+                profit=1.25,
+                swap=0.0,
+                commission=-0.05,
+                price=2010.5,
+                volume=0.1,
+                comment="tp hit",
+            ),
+        ]
+        self.exec._mt5 = fake_mt5
+        self.exec._conn = MagicMock()
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            snap = self.exec.closed_trades_snapshot(signal_symbol="ETHUSD", hours=24, limit=5)
+
+        self.assertTrue(snap["connected"])
+        self.assertEqual(len(snap["closed_trades"]), 1)
+        row = snap["closed_trades"][0]
+        self.assertEqual(row["symbol"], "ETHUSD")
+        self.assertEqual(row["reason"], "TP")
+        self.assertAlmostEqual(float(row["pnl"]), 1.20, places=5)
+
+    def test_closed_trades_snapshot_falls_back_to_timestamp_query_for_bridge(self):
+        fake_mt5 = MagicMock()
+        fake_mt5.account_info.return_value = MagicMock(login=123456, server="TEST-MT5")
+        fake_mt5.DEAL_ENTRY_OUT = 1
+        fake_mt5.DEAL_REASON_TP = 5
+        fake_mt5.DEAL_TYPE_BUY = 0
+        fake_mt5.DEAL_TYPE_SELL = 1
+
+        deal = SimpleNamespace(
+            entry=1,
+            reason=5,
+            type=0,
+            position_id=888,
+            ticket=2001,
+            symbol="ETHUSD",
+            time=1700000100,
+            profit=2.85,
+            swap=0.0,
+            commission=0.0,
+            price=1920.0,
+            volume=0.1,
+            comment="[tp 1920.15]",
+        )
+
+        def _history_deals_get(a, b):
+            # Simulate bridge behavior: datetime calls return None, timestamp ints work.
+            if isinstance(a, int) and isinstance(b, int):
+                return (deal,)
+            return None
+
+        fake_mt5.history_deals_get.side_effect = _history_deals_get
+        self.exec._mt5 = fake_mt5
+        self.exec._conn = MagicMock()
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+
+        with patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            snap = self.exec.closed_trades_snapshot(signal_symbol="ETHUSD", hours=24, limit=5)
+
+        self.assertTrue(snap["connected"])
+        self.assertEqual(snap.get("history_query_mode"), "ts_int")
+        self.assertEqual(len(snap["closed_trades"]), 1)
+        self.assertEqual(snap["closed_trades"][0]["reason"], "TP")
+
+    def test_execute_signal_auto_downsizes_volume_when_affordable(self):
+        sig = make_signal("ETH/USDT", confidence=90.0, direction="long")
+        sig.stop_loss = 1900.0
+        sig.take_profit_2 = 2100.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.account_info.return_value = MagicMock(margin_free=10.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=2000.0, bid=1999.9)
+        fake_mt5.positions_get.return_value = []
+
+        def _margin_calc(_otype, _sym, vol, _price):
+            # linear margin: 0.01 lot => 1.0 margin
+            return float(vol) * 100.0
+
+        fake_mt5.order_calc_margin.side_effect = _margin_calc
+        fake_mt5.order_send.return_value = MagicMock(retcode=10009, order=1234, deal=1235)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_LOT_SIZE", 0.10), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 35), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch.object(self.exec, "_resolve_filled_position_id", return_value=999):
+            res = self.exec.execute_signal(sig, source="test")
+
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, "filled")
+        sent_req = fake_mt5.order_send.call_args.args[0]
+        self.assertLess(float(sent_req["volume"]), 0.10)
+        self.assertGreaterEqual(float(sent_req["volume"]), 0.01)
+
+    def test_execute_signal_applies_adaptive_execution_plan(self):
+        sig = make_signal("ETH/USDT", confidence=90.0, direction="long")
+        sig.stop_loss = 1900.0
+        sig.take_profit_2 = 2100.0
+        sig.take_profit_1 = 2050.0
+        sig.take_profit_3 = 2200.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=2000.0, bid=1999.9)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+        fake_mt5.order_send.return_value = MagicMock(retcode=10009, order=1234, deal=1235)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        plan = AdaptiveExecutionPlan(
+            ok=True,
+            applied=True,
+            reason="adaptive_applied",
+            signal_symbol="ETH/USDT",
+            broker_symbol="ETHUSD",
+            account_key="TEST|123",
+            rr_target=1.6,
+            rr_base=2.0,
+            stop_scale=0.9,
+            size_multiplier=0.8,
+            entry=2000.0,
+            stop_loss=1910.0,
+            take_profit_1=2090.0,
+            take_profit_2=2144.0,
+            take_profit_3=2234.0,
+            factors={"samples": 12, "spread_pct": 0.005, "atr_pct": 1.75},
+        )
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_LOT_SIZE", 0.10), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", True), \
+             patch.object(self.exec, "status", return_value={"account_server": "TEST"}), \
+             patch("execution.mt5_executor.mt5_adaptive_trade_planner.plan_execution", return_value=plan), \
+             patch.object(self.exec, "_resolve_filled_position_id", return_value=999):
+            res = self.exec.execute_signal(sig, source="test", volume_multiplier=1.0)
+
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, "filled")
+        self.assertIsInstance(res.execution_meta, dict)
+        self.assertEqual(float(sig.risk_reward), 1.6)
+        sent_req = fake_mt5.order_send.call_args.args[0]
+        self.assertAlmostEqual(float(sent_req["sl"]), 1910.0, places=2)
+        self.assertAlmostEqual(float(sent_req["tp"]), 2144.0, places=2)
+        # lot 0.10 * sizex0.8 => 0.08 (then normalized by step stays 0.08)
+        self.assertAlmostEqual(float(sent_req["volume"]), 0.08, places=2)
+
+    def test_preview_adaptive_execution_returns_plan_without_sending_order(self):
+        sig = make_signal("ETH/USDT", confidence=90.0, direction="long")
+        sig.stop_loss = 1900.0
+        sig.take_profit_2 = 2100.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.account_info.return_value = MagicMock(login=123, balance=10.0, equity=10.0, margin_free=10.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2, point=0.01, trade_stops_level=1,
+            volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=0
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=2000.0, bid=1999.9)
+        fake_mt5.order_calc_margin.return_value = 1.0
+
+        self.exec._mt5 = fake_mt5
+        self.exec._conn = MagicMock()
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        plan = AdaptiveExecutionPlan(
+            ok=True, applied=True, reason="adaptive_applied",
+            signal_symbol="ETH/USDT", broker_symbol="ETHUSD", account_key="TEST|123",
+            rr_target=1.7, rr_base=2.0, stop_scale=0.95, size_multiplier=0.85,
+            entry=2000.0, stop_loss=1910.0, take_profit_1=2090.0, take_profit_2=2153.0, take_profit_3=2243.0,
+            factors={"samples": 7, "spread_pct": 0.005, "atr_pct": 1.2},
+        )
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_LOT_SIZE", 0.10), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")), \
+             patch.object(self.exec, "status", return_value={"account_server": "TEST"}), \
+             patch("execution.mt5_executor.mt5_adaptive_trade_planner.plan_execution", return_value=plan):
+            preview = self.exec.preview_adaptive_execution(sig, source="test")
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["status"], "ok")
+        self.assertEqual(preview["broker_symbol"], "ETHUSD")
+        self.assertEqual(float(preview["execution"]["risk_reward"]), 1.7)
+        # Preview should mirror execute-path volume normalization (0.085 -> 0.09 on 0.01 grid).
+        self.assertAlmostEqual(float(preview["execution"]["fitted_volume"]), 0.09, places=2)
+        self.assertFalse(fake_mt5.order_send.called)
+
+    def test_execute_signal_micro_mode_skips_wide_spread(self):
+        sig = make_signal("ETH/USDT", confidence=90.0, direction="long")
+        sig.stop_loss = 1900.0
+        sig.take_profit_2 = 2100.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.account_info.return_value = MagicMock(margin_free=100.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2, point=0.01, trade_stops_level=1,
+            volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=0
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=2000.0, bid=1990.0)  # 0.5% spread
+        fake_mt5.positions_get.return_value = []
+
+        self.exec._mt5 = fake_mt5
+        self.exec._conn = MagicMock()
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MICRO_MODE_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MICRO_MAX_SPREAD_PCT", 0.15), \
+             patch.object(self.exec, "_ensure_connection", return_value=(True, "connected")):
+            res = self.exec.execute_signal(sig, source="test")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "micro_filtered")
+        self.assertIn("spread filter", res.message.lower())
+
+    def test_position_limits_micro_mode_single_position_only(self):
+        fake_mt5 = MagicMock()
+        fake_mt5.positions_get.side_effect = [[SimpleNamespace(ticket=1)], []]
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        self.exec._mt5 = fake_mt5
+
+        with patch("execution.mt5_executor.config.MT5_MAX_OPEN_POSITIONS", 5), \
+             patch("execution.mt5_executor.config.MT5_MAX_POSITIONS_PER_SYMBOL", 5), \
+             patch("execution.mt5_executor.config.MT5_MICRO_MODE_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MICRO_SINGLE_POSITION_ONLY", True):
+            ok, reason = self.exec._position_limits_ok("ETHUSD", "long")
+
+        self.assertFalse(ok)
+        self.assertIn("single open position", reason.lower())
+
+    def test_micro_whitelist_learner_records_and_reports_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch("execution.mt5_executor.config.MT5_MICRO_WHITELIST_PATH", f"{td}\\micro.json"):
+                exec2 = MT5Executor()
+            acct = SimpleNamespace(login=123, server="TEST", balance=6.26, equity=6.26, margin_free=6.26)
+            ctx = exec2._micro_account_bucket_ctx(acct)
+            with patch("execution.mt5_executor.config.MT5_MICRO_MODE_ENABLED", True), \
+                 patch("execution.mt5_executor.config.MT5_MICRO_WHITELIST_LEARNER_ENABLED", True):
+                exec2._micro_record_symbol_observation(ctx, "ETHUSD", signal_symbol="ETH/USDT", status="allow", reason="affordable", margin_required=0.09)
+                exec2._micro_record_symbol_observation(ctx, "XAUUSD", signal_symbol="XAUUSD", status="deny_margin", reason="min lot too high", min_lot_margin=10.31)
+                stat = exec2.micro_whitelist_status(acct)
+                cached = exec2._micro_cached_deny(ctx, "XAUUSD")
+
+            self.assertTrue(stat["enabled"])
+            self.assertEqual(stat["total_symbols"], 2)
+            self.assertEqual(stat["allowed"], 1)
+            self.assertEqual(stat["denied"], 1)
+            self.assertIsNotNone(cached)
+            self.assertEqual(str(cached.get("status")), "deny_margin")
+
+
+if __name__ == "__main__":
+    unittest.main()
