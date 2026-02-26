@@ -340,71 +340,105 @@ class TelegramNotifier:
             return f"{v / 1_000:.2f}K"
         return f"{v:.2f}"
 
-    # ─── Trade Signal Formatter ────────────────────────────────────────────────
+    # ─── Trade Signal Formatter (Tiger Hunter) ──────────────────────────────
     def send_signal(self, signal, chat_id: Optional[int] = None) -> bool:
-        """
-        Send a beautifully formatted trade signal.
-        `signal` is a TradeSignal dataclass instance.
-        """
+        """Send a beautifully formatted Tiger Hunter trade signal."""
         e = self._escape
         direction_emoji = "🟢 LONG" if signal.direction == "long" else "🔴 SHORT"
         conf_emoji = signal.confidence_emoji()
-
-        # Confidence bar
         bars = int(signal.confidence / 10)
         conf_bar = "█" * bars + "░" * (10 - bars)
 
+        # Tiger Hunter metadata (backward-compatible)
+        sl_type = str(getattr(signal, "sl_type", "") or "")
+        tp_type = str(getattr(signal, "tp_type", "") or "")
+        entry_type = str(getattr(signal, "entry_type", "") or "")
+        sl_mapped = bool(getattr(signal, "sl_liquidity_mapped", False))
+        lp_count = int(getattr(signal, "liquidity_pools_count", 0) or 0)
+
+        sep1 = "═" * 35
+        sep2 = "─" * 30
         lines = [
-            f"{'═' * 35}",
-            f"⚡ *DEXTER PRO SIGNAL* {conf_emoji}",
-            f"{'═' * 35}",
-            f"",
+            sep1,
+            f"🐯 *TIGER HUNTER SIGNAL* {conf_emoji}",
+            sep1,
+            "",
             f"*Symbol:* `{e(signal.symbol)}`",
             f"*Direction:* {direction_emoji}",
             f"*Pattern:* `{e(signal.pattern)}`",
             f"*Timeframe:* `{e(signal.timeframe)}`",
             f"*Session:* `{e(signal.session)}`",
-            f"",
-            f"{'─' * 30}",
-            f"📊 *TRADE LEVELS*",
-            f"{'─' * 30}",
+            "",
+            sep2,
+            "📊 *TRADE LEVELS*",
+            sep2,
             f"🎯 *Entry:*   `{e(self._fmt_price(signal.entry))}`",
-            f"🛑 *Stop:*    `{e(self._fmt_price(signal.stop_loss))}`",
-            f"✅ *TP1 \\(1R\\):* `{e(self._fmt_price(signal.take_profit_1))}`",
-            f"✅ *TP2 \\(2R\\):* `{e(self._fmt_price(signal.take_profit_2))}`",
-            f"🚀 *TP3 \\(3R\\):* `{e(self._fmt_price(signal.take_profit_3))}`",
-            f"",
-            f"⚖️ *R:R Ratio:* `1:{e(signal.risk_reward)}`",
-            f"📏 *ATR:* `{e(self._fmt_price(signal.atr))}`",
-            f"",
-            f"{'─' * 30}",
-            f"🧠 *ANALYSIS*",
-            f"{'─' * 30}",
-            f"📈 *Trend:* `{e(signal.trend)}`",
-            f"📊 *RSI:* `{e(signal.rsi)}`",
-            f"",
-            f"{'─' * 30}",
-            f"✅ *REASONS*",
         ]
 
+        if entry_type == "limit":
+            lines.append("   _🎯 Limit order \\(patience entry\\)_")
+
+        sl_badge = " 🛡️ _Anti\\-Sweep_" if (sl_mapped or sl_type == "anti_sweep") else ""
+        lines.append(f"🛑 *Stop:*    `{e(self._fmt_price(signal.stop_loss))}`{sl_badge}")
+
+        tp_badge = " ⚡ _Liq Target_" if tp_type == "liquidity" else ""
+        lines += [
+            f"✅ *TP1 \\(1R\\):* `{e(self._fmt_price(signal.take_profit_1))}`",
+            f"✅ *TP2 \\(2R\\):* `{e(self._fmt_price(signal.take_profit_2))}`{tp_badge}",
+            f"🚀 *TP3 \\(3R\\):* `{e(self._fmt_price(signal.take_profit_3))}`",
+            "",
+            f"⚖️ *R:R Ratio:* `1:{e(signal.risk_reward)}`",
+            f"📏 *ATR:* `{e(self._fmt_price(signal.atr))}`",
+        ]
+        if lp_count > 0:
+            lines.append(f"🌊 *Liquidity Pools:* `{e(lp_count)}` mapped")
+
+        lines += [
+            "",
+            sep2,
+            "🧠 *ANALYSIS*",
+            sep2,
+            f"📈 *Trend:* `{e(signal.trend)}`",
+            f"📊 *RSI:* `{e(signal.rsi)}`",
+            "",
+            sep2,
+            "✅ *REASONS*",
+        ]
         for reason in signal.reasons[:6]:
             lines.append(f"• {e(reason)}")
-
         if signal.warnings:
             lines.append("")
             lines.append("⚠️ *WARNINGS*")
             for warn in signal.warnings[:3]:
                 lines.append(f"• {e(warn)}")
 
+        # Tiger quality badges
+        tiger_badges = []
+        if sl_mapped:
+            tiger_badges.append("🛡️ Anti\\-Sweep SL")
+        if tp_type == "liquidity":
+            tiger_badges.append("⚡ Liq TP")
+        if entry_type == "limit":
+            tiger_badges.append("🎯 Limit Entry")
+        if tiger_badges:
+            lines += [
+                "",
+                sep2,
+                "🐯 *TIGER QUALITY*",
+                sep2,
+                "  ".join(tiger_badges),
+            ]
+
         lines += [
-            f"",
-            f"{'─' * 30}",
-            f"🎯 *CONFIDENCE*",
+            "",
+            sep2,
+            "🎯 *CONFIDENCE*",
             f"`{conf_bar}` `{e(signal.confidence)}%`",
-            f"",
+            "",
             f"🕐 _{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
-            f"{'═' * 35}",
-            f"_⚠️ For informational purposes only\\. Not financial advice\\._",
+            sep1,
+            "_🐯 Tiger Hunter AI \\| Dexter Pro V3_",
+            "_⚠️ Not financial advice\\._",
         ]
 
         return self._send(
@@ -2285,7 +2319,57 @@ class TelegramNotifier:
     def send_error(self, error_msg: str) -> bool:
         return self._send(f"❌ *DEXTER PRO ERROR*\n\n`{self._escape(error_msg)}`")
 
+    # ─── Tiger Daily Performance Summary ──────────────────────────────────────
+    def send_daily_performance_summary(self, chat_id=None) -> bool:
+        """Send daily Tiger Hunter performance summary for subscribers."""
+        try:
+            from api.signal_store import signal_store as _ss
+            if _ss is None:
+                return False
+            stats = _ss.get_performance_stats()
+            curve = _ss.get_equity_curve(initial_equity=15.0)
+        except Exception:
+            return False
+
+        e = self._escape
+        if stats["completed_signals"] == 0:
+            return False
+
+        eq = curve[-1]["equity"] if curve else 15.0
+        growth = ((eq - 15.0) / 15.0 * 100) if eq > 0 else 0.0
+        wr = stats["win_rate"]
+        wr_e = "🟢" if wr >= 60 else ("🟡" if wr >= 50 else "🔴")
+        pf = int(min(1.0, eq / 1_000_000.0) * 20)
+        bar = "█" * pf + "░" * (20 - pf)
+
+        sep1 = "═" * 35
+        sep2 = "─" * 30
+        ts = stats.get("tiger_stats", {})
+        lns = [
+            sep1, "🐯 *TIGER HUNTER DAILY REPORT*", sep1, "",
+            "📊 *PERFORMANCE*", sep2,
+            f"{wr_e} Win Rate: `{e(f'{wr:.1f}')}%`",
+            f"💰 P&L: `${e(f'{stats['total_pnl_usd']:.2f}')}`",
+            f"📈 Profit Factor: `{e(f'{stats['profit_factor']:.2f}')}`",
+            "",
+            "💎 *$15 → $1M*", sep2,
+            f"💵 Equity: `${e(f'{eq:.2f}')}`  Growth: `{e(f'{growth:+.1f}')}%`",
+            f"`{bar}`",
+            "",
+        ]
+        if ts:
+            lns += [
+                "🐯 *TIGER STATS*", sep2,
+                f"🛡️ Anti\\-Sweep: `{ts.get('anti_sweep_sl_pct',0):.0f}%`"
+                f"  ⚡ Liq TP: `{ts.get('liquidity_tp_pct',0):.0f}%`",
+                "",
+            ]
+        lns += [
+            f"🕐 _{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
+            sep1,
+            "_🐯 Tiger Hunter AI \\| Dexter Pro V3_",
+        ]
+        return self._send("\n".join(lns), chat_id=chat_id, feature="daily_report")
+
 
 notifier = TelegramNotifier()
-
-
