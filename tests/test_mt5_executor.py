@@ -539,6 +539,26 @@ class MT5ExecutorTests(unittest.TestCase):
             self.assertIsNotNone(cached)
             self.assertEqual(str(cached.get("status")), "deny_margin")
 
+    def test_crypto_confidence_soft_filter_supports_mapped_symbol_overrides(self):
+        sig = make_signal("ETH/USDT", confidence=73.5, direction="long")
+        self.exec._symbols_cache = ["ETHUSD"]
+        self.exec._symbols_cache_ts = 9e9
+
+        with patch.object(self.exec, "resolve_symbol", return_value="ETHUSD"), \
+             patch("execution.mt5_executor.config.MT5_CRYPTO_CONF_SOFT_FILTER_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS", 4.0), \
+             patch("execution.mt5_executor.config.MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY", 0.25), \
+             patch("execution.mt5_executor.config.get_mt5_crypto_conf_soft_filter_band_pts_symbol_overrides", return_value={"ETHUSD": 2.0}), \
+             patch("execution.mt5_executor.config.get_mt5_crypto_conf_soft_filter_max_penalty_symbol_overrides", return_value={"ETHUSD": 0.5}):
+            applied, info = self.exec._maybe_apply_fx_confidence_soft_filter(sig, source="crypto", min_conf=75.0)
+
+        self.assertTrue(applied)
+        self.assertTrue(info.get("applied"))
+        self.assertEqual(info.get("reason"), "soft_size_penalty")
+        self.assertAlmostEqual(float(info.get("size_multiplier")), 0.625, places=3)
+        self.assertIn("mapped", str(info.get("band_pts_override_reason", "")))
+        self.assertIn("mapped", str(info.get("max_penalty_override_reason", "")))
+
 
 if __name__ == "__main__":
     unittest.main()

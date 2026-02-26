@@ -118,6 +118,47 @@ class MT5OrchestratorTests(unittest.TestCase):
             self.assertLess(float(pol.get("pm_early_risk_trigger_r")), 0.0)
             self.assertLess(float(pol.get("pm_early_risk_sl_r")), 0.0)
 
+    def test_pre_trade_plan_applies_symbol_specific_canary_and_risk_overrides(self):
+        status = {
+            "enabled": True,
+            "connected": True,
+            "account_login": 123,
+            "account_server": "TEST-MT5",
+            "balance": 10.0,
+            "equity": 10.0,
+            "margin_free": 10.0,
+            "currency": "USD",
+        }
+        gate = SimpleNamespace(allow=True, status="allowed", reason="ok", account_key="TEST-MT5|123", snapshot={"x": 1})
+        wf_dec = SimpleNamespace(
+            canary_mode=True,
+            canary_reason="wf_pass",
+            risk_multiplier=0.90,
+            train_trades=10,
+            forward_trades=3,
+            forward_win_rate=0.66,
+            forward_mae=0.3,
+        )
+        sig = SimpleNamespace(symbol="ETH/USDT", raw_scores={})
+
+        with patch("learning.mt5_orchestrator.mt5_executor.status", return_value=status), \
+             patch("learning.mt5_orchestrator.mt5_executor.resolve_symbol", return_value="ETHUSD"), \
+             patch("learning.mt5_orchestrator.mt5_autopilot_core.pre_trade_gate", return_value=gate), \
+             patch("learning.mt5_orchestrator.mt5_walkforward.decision", return_value=wf_dec), \
+             patch("learning.mt5_orchestrator.mt5_walkforward.build_report", return_value={"ok": True, "train": {}, "forward": {}, "canary": {}}), \
+             patch("learning.mt5_orchestrator.mt5_autopilot_core.status", return_value={"risk_gate": {}, "journal": {}, "calibration": {}}), \
+             patch("learning.mt5_orchestrator.config.get_mt5_canary_force_symbol_overrides", return_value={"ETHUSD": False}), \
+             patch("learning.mt5_orchestrator.config.get_mt5_risk_multiplier_symbol_overrides", return_value={"ETHUSD": 0.42}), \
+             patch("learning.mt5_orchestrator.config.get_mt5_risk_multiplier_min_symbol_overrides", return_value={}), \
+             patch("learning.mt5_orchestrator.config.get_mt5_risk_multiplier_max_symbol_overrides", return_value={}):
+            plan = self.orch.pre_trade_plan(signal=sig, source="crypto")
+
+        self.assertTrue(plan.allow)
+        self.assertFalse(plan.canary_mode)
+        self.assertAlmostEqual(float(plan.risk_multiplier), 0.42, places=4)
+        self.assertIn("symbol_policy_overrides", plan.walkforward)
+        self.assertIn("risk_multiplier_fixed", plan.walkforward["symbol_policy_overrides"])
+
 
 if __name__ == "__main__":
     unittest.main()

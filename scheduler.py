@@ -155,21 +155,55 @@ class DexterScheduler:
                 self._last_neural_filter_not_ready_log_ts = now_ts
         return ready, state
 
+    def _symbol_override_candidates(self, signal) -> list[str]:
+        candidates: list[str] = []
+        try:
+            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+        except Exception:
+            sym = ""
+        if sym:
+            candidates.append(sym)
+            try:
+                mapped = str(mt5_executor.resolve_symbol(sym) or "").strip().upper()
+            except Exception:
+                mapped = ""
+            if mapped and mapped not in candidates:
+                candidates.append(mapped)
+        return candidates
+
+    @staticmethod
+    def _lookup_symbol_override(candidates: list[str], overrides: dict) -> tuple[float | None, str]:
+        for idx, c in enumerate(candidates):
+            if not c or c not in overrides:
+                continue
+            try:
+                val = float(overrides[c])
+            except Exception:
+                continue
+            if idx == 0:
+                return val, f"symbol_override:{c}"
+            base_sym = candidates[0] if candidates else ""
+            return val, f"symbol_override_mapped:{c}<-{base_sym}"
+        return None, ""
+
     def _neural_min_prob_for_signal(self, signal, source: str) -> tuple[float, str]:
         base = float(getattr(config, "NEURAL_BRAIN_MIN_PROB", 0.55) or 0.55)
         reason = "global"
         src = str(source or "").strip().lower()
         sym = ""
+        candidates: list[str] = []
         if src == "fx":
             fx_min = float(getattr(config, "NEURAL_BRAIN_MIN_PROB_FX", base) or base)
             base = fx_min
             reason = "fx_default"
         try:
-            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+            candidates = self._symbol_override_candidates(signal)
+            sym = candidates[0] if candidates else str(getattr(signal, "symbol", "") or "").strip().upper()
             overrides = config.get_neural_min_prob_symbol_overrides()
-            if sym and sym in overrides:
-                base = float(overrides[sym])
-                reason = f"symbol_override:{sym}"
+            v, why = self._lookup_symbol_override(candidates or ([sym] if sym else []), overrides)
+            if v is not None:
+                base = float(v)
+                reason = why or reason
         except Exception:
             pass
         if src == 'fx' and sym:
@@ -215,10 +249,29 @@ class DexterScheduler:
         base_high = float(getattr(config, 'NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH', 0.48) or 0.48)
         low = float(base_low)
         high = float(base_high)
+        max_penalty = float(getattr(config, 'NEURAL_BRAIN_FX_SOFT_FILTER_MAX_CONF_PENALTY', 4.0) or 4.0)
         if high < low:
             low, high = high, low
             base_low, base_high = low, high
         sym = str(getattr(signal, 'symbol', '') or '').strip().upper()
+        try:
+            candidates = self._symbol_override_candidates(signal)
+            low_over, low_reason = self._lookup_symbol_override(candidates, config.get_neural_fx_soft_filter_band_low_symbol_overrides())
+            if low_over is not None:
+                low = float(low_over)
+                info['band_low_override_reason'] = low_reason
+            high_over, high_reason = self._lookup_symbol_override(candidates, config.get_neural_fx_soft_filter_band_high_symbol_overrides())
+            if high_over is not None:
+                high = float(high_over)
+                info['band_high_override_reason'] = high_reason
+            pen_over, pen_reason = self._lookup_symbol_override(candidates, config.get_neural_fx_soft_filter_max_penalty_symbol_overrides())
+            if pen_over is not None:
+                max_penalty = float(pen_over)
+                info['max_penalty_override_reason'] = pen_reason
+        except Exception:
+            pass
+        if high < low:
+            low, high = min(low, high), max(low, high)
         if sym and bool(getattr(config, 'NEURAL_BRAIN_FX_SOFT_FILTER_LEARNED_BAND_ENABLED', False)):
             try:
                 learned = mt5_autopilot_core.fx_learned_neural_soft_band(
@@ -256,7 +309,6 @@ class DexterScheduler:
             return False, info
         # Soft band fallback: degrade confidence instead of hard blocking.
         try:
-            max_penalty = float(getattr(config, 'NEURAL_BRAIN_FX_SOFT_FILTER_MAX_CONF_PENALTY', 4.0) or 4.0)
             span = max(0.0001, float(min_prob) - low)
             ratio = max(0.0, min(1.0, (float(min_prob) - p) / span))
             penalty = round(max_penalty * ratio, 2)

@@ -4,6 +4,7 @@ Loads from .env.local first (highest priority), then falls back to .env
 """
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # ── Load order: .env.local → .env ────────────────────────────────────────────
@@ -162,6 +163,17 @@ class Config:
     MT5_MAX_MARGIN_USAGE_PCT: float = float(os.getenv("MT5_MAX_MARGIN_USAGE_PCT", "35"))
     MT5_MAX_MARGIN_USAGE_PCT_FX: float = float(os.getenv("MT5_MAX_MARGIN_USAGE_PCT_FX", os.getenv("MT5_MAX_MARGIN_USAGE_PCT", "35")))
     MT5_MAX_MARGIN_USAGE_PCT_SYMBOL_OVERRIDES: str = os.getenv("MT5_MAX_MARGIN_USAGE_PCT_SYMBOL_OVERRIDES", "")
+    MT5_RISK_MULTIPLIER_SYMBOL_OVERRIDES: str = os.getenv("MT5_RISK_MULTIPLIER_SYMBOL_OVERRIDES", "")
+    MT5_RISK_MULTIPLIER_MIN_SYMBOL_OVERRIDES: str = os.getenv("MT5_RISK_MULTIPLIER_MIN_SYMBOL_OVERRIDES", "")
+    MT5_RISK_MULTIPLIER_MAX_SYMBOL_OVERRIDES: str = os.getenv("MT5_RISK_MULTIPLIER_MAX_SYMBOL_OVERRIDES", "")
+    MT5_CANARY_FORCE_SYMBOL_OVERRIDES: str = os.getenv("MT5_CANARY_FORCE_SYMBOL_OVERRIDES", "")
+    MT5_PENDING_ENTRY_ENABLED: bool = os.getenv("MT5_PENDING_ENTRY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    MT5_PENDING_ENTRY_DEFAULT_MODE: str = os.getenv("MT5_PENDING_ENTRY_DEFAULT_MODE", "auto")
+    MT5_PENDING_ENTRY_MODE_SYMBOL_OVERRIDES: str = os.getenv("MT5_PENDING_ENTRY_MODE_SYMBOL_OVERRIDES", "")
+    MT5_PENDING_ENTRY_MIN_ADV_ATR: float = float(os.getenv("MT5_PENDING_ENTRY_MIN_ADV_ATR", "0.08"))
+    MT5_PENDING_ENTRY_MAX_DIST_ATR: float = float(os.getenv("MT5_PENDING_ENTRY_MAX_DIST_ATR", "1.25"))
+    MT5_PENDING_ENTRY_MIN_ADV_ATR_SYMBOL_OVERRIDES: str = os.getenv("MT5_PENDING_ENTRY_MIN_ADV_ATR_SYMBOL_OVERRIDES", "")
+    MT5_PENDING_ENTRY_MAX_DIST_ATR_SYMBOL_OVERRIDES: str = os.getenv("MT5_PENDING_ENTRY_MAX_DIST_ATR_SYMBOL_OVERRIDES", "")
     MT5_MIN_FREE_MARGIN_AFTER_TRADE: float = float(os.getenv("MT5_MIN_FREE_MARGIN_AFTER_TRADE", "1"))
     MT5_COMMENT_PREFIX: str = os.getenv("MT5_COMMENT_PREFIX", "DEXTER")
     MT5_NOTIFY_EXECUTED: bool = os.getenv("MT5_NOTIFY_EXECUTED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -419,6 +431,9 @@ class Config:
     NEURAL_BRAIN_MIN_PROB: float = float(os.getenv("NEURAL_BRAIN_MIN_PROB", "0.55"))
     NEURAL_BRAIN_MIN_PROB_FX: float = float(os.getenv("NEURAL_BRAIN_MIN_PROB_FX", os.getenv("NEURAL_BRAIN_MIN_PROB", "0.55")))
     NEURAL_BRAIN_MIN_PROB_SYMBOL_OVERRIDES: str = os.getenv("NEURAL_BRAIN_MIN_PROB_SYMBOL_OVERRIDES", "")
+    NEURAL_BRAIN_FX_SOFT_FILTER_BAND_LOW_SYMBOL_OVERRIDES: str = os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_BAND_LOW_SYMBOL_OVERRIDES", "")
+    NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH_SYMBOL_OVERRIDES: str = os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH_SYMBOL_OVERRIDES", "")
+    NEURAL_BRAIN_FX_SOFT_FILTER_MAX_CONF_PENALTY_SYMBOL_OVERRIDES: str = os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_MAX_CONF_PENALTY_SYMBOL_OVERRIDES", "")
     NEURAL_BRAIN_FX_SOFT_FILTER_ENABLED: bool = os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     NEURAL_BRAIN_FX_SOFT_FILTER_BAND_LOW: float = float(os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_BAND_LOW", "0.43"))
     NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH: float = float(os.getenv("NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH", "0.48"))
@@ -432,9 +447,13 @@ class Config:
     MT5_FX_CONF_SOFT_FILTER_ENABLED: bool = os.getenv("MT5_FX_CONF_SOFT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     MT5_FX_CONF_SOFT_FILTER_BAND_PTS: float = float(os.getenv("MT5_FX_CONF_SOFT_FILTER_BAND_PTS", "6.0"))
     MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY: float = float(os.getenv("MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY", "0.35"))
+    MT5_FX_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES: str = os.getenv("MT5_FX_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES", "")
+    MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES: str = os.getenv("MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES", "")
     MT5_CRYPTO_CONF_SOFT_FILTER_ENABLED: bool = os.getenv("MT5_CRYPTO_CONF_SOFT_FILTER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS: float = float(os.getenv("MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS", "4.0"))
     MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY: float = float(os.getenv("MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY", "0.25"))
+    MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES: str = os.getenv("MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES", "")
+    MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES: str = os.getenv("MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES", "")
     MT5_FX_CONF_SOFT_FILTER_LEARNED_BAND_ENABLED: bool = os.getenv("MT5_FX_CONF_SOFT_FILTER_LEARNED_BAND_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     MT5_FX_CONF_SOFT_FILTER_LEARNED_LOOKBACK_DAYS: int = int(os.getenv("MT5_FX_CONF_SOFT_FILTER_LEARNED_LOOKBACK_DAYS", "60"))
     MT5_FX_CONF_SOFT_FILTER_LEARNED_MIN_RESOLVED: int = int(os.getenv("MT5_FX_CONF_SOFT_FILTER_LEARNED_MIN_RESOLVED", "8"))
@@ -598,6 +617,26 @@ class Config:
         return out
 
     @classmethod
+    def _parse_bool_or_auto_map(cls, raw: str) -> dict[str, Optional[bool]]:
+        out: dict[str, Optional[bool]] = {}
+        for chunk in (raw or "").split(","):
+            item = chunk.strip()
+            if not item or "=" not in item:
+                continue
+            left, right = item.split("=", 1)
+            k = left.strip().upper()
+            if not k:
+                continue
+            v = right.strip().lower()
+            if v in {"auto", "none", "default", ""}:
+                out[k] = None
+            elif v in {"1", "true", "yes", "on"}:
+                out[k] = True
+            elif v in {"0", "false", "no", "off"}:
+                out[k] = False
+        return out
+
+    @classmethod
     def _parse_int_list(cls, raw: str) -> list[int]:
         out: list[int] = []
         for part in (raw or "").split(","):
@@ -653,6 +692,22 @@ class Config:
         return cls._parse_float_map(cls.MT5_MAX_MARGIN_USAGE_PCT_SYMBOL_OVERRIDES)
 
     @classmethod
+    def get_mt5_risk_multiplier_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_RISK_MULTIPLIER_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_risk_multiplier_min_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_RISK_MULTIPLIER_MIN_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_risk_multiplier_max_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_RISK_MULTIPLIER_MAX_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_canary_force_symbol_overrides(cls) -> dict[str, Optional[bool]]:
+        return cls._parse_bool_or_auto_map(cls.MT5_CANARY_FORCE_SYMBOL_OVERRIDES)
+
+    @classmethod
     def get_mt5_symbol_map(cls) -> dict[str, str]:
         """
         Parse MT5 symbol map from env string:
@@ -667,6 +722,34 @@ class Config:
     @classmethod
     def get_neural_min_prob_symbol_overrides(cls) -> dict[str, float]:
         return cls._parse_float_map(cls.NEURAL_BRAIN_MIN_PROB_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_neural_fx_soft_filter_band_low_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.NEURAL_BRAIN_FX_SOFT_FILTER_BAND_LOW_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_neural_fx_soft_filter_band_high_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.NEURAL_BRAIN_FX_SOFT_FILTER_BAND_HIGH_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_neural_fx_soft_filter_max_penalty_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.NEURAL_BRAIN_FX_SOFT_FILTER_MAX_CONF_PENALTY_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_fx_conf_soft_filter_band_pts_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_FX_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_fx_conf_soft_filter_max_penalty_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_crypto_conf_soft_filter_band_pts_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS_SYMBOL_OVERRIDES)
+
+    @classmethod
+    def get_mt5_crypto_conf_soft_filter_max_penalty_symbol_overrides(cls) -> dict[str, float]:
+        return cls._parse_float_map(cls.MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY_SYMBOL_OVERRIDES)
 
     @classmethod
     def get_exec_reasons_delta_marker_utc(cls) -> str:

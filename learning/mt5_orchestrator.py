@@ -127,6 +127,37 @@ class MT5Orchestrator:
             "notes": "",
         }
 
+    def _symbol_override_candidates(self, signal) -> list[str]:
+        candidates: list[str] = []
+
+        def _add(v: str):
+            s = str(v or "").strip().upper()
+            if s and s not in candidates:
+                candidates.append(s)
+
+        try:
+            _add(str(getattr(signal, "symbol", "") or ""))
+        except Exception:
+            pass
+        try:
+            if candidates:
+                _add(str(mt5_executor.resolve_symbol(candidates[0]) or ""))
+        except Exception:
+            pass
+        return candidates
+
+    @staticmethod
+    def _lookup_symbol_override(candidates: list[str], overrides: dict) -> tuple[object, str]:
+        for idx, c in enumerate(candidates):
+            if not c or c not in overrides:
+                continue
+            val = overrides.get(c)
+            if idx == 0:
+                return val, f"symbol_override:{c}"
+            base_sym = candidates[0] if candidates else ""
+            return val, f"symbol_override_mapped:{c}<-{base_sym}"
+        return None, ""
+
     def policy_key_specs(self) -> list[dict]:
         return [
             {
@@ -641,6 +672,42 @@ class MT5Orchestrator:
         row = self._load_account_row(account_key) or {}
         policy = dict(self._default_policy())
         policy.update(dict(row.get("policy", {}) or {}))
+        symbol_policy_meta: dict[str, str] = {}
+        try:
+            candidates = self._symbol_override_candidates(signal)
+        except Exception:
+            candidates = []
+        try:
+            canary_val, canary_reason = self._lookup_symbol_override(candidates, config.get_mt5_canary_force_symbol_overrides())
+            if canary_reason:
+                symbol_policy_meta["canary_force"] = canary_reason
+            if isinstance(canary_val, bool) or canary_val is None:
+                if canary_reason:
+                    policy["canary_force"] = canary_val
+        except Exception:
+            pass
+        try:
+            fixed_mult, fixed_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_symbol_overrides())
+            if fixed_mult is not None:
+                policy["min_risk_multiplier"] = float(fixed_mult)
+                policy["max_risk_multiplier"] = float(fixed_mult)
+                symbol_policy_meta["risk_multiplier_fixed"] = fixed_reason
+        except Exception:
+            pass
+        try:
+            min_mult_ov, min_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_min_symbol_overrides())
+            if min_mult_ov is not None:
+                policy["min_risk_multiplier"] = float(min_mult_ov)
+                symbol_policy_meta["min_risk_multiplier"] = min_reason
+        except Exception:
+            pass
+        try:
+            max_mult_ov, max_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_max_symbol_overrides())
+            if max_mult_ov is not None:
+                policy["max_risk_multiplier"] = float(max_mult_ov)
+                symbol_policy_meta["max_risk_multiplier"] = max_reason
+        except Exception:
+            pass
         gate_overrides = {
             "daily_loss_limit_usd": policy.get("daily_loss_limit_usd"),
             "daily_loss_limit_pct": policy.get("daily_loss_limit_pct"),
@@ -671,6 +738,37 @@ class MT5Orchestrator:
         row = self._load_account_row(account_key) or row
         policy = dict(self._default_policy())
         policy.update(dict(row.get("policy", {}) or {}))
+        try:
+            canary_val, canary_reason = self._lookup_symbol_override(candidates, config.get_mt5_canary_force_symbol_overrides())
+            if canary_reason:
+                symbol_policy_meta["canary_force"] = canary_reason
+            if isinstance(canary_val, bool) or canary_val is None:
+                if canary_reason:
+                    policy["canary_force"] = canary_val
+        except Exception:
+            pass
+        try:
+            fixed_mult, fixed_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_symbol_overrides())
+            if fixed_mult is not None:
+                policy["min_risk_multiplier"] = float(fixed_mult)
+                policy["max_risk_multiplier"] = float(fixed_mult)
+                symbol_policy_meta["risk_multiplier_fixed"] = fixed_reason
+        except Exception:
+            pass
+        try:
+            min_mult_ov, min_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_min_symbol_overrides())
+            if min_mult_ov is not None:
+                policy["min_risk_multiplier"] = float(min_mult_ov)
+                symbol_policy_meta["min_risk_multiplier"] = min_reason
+        except Exception:
+            pass
+        try:
+            max_mult_ov, max_reason = self._lookup_symbol_override(candidates, config.get_mt5_risk_multiplier_max_symbol_overrides())
+            if max_mult_ov is not None:
+                policy["max_risk_multiplier"] = float(max_mult_ov)
+                symbol_policy_meta["max_risk_multiplier"] = max_reason
+        except Exception:
+            pass
 
         wf_dec = mt5_walkforward.decision(
             account_key,
@@ -701,6 +799,7 @@ class MT5Orchestrator:
                 "forward_trades": wf_dec.forward_trades,
                 "forward_win_rate": wf_dec.forward_win_rate,
                 "forward_mae": wf_dec.forward_mae,
+                "symbol_policy_overrides": symbol_policy_meta,
             },
             policy=policy,
         )

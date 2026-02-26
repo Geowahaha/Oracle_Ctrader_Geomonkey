@@ -866,6 +866,45 @@ class MT5Executor:
             pass
         return float(base), reason
 
+    def _symbol_override_candidates(self, signal=None, *, signal_symbol: str = "", broker_symbol: str = "") -> list[str]:
+        candidates: list[str] = []
+
+        def _add(v: str):
+            s = str(v or "").strip().upper()
+            if s and s not in candidates:
+                candidates.append(s)
+
+        _add(broker_symbol)
+        _add(signal_symbol)
+        try:
+            _add(str(getattr(signal, "symbol", "") or ""))
+        except Exception:
+            pass
+
+        if not broker_symbol:
+            try:
+                base_sig = next((c for c in candidates if c), "")
+                mapped = self.resolve_symbol(base_sig) if base_sig else ""
+                _add(str(mapped or ""))
+            except Exception:
+                pass
+        return candidates
+
+    @staticmethod
+    def _lookup_symbol_float_override(candidates: list[str], overrides: dict[str, float]) -> tuple[Optional[float], str]:
+        for idx, c in enumerate(candidates):
+            if not c or c not in overrides:
+                continue
+            try:
+                val = float(overrides[c])
+            except Exception:
+                continue
+            if idx == 0:
+                return val, f"symbol_override:{c}"
+            base_sym = candidates[0] if candidates else ""
+            return val, f"symbol_override_mapped:{c}<-{base_sym}"
+        return None, ""
+
     def _maybe_apply_fx_confidence_soft_filter(self, signal, source: str, min_conf: float) -> tuple[bool, dict]:
         info = {
             "applied": False,
@@ -889,12 +928,16 @@ class MT5Executor:
             band_pts_cfg = float(getattr(config, "MT5_FX_CONF_SOFT_FILTER_BAND_PTS", 6.0) or 6.0)
             max_penalty_cfg = float(getattr(config, "MT5_FX_CONF_SOFT_FILTER_MAX_SIZE_PENALTY", 0.35) or 0.35)
             learned_enabled = bool(getattr(config, "MT5_FX_CONF_SOFT_FILTER_LEARNED_BAND_ENABLED", False))
+            band_overrides = config.get_mt5_fx_conf_soft_filter_band_pts_symbol_overrides()
+            pen_overrides = config.get_mt5_fx_conf_soft_filter_max_penalty_symbol_overrides()
         else:
             sf_label = "CRYPTO"
             enabled = bool(getattr(config, "MT5_CRYPTO_CONF_SOFT_FILTER_ENABLED", False))
             band_pts_cfg = float(getattr(config, "MT5_CRYPTO_CONF_SOFT_FILTER_BAND_PTS", 4.0) or 4.0)
             max_penalty_cfg = float(getattr(config, "MT5_CRYPTO_CONF_SOFT_FILTER_MAX_SIZE_PENALTY", 0.25) or 0.25)
             learned_enabled = False
+            band_overrides = config.get_mt5_crypto_conf_soft_filter_band_pts_symbol_overrides()
+            pen_overrides = config.get_mt5_crypto_conf_soft_filter_max_penalty_symbol_overrides()
         if not enabled:
             info["reason"] = "disabled"
             return False, info
@@ -903,6 +946,18 @@ class MT5Executor:
         if conf >= float(min_conf):
             info["reason"] = "above_min"
             return False, info
+        candidates = self._symbol_override_candidates(signal)
+        try:
+            band_override, band_reason = self._lookup_symbol_float_override(candidates, band_overrides)
+            if band_override is not None:
+                band_pts_cfg = float(band_override)
+                info["band_pts_override_reason"] = band_reason
+            pen_override, pen_reason = self._lookup_symbol_float_override(candidates, pen_overrides)
+            if pen_override is not None:
+                max_penalty_cfg = float(pen_override)
+                info["max_penalty_override_reason"] = pen_reason
+        except Exception:
+            pass
         band_pts = max(0.5, float(band_pts_cfg))
         floor = float(min_conf) - band_pts
         ceil = float(min_conf)
