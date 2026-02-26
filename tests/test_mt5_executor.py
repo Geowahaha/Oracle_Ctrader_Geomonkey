@@ -39,6 +39,11 @@ class MT5ExecutorTests(unittest.TestCase):
             f"{self._td.name}\\mt5_micro_whitelist_test.json",
         )
         self._whitelist_path_patch.start()
+        # Disable Tiger Risk Governor in legacy tests to preserve original behavior
+        self._tiger_patch = patch("execution.mt5_executor.tiger_risk_governor", None)
+        self._tiger_patch.start()
+        self._store_patch = patch("execution.mt5_executor.signal_store", None)
+        self._store_patch.start()
         self.exec = MT5Executor()
         # Keep tests independent from live .env allow/block symbol settings.
         self.exec._allow_symbols = set()
@@ -47,6 +52,8 @@ class MT5ExecutorTests(unittest.TestCase):
     def tearDown(self):
         try:
             self._whitelist_path_patch.stop()
+            self._tiger_patch.stop()
+            self._store_patch.stop()
         finally:
             self._td.cleanup()
 

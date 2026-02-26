@@ -21,6 +21,16 @@ from config import config
 from learning.mt5_adaptive_trade_planner import mt5_adaptive_trade_planner
 
 try:
+    from execution.tiger_risk_governor import tiger_risk_governor
+except Exception:
+    tiger_risk_governor = None
+
+try:
+    from api.signal_store import signal_store
+except Exception:
+    signal_store = None
+
+try:
     import rpyc
 except Exception:  # pragma: no cover - handled in runtime checks
     rpyc = None
@@ -1256,9 +1266,72 @@ class MT5Executor:
                 if not (sl > price + min_gap and tp < price - min_gap):
                     return _attach_meta(MT5ExecutionResult(False, "invalid_stops", "short stops invalid for current price", sig_symbol, broker_symbol))
 
+            # ── Tiger Risk Governor: Quality-Based Lot Sizing ─────────────
+            tiger_meta = {}
+            tiger_lot = None
+            if tiger_risk_governor is not None:
+                try:
+                    equity = float(getattr(account, "equity", 0.0) or 0.0)
+                    confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+                    sl_mapped = bool(getattr(signal, "sl_liquidity_mapped", False))
+
+                    # Calculate SL distance in pips
+                    signal_sl = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+                    risk_dist = abs(price - signal_sl) if signal_sl > 0 else 0.0
+                    pip_size = float(point * 10) if point > 0 else 0.0001
+                    risk_pips = (risk_dist / pip_size) if pip_size > 0 else 50.0
+                    risk_pips = max(5.0, risk_pips)  # floor 5 pips
+
+                    # Pip value estimate (per micro lot)
+                    pip_value = 0.10  # default for FX micro
+                    if "JPY" in up_broker:
+                        pip_value = 0.08
+                    elif any(x in up_broker for x in ["XAU", "GOLD"]):
+                        pip_value = 0.10
+                    elif any(x in up_broker for x in ["BTC", "ETH", "CRYPTO"]):
+                        pip_value = 0.01
+
+                    tiger_lot, tiger_meta = tiger_risk_governor.calculate_lot_size(
+                        equity=equity,
+                        risk_distance_pips=risk_pips,
+                        pip_value=pip_value,
+                        confidence=confidence,
+                        sl_liquidity_mapped=sl_mapped,
+                    )
+                    # Check position limit
+                    current_pos = len(self._mt5.positions_get() or ())
+                    pos_ok, pos_reason = tiger_risk_governor.check_position_limit(equity, current_pos)
+                    if not pos_ok:
+                        return _attach_meta(MT5ExecutionResult(
+                            False, "tiger_limit", pos_reason, sig_symbol, broker_symbol
+                        ))
+
+                    # Check circuit breaker
+                    daily_pnl = float(getattr(account, "profit", 0.0) or 0.0)
+                    cb_ok, cb_reason = tiger_risk_governor.check_circuit_breaker(equity, daily_pnl)
+                    if not cb_ok:
+                        return _attach_meta(MT5ExecutionResult(
+                            False, "tiger_circuit_breaker", cb_reason, sig_symbol, broker_symbol
+                        ))
+
+                    logger.info(
+                        "[MT5Tiger] %s lot=%.2f phase=%s equity=$%.2f risk_pips=%.1f conf=%.1f sl_mapped=%s",
+                        broker_symbol, tiger_lot, tiger_meta.get('phase', '?'),
+                        equity, risk_pips, confidence, sl_mapped,
+                    )
+                except Exception as e:
+                    logger.debug("[MT5Tiger] governor integration error: %s", e, exc_info=True)
+
             vm_in = 1.0 if volume_multiplier is None else max(0.05, float(volume_multiplier))
             vm = max(0.05, float(vm_in) * float(adaptive_size_mult or 1.0) * float(conf_soft_size_mult or 1.0))
-            desired_volume = self._normalize_volume(float(config.MT5_LOT_SIZE) * vm, symbol_info)
+
+            if tiger_lot is not None and tiger_lot > 0:
+                # Use Tiger Risk Governor lot as base, still apply adaptive multipliers
+                desired_volume = self._normalize_volume(float(tiger_lot) * float(adaptive_size_mult or 1.0), symbol_info)
+            else:
+                # Fallback: original static lot sizing
+                desired_volume = self._normalize_volume(float(config.MT5_LOT_SIZE) * vm, symbol_info)
+
             volume = desired_volume
             if volume <= 0:
                 return _attach_meta(MT5ExecutionResult(False, "error", "volume normalized to zero", sig_symbol, broker_symbol))
@@ -1363,7 +1436,21 @@ class MT5Executor:
             ticket = getattr(result, "order", None) or getattr(result, "deal", None)
             if retcode in done_codes:
                 position_id = self._resolve_filled_position_id(broker_symbol, is_long, comment)
-                return _attach_meta(MT5ExecutionResult(
+
+                # ── Tiger: Record signal in Signal Store ─────────────────
+                try:
+                    if signal_store is not None:
+                        signal_store.store_signal(
+                            signal,
+                            source=str(source or ""),
+                            mt5_ticket=int(ticket) if ticket else None,
+                            mt5_executed=True,
+                            execution_status="filled",
+                        )
+                except Exception as e:
+                    logger.debug("[MT5Tiger] signal_store error: %s", e)
+
+                result_obj = MT5ExecutionResult(
                     True,
                     "filled",
                     f"order accepted retcode={retcode}",
@@ -1373,7 +1460,16 @@ class MT5Executor:
                     ticket=int(ticket) if ticket else None,
                     position_id=position_id,
                     volume=float(volume),
-                ))
+                )
+                # Attach Tiger metadata
+                if tiger_meta:
+                    try:
+                        meta = getattr(result_obj, 'execution_meta', {}) or {}
+                        meta['tiger_risk'] = tiger_meta
+                        result_obj.execution_meta = meta
+                    except Exception:
+                        pass
+                return _attach_meta(result_obj)
             return _attach_meta(MT5ExecutionResult(
                 False,
                 "rejected",
