@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.technical import TechnicalAnalysis
-from analysis.smc import SMCAnalyzer, SMCContext
+from analysis.smc import SMCAnalyzer, SMCContext, LiquidityPool
 
 logger = logging.getLogger(__name__)
 ta = TechnicalAnalysis()
@@ -37,6 +37,14 @@ class TradeSignal:
     warnings: list = field(default_factory=list)
     smc_context: Optional[SMCContext] = None
     raw_scores: dict = field(default_factory=dict)
+    # ── Tiger Hunter fields ──
+    entry_type: str = "market"          # "market" | "limit" | "patience"
+    sl_type: str = "atr"                # "atr" | "anti_sweep" | "structure"
+    sl_reason: str = ""                 # human-readable SL placement reason
+    tp_type: str = "rr"                 # "rr" | "liquidity" | "structure"
+    tp_reason: str = ""                 # human-readable TP targeting reason
+    sl_liquidity_mapped: bool = False   # True if SL used anti-sweep logic
+    liquidity_pools_count: int = 0      # number of pools detected nearby
 
     def to_dict(self) -> dict:
         return {
@@ -57,6 +65,13 @@ class TradeSignal:
             "pattern": self.pattern,
             "reasons": self.reasons,
             "warnings": self.warnings,
+            # Tiger Hunter metadata
+            "entry_type": self.entry_type,
+            "sl_type": self.sl_type,
+            "sl_reason": self.sl_reason,
+            "tp_type": self.tp_type,
+            "tp_reason": self.tp_reason,
+            "sl_liquidity_mapped": self.sl_liquidity_mapped,
         }
 
     def emoji_direction(self) -> str:
@@ -504,39 +519,79 @@ class SignalGenerator:
             if confidence < self.min_confidence:
                 return None
 
-            # ── Build entry, SL, TP ───────────────────────────────────────────
+            # ── Build entry, SL, TP ── Tiger Hunter Pipeline ─────────────────
             entry, entry_note = self._select_advantaged_entry(
                 direction=direction,
                 close=close,
                 atr=atr,
                 smc_ctx=smc_ctx,
             )
+            entry_type = "limit" if entry_note else "market"
             if entry_note:
                 add_reason(direction, entry_note)
 
-            if direction == "long":
-                stop_loss = close - 1.5 * atr
-                # Check if OB provides a better SL
-                if smc_ctx.nearest_ob and smc_ctx.nearest_ob.direction == "bullish":
-                    ob_sl = smc_ctx.nearest_ob.low * 0.999
-                    stop_loss = max(stop_loss, ob_sl)  # use higher of the two
-                risk = entry - stop_loss
-                tp1 = entry + risk
-                tp2 = entry + 2 * risk
-                tp3 = entry + 3 * risk
+            # ── Tiger Hunter: Anti-Sweep SL ─────────────────────────────────
+            pools = getattr(smc_ctx, "liquidity_pools", []) or []
+            stop_loss, sl_reason = smc.anti_sweep_sl(
+                entry=entry,
+                direction=direction,
+                liquidity_pools=pools,
+                atr=atr,
+                ob=smc_ctx.nearest_ob,
+            )
+            sl_liquidity_mapped = "Anti-sweep" in sl_reason or "behind" in sl_reason.lower()
+            sl_type = "anti_sweep" if sl_liquidity_mapped else "atr"
+            if sl_reason:
+                add_reason(direction, sl_reason)
+
+            risk = abs(entry - stop_loss)
+            if not np.isfinite(risk) or risk <= 0:
+                return None
+
+            # ── Tiger Hunter: Liquidity TP Targets ──────────────────────────
+            liq_tp_levels, tp_reason = smc.liquidity_tp_targets(
+                entry=entry,
+                direction=direction,
+                atr=atr,
+                liquidity_pools=pools,
+                fvgs=smc_ctx.fair_value_gaps,
+            )
+
+            if liq_tp_levels and len(liq_tp_levels) >= 1:
+                # Use liquidity-based TP targets
+                tp_type = "liquidity"
+                tp1 = liq_tp_levels[0]
+                tp2 = liq_tp_levels[1] if len(liq_tp_levels) >= 2 else (
+                    entry + 2 * risk if direction == "long" else entry - 2 * risk
+                )
+                tp3 = liq_tp_levels[2] if len(liq_tp_levels) >= 3 else (
+                    entry + 3 * risk if direction == "long" else entry - 3 * risk
+                )
+                # Validate TP direction (tp must be in profit direction)
+                if direction == "long":
+                    tp1 = max(tp1, entry + 0.5 * risk)  # minimum 0.5R
+                    tp2 = max(tp2, tp1 + 0.3 * risk)
+                    tp3 = max(tp3, tp2 + 0.3 * risk)
+                else:
+                    tp1 = min(tp1, entry - 0.5 * risk)
+                    tp2 = min(tp2, tp1 - 0.3 * risk)
+                    tp3 = min(tp3, tp2 - 0.3 * risk)
+                if tp_reason:
+                    add_reason(direction, tp_reason)
             else:
-                stop_loss = close + 1.5 * atr
-                if smc_ctx.nearest_ob and smc_ctx.nearest_ob.direction == "bearish":
-                    ob_sl = smc_ctx.nearest_ob.high * 1.001
-                    stop_loss = min(stop_loss, ob_sl)
-                risk = stop_loss - entry
-                tp1 = entry - risk
-                tp2 = entry - 2 * risk
-                tp3 = entry - 3 * risk
+                # Fallback: mechanical R:R targets
+                tp_type = "rr"
+                tp_reason = "TP: mechanical R:R"
+                if direction == "long":
+                    tp1 = entry + risk
+                    tp2 = entry + 2 * risk
+                    tp3 = entry + 3 * risk
+                else:
+                    tp1 = entry - risk
+                    tp2 = entry - 2 * risk
+                    tp3 = entry - 3 * risk
 
             if not all(np.isfinite(v) for v in (entry, stop_loss, tp1, tp2, tp3, risk)):
-                return None
-            if risk <= 0:
                 return None
 
             rr = round(abs(tp2 - entry) / abs(entry - stop_loss), 2)
@@ -570,6 +625,14 @@ class SignalGenerator:
                 warnings=warnings,
                 smc_context=smc_ctx,
                 raw_scores={"long": long_score, "short": short_score, "edge": score_edge},
+                # Tiger Hunter metadata
+                entry_type=entry_type,
+                sl_type=sl_type,
+                sl_reason=sl_reason,
+                tp_type=tp_type,
+                tp_reason=tp_reason,
+                sl_liquidity_mapped=sl_liquidity_mapped,
+                liquidity_pools_count=len(pools),
             )
 
         except Exception as e:

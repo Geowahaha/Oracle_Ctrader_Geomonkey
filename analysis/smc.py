@@ -46,11 +46,23 @@ class StructureLevel:
 
 
 @dataclass
+class LiquidityPool:
+    """Represents a cluster of stop-losses / equal highs/lows where stops accumulate."""
+    pool_type: str             # 'equal_highs' | 'equal_lows' | 'swing_cluster' | 'session_extreme'
+    price: float               # the key price level
+    strength: float            # 0-1 how many touches / confluence
+    side: str                  # 'buy_side' (above price) | 'sell_side' (below price)
+    touch_count: int = 1       # number of times price tested this level
+    distance_atr: float = 0.0  # distance from current price in ATR units
+
+
+@dataclass
 class SMCContext:
     order_blocks: list = field(default_factory=list)
     fair_value_gaps: list = field(default_factory=list)
     structure_levels: list = field(default_factory=list)
     liquidity_levels: list = field(default_factory=list)
+    liquidity_pools: list = field(default_factory=list)        # Tiger Hunter pools
     current_trend: str = "ranging"
     nearest_ob: Optional[OrderBlock] = None
     nearest_fvg: Optional[FairValueGap] = None
@@ -320,6 +332,298 @@ class SMCAnalyzer:
         levels.sort(key=lambda x: x["distance_pct"])
         return levels[:10]
 
+    # ─── Tiger Hunter: Liquidity Pool Detection ──────────────────────────────
+    def detect_liquidity_pools(self, df: pd.DataFrame,
+                                lookback: int = 100) -> list[LiquidityPool]:
+        """
+        Tiger Hunter: Map where stop-losses accumulate.
+        Detects:
+        1. Equal highs (buy-side liquidity — shorts' SLs sit above)
+        2. Equal lows (sell-side liquidity — longs' SLs sit below)
+        3. Swing clusters (multiple swing points at similar levels)
+        4. Session extremes (Asian range H/L etc.)
+        """
+        pools: list[LiquidityPool] = []
+        data = df.tail(lookback)
+        current_price = float(df["close"].iloc[-1])
+        atr = float(df["close"].diff().abs().rolling(14).mean().iloc[-1])
+        if pd.isna(atr) or atr <= 0:
+            atr = float((df["high"] - df["low"]).mean())
+        if atr <= 0:
+            return pools
+
+        # --- Equal Highs Detection (Buy-side liquidity above) ---
+        highs = data["high"].values
+        eq_high_tolerance = current_price * 0.0015  # 0.15% tolerance
+        high_clusters: dict[float, int] = {}
+        for i in range(len(highs)):
+            h = float(highs[i])
+            if not np.isfinite(h) or h <= 0:
+                continue
+            matched = False
+            for key in list(high_clusters.keys()):
+                if abs(h - key) <= eq_high_tolerance:
+                    high_clusters[key] += 1
+                    matched = True
+                    break
+            if not matched:
+                high_clusters[h] = 1
+
+        for level, count in high_clusters.items():
+            if count >= 2:  # at least 2 touches = equal highs
+                dist = abs(current_price - level)
+                pools.append(LiquidityPool(
+                    pool_type="equal_highs",
+                    price=level,
+                    strength=min(1.0, count / 5.0),
+                    side="buy_side",
+                    touch_count=count,
+                    distance_atr=round(dist / atr, 2) if atr > 0 else 0.0,
+                ))
+
+        # --- Equal Lows Detection (Sell-side liquidity below) ---
+        lows = data["low"].values
+        eq_low_tolerance = current_price * 0.0015
+        low_clusters: dict[float, int] = {}
+        for i in range(len(lows)):
+            lo = float(lows[i])
+            if not np.isfinite(lo) or lo <= 0:
+                continue
+            matched = False
+            for key in list(low_clusters.keys()):
+                if abs(lo - key) <= eq_low_tolerance:
+                    low_clusters[key] += 1
+                    matched = True
+                    break
+            if not matched:
+                low_clusters[lo] = 1
+
+        for level, count in low_clusters.items():
+            if count >= 2:
+                dist = abs(current_price - level)
+                pools.append(LiquidityPool(
+                    pool_type="equal_lows",
+                    price=level,
+                    strength=min(1.0, count / 5.0),
+                    side="sell_side",
+                    touch_count=count,
+                    distance_atr=round(dist / atr, 2) if atr > 0 else 0.0,
+                ))
+
+        # --- Swing Cluster Detection ---
+        if "swing_high" in data.columns:
+            swing_highs_df = data[data["swing_high"] == True]
+            if len(swing_highs_df) >= 2:
+                sh_vals = swing_highs_df["high"].values
+                for i in range(len(sh_vals)):
+                    cluster_count = sum(
+                        1 for j in range(len(sh_vals))
+                        if i != j and abs(float(sh_vals[i]) - float(sh_vals[j])) <= eq_high_tolerance
+                    )
+                    if cluster_count >= 1:
+                        level = float(sh_vals[i])
+                        dist = abs(current_price - level)
+                        pools.append(LiquidityPool(
+                            pool_type="swing_cluster",
+                            price=level,
+                            strength=min(1.0, (cluster_count + 1) / 4.0),
+                            side="buy_side" if level > current_price else "sell_side",
+                            touch_count=cluster_count + 1,
+                            distance_atr=round(dist / atr, 2) if atr > 0 else 0.0,
+                        ))
+
+        if "swing_low" in data.columns:
+            swing_lows_df = data[data["swing_low"] == True]
+            if len(swing_lows_df) >= 2:
+                sl_vals = swing_lows_df["low"].values
+                for i in range(len(sl_vals)):
+                    cluster_count = sum(
+                        1 for j in range(len(sl_vals))
+                        if i != j and abs(float(sl_vals[i]) - float(sl_vals[j])) <= eq_low_tolerance
+                    )
+                    if cluster_count >= 1:
+                        level = float(sl_vals[i])
+                        dist = abs(current_price - level)
+                        pools.append(LiquidityPool(
+                            pool_type="swing_cluster",
+                            price=level,
+                            strength=min(1.0, (cluster_count + 1) / 4.0),
+                            side="buy_side" if level > current_price else "sell_side",
+                            touch_count=cluster_count + 1,
+                            distance_atr=round(dist / atr, 2) if atr > 0 else 0.0,
+                        ))
+
+        # Deduplicate pools that are very close to each other
+        deduped: list[LiquidityPool] = []
+        for pool in sorted(pools, key=lambda p: p.strength, reverse=True):
+            is_dup = any(
+                abs(pool.price - existing.price) <= eq_high_tolerance
+                for existing in deduped
+            )
+            if not is_dup:
+                deduped.append(pool)
+
+        # Sort by proximity to current price
+        deduped.sort(key=lambda p: p.distance_atr)
+        return deduped[:15]
+
+    # ─── Tiger Hunter: Anti-Sweep Stop Loss ──────────────────────────────────
+    def anti_sweep_sl(
+        self,
+        entry: float,
+        direction: str,
+        liquidity_pools: list[LiquidityPool],
+        atr: float,
+        ob: Optional[OrderBlock] = None,
+    ) -> tuple[float, str]:
+        """
+        Tiger Hunter: Place SL BEHIND liquidity pools, not AT obvious levels.
+
+        For LONG: find sell-side liquidity below entry, place SL behind it.
+        For SHORT: find buy-side liquidity above entry, place SL behind it.
+
+        Returns (sl_price, sl_reason).
+        """
+        entry = float(entry)
+        atr = float(atr)
+        buffer = atr * 0.25  # buffer zone beyond liquidity
+
+        # Default: 1.5× ATR (fallback)
+        if direction == "long":
+            default_sl = entry - 1.5 * atr
+        else:
+            default_sl = entry + 1.5 * atr
+
+        if not liquidity_pools:
+            # Try OB-based SL as fallback
+            if ob and direction == "long" and ob.direction == "bullish":
+                ob_sl = float(ob.low) - buffer
+                return max(ob_sl, default_sl), "🛡️ SL behind bullish OB"
+            elif ob and direction == "short" and ob.direction == "bearish":
+                ob_sl = float(ob.high) + buffer
+                return min(ob_sl, default_sl), "🛡️ SL behind bearish OB"
+            return default_sl, "SL: 1.5× ATR (no liquidity mapped)"
+
+        if direction == "long":
+            # Find sell-side pools below entry (within reasonable range)
+            sell_pools = [
+                p for p in liquidity_pools
+                if p.side == "sell_side"
+                and p.price < entry
+                and p.distance_atr <= 3.0  # within 3 ATR
+            ]
+            if sell_pools:
+                # Pick the strongest nearby pool
+                best_pool = max(sell_pools, key=lambda p: p.strength)
+                sl = best_pool.price - buffer  # BEHIND the pool
+                # Don't let SL be worse than default
+                sl = max(sl, default_sl)
+                # Minimum risk: at least 0.5 ATR
+                if entry - sl < 0.5 * atr:
+                    sl = entry - 0.5 * atr
+                reason = (
+                    f"🛡️ Anti-sweep SL behind {best_pool.pool_type} "
+                    f"({best_pool.touch_count} touches)"
+                )
+                return sl, reason
+
+            # Fallback: OB-based
+            if ob and ob.direction == "bullish":
+                ob_sl = float(ob.low) - buffer
+                return max(ob_sl, default_sl), "🛡️ SL behind bullish OB"
+
+        else:  # short
+            buy_pools = [
+                p for p in liquidity_pools
+                if p.side == "buy_side"
+                and p.price > entry
+                and p.distance_atr <= 3.0
+            ]
+            if buy_pools:
+                best_pool = max(buy_pools, key=lambda p: p.strength)
+                sl = best_pool.price + buffer
+                sl = min(sl, default_sl)
+                if sl - entry < 0.5 * atr:
+                    sl = entry + 0.5 * atr
+                reason = (
+                    f"🛡️ Anti-sweep SL behind {best_pool.pool_type} "
+                    f"({best_pool.touch_count} touches)"
+                )
+                return sl, reason
+
+            if ob and ob.direction == "bearish":
+                ob_sl = float(ob.high) + buffer
+                return min(ob_sl, default_sl), "🛡️ SL behind bearish OB"
+
+        return default_sl, "SL: 1.5× ATR (no suitable pools)"
+
+    # ─── Tiger Hunter: Liquidity TP Targets ──────────────────────────────────
+    def liquidity_tp_targets(
+        self,
+        entry: float,
+        direction: str,
+        atr: float,
+        liquidity_pools: list[LiquidityPool],
+        fvgs: list[FairValueGap] = None,
+    ) -> tuple[list[float], str]:
+        """
+        Tiger Hunter: Target TP at OPPOSING liquidity pools.
+
+        For LONG: target buy-side liquidity above (where shorts' SLs sit).
+        For SHORT: target sell-side liquidity below (where longs' SLs sit).
+
+        Returns (tp_levels, tp_reason).
+        """
+        entry = float(entry)
+        atr = float(atr)
+        targets: list[tuple[float, str]] = []
+
+        if direction == "long":
+            # Target buy-side liquidity above entry
+            buy_pools = sorted(
+                [p for p in liquidity_pools
+                 if p.side == "buy_side" and p.price > entry],
+                key=lambda p: p.price,
+            )
+            for pool in buy_pools[:3]:
+                targets.append((pool.price, f"Liquidity: {pool.pool_type}"))
+
+            # Also target unfilled bearish FVGs above
+            if fvgs:
+                for fvg in fvgs:
+                    if fvg.direction == "bearish" and float(fvg.lower) > entry:
+                        targets.append((float(fvg.lower), "FVG fill"))
+
+        else:  # short
+            sell_pools = sorted(
+                [p for p in liquidity_pools
+                 if p.side == "sell_side" and p.price < entry],
+                key=lambda p: p.price,
+                reverse=True,
+            )
+            for pool in sell_pools[:3]:
+                targets.append((pool.price, f"Liquidity: {pool.pool_type}"))
+
+            if fvgs:
+                for fvg in fvgs:
+                    if fvg.direction == "bullish" and float(fvg.upper) < entry:
+                        targets.append((float(fvg.upper), "FVG fill"))
+
+        if not targets:
+            # Fallback: mechanical R:R targets
+            return [], "TP: mechanical R:R (no opposing liquidity)"
+
+        # Sort by distance and pick up to 3
+        if direction == "long":
+            targets.sort(key=lambda t: t[0])
+        else:
+            targets.sort(key=lambda t: t[0], reverse=True)
+
+        tp_levels = [t[0] for t in targets[:3]]
+        tp_sources = [t[1] for t in targets[:3]]
+        reason = f"⚡ TP at opposing liquidity: {', '.join(tp_sources[:2])}"
+        return tp_levels, reason
+
     # ─── Full SMC Context ─────────────────────────────────────────────────────
     def analyze(self, df: pd.DataFrame) -> SMCContext:
         """Run full SMC analysis and return a structured context object."""
@@ -330,6 +634,7 @@ class SMCAnalyzer:
             ctx.fair_value_gaps = self.find_fvg(df)
             ctx.structure_levels = self.find_bos_choch(df)
             ctx.liquidity_levels = self.find_liquidity_levels(df)
+            ctx.liquidity_pools = self.detect_liquidity_pools(df)
 
             current_price = float(df["close"].iloc[-1])
 
