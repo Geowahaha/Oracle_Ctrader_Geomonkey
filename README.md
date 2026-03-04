@@ -17,7 +17,13 @@ You only need to add **2 things**:
 
 ```bash
 # Open .env.local and fill in:
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx    # from console.anthropic.com
+# Pick at least one AI key:
+# ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx              # Anthropic
+# GEMINI_API_KEY=AIza...                             # Google AI Studio Gemini
+# GEMINI_VERTEX_AI_API_KEY=AQ....                    # Vertex AI Gemini (low-cost option)
+# Optional model overrides:
+# GEMINI_MODEL=gemini-2.0-flash
+# GEMINI_VERTEX_MODEL=gemini-2.5-flash-lite
 TELEGRAM_CHAT_ID=123456789               # your Telegram chat ID
 TELEGRAM_BROADCAST_SIGNALS=1             # push scheduler alerts to entitled subscribers
 ```
@@ -35,6 +41,12 @@ python main.py monitor
 # Or run a one-time scan
 python main.py scan all
 ```
+
+### Run 24/7 on Oracle Always Free VM
+Use the Oracle deployment guide and bootstrap script:
+
+- `ops/ORACLE_ALWAYS_FREE_VM.md`
+- `ops/oracle_always_free_setup.sh`
 
 ---
 
