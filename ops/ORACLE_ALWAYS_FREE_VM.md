@@ -1,6 +1,6 @@
 # Oracle Always Free VM (24/7 Dexter Monitor)
 
-This guide runs Dexter continuously on an Oracle Always Free Ubuntu VM.
+This guide runs Dexter continuously on an Oracle Always Free VM.
 
 ## 1) Create VM (Oracle Cloud)
 
@@ -18,23 +18,23 @@ Pick one:
 ## 3) SSH and run bootstrap script
 
 ```bash
-ssh -i <your_key>.pem ubuntu@<your_vm_public_ip>
+ssh -i <your_key>.pem <ubuntu_or_opc>@<your_vm_public_ip>
 ```
 
 If using Git:
 
 ```bash
-sudo apt-get update -y && sudo apt-get install -y git
+sudo dnf -y install git || sudo apt-get update -y && sudo apt-get install -y git
 git clone <YOUR_REPO_URL> ~/dexter_repo
 cd ~/dexter_repo
-sudo REPO_URL="<YOUR_REPO_URL>" APP_USER=ubuntu APP_DIR=/opt/dexter_pro BRANCH=main bash ops/oracle_always_free_setup.sh
+sudo REPO_URL="<YOUR_REPO_URL>" APP_USER="$(id -un)" APP_DIR=/opt/dexter_pro BRANCH=main bash ops/oracle_always_free_setup.sh
 ```
 
 If code is already copied into `/opt/dexter_pro`, run:
 
 ```bash
 cd /opt/dexter_pro
-sudo APP_USER=ubuntu APP_DIR=/opt/dexter_pro bash ops/oracle_always_free_setup.sh
+sudo APP_USER="$(id -un)" APP_DIR=/opt/dexter_pro bash ops/oracle_always_free_setup.sh
 ```
 
 ## 4) Fill `.env.local`
@@ -42,7 +42,7 @@ sudo APP_USER=ubuntu APP_DIR=/opt/dexter_pro bash ops/oracle_always_free_setup.s
 Edit:
 
 ```bash
-sudo -u ubuntu nano /opt/dexter_pro/.env.local
+sudo -u "$(id -un)" nano /opt/dexter_pro/.env.local
 ```
 
 Minimum required:
@@ -81,3 +81,4 @@ sudo systemctl enable dexter-monitor
 - Service auto-restarts on crash and auto-starts on reboot.
 - This setup is for signal generation/Telegram alerting.
 - If you need live MT5 execution, you need a Windows host/VPS running MT5 bridge and set `MT5_HOST` reachable from VM.
+- The setup script auto-detects package manager (`apt`, `dnf`, or `yum`), so it works for Ubuntu and Oracle Linux.

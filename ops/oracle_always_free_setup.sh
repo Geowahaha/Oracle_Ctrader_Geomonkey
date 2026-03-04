@@ -3,13 +3,18 @@ set -euo pipefail
 
 # Oracle Always Free VM bootstrap for Dexter Pro monitor mode.
 # Usage:
-#   sudo REPO_URL="https://github.com/<you>/<repo>.git" bash ops/oracle_always_free_setup.sh
+#   sudo REPO_URL="https://github.com/<you>/<repo>.git" APP_USER="$(id -un)" bash ops/oracle_always_free_setup.sh
 # Optional vars:
-#   APP_USER=ubuntu
+#   APP_USER=ubuntu|opc
 #   APP_DIR=/opt/dexter_pro
 #   BRANCH=main
 
-APP_USER="${APP_USER:-ubuntu}"
+DEFAULT_USER="${SUDO_USER:-ubuntu}"
+if [[ -z "${DEFAULT_USER}" || "${DEFAULT_USER}" == "root" ]]; then
+  DEFAULT_USER="ubuntu"
+fi
+
+APP_USER="${APP_USER:-${DEFAULT_USER}}"
 APP_DIR="${APP_DIR:-/opt/dexter_pro}"
 BRANCH="${BRANCH:-main}"
 REPO_URL="${REPO_URL:-}"
@@ -24,10 +29,44 @@ if ! id -u "${APP_USER}" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/7] Installing system packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y git python3 python3-venv python3-pip ca-certificates build-essential
+install_system_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[1/7] Installing system packages via apt..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y git python3 python3-venv python3-pip ca-certificates build-essential
+    return
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    echo "[1/7] Installing system packages via dnf..."
+    dnf -y makecache
+    dnf -y install git python3 python3-pip ca-certificates gcc make
+    return
+  fi
+
+  if command -v yum >/dev/null 2>&1; then
+    echo "[1/7] Installing system packages via yum..."
+    yum -y makecache
+    yum -y install git python3 python3-pip ca-certificates gcc make
+    return
+  fi
+
+  echo "Unsupported package manager (need apt-get/dnf/yum)." >&2
+  exit 1
+}
+
+create_virtualenv() {
+  if sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && python3 -m venv .venv"; then
+    return
+  fi
+
+  echo "python3 -m venv failed; trying virtualenv fallback..."
+  sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && python3 -m pip install --user virtualenv"
+  sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && python3 -m virtualenv .venv"
+}
+
+install_system_packages
 
 echo "[2/7] Preparing app directory: ${APP_DIR}"
 mkdir -p "${APP_DIR}"
@@ -52,7 +91,7 @@ if [[ ! -f "${APP_DIR}/requirements.txt" ]]; then
 fi
 
 echo "[4/7] Creating virtualenv and installing Python deps..."
-sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && python3 -m venv .venv"
+create_virtualenv
 sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && . .venv/bin/activate && pip install --upgrade pip wheel"
 sudo -u "${APP_USER}" bash -lc "cd '${APP_DIR}' && . .venv/bin/activate && pip install -r requirements.txt"
 
