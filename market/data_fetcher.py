@@ -482,6 +482,23 @@ class SessionManager:
         return active if active else ["off_hours"]
 
     @staticmethod
+    def is_fx_weekend_closed(now_utc: Optional[datetime] = None) -> bool:
+        now = now_utc or datetime.now(timezone.utc)
+        hm = (int(now.hour) * 60) + int(now.minute)
+        wd = int(now.weekday())
+        if wd == 5:
+            return True
+        if wd == 6 and hm < ((22 * 60) + 5):
+            return True
+        if wd == 4 and hm >= (22 * 60):
+            return True
+        return False
+
+    @staticmethod
+    def is_xauusd_market_open(now_utc: Optional[datetime] = None) -> bool:
+        return not SessionManager.is_fx_weekend_closed(now_utc=now_utc)
+
+    @staticmethod
     def is_high_volatility_window() -> bool:
         sessions = SessionManager.current_sessions()
         return any(s in sessions for s in ["london", "new_york", "overlap"])
@@ -493,6 +510,8 @@ class SessionManager:
             "utc_time":        now_utc.strftime("%Y-%m-%d %H:%M UTC"),
             "active_sessions": SessionManager.current_sessions(),
             "high_volatility": SessionManager.is_high_volatility_window(),
+            "xauusd_market_open": SessionManager.is_xauusd_market_open(now_utc=now_utc),
+            "fx_weekend_closed": SessionManager.is_fx_weekend_closed(now_utc=now_utc),
         }
 
 

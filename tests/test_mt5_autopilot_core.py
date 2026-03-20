@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -56,7 +58,9 @@ class MT5AutopilotCoreTests(unittest.TestCase):
         open_snap = {"positions": [], "orders": []}
         with patch("learning.mt5_autopilot_core.config.MT5_ENABLED", True), \
              patch("learning.mt5_autopilot_core.config.MT5_AUTOPILOT_ENABLED", True), \
+             patch("learning.mt5_autopilot_core.config.MT5_RISK_GOV_LANE_AWARE_ENABLED", False), \
              patch("learning.mt5_autopilot_core.config.MT5_RISK_GOV_DAILY_LOSS_LIMIT_USD", 1.0), \
+             patch("learning.mt5_autopilot_core.config.get_mt5_risk_gov_daily_loss_limit_usd_lane_overrides", return_value={}), \
              patch("learning.mt5_autopilot_core.mt5_executor.status", return_value=status), \
              patch("learning.mt5_autopilot_core.mt5_executor.open_positions_snapshot", return_value=open_snap), \
              patch("learning.mt5_autopilot_core.mt5_executor.closed_trades_snapshot", return_value=closed):
@@ -114,6 +118,39 @@ class MT5AutopilotCoreTests(unittest.TestCase):
         self.assertEqual(st["journal"]["resolved"], 1)
         self.assertEqual(st["calibration"]["labeled_7d"], 1)
         self.assertIsNotNone(st["calibration"]["mae_7d"])
+
+    def test_record_scalping_net_log_accepts_btc_source(self):
+        closed_row = {
+            "close_time": 4102444799,
+            "pnl": 3.5,
+            "profit": 4.0,
+            "swap": -0.1,
+            "commission": -0.4,
+        }
+        with patch("learning.mt5_autopilot_core.config.SCALPING_NET_LOG_ENABLED", True):
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                self.core._record_scalping_net_log(
+                    conn=conn,
+                    journal_id=77,
+                    account_key="TEST-MT5|123",
+                    source="scalp_btcusd",
+                    signal_symbol="BTCUSD",
+                    broker_symbol="BTCUSD",
+                    position_id=888,
+                    ticket=888,
+                    opened_at="2099-12-31T23:00:00Z",
+                    closed_row=closed_row,
+                    close_reason="TP",
+                    outcome=1,
+                )
+                rows = conn.execute(
+                    "SELECT source, canonical_symbol, pnl_net_usd FROM mt5_scalping_net_log WHERE journal_id=77"
+                ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "scalp_btcusd")
+        self.assertEqual(rows[0][1], "BTC/USDT")
+        self.assertAlmostEqual(float(rows[0][2]), 3.5, places=6)
 
 
 if __name__ == "__main__":

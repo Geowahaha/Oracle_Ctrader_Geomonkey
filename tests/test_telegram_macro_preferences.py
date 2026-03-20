@@ -2,14 +2,243 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from config import config
 from market.economic_calendar import EconomicEvent
 from market.macro_news import MacroHeadline
 from notifier.telegram_bot import TelegramNotifier
 from scanners.stock_scanner import StockOpportunity
 from analysis.signals import TradeSignal
+from execution.mt5_executor import MT5ExecutionResult
 
 
 class TelegramMacroPreferenceTests(unittest.TestCase):
+    def test_send_xau_guard_transition_alert_for_news_freeze(self):
+        n = TelegramNotifier()
+        payload = {
+            "kind": "news_freeze",
+            "action": "activated",
+            "checked_utc": "2026-03-19T14:30:00Z",
+            "title": "US CPI",
+            "nearest_min": 18,
+            "window_min": 20,
+        }
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_xau_guard_transition_alert(payload, chat_id=999)
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("NEWS FREEZE ACTIVE", text)
+        self.assertIn("blocked because CPI", text)
+        self.assertEqual(send_call.call_args.kwargs["feature"], "calendar")
+        self.assertEqual(send_call.call_args.kwargs["signal_symbol"], "XAUUSD")
+        self.assertIsNone(send_call.call_args.kwargs["parse_mode"])
+
+    def test_send_xau_guard_transition_alert_for_kill_switch(self):
+        n = TelegramNotifier()
+        payload = {
+            "kind": "kill_switch",
+            "action": "cleared",
+            "checked_utc": "2026-03-19T14:31:00Z",
+            "title": "Reuters headline",
+            "shock_score": 18.4,
+            "source": "Reuters",
+            "verification": "confirmed",
+        }
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_xau_guard_transition_alert(payload, chat_id=999)
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("KILL SWITCH CLEARED", text)
+        self.assertIn("Reuters headline", text)
+        self.assertEqual(send_call.call_args.kwargs["feature"], "macro")
+
+    def test_send_signal_marks_scalping_signal_type(self):
+        n = TelegramNotifier()
+        sig = TradeSignal(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=74.0,
+            entry=2145.0,
+            stop_loss=2151.0,
+            take_profit_1=2140.0,
+            take_profit_2=2135.0,
+            take_profit_3=2130.0,
+            risk_reward=2.0,
+            timeframe="5m+1m",
+            session="new_york",
+            trend="bearish",
+            rsi=44.0,
+            atr=3.2,
+            pattern="SCALP_TEST",
+            reasons=[],
+            warnings=[],
+            raw_scores={"scalping": True, "scalping_source": "scalp_xauusd"},
+        )
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_signal(sig, chat_id=999)
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("Signal Type:* `SCALPING`", text)
+
+    def test_send_signal_includes_run_trace_tag(self):
+        n = TelegramNotifier()
+        sig = TradeSignal(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=81.2,
+            entry=2101.1,
+            stop_loss=2098.8,
+            take_profit_1=2102.4,
+            take_profit_2=2103.7,
+            take_profit_3=2105.0,
+            risk_reward=1.4,
+            timeframe="5m+1m",
+            session="asian",
+            trend="bullish",
+            rsi=58.0,
+            atr=3.1,
+            pattern="TRACE_TEST",
+            reasons=[],
+            warnings=[],
+            raw_scores={"signal_run_no": 42, "signal_trace_tag": "R000042", "signal_run_id": "20260306010101-000042"},
+        )
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_signal(sig, chat_id=999)
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("`#R000042`", text)
+
+    def test_mt5_execution_update_includes_run_trace(self):
+        n = TelegramNotifier()
+        sig = TradeSignal(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=79.0,
+            entry=2099.5,
+            stop_loss=2097.0,
+            take_profit_1=2100.5,
+            take_profit_2=2101.5,
+            take_profit_3=2102.5,
+            risk_reward=1.2,
+            timeframe="5m+1m",
+            session="asian",
+            trend="bullish",
+            rsi=55.0,
+            atr=2.8,
+            pattern="TRACE_EXEC",
+            reasons=[],
+            warnings=[],
+            raw_scores={"signal_run_no": 8, "signal_trace_tag": "R000008", "signal_run_id": "20260306010202-000008"},
+        )
+        res = MT5ExecutionResult(
+            ok=True,
+            status="filled",
+            message="order accepted retcode=10009",
+            signal_symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            ticket=123,
+            position_id=123,
+        )
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_mt5_execution_update(sig, res, source="scalp_xauusd")
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("*Run:* `#R000008`", text)
+        self.assertIn("*ID:* `20260306010202\\-000008`", text)
+
+    def test_mt5_execution_update_shows_planned_vs_fill(self):
+        n = TelegramNotifier()
+        sig = TradeSignal(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=83.0,
+            entry=5114.98,
+            stop_loss=5118.36,
+            take_profit_1=5111.85,
+            take_profit_2=5110.80,
+            take_profit_3=5109.41,
+            risk_reward=1.2,
+            timeframe="5m+1m",
+            session="london",
+            trend="bearish",
+            rsi=38.0,
+            atr=6.1,
+            pattern="TRACE_EXEC",
+            reasons=[],
+            warnings=[],
+            raw_scores={
+                "signal_run_no": 9,
+                "signal_trace_tag": "R000009",
+                "signal_run_id": "20260306010303-000009",
+                "mt5_planned_entry_price": 5114.98,
+                "mt5_request_price": 5110.35,
+                "mt5_actual_fill_price": 5110.35,
+                "mt5_limit_fallback_market": True,
+                "mt5_limit_fallback_reason": "ok",
+            },
+        )
+        res = MT5ExecutionResult(
+            ok=True,
+            status="filled",
+            message="order accepted retcode=10009",
+            signal_symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            ticket=456,
+            position_id=456,
+        )
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_mt5_execution_update(sig, res, source="scalp_xauusd:bypass")
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("Planned/Fill", text)
+        self.assertIn("Limit Fallback", text)
+
+    def test_bypass_quick_tp_update_is_short_and_plain(self):
+        n = TelegramNotifier()
+        with patch.object(n, "_send", return_value=True) as send_call:
+            ok = n.send_mt5_bypass_quick_tp_update(
+                symbol="XAUUSD",
+                ticket=1517262012,
+                profit_usd=8.33,
+                target_usd=7.20,
+                balance_usd=721.76,
+            )
+        self.assertTrue(ok)
+        text = send_call.call_args.args[0]
+        self.assertIn("BYPASS QUICK-TP CLOSED", text)
+        self.assertIn("XAUUSD", text)
+        self.assertIn("1517262012", text)
+        self.assertIn("+8.33$", text)
+        self.assertEqual(send_call.call_args.kwargs.get("parse_mode"), None)
+
+    def test_resolve_targets_applies_symbol_filter_to_owner_chat(self):
+        n = TelegramNotifier()
+        n.broadcast_enabled = False
+        old_owner = getattr(config, "TELEGRAM_CHAT_ID", "")
+        try:
+            config.TELEGRAM_CHAT_ID = "123456789"
+            with patch("notifier.telegram_bot.access_manager.user_signal_filter_allows", return_value=False):
+                ids = n._resolve_target_chat_ids(
+                    chat_id=None,
+                    feature="scan_stocks",
+                    signal_symbol="MBG.DE",
+                    signal_symbols=["MBG.DE", "RWE.DE"],
+                )
+            self.assertEqual(ids, [])
+        finally:
+            config.TELEGRAM_CHAT_ID = old_owner
+
+    def test_resolve_targets_applies_symbol_filter_to_direct_chat(self):
+        n = TelegramNotifier()
+        n.broadcast_enabled = False
+        with patch("notifier.telegram_bot.access_manager.user_signal_filter_allows", return_value=False):
+            ids = n._resolve_target_chat_ids(
+                chat_id=777,
+                feature="scan_stocks",
+                signal_symbol="MBG.DE",
+                signal_symbols=["MBG.DE"],
+            )
+        self.assertEqual(ids, [])
+
     def test_vi_stock_summary_includes_profile_reasons_and_escapes_plus(self):
         n = TelegramNotifier()
         sig = TradeSignal(

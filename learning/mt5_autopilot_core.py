@@ -22,6 +22,11 @@ from typing import Optional
 
 from config import config
 from execution.mt5_executor import mt5_executor
+try:
+    from learning.symbol_normalizer import canonical_symbol
+except Exception:  # pragma: no cover - safe fallback for runtime
+    def canonical_symbol(symbol: str) -> str:
+        return str(symbol or "").strip().upper()
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,32 @@ def _safe_int(v, default: int = 0) -> int:
         return int(v)
     except Exception:
         return int(default)
+
+
+def _source_lane(source: str) -> str:
+    src = str(source or "").strip().lower()
+    if not src:
+        return "main"
+    if ":canary" in src or src.endswith("canary"):
+        return "canary"
+    if ":bypass" in src or src.endswith("bypass"):
+        return "bypass"
+    winner_tag = str(getattr(config, "MT5_BEST_LANE_TAG", "winner") or "winner").strip().lower()
+    if winner_tag and (f":{winner_tag}" in src or src == winner_tag):
+        return "winner"
+    return "main"
+
+
+def _empty_lane_metrics() -> dict:
+    return {
+        "daily_realized_pnl": 0.0,
+        "daily_loss_abs": 0.0,
+        "daily_win_count": 0,
+        "daily_loss_count": 0,
+        "consecutive_losses": 0,
+        "last_loss_ts": 0,
+        "recent_rejections_1h": 0,
+    }
 
 
 @dataclass
@@ -151,6 +182,34 @@ class MT5AutopilotCore:
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_mt5_exec_pos ON mt5_execution_journal(position_id, ticket)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mt5_scalping_net_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT NOT NULL,
+                        journal_id INTEGER NOT NULL UNIQUE,
+                        account_key TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        canonical_symbol TEXT NOT NULL,
+                        signal_symbol TEXT,
+                        broker_symbol TEXT,
+                        position_id INTEGER,
+                        ticket INTEGER,
+                        opened_at TEXT,
+                        closed_at TEXT,
+                        duration_min REAL,
+                        pnl_net_usd REAL,
+                        gross_profit REAL,
+                        swap REAL,
+                        commission REAL,
+                        close_reason TEXT,
+                        outcome INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_scalp_net_symbol_time ON mt5_scalping_net_log(canonical_symbol, closed_at)"
                 )
                 conn.execute(
                     """
@@ -256,6 +315,7 @@ class MT5AutopilotCore:
         now_dt = _utc_now()
         today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
+        # Account-level realized PnL from MT5 history (kept for visibility/backward compatibility).
         closed = list(closed_snap.get("closed_trades", []) or [])
         daily_pnl = 0.0
         win_count = 0
@@ -292,8 +352,17 @@ class MT5AutopilotCore:
                 # flat trade breaks the streak conservatively
                 break
 
-        # Recent rejection storm (journal-based; only this account)
+        # Journal-based lane metrics (main / winner / bypass) for lane-aware governors.
         rejection_1h = 0
+        lane_metrics = {
+            "main": _empty_lane_metrics(),
+            "winner": _empty_lane_metrics(),
+            "bypass": _empty_lane_metrics(),
+            "canary": _empty_lane_metrics(),
+        }
+        lane_ordered: dict[str, list[tuple[int, float]]] = {k: [] for k in lane_metrics.keys()}
+        since_iso = _iso(now_dt - timedelta(hours=1))
+        today_start_iso = _iso(today_start)
         with self._lock:
             with closing(self._connect()) as conn:
                 cur = conn.execute(
@@ -307,6 +376,66 @@ class MT5AutopilotCore:
                 )
                 row = cur.fetchone()
                 rejection_1h = _safe_int((row[0] if row else 0), 0)
+                realized_rows = conn.execute(
+                    """
+                    SELECT COALESCE(closed_at, created_at), COALESCE(pnl, 0.0), COALESCE(source, '')
+                      FROM mt5_execution_journal
+                     WHERE account_key = ?
+                       AND resolved = 1
+                       AND COALESCE(closed_at, created_at) >= ?
+                     ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
+                    """,
+                    (account_key, today_start_iso),
+                ).fetchall()
+                for ts_text, pnl_raw, src in list(realized_rows or []):
+                    lane = _source_lane(str(src or ""))
+                    if lane not in lane_metrics:
+                        lane = "main"
+                    pnl_v = _safe_float(pnl_raw, 0.0)
+                    lane_metrics[lane]["daily_realized_pnl"] += pnl_v
+                    ts_dt = _parse_iso(str(ts_text or ""))
+                    ts_int = int(ts_dt.timestamp()) if ts_dt else 0
+                    lane_ordered[lane].append((ts_int, pnl_v))
+                    if pnl_v > 1e-12:
+                        lane_metrics[lane]["daily_win_count"] += 1
+                    elif pnl_v < -1e-12:
+                        lane_metrics[lane]["daily_loss_count"] += 1
+                        lane_metrics[lane]["last_loss_ts"] = max(int(lane_metrics[lane]["last_loss_ts"]), ts_int)
+                reject_rows = conn.execute(
+                    """
+                    SELECT COALESCE(source,''), COUNT(*)
+                      FROM mt5_execution_journal
+                     WHERE account_key = ?
+                       AND created_at >= ?
+                       AND mt5_status IN ('rejected','error','invalid_stops')
+                     GROUP BY COALESCE(source,'')
+                    """,
+                    (account_key, since_iso),
+                ).fetchall()
+                for src, c in list(reject_rows or []):
+                    lane = _source_lane(str(src or ""))
+                    if lane not in lane_metrics:
+                        lane = "main"
+                    lane_metrics[lane]["recent_rejections_1h"] += _safe_int(c, 0)
+
+        for lane, seq in lane_ordered.items():
+            cons = 0
+            for _ts, pnl_v in list(seq or []):
+                if pnl_v < -1e-12:
+                    cons += 1
+                elif pnl_v > 1e-12:
+                    break
+                else:
+                    break
+            lane_metrics[lane]["consecutive_losses"] = int(cons)
+            lane_metrics[lane]["daily_loss_abs"] = round(
+                abs(min(0.0, _safe_float(lane_metrics[lane]["daily_realized_pnl"], 0.0))),
+                4,
+            )
+            lane_metrics[lane]["daily_realized_pnl"] = round(
+                _safe_float(lane_metrics[lane]["daily_realized_pnl"], 0.0),
+                4,
+            )
 
         snapshot = {
             "ok": True,
@@ -322,6 +451,7 @@ class MT5AutopilotCore:
             "last_loss_ts": last_loss_ts,
             "recent_rejections_1h": rejection_1h,
             "closed_history_query_mode": str(closed_snap.get("history_query_mode", "") or ""),
+            "lane_metrics": lane_metrics,
             "cache_hit": False,
             "computed_at": _iso(now_dt),
         }
@@ -361,78 +491,181 @@ class MT5AutopilotCore:
         st = dict(snap.get("status") or {})
         account_key = str(snap.get("account_key") or "")
         overrides = dict(policy_overrides or {})
+        lane = _source_lane(source)
+        lane_aware = bool(getattr(config, "MT5_RISK_GOV_LANE_AWARE_ENABLED", True))
+        lane_metrics_all = dict(snap.get("lane_metrics") or {})
+        active_metrics = dict(snap)
+        if lane_aware and lane in lane_metrics_all:
+            active_metrics = dict(lane_metrics_all.get(lane) or {})
+        active_metrics["lane"] = lane
         equity = max(
             _safe_float(st.get("equity", 0.0), 0.0),
             _safe_float(st.get("balance", 0.0), 0.0),
             0.0,
         )
-        daily_loss_abs = _safe_float(snap.get("daily_loss_abs", 0.0), 0.0)
+        daily_loss_abs = _safe_float(active_metrics.get("daily_loss_abs", snap.get("daily_loss_abs", 0.0)), 0.0)
+
+        # Respect global config when orchestrator passes explicit None overrides.
+        def _override_or_config(key: str, config_attr: str, fallback):
+            raw = overrides.get(key)
+            if raw is None:
+                raw = getattr(config, config_attr, fallback)
+            return raw
+
+        def _lane_override_float(value: float, lane_map: dict[str, float]) -> float:
+            out = float(value)
+            cand = lane_map.get(lane)
+            if cand is None:
+                cand = lane_map.get(str(lane).upper())
+            if cand is None:
+                cand = lane_map.get(str(lane).lower())
+            if cand is not None:
+                out = _safe_float(cand, out)
+            return float(out)
+
+        def _lane_override_int(value: int, lane_map: dict[str, int]) -> int:
+            out = int(value)
+            cand = lane_map.get(lane)
+            if cand is None:
+                cand = lane_map.get(str(lane).upper())
+            if cand is None:
+                cand = lane_map.get(str(lane).lower())
+            if cand is not None:
+                out = _safe_int(cand, out)
+            return int(out)
+
         daily_loss_limit_usd = max(
             0.0,
             _safe_float(
-                overrides.get("daily_loss_limit_usd", getattr(config, "MT5_RISK_GOV_DAILY_LOSS_LIMIT_USD", 2.0)),
+                _override_or_config("daily_loss_limit_usd", "MT5_RISK_GOV_DAILY_LOSS_LIMIT_USD", 2.0),
                 2.0,
+            ),
+        )
+        daily_loss_limit_usd = max(
+            0.0,
+            _lane_override_float(
+                daily_loss_limit_usd,
+                dict(getattr(config, "get_mt5_risk_gov_daily_loss_limit_usd_lane_overrides", lambda: {})() or {}),
             ),
         )
         daily_loss_limit_pct = max(
             0.0,
             _safe_float(
-                overrides.get("daily_loss_limit_pct", getattr(config, "MT5_RISK_GOV_DAILY_LOSS_LIMIT_PCT", 15.0)),
+                _override_or_config("daily_loss_limit_pct", "MT5_RISK_GOV_DAILY_LOSS_LIMIT_PCT", 15.0),
                 15.0,
+            ),
+        )
+        daily_loss_limit_pct = max(
+            0.0,
+            _lane_override_float(
+                daily_loss_limit_pct,
+                dict(getattr(config, "get_mt5_risk_gov_daily_loss_limit_pct_lane_overrides", lambda: {})() or {}),
             ),
         )
         max_cons_losses = max(
             0,
             _safe_int(
-                overrides.get("max_consecutive_losses", getattr(config, "MT5_RISK_GOV_MAX_CONSECUTIVE_LOSSES", 2)),
+                _override_or_config("max_consecutive_losses", "MT5_RISK_GOV_MAX_CONSECUTIVE_LOSSES", 2),
                 2,
+            ),
+        )
+        max_cons_losses = max(
+            0,
+            _lane_override_int(
+                max_cons_losses,
+                dict(getattr(config, "get_mt5_risk_gov_max_consecutive_losses_lane_overrides", lambda: {})() or {}),
             ),
         )
         cooldown_min = max(
             0,
             _safe_int(
-                overrides.get("loss_cooldown_min", getattr(config, "MT5_RISK_GOV_LOSS_COOLDOWN_MIN", 30)),
+                _override_or_config("loss_cooldown_min", "MT5_RISK_GOV_LOSS_COOLDOWN_MIN", 30),
                 30,
+            ),
+        )
+        cooldown_min = max(
+            0,
+            _lane_override_int(
+                cooldown_min,
+                dict(getattr(config, "get_mt5_risk_gov_loss_cooldown_min_lane_overrides", lambda: {})() or {}),
             ),
         )
         reject_limit = max(
             0,
             _safe_int(
-                overrides.get("max_rejections_1h", getattr(config, "MT5_RISK_GOV_MAX_REJECTIONS_1H", 5)),
+                _override_or_config("max_rejections_1h", "MT5_RISK_GOV_MAX_REJECTIONS_1H", 5),
                 5,
+            ),
+        )
+        reject_limit = max(
+            0,
+            _lane_override_int(
+                reject_limit,
+                dict(getattr(config, "get_mt5_risk_gov_max_rejections_1h_lane_overrides", lambda: {})() or {}),
             ),
         )
 
         # Hard stop: daily realized loss in USD.
         if daily_loss_limit_usd > 0 and daily_loss_abs >= daily_loss_limit_usd:
-            reason = f"risk governor: daily realized loss {daily_loss_abs:.2f} >= ${daily_loss_limit_usd:.2f}"
-            self._log_risk_event(account_key, "daily_loss", "block", reason, {"snapshot": snap, "source": source})
+            reason = f"risk governor[{lane}]: daily realized loss {daily_loss_abs:.2f} >= ${daily_loss_limit_usd:.2f}"
+            self._log_risk_event(
+                account_key,
+                "daily_loss",
+                "block",
+                reason,
+                {"snapshot": snap, "active_metrics": active_metrics, "source": source, "lane": lane},
+            )
             return GateDecision(False, "guard_blocked", reason, account_key=account_key, snapshot=snap)
 
         # Hard stop: daily realized loss as % equity.
         if equity > 0 and daily_loss_limit_pct > 0:
             loss_pct = (daily_loss_abs / equity) * 100.0
             if loss_pct >= daily_loss_limit_pct:
-                reason = f"risk governor: daily realized loss {loss_pct:.1f}% >= {daily_loss_limit_pct:.1f}% of equity"
-                self._log_risk_event(account_key, "daily_loss_pct", "block", reason, {"snapshot": snap, "source": source})
+                reason = (
+                    f"risk governor[{lane}]: daily realized loss "
+                    f"{loss_pct:.1f}% >= {daily_loss_limit_pct:.1f}% of equity"
+                )
+                self._log_risk_event(
+                    account_key,
+                    "daily_loss_pct",
+                    "block",
+                    reason,
+                    {"snapshot": snap, "active_metrics": active_metrics, "source": source, "lane": lane},
+                )
                 return GateDecision(False, "guard_blocked", reason, account_key=account_key, snapshot=snap)
 
         # Cooldown after consecutive losses.
-        cons_losses = _safe_int(snap.get("consecutive_losses", 0), 0)
-        last_loss_ts = _safe_int(snap.get("last_loss_ts", 0), 0)
+        cons_losses = _safe_int(active_metrics.get("consecutive_losses", snap.get("consecutive_losses", 0)), 0)
+        last_loss_ts = _safe_int(active_metrics.get("last_loss_ts", snap.get("last_loss_ts", 0)), 0)
         if max_cons_losses > 0 and cons_losses >= max_cons_losses and cooldown_min > 0 and last_loss_ts > 0:
             age_min = max(0.0, (_utc_now().timestamp() - float(last_loss_ts)) / 60.0)
             if age_min < float(cooldown_min):
                 reason = (
-                    f"risk governor: cooldown after {cons_losses} consecutive losses "
+                    f"risk governor[{lane}]: cooldown after {cons_losses} consecutive losses "
                     f"({age_min:.0f}m < {cooldown_min}m)"
                 )
-                self._log_risk_event(account_key, "loss_streak", "cooldown", reason, {"snapshot": snap, "source": source})
+                self._log_risk_event(
+                    account_key,
+                    "loss_streak",
+                    "cooldown",
+                    reason,
+                    {"snapshot": snap, "active_metrics": active_metrics, "source": source, "lane": lane},
+                )
                 return GateDecision(False, "guard_blocked", reason, account_key=account_key, snapshot=snap)
 
-        if reject_limit > 0 and _safe_int(snap.get("recent_rejections_1h", 0), 0) >= reject_limit:
-            reason = f"risk governor: recent MT5 rejections/errors >= {reject_limit}/h"
-            self._log_risk_event(account_key, "reject_storm", "cooldown", reason, {"snapshot": snap, "source": source})
+        recent_rejections = _safe_int(
+            active_metrics.get("recent_rejections_1h", snap.get("recent_rejections_1h", 0)),
+            0,
+        )
+        if reject_limit > 0 and recent_rejections >= reject_limit:
+            reason = f"risk governor[{lane}]: recent MT5 rejections/errors >= {reject_limit}/h"
+            self._log_risk_event(
+                account_key,
+                "reject_storm",
+                "cooldown",
+                reason,
+                {"snapshot": snap, "active_metrics": active_metrics, "source": source, "lane": lane},
+            )
             return GateDecision(False, "guard_blocked", reason, account_key=account_key, snapshot=snap)
 
         return GateDecision(True, "allowed", "ok", account_key=account_key, snapshot=snap)
@@ -517,7 +750,7 @@ class MT5AutopilotCore:
             with closing(self._connect()) as conn:
                 unresolved_rows = conn.execute(
                     """
-                    SELECT id, broker_symbol, signal_symbol, position_id, ticket, created_at, neural_prob
+                    SELECT id, source, broker_symbol, signal_symbol, position_id, ticket, created_at, neural_prob
                     FROM mt5_execution_journal
                     WHERE account_key=? AND resolved=0 AND mt5_status IN ('filled','dry_run')
                     ORDER BY id DESC
@@ -526,36 +759,71 @@ class MT5AutopilotCore:
                     (account_key,),
                 ).fetchall()
                 unresolved = len(unresolved_rows)
-                # Build index from closed trades by position_id then symbol.
-                by_pos = {}
-                by_symbol = {}
-                for row in closed_rows:
-                    pos = row.get("position_id")
-                    if pos:
-                        by_pos[int(pos)] = row
-                    sym = str(row.get("symbol", "") or "").upper()
-                    by_symbol.setdefault(sym, []).append(row)
+                # Build one-to-one index from closed trades:
+                # 1) exact: position_id / ticket
+                # 2) fallback: symbol + nearest close_time after open_time (bounded window)
+                by_pos: dict[int, dict] = {}
+                by_symbol: dict[str, list[dict]] = {}
+                used_uids: set[int] = set()
+                for idx, row in enumerate(closed_rows):
+                    item = dict(row or {})
+                    item["_uid"] = int(idx)
+                    pos = _safe_int(item.get("position_id"), 0)
+                    if pos > 0 and pos not in by_pos:
+                        by_pos[pos] = item
+                    sym = str(item.get("symbol", "") or "").upper()
+                    by_symbol.setdefault(sym, []).append(item)
                 for sym_list in by_symbol.values():
-                    sym_list.sort(key=lambda r: _safe_int(r.get("close_time", 0), 0), reverse=True)
+                    sym_list.sort(key=lambda r: _safe_int(r.get("close_time", 0), 0))
+                max_fallback_age_sec = max(
+                    60,
+                    int(getattr(config, "MT5_AUTOPILOT_OUTCOME_MATCH_MAX_AGE_SEC", 48 * 3600) or (48 * 3600)),
+                )
 
-                for rid, broker_symbol, signal_symbol, position_id, ticket, created_at, neural_prob in unresolved_rows:
+                for rid, source, broker_symbol, signal_symbol, position_id, ticket, created_at, neural_prob in unresolved_rows:
                     match = None
+                    matched_uid = -1
                     pos_i = _safe_int(position_id, 0)
-                    if pos_i > 0:
-                        match = by_pos.get(pos_i)
+                    ticket_i = _safe_int(ticket, 0)
+
+                    # Prefer deterministic exact keys first.
+                    for key in (pos_i, ticket_i):
+                        if key <= 0:
+                            continue
+                        cand = by_pos.get(key)
+                        if cand is None:
+                            continue
+                        uid = _safe_int(cand.get("_uid"), -1)
+                        if uid in used_uids:
+                            continue
+                        match = cand
+                        matched_uid = uid
+                        break
                     if match is None:
                         sym_key = str(broker_symbol or signal_symbol or "").upper()
                         created_dt = _parse_iso(created_at) or (_utc_now() - timedelta(days=365))
+                        created_ts = int(created_dt.timestamp())
+                        best: tuple[int, int, dict] | None = None
                         for cand in by_symbol.get(sym_key, []):
                             cts = _safe_int(cand.get("close_time", 0), 0)
                             if cts <= 0:
                                 continue
-                            cdt = datetime.fromtimestamp(cts, tz=timezone.utc)
-                            if cdt >= created_dt:
-                                match = cand
-                                break
+                            uid = _safe_int(cand.get("_uid"), -1)
+                            if uid in used_uids:
+                                continue
+                            if cts < created_ts:
+                                continue
+                            age_sec = cts - created_ts
+                            if age_sec > max_fallback_age_sec:
+                                continue
+                            if (best is None) or (age_sec < best[0]):
+                                best = (age_sec, uid, cand)
+                        if best is not None:
+                            _, matched_uid, match = best
                     if match is None:
                         continue
+                    if matched_uid >= 0:
+                        used_uids.add(matched_uid)
 
                     pnl = _safe_float(match.get("pnl", 0.0), 0.0)
                     outcome = 1 if pnl > 1e-12 else (0 if pnl < -1e-12 else None)
@@ -582,6 +850,20 @@ class MT5AutopilotCore:
                             pred_err,
                             int(rid),
                         ),
+                    )
+                    self._record_scalping_net_log(
+                        conn=conn,
+                        journal_id=int(rid),
+                        account_key=account_key,
+                        source=str(source or ""),
+                        signal_symbol=str(signal_symbol or ""),
+                        broker_symbol=str(broker_symbol or ""),
+                        position_id=_safe_int(position_id, 0),
+                        ticket=_safe_int(ticket, 0),
+                        opened_at=str(created_at or ""),
+                        closed_row=match,
+                        close_reason=str(match.get("reason", "") or ""),
+                        outcome=outcome,
                     )
                     updated += 1
                     matched += 1
@@ -610,6 +892,151 @@ class MT5AutopilotCore:
             "as_of": now_iso,
         }
 
+    @staticmethod
+    def _normalize_direction(raw: str) -> str:
+        d = str(raw or "").strip().lower()
+        if d in {"buy", "long", "0"}:
+            return "long"
+        if d in {"sell", "short", "1"}:
+            return "short"
+        return d
+
+    def _resolve_stale_unmatched(self, account_key: str, open_positions: list[dict]) -> dict:
+        stale_hours = max(0.0, float(getattr(config, "MT5_AUTOPILOT_UNRESOLVED_STALE_HOURS", 96) or 96))
+        if stale_hours <= 0 or (not account_key):
+            return {
+                "stale_hours": float(stale_hours),
+                "stale_candidates": 0,
+                "stale_resolved": 0,
+            }
+
+        open_ids: set[int] = set()
+        open_sym_dir: set[tuple[str, str]] = set()
+        for row in list(open_positions or []):
+            rec = dict(row or {})
+            tid = _safe_int(rec.get("ticket"), 0)
+            if tid > 0:
+                open_ids.add(tid)
+            sym = canonical_symbol(str(rec.get("symbol", "") or ""))
+            d = self._normalize_direction(str(rec.get("type", "") or ""))
+            if sym and d in {"long", "short"}:
+                open_sym_dir.add((sym, d))
+
+        cutoff_iso = _iso(_utc_now() - timedelta(hours=stale_hours))
+        stale_candidates = 0
+        stale_resolved = 0
+        now_iso = _iso(_utc_now())
+
+        with self._lock:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, broker_symbol, signal_symbol, direction, position_id, ticket
+                      FROM mt5_execution_journal
+                     WHERE account_key=?
+                       AND resolved=0
+                       AND mt5_status IN ('filled','dry_run')
+                       AND created_at<=?
+                     ORDER BY id ASC
+                     LIMIT 5000
+                    """,
+                    (account_key, cutoff_iso),
+                ).fetchall()
+                stale_candidates = len(rows)
+                for rid, broker_symbol, signal_symbol, direction, position_id, ticket in rows:
+                    pos_i = _safe_int(position_id, 0)
+                    ticket_i = _safe_int(ticket, 0)
+                    if (pos_i > 0 and pos_i in open_ids) or (ticket_i > 0 and ticket_i in open_ids):
+                        continue
+                    sym = canonical_symbol(str(broker_symbol or signal_symbol or ""))
+                    d = self._normalize_direction(str(direction or ""))
+                    if sym and d in {"long", "short"} and (sym, d) in open_sym_dir:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE mt5_execution_journal
+                           SET resolved=1,
+                               outcome=NULL,
+                               pnl=0.0,
+                               close_reason='UNMAPPED_STALE',
+                               closed_at=?,
+                               prediction_error=NULL
+                         WHERE id=?
+                        """,
+                        (now_iso, int(rid)),
+                    )
+                    stale_resolved += 1
+                conn.commit()
+        return {
+            "stale_hours": float(stale_hours),
+            "stale_candidates": int(stale_candidates),
+            "stale_resolved": int(stale_resolved),
+        }
+
+    def _record_scalping_net_log(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        journal_id: int,
+        account_key: str,
+        source: str,
+        signal_symbol: str,
+        broker_symbol: str,
+        position_id: int,
+        ticket: int,
+        opened_at: str,
+        closed_row: dict,
+        close_reason: str,
+        outcome: Optional[int],
+    ) -> None:
+        if not bool(getattr(config, "SCALPING_NET_LOG_ENABLED", True)):
+            return
+        src = str(source or "").strip().lower()
+        if src not in {"scalp_xauusd", "scalp_ethusd", "scalp_btcusd"}:
+            return
+        closed = dict(closed_row or {})
+        close_ts = _safe_int(closed.get("close_time", 0), 0)
+        if close_ts <= 0:
+            return
+        close_dt = datetime.fromtimestamp(close_ts, tz=timezone.utc)
+        open_dt = _parse_iso(str(opened_at or "")) or close_dt
+        duration_min = max(0.0, (close_dt - open_dt).total_seconds() / 60.0)
+        pnl_net = _safe_float(closed.get("pnl", 0.0), 0.0)
+        gross_profit = _safe_float(closed.get("profit", pnl_net), pnl_net)
+        swap = _safe_float(closed.get("swap", 0.0), 0.0)
+        commission = _safe_float(closed.get("commission", 0.0), 0.0)
+        canon = canonical_symbol(str(broker_symbol or signal_symbol or ""))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO mt5_scalping_net_log(
+                created_at, journal_id, account_key, source, canonical_symbol,
+                signal_symbol, broker_symbol, position_id, ticket,
+                opened_at, closed_at, duration_min, pnl_net_usd,
+                gross_profit, swap, commission, close_reason, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _iso(_utc_now()),
+                int(journal_id),
+                str(account_key or ""),
+                src,
+                str(canon or ""),
+                str(signal_symbol or ""),
+                str(broker_symbol or ""),
+                (_safe_int(position_id, 0) or None),
+                (_safe_int(ticket, 0) or None),
+                str(_iso(open_dt)),
+                str(_iso(close_dt)),
+                round(float(duration_min), 4),
+                round(float(pnl_net), 6),
+                round(float(gross_profit), 6),
+                round(float(swap), 6),
+                round(float(commission), 6),
+                str(close_reason or "")[:60],
+                (None if outcome is None else int(outcome)),
+            ),
+        )
+
     def sync_outcomes_from_mt5(self, hours: int = 72) -> dict:
         if not self.enabled:
             return {"ok": False, "message": "disabled"}
@@ -622,14 +1049,20 @@ class MT5AutopilotCore:
             return {"ok": False, "message": str(closed.get("error") or "closed snapshot failed")}
         rows = list(closed.get("closed_trades", []) or [])
         out = self._match_and_update_outcomes(account_key, rows)
+        open_snap = mt5_executor.open_positions_snapshot(limit=200)
+        open_rows = list(open_snap.get("positions", []) or []) if bool(open_snap.get("connected")) else []
+        stale_out = self._resolve_stale_unmatched(account_key, open_rows)
         out.update(
             {
                 "ok": True,
                 "account_key": account_key,
                 "closed_rows_seen": len(rows),
                 "history_query_mode": str(closed.get("history_query_mode", "") or ""),
+                "open_positions_seen": len(open_rows),
+                "open_positions_connected": bool(open_snap.get("connected")),
             }
         )
+        out.update(stale_out)
         return out
 
     @staticmethod

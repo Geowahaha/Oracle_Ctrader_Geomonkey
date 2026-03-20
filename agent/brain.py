@@ -1,6 +1,6 @@
 """
 agent/brain.py - Multi-provider Autonomous Financial Research Agent
-Provider order: Groq -> Gemini -> Anthropic
+Provider order: Groq -> Gemini -> Anthropic -> OpenRouter
 """
 import json
 import logging
@@ -109,7 +109,9 @@ class DexterBrain:
         self.max_iterations = max_iterations
         self.provider_chain = self._build_provider_chain()
         if not self.provider_chain:
-            raise ValueError("No AI provider key found (set GROQ_API_KEY or GEMINI_API_KEY or ANTHROPIC_API_KEY)")
+            raise ValueError(
+                "No AI provider key found (set GROQ_API_KEY or GEMINI_API_KEY or GEMINI_VERTEX_AI_API_KEY or ANTHROPIC_API_KEY)"
+            )
         self.provider = self.provider_chain[0]
         self.model = config.model_for_provider(self.provider)
         self.client = None
@@ -119,13 +121,15 @@ class DexterBrain:
         available: list[str] = []
         if config.GROQ_API_KEY:
             available.append("groq")
-        if config.GEMINI_API_KEY:
+        if config.has_gemini_key():
             available.append("gemini")
         if config.ANTHROPIC_API_KEY:
             available.append("anthropic")
+        if config.OPENROUTER_API_KEY:
+            available.append("openrouter")
 
         pref = (config.AI_PROVIDER or "auto").strip().lower()
-        if pref in ("groq", "gemini", "anthropic") and pref in available:
+        if pref in ("groq", "gemini", "anthropic", "openrouter") and pref in available:
             return [pref] + [p for p in available if p != pref]
         return available
 
@@ -245,12 +249,12 @@ class DexterBrain:
             logger.error(f"Tool execution error [{tool_name}]: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    # ─── OpenAI-Compatible Providers (Groq / Gemini) ─────────────────────────
+    # ─── OpenAI-Compatible Providers (Groq / OpenRouter) ─────────────────────
     def _openai_compat_endpoint(self, provider: str) -> tuple[str, str]:
         if provider == "groq":
             return "https://api.groq.com/openai/v1/chat/completions", config.GROQ_API_KEY
-        if provider == "gemini":
-            return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", config.GEMINI_API_KEY
+        if provider == "openrouter":
+            return "https://openrouter.ai/api/v1/chat/completions", config.OPENROUTER_API_KEY
         raise ValueError(f"Provider {provider} is not OpenAI-compatible path")
 
     def _chat_openai_compat(
@@ -287,6 +291,126 @@ class DexterBrain:
             raise RuntimeError(f"{provider.upper()} API error {resp.status_code}: {detail}")
         data = resp.json()
         return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+    def _gemini_native_endpoint_and_key(self) -> tuple[str, str]:
+        model = config.model_for_provider("gemini")
+        mode = config.gemini_mode()
+        if mode == "vertex":
+            endpoint = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent"
+            return endpoint, config.GEMINI_VERTEX_AI_API_KEY
+        if mode == "direct":
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            return endpoint, config.GEMINI_API_KEY
+        raise RuntimeError("Gemini provider selected but no Gemini key is configured")
+
+    @staticmethod
+    def _message_content_to_text(content: object) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            out: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    txt = item.strip()
+                    if txt:
+                        out.append(txt)
+                    continue
+                if isinstance(item, dict):
+                    txt = str(
+                        item.get("text")
+                        or item.get("input_text")
+                        or ""
+                    ).strip()
+                    if txt:
+                        out.append(txt)
+            return "\n".join(out).strip()
+        if isinstance(content, dict):
+            txt = str(content.get("text") or content.get("input_text") or "").strip()
+            return txt
+        if content is None:
+            return ""
+        return str(content).strip()
+
+    def _chat_gemini_native(
+        self,
+        messages: list[dict],
+        max_tokens: int = 1400,
+        temperature: float = 0.2,
+    ) -> str:
+        endpoint, api_key = self._gemini_native_endpoint_and_key()
+        system_parts: list[str] = []
+        contents: list[dict] = []
+
+        for msg in messages:
+            role = str(msg.get("role", "user")).strip().lower()
+            text = self._message_content_to_text(msg.get("content"))
+            if not text:
+                continue
+            if role == "system":
+                system_parts.append(text)
+                continue
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({
+                "role": gemini_role,
+                "parts": [{"text": text}],
+            })
+
+        if not contents:
+            raise RuntimeError("Gemini payload is empty")
+
+        payload: dict = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": int(max_tokens),
+            },
+        }
+        if system_parts:
+            payload["systemInstruction"] = {
+                "parts": [{"text": "\n\n".join(system_parts)[:20000]}],
+            }
+
+        resp = requests.post(
+            endpoint,
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=90,
+        )
+        if resp.status_code >= 400:
+            detail = resp.text[:500]
+            try:
+                parsed = resp.json()
+                detail = (
+                    parsed.get("error", {}).get("message")
+                    or parsed.get("error_description")
+                    or parsed.get("message")
+                    or detail
+                )
+            except Exception:
+                pass
+            raise RuntimeError(f"GEMINI API error {resp.status_code}: {detail}")
+
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            feedback = data.get("promptFeedback", {}) or {}
+            block_reason = str(feedback.get("blockReason") or "").strip()
+            block_msg = f" blocked: {block_reason}" if block_reason else ""
+            raise RuntimeError(f"GEMINI returned no candidates{block_msg}")
+
+        parts = ((candidates[0] or {}).get("content", {}) or {}).get("parts", []) or []
+        text_chunks: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            txt = str(part.get("text") or "").strip()
+            if txt:
+                text_chunks.append(txt)
+        answer = "\n".join(text_chunks).strip()
+        if not answer:
+            raise RuntimeError("GEMINI returned empty answer")
+        return answer
 
     def _build_fast_context(self) -> dict:
         """Build compact live context for one-shot LLM research."""
@@ -362,6 +486,20 @@ class DexterBrain:
             raise RuntimeError(f"{provider.upper()} returned empty answer")
         return answer
 
+    def _research_gemini(self, question: str) -> str:
+        ctx = self._build_fast_context()
+        user_prompt = (
+            f"Question: {question}\n\n"
+            "Use this live context JSON and answer with directional bias, levels, risk, confidence.\n"
+            "If confidence is low, say so clearly.\n\n"
+            f"Context JSON:\n{json.dumps(ctx, default=str)[:12000]}"
+        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._chat_gemini_native(messages=messages)
+
     # ─── Anthropic Tool Loop (legacy path) ────────────────────────────────────
     def _research_anthropic(self, question: str) -> Generator[AgentEvent, None, None]:
         messages = [{"role": "user", "content": question}]
@@ -426,9 +564,15 @@ class DexterBrain:
             )
 
             try:
-                if provider in ("groq", "gemini"):
+                if provider in ("groq", "openrouter"):
                     yield AgentEvent("thinking", content="Collected live market context.", iteration=idx)
                     answer = self._research_openai_compat(question, provider)
+                    yield AgentEvent("answer", content=answer, iteration=idx)
+                    return
+
+                if provider == "gemini":
+                    yield AgentEvent("thinking", content="Collected live market context.", iteration=idx)
+                    answer = self._research_gemini(question)
                     yield AgentEvent("answer", content=answer, iteration=idx)
                     return
 

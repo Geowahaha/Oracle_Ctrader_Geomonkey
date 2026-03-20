@@ -7,7 +7,10 @@ import logging
 import threading
 import time
 import json
+import os
 import re
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -38,6 +41,14 @@ class TelegramAdminBot:
         self._chat_user_map: dict[int, int] = {}
         self._chat_mt5_context: dict[int, dict] = {}
         self._chat_pending_slots: dict[int, dict] = {}
+        self._chat_pending_intent_confirm: dict[int, dict] = {}
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = os.path.join(root_dir, "data")
+        self._intent_learning_file = os.path.join(data_dir, "intent_phrase_memory.json")
+        self._intent_events_file = os.path.join(data_dir, "intent_events.jsonl")
+        self._intent_learning_lock = threading.Lock()
+        self._intent_phrase_memory: dict[str, dict] = {}
+        self._load_intent_phrase_memory()
 
     def _api_get(self, method: str, params: Optional[dict] = None, timeout: int = 35) -> Optional[dict]:
         try:
@@ -121,6 +132,131 @@ class TelegramAdminBot:
             "text": text,
             "disable_web_page_preview": True,
         })
+
+    def _load_intent_phrase_memory(self) -> None:
+        path = str(getattr(self, "_intent_learning_file", "") or "").strip()
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                self._intent_phrase_memory = {}
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            phrases = obj.get("phrases", {}) if isinstance(obj, dict) else {}
+            if not isinstance(phrases, dict):
+                phrases = {}
+            sanitized: dict[str, dict] = {}
+            for k, v in phrases.items():
+                key = str(k or "").strip()
+                if not key or not isinstance(v, dict):
+                    continue
+                cmd = str(v.get("command") or "").strip().lower()
+                args = str(v.get("args") or "").strip()
+                if not cmd:
+                    continue
+                sanitized[key] = {
+                    "command": cmd,
+                    "args": args,
+                    "count": int(v.get("count", 1) or 1),
+                    "updated_at": float(v.get("updated_at", time.time()) or time.time()),
+                    "source": str(v.get("source") or "memory"),
+                }
+            self._intent_phrase_memory = sanitized
+        except Exception as e:
+            logger.warning("[AdminBot] failed to load intent phrase memory: %s", e)
+            self._intent_phrase_memory = {}
+
+    def _save_intent_phrase_memory(self) -> None:
+        path = str(getattr(self, "_intent_learning_file", "") or "").strip()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {
+                "updated_at": time.time(),
+                "phrases": self._intent_phrase_memory,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("[AdminBot] failed to save intent phrase memory: %s", e)
+
+    @staticmethod
+    def _normalize_intent_phrase_key(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        q = TelegramAdminBot._normalize_intent_text(raw)
+        q = re.sub(r"\s+", " ", q).strip()
+        return q[:240]
+
+    def _record_intent_event(
+        self,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        outcome: str,
+        command: str = "",
+        args: str = "",
+        source: str = "heuristic",
+    ) -> None:
+        path = str(getattr(self, "_intent_events_file", "") or "").strip()
+        if not path:
+            return
+        rec = {
+            "ts": time.time(),
+            "chat_id": int(chat_id),
+            "user_id": int(user_id),
+            "text": str(text or "")[:600],
+            "normalized": self._normalize_intent_phrase_key(text),
+            "outcome": str(outcome or "")[:48],
+            "command": str(command or "").strip().lower(),
+            "args": str(args or "").strip()[:240],
+            "source": str(source or "heuristic")[:48],
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug("[AdminBot] failed to append intent event: %s", e)
+
+    def _remember_intent_phrase(
+        self,
+        text: str,
+        command: str,
+        args: str = "",
+        source: str = "heuristic",
+    ) -> None:
+        key = self._normalize_intent_phrase_key(text)
+        cmd = str(command or "").strip().lower()
+        if not key or not cmd:
+            return
+        with self._intent_learning_lock:
+            old = dict(self._intent_phrase_memory.get(key) or {})
+            cnt = int(old.get("count", 0) or 0) + 1
+            self._intent_phrase_memory[key] = {
+                "command": cmd,
+                "args": str(args or "").strip(),
+                "count": cnt,
+                "updated_at": time.time(),
+                "source": str(source or "heuristic"),
+            }
+            self._save_intent_phrase_memory()
+
+    def _lookup_learned_intent(self, text: str) -> Optional[tuple[str, str]]:
+        key = self._normalize_intent_phrase_key(text)
+        if not key:
+            return None
+        rec = self._intent_phrase_memory.get(key)
+        if not rec:
+            return None
+        cmd = str(rec.get("command") or "").strip().lower()
+        args = str(rec.get("args") or "").strip()
+        if not cmd:
+            return None
+        return cmd, args
 
     @staticmethod
     def _detect_language(text: str) -> str:
@@ -319,6 +455,36 @@ class TelegramAdminBot:
             except Exception:
                 return None
         return None
+
+    @classmethod
+    def _monitor_tz_for_user(cls, user_id: Optional[int]) -> tuple[timezone, str]:
+        """Resolve monitor timezone from user's /tz preference; fallback to Bangkok."""
+        offset = "+07:00"
+        try:
+            if user_id is not None:
+                saved = access_manager.get_user_news_utc_offset(int(user_id))
+                if saved:
+                    offset = str(saved).strip().upper()
+        except Exception:
+            offset = "+07:00"
+        if not (len(offset) == 6 and offset[0] in {"+", "-"} and offset[3] == ":"):
+            offset = "+07:00"
+        try:
+            sign = 1 if offset[0] == "+" else -1
+            hh = int(offset[1:3])
+            mm = int(offset[4:6])
+            if not (0 <= hh <= 14 and 0 <= mm < 60):
+                raise ValueError("invalid offset")
+            tz_obj = timezone(sign * timedelta(hours=hh, minutes=mm))
+            return tz_obj, f"UTC{offset}"
+        except Exception:
+            return timezone(timedelta(hours=7)), "UTC+07:00"
+
+    @classmethod
+    def _monitor_local_time_text(cls, user_id: Optional[int]) -> str:
+        tz_obj, tz_label = cls._monitor_tz_for_user(user_id)
+        now_local = datetime.now(timezone.utc).astimezone(tz_obj)
+        return f"{now_local.strftime('%H:%M')} {tz_label}"
 
     def _language_pref_offer_text(self, chat_id: int, ui_lang: str) -> str:
         counts = dict(self._chat_lang_counts.get(int(chat_id), {}) or {})
@@ -556,14 +722,18 @@ class TelegramAdminBot:
             "start", "help", "status",
             "scan_gold", "scan_crypto", "scan_fx", "scan_stocks", "scan_thai", "scan_thai_vi", "scan_us", "scan_us_open", "scan_vi", "scan_vi_buffett", "scan_vi_turnaround", "scan_all",
             "monitor_us",
+            "scalping_status", "scalping_on", "scalping_off", "scalping_scan", "scalping_logic",
             "us_open_report",
             "us_open_dashboard",
             "us_open_guard_status",
             "signal_dashboard",
+            "signal_monitor",
+            "signal_filter", "show_only", "show_add", "show_clear", "show_all",
             "calendar", "macro", "tz", "timezone",
             "macro_report", "macro_weights", "markets", "gold_overview",
             "mt5_status", "mt5_history", "mt5_backtest", "mt5_train",
             "mt5_autopilot", "mt5_walkforward", "mt5_manage", "mt5_affordable", "mt5_exec_reasons", "mt5_pm_learning", "mt5_policy", "mt5_plan", "mt5_adaptive_explain",
+            "run",
             "stock_mt5_filter",
             "plan", "upgrade", "research",
             "grant", "setplan", "revoke", "block", "admin_add", "admin_del", "admin_list", "user_list",
@@ -595,11 +765,22 @@ class TelegramAdminBot:
             "us_open_guard": "us_open_guard_status",
             "signaldashboard": "signal_dashboard",
             "daily_signal_dashboard": "signal_dashboard",
+            "signalmonitor": "signal_monitor",
+            "monitor_signal": "signal_monitor",
+            "dashboard_monitor": "signal_monitor",
+            "runid": "run",
+            "trace": "run",
+            "traceid": "run",
             "calender": "calendar",
             "macro_weigths": "macro_weights",
             "macro_wights": "macro_weights",
             "stockmt5filter": "stock_mt5_filter",
             "stock_mt5filter": "stock_mt5_filter",
+            "signalfilter": "signal_filter",
+            "showonly": "show_only",
+            "showadd": "show_add",
+            "showclear": "show_clear",
+            "showall": "show_all",
             "adminadd": "admin_add",
             "admindel": "admin_del",
             "adminremove": "admin_del",
@@ -612,6 +793,15 @@ class TelegramAdminBot:
             "scanviturnaround": "scan_vi_turnaround",
             "scanfx": "scan_fx",
             "scanforex": "scan_fx",
+            "scalpstatus": "scalping_status",
+            "scalpingstatus": "scalping_status",
+            "scalpon": "scalping_on",
+            "scalpingon": "scalping_on",
+            "scalpoff": "scalping_off",
+            "scalpingoff": "scalping_off",
+            "scalpscan": "scalping_scan",
+            "scalp_logic": "scalping_logic",
+            "scalpinglogic": "scalping_logic",
         }
         if raw in aliases:
             return aliases[raw]
@@ -641,10 +831,35 @@ class TelegramAdminBot:
 
     @staticmethod
     def _parse_signal_dashboard_args(text: str) -> dict:
-        out = {"days": 1, "top": 5, "market_filter": None, "compare": False, "left": None, "right": None}
+        out = {
+            "days": 1,
+            "top": 5,
+            "market_filter": None,
+            "symbol_filter": None,
+            "window_mode": "today",
+            "compare": False,
+            "left": None,
+            "right": None,
+        }
         raw = str(text or "").strip()
         if not raw:
             return out
+        q = raw.lower().strip()
+
+        # Natural-language window presets.
+        if any(k in q for k in ("this month", "เดือนนี้", "เดือนนี", "mtd")):
+            out["window_mode"] = "this_month"
+            out["days"] = 30
+        elif any(k in q for k in ("this week", "สัปดาห์นี้", "อาทิตย์นี้", "wtd")):
+            out["window_mode"] = "this_week"
+            out["days"] = 7
+        elif any(k in q for k in ("yesterday", "เมื่อวาน", "yday")):
+            out["window_mode"] = "yesterday"
+            out["days"] = 1
+        elif any(k in q for k in ("today", "วันนี้", "วันนี")):
+            out["window_mode"] = "today"
+            out["days"] = 1
+
         toks = [t for t in re.split(r"\s+", raw) if t]
         market_aliases = {
             "th": "thai", "thai": "thai", "thailand": "thai",
@@ -666,10 +881,22 @@ class TelegramAdminBot:
                 continue
             if tl in {"today", "1d", "d1", "วันนี้", "วันนี"}:
                 out["days"] = 1
+                out["window_mode"] = "today"
+            elif tl in {"yesterday", "yday", "เมื่อวาน"}:
+                out["days"] = 1
+                out["window_mode"] = "yesterday"
+            elif tl in {"week", "thisweek", "this_week", "wtd", "สัปดาห์นี้", "อาทิตย์นี้"}:
+                out["days"] = 7
+                out["window_mode"] = "this_week"
+            elif tl in {"month", "thismonth", "this_month", "mtd", "เดือนนี้"}:
+                out["days"] = 30
+                out["window_mode"] = "this_month"
             elif (m := re.fullmatch(r"(\d{1,2})d", tl)):
                 out["days"] = max(1, min(30, int(m.group(1))))
+                out["window_mode"] = "rolling_days"
             elif tl.isdigit():
                 out["days"] = max(1, min(30, int(tl)))
+                out["window_mode"] = "rolling_days"
             elif tl.startswith("top") and len(tl) > 3 and tl[3:].isdigit():
                 out["top"] = max(1, min(20, int(tl[3:])))
             elif tl == "top" and (i + 1) < len(toks) and str(toks[i+1]).isdigit():
@@ -686,11 +913,1104 @@ class TelegramAdminBot:
                         out["right"] = mkt
                 else:
                     out["market_filter"] = mkt
+                    if tl in {"gold", "xau", "xauusd", "ทอง"} and not out.get("symbol_filter"):
+                        out["symbol_filter"] = "XAUUSD"
+            elif not compare_mode:
+                stop_words = {
+                    "this", "that", "week", "month", "today", "yesterday", "top", "compare", "vs",
+                    "dashboard", "signal", "signals", "all", "market", "markets",
+                }
+                if tl in stop_words:
+                    i += 1
+                    continue
+                sym = TelegramAdminBot._normalize_dashboard_symbol(tk)
+                if sym and sym not in {"TODAY", "YESTERDAY", "THISWEEK", "THISMONTH"}:
+                    out["symbol_filter"] = sym
+                    if sym == "XAUUSD" and not out.get("market_filter"):
+                        out["market_filter"] = "gold"
+                    elif sym.startswith("BTC") or sym.startswith("ETH"):
+                        out["market_filter"] = out.get("market_filter") or "crypto"
             i += 1
         if out["compare"]:
             out["left"] = out["left"] or "us"
             out["right"] = out["right"] or "thai"
         return out
+
+    @staticmethod
+    def _normalize_dashboard_symbol(token: str) -> str:
+        t = str(token or "").strip().upper().replace(" ", "")
+        if not t:
+            return ""
+        alias = {
+            "GOLD": "XAUUSD",
+            "XAU": "XAUUSD",
+            "XAUUSD": "XAUUSD",
+            "ETH": "ETHUSD",
+            "ETHUSD": "ETHUSD",
+            "ETHUSDT": "ETHUSD",
+            "ETH/USDT": "ETHUSD",
+            "BTC": "BTCUSD",
+            "BTCUSD": "BTCUSD",
+            "BTCUSDT": "BTCUSD",
+            "BTC/USDT": "BTCUSD",
+        }
+        if t in alias:
+            return alias[t]
+        compact = t.replace("/", "")
+        if compact in alias:
+            return alias[compact]
+        if t.endswith("/USDT") and len(t) > 5:
+            return f"{t[:-5]}USD"
+        if t.endswith("USDT") and len(t) > 4:
+            return f"{t[:-4]}USD"
+        if re.fullmatch(r"[A-Z0-9._-]{3,20}", t):
+            return t
+        return ""
+
+    @staticmethod
+    def _parse_signal_monitor_args(text: str) -> dict:
+        parsed = TelegramAdminBot._parse_signal_dashboard_args(text)
+        raw = str(text or "").strip()
+        stop_words = {
+            "today", "yesterday", "this", "week", "month", "thisweek", "thismonth", "wtd", "mtd",
+            "dashboard", "signal", "signals", "monitor", "top", "compare", "vs",
+        }
+
+        symbols: list[str] = []
+        seen: set[str] = set()
+
+        def _add_symbol(token: str) -> None:
+            sym = TelegramAdminBot._normalize_dashboard_symbol(token)
+            if not sym:
+                return
+            if sym in {"TODAY", "YESTERDAY", "THIS", "WEEK", "MONTH"}:
+                return
+            if sym in seen:
+                return
+            seen.add(sym)
+            symbols.append(sym)
+
+        for tk in [t for t in re.split(r"[\s,;|]+", raw) if t]:
+            if str(tk).strip().lower() in stop_words:
+                continue
+            _add_symbol(tk)
+
+        for alias in TelegramAdminBot._extract_signal_filter_symbols_from_text(raw):
+            _add_symbol(alias)
+
+        symbol_from_dash = str(parsed.get("symbol_filter") or "").strip().upper()
+        if symbol_from_dash:
+            _add_symbol(symbol_from_dash)
+
+        market = str(parsed.get("market_filter") or "").strip().lower()
+        if (not symbols) and market == "gold":
+            symbols = ["XAUUSD"]
+
+        out = {
+            "symbol": symbols[0] if symbols else "",
+            "symbols": symbols,
+            "window_mode": str(parsed.get("window_mode") or "today").strip().lower(),
+            "days": int(parsed.get("days", 1) or 1),
+        }
+        return out
+
+    @staticmethod
+    def _monitor_window_bounds(mode: str, days: int) -> tuple[float, float]:
+        now = datetime.now(timezone.utc)
+        day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        m = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if m == "yesterday":
+            start = day_start - timedelta(days=1)
+            end = day_start
+            return start.timestamp(), end.timestamp()
+        if m == "this_week":
+            start = day_start - timedelta(days=day_start.weekday())
+            return start.timestamp(), now.timestamp()
+        if m == "this_month":
+            start = day_start.replace(day=1)
+            return start.timestamp(), now.timestamp()
+        if m == "rolling_days":
+            span = max(1, min(30, int(days or 1)))
+            start = now - timedelta(days=span)
+            return start.timestamp(), now.timestamp()
+        # default: today
+        return day_start.timestamp(), now.timestamp()
+
+    @staticmethod
+    def _signal_monitor_status_label(status: str, lang: str = "en") -> str:
+        ui = str(lang or "en").lower()
+        table = {
+            "no_signal": {
+                "en": "No new signal this round",
+                "th": "ยังไม่มีสัญญาณใหม่ในรอบนี้",
+                "de": "Kein neues Signal in diesem Zyklus",
+            },
+            "no_setup": {
+                "en": "No setup passed base engine",
+                "th": "ยังไม่มี setup ผ่าน engine หลัก",
+                "de": "Kein Setup hat den Basis-Filter bestanden",
+            },
+            "no_h1_data": {
+                "en": "Missing H1 data",
+                "th": "ข้อมูล H1 ยังไม่พอ",
+                "de": "H1-Daten fehlen",
+            },
+            "trap_guard_blocked": {
+                "en": "Blocked by XAU trap guard",
+                "th": "ถูกบล็อกโดย XAU trap guard",
+                "de": "Durch XAU-Trap-Guard blockiert",
+            },
+            "below_confidence": {
+                "en": "Signal below confidence threshold",
+                "th": "สัญญาณต่ำกว่า confidence threshold",
+                "de": "Signal unter Confidence-Schwelle",
+            },
+            "cooldown_suppressed": {
+                "en": "Signal suppressed by cooldown",
+                "th": "สัญญาณถูก cooldown กดไว้",
+                "de": "Signal durch Cooldown unterdrückt",
+            },
+            "ready": {
+                "en": "New signal ready",
+                "th": "มีสัญญาณใหม่พร้อมใช้งาน",
+                "de": "Neues Signal bereit",
+            },
+            "sent": {
+                "en": "Signal sent",
+                "th": "ส่งสัญญาณแล้ว",
+                "de": "Signal gesendet",
+            },
+            "sent_manual_bypass_cooldown": {
+                "en": "Signal sent (manual cooldown bypass)",
+                "th": "ส่งสัญญาณแล้ว (manual bypass cooldown)",
+                "de": "Signal gesendet (manueller Cooldown-Bypass)",
+            },
+            "m1_rejected": {
+                "en": "Trigger rejected by M1 filter",
+                "th": "M1 filter ไม่ยืนยันทิศทาง",
+                "de": "Trigger vom M1-Filter abgelehnt",
+            },
+            "regime_blocked": {
+                "en": "Blocked by higher-timeframe regime guard",
+                "th": "ถูกบล็อกโดย higher-timeframe regime guard",
+                "de": "Durch Higher-Timeframe-Regime-Guard blockiert",
+            },
+            "disabled": {
+                "en": "Scanner disabled",
+                "th": "scanner ถูกปิดอยู่",
+                "de": "Scanner deaktiviert",
+            },
+            "unsupported_symbol": {
+                "en": "Unsupported monitor symbol",
+                "th": "ยังไม่รองรับ monitor สำหรับสัญลักษณ์นี้",
+                "de": "Dieses Symbol wird im Monitor nicht unterstützt",
+            },
+            "error": {
+                "en": "Scan error",
+                "th": "เกิดข้อผิดพลาดในการสแกน",
+                "de": "Scan-Fehler",
+            },
+        }
+        rec = table.get(str(status or "").strip().lower())
+        if rec:
+            return str(rec.get(ui) or rec.get("en"))
+        return str(status or "unknown")
+
+    @staticmethod
+    def _fmt_monitor_profit(value: float) -> str:
+        try:
+            val = round(float(value), 2)
+        except Exception:
+            return str(value)
+        if abs(val - round(val)) < 1e-9:
+            return str(int(round(val)))
+        return f"{val:.2f}".rstrip("0").rstrip(".")
+
+    @classmethod
+    def _format_monitor_perf_line(
+        cls,
+        label: str,
+        count: int,
+        wins: int,
+        losses: int,
+        profit_usd: float,
+    ) -> str:
+        ptxt = cls._fmt_monitor_profit(profit_usd)
+        return f"{label} {int(count)} W{int(wins)}/L{int(losses)} Profit={ptxt}$"
+
+    @staticmethod
+    def _ts_to_iso_utc(ts: Optional[float]) -> str:
+        if ts is None:
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _monitor_symbol_aliases(symbol: str) -> tuple[str, ...]:
+        token = str(symbol or "").strip().upper()
+        aliases = {token}
+        if token in {"XAU", "GOLD"}:
+            aliases.add("XAUUSD")
+        if token.endswith("USD") and len(token) > 3:
+            base = token[:-3]
+            aliases.add(f"{base}/USDT")
+            aliases.add(f"{base}USDT")
+        if token.endswith("USDT") and len(token) > 4:
+            base = token[:-4]
+            aliases.add(f"{base}/USDT")
+            aliases.add(f"{base}USD")
+        if token.endswith("/USDT") and len(token) > 6:
+            base = token.split("/", 1)[0]
+            aliases.add(f"{base}USD")
+            aliases.add(f"{base}USDT")
+        return tuple(sorted(a for a in aliases if a))
+
+    @staticmethod
+    def _mt5_lane_from_source(source: str) -> str:
+        src = str(source or "").strip().lower()
+        if not src:
+            return "main"
+        if ":bypass" in src or src.endswith("bypass"):
+            return "bypass"
+        lane_tag = str(getattr(config, "MT5_BEST_LANE_TAG", "winner") or "winner").strip().lower()
+        if lane_tag and (f":{lane_tag}" in src or src == lane_tag):
+            return "winner"
+        return "main"
+
+    def _load_mt5_exec_stats_filtered(self, symbol: str, start_ts: Optional[float], end_ts: Optional[float]) -> dict:
+        lane_names = ("main", "winner", "bypass")
+
+        def _empty_lane() -> dict:
+            return {
+                "sent": 0,
+                "filled": 0,
+                "skipped": 0,
+                "guard_blocked": 0,
+                "errors": 0,
+                "fill_rate_pct": 0.0,
+                "top_block_reason": "",
+            }
+
+        out = {
+            "enabled": bool(getattr(config, "MT5_AUTOPILOT_ENABLED", False)),
+            "available": False,
+            "sent": 0,
+            "filled": 0,
+            "skipped": 0,
+            "guard_blocked": 0,
+            "errors": 0,
+            "fill_rate_pct": 0.0,
+            "top_block_reason": "",
+            "lanes": {name: _empty_lane() for name in lane_names},
+        }
+        if not out["enabled"]:
+            return out
+        try:
+            db_cfg = str(getattr(config, "MT5_AUTOPILOT_DB_PATH", "") or "").strip()
+            db_path = db_cfg or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data",
+                "mt5_autopilot.db",
+            )
+            if not os.path.exists(db_path):
+                return out
+            aliases = self._monitor_symbol_aliases(symbol)
+            if not aliases:
+                return out
+            since_iso = self._ts_to_iso_utc(start_ts)
+            until_iso = self._ts_to_iso_utc(end_ts)
+            account_key = ""
+            try:
+                from learning.mt5_autopilot_core import mt5_autopilot_core
+
+                gate = mt5_autopilot_core.pre_trade_gate(signal=None, source="signal_monitor")
+                account_key = str(getattr(gate, "account_key", "") or "").strip()
+            except Exception:
+                account_key = ""
+
+            ph = ",".join(["?"] * len(aliases))
+            where = [
+                "created_at >= ?",
+                "created_at < ?",
+                f"(UPPER(COALESCE(signal_symbol,'')) IN ({ph}) OR UPPER(COALESCE(broker_symbol,'')) IN ({ph}))",
+            ]
+            params: list = [since_iso, until_iso]
+            params.extend(list(aliases))
+            params.extend(list(aliases))
+            if account_key:
+                where.append("account_key = ?")
+                params.append(account_key)
+            where_sql = " AND ".join(where)
+            with sqlite3.connect(db_path) as conn:
+                status_rows = conn.execute(
+                    f"""
+                    SELECT COALESCE(source,''), COALESCE(mt5_status,''), COUNT(*)
+                      FROM mt5_execution_journal
+                     WHERE {where_sql}
+                     GROUP BY COALESCE(source,''), COALESCE(mt5_status,'')
+                    """,
+                    tuple(params),
+                ).fetchall()
+                lane_stats = {name: _empty_lane() for name in lane_names}
+                for src, st, c in list(status_rows or []):
+                    lane = self._mt5_lane_from_source(str(src or ""))
+                    if lane not in lane_stats:
+                        lane = "main"
+                    count = int(c or 0)
+                    ls = lane_stats[lane]
+                    ls["sent"] += count
+                    st_l = str(st or "").strip().lower()
+                    if st_l in {"filled", "dry_run"}:
+                        ls["filled"] += count
+                    elif st_l == "skipped":
+                        ls["skipped"] += count
+                    elif st_l == "guard_blocked":
+                        ls["guard_blocked"] += count
+                    elif st_l in {"rejected", "error", "invalid_stops"}:
+                        ls["errors"] += count
+
+                for name in lane_names:
+                    sent_lane = int(lane_stats[name]["sent"] or 0)
+                    filled_lane = int(lane_stats[name]["filled"] or 0)
+                    lane_stats[name]["fill_rate_pct"] = round((100.0 * filled_lane / sent_lane), 2) if sent_lane > 0 else 0.0
+
+                sent = sum(int(lane_stats[name]["sent"] or 0) for name in lane_names)
+                filled = sum(int(lane_stats[name]["filled"] or 0) for name in lane_names)
+                skipped = sum(int(lane_stats[name]["skipped"] or 0) for name in lane_names)
+                blocked = sum(int(lane_stats[name]["guard_blocked"] or 0) for name in lane_names)
+                errors = sum(int(lane_stats[name]["errors"] or 0) for name in lane_names)
+                out.update(
+                    {
+                        "available": True,
+                        "sent": sent,
+                        "filled": filled,
+                        "skipped": skipped,
+                        "guard_blocked": blocked,
+                        "errors": errors,
+                        "fill_rate_pct": round((100.0 * filled / sent), 2) if sent > 0 else 0.0,
+                        "lanes": lane_stats,
+                    }
+                )
+                blocked_rows = conn.execute(
+                    f"""
+                    SELECT COALESCE(source,''), COALESCE(mt5_message, ''), COUNT(*) AS c
+                      FROM mt5_execution_journal
+                     WHERE {where_sql}
+                       AND mt5_status IN ('skipped','guard_blocked')
+                     GROUP BY COALESCE(source,''), COALESCE(mt5_message,'')
+                     ORDER BY c DESC, source ASC
+                    """,
+                    tuple(params),
+                ).fetchall()
+                best_overall_msg = ""
+                best_overall_count = -1
+                lane_top: dict[str, tuple[str, int]] = {name: ("", 0) for name in lane_names}
+                for src, msg, c in list(blocked_rows or []):
+                    count = int(c or 0)
+                    msg_text = str(msg or "").strip()
+                    lane = self._mt5_lane_from_source(str(src or ""))
+                    if lane not in lane_top:
+                        lane = "main"
+                    prev_msg, prev_count = lane_top[lane]
+                    if count > prev_count and msg_text:
+                        lane_top[lane] = (msg_text, count)
+                    if count > best_overall_count and msg_text:
+                        best_overall_msg = msg_text
+                        best_overall_count = count
+                if best_overall_msg:
+                    out["top_block_reason"] = best_overall_msg[:220]
+                lanes_out = dict(out.get("lanes") or {})
+                for name in lane_names:
+                    if name not in lanes_out:
+                        lanes_out[name] = _empty_lane()
+                    top_msg = str(lane_top.get(name, ("", 0))[0] or "").strip()
+                    if top_msg:
+                        lanes_out[name]["top_block_reason"] = top_msg[:220]
+                out["lanes"] = lanes_out
+        except Exception:
+            return out
+        return out
+
+    def _load_crypto_lane_stats_filtered(self, symbol: str, start_ts: Optional[float], end_ts: Optional[float]) -> dict:
+        symbol_up = str(symbol or "").strip().upper()
+        source_map = {
+            "BTCUSD": {"main": "scalp_btcusd", "winner": "scalp_btcusd:winner"},
+            "ETHUSD": {"main": "scalp_ethusd", "winner": "scalp_ethusd:winner"},
+        }
+        selected = dict(source_map.get(symbol_up) or {})
+
+        def _bucket() -> dict:
+            return {
+                "sent": 0,
+                "filled": 0,
+                "resolved": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+                "fill_rate_pct": 0.0,
+                "win_rate_pct": 0.0,
+            }
+
+        out = {
+            "available": False,
+            "symbol": symbol_up,
+            "lanes": {name: _bucket() for name in ("main", "winner")},
+        }
+        if not selected:
+            return out
+        try:
+            db_cfg = str(getattr(config, "MT5_AUTOPILOT_DB_PATH", "") or "").strip()
+            db_path = db_cfg or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data",
+                "mt5_autopilot.db",
+            )
+            if not os.path.exists(db_path):
+                return out
+            since_iso = self._ts_to_iso_utc(start_ts)
+            until_iso = self._ts_to_iso_utc(end_ts)
+            account_key = ""
+            try:
+                from learning.mt5_autopilot_core import mt5_autopilot_core
+
+                gate = mt5_autopilot_core.pre_trade_gate(signal=None, source="signal_monitor")
+                account_key = str(getattr(gate, "account_key", "") or "").strip()
+            except Exception:
+                account_key = ""
+
+            sources = [selected["main"], selected["winner"]]
+            ph = ",".join(["?"] * len(sources))
+            where = [
+                "created_at >= ?",
+                "created_at < ?",
+                f"LOWER(COALESCE(source,'')) IN ({ph})",
+            ]
+            params: list = [since_iso, until_iso]
+            params.extend([str(src).strip().lower() for src in sources])
+            if account_key:
+                where.append("account_key = ?")
+                params.append(account_key)
+            where_sql = " AND ".join(where)
+            with sqlite3.connect(db_path) as conn:
+                status_rows = conn.execute(
+                    f"""
+                    SELECT LOWER(COALESCE(source,'')), COALESCE(mt5_status,''), COUNT(*)
+                      FROM mt5_execution_journal
+                     WHERE {where_sql}
+                     GROUP BY LOWER(COALESCE(source,'')), COALESCE(mt5_status,'')
+                    """,
+                    tuple(params),
+                ).fetchall()
+                resolved_rows = conn.execute(
+                    f"""
+                    SELECT LOWER(COALESCE(source,'')),
+                           SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) AS resolved,
+                           SUM(CASE WHEN resolved = 1 AND outcome = 1 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN resolved = 1 AND outcome = 0 THEN 1 ELSE 0 END) AS losses,
+                           SUM(CASE WHEN resolved = 1 THEN COALESCE(pnl, 0.0) ELSE 0.0 END) AS pnl
+                      FROM mt5_execution_journal
+                     WHERE {where_sql}
+                     GROUP BY LOWER(COALESCE(source,''))
+                    """,
+                    tuple(params),
+                ).fetchall()
+            lookup = {str(v).strip().lower(): k for k, v in selected.items()}
+            lanes = {name: _bucket() for name in ("main", "winner")}
+            for src, st, c in list(status_rows or []):
+                lane = lookup.get(str(src or "").strip().lower())
+                if not lane:
+                    continue
+                count = int(c or 0)
+                bucket = lanes[lane]
+                bucket["sent"] += count
+                st_l = str(st or "").strip().lower()
+                if st_l in {"filled", "dry_run"}:
+                    bucket["filled"] += count
+            for src, resolved, wins, losses, pnl in list(resolved_rows or []):
+                lane = lookup.get(str(src or "").strip().lower())
+                if not lane:
+                    continue
+                bucket = lanes[lane]
+                bucket["resolved"] = int(resolved or 0)
+                bucket["wins"] = int(wins or 0)
+                bucket["losses"] = int(losses or 0)
+                bucket["pnl"] = round(float(pnl or 0.0), 2)
+            for lane in ("main", "winner"):
+                bucket = lanes[lane]
+                sent = int(bucket["sent"] or 0)
+                filled = int(bucket["filled"] or 0)
+                resolved = int(bucket["resolved"] or 0)
+                wins = int(bucket["wins"] or 0)
+                bucket["fill_rate_pct"] = round((100.0 * filled / sent), 2) if sent > 0 else 0.0
+                bucket["win_rate_pct"] = round((100.0 * wins / resolved), 2) if resolved > 0 else 0.0
+            out["available"] = True
+            out["lanes"] = lanes
+        except Exception:
+            return out
+        return out
+
+    def _load_ctrader_lane_stats_filtered(self, symbol: str, start_ts: Optional[float], end_ts: Optional[float]) -> dict:
+        symbol_up = str(symbol or "").strip().upper()
+        out = {"available": False, "symbol": symbol_up, "lanes": {}}
+        if symbol_up not in {"BTCUSD", "ETHUSD"}:
+            return out
+        try:
+            from execution.ctrader_executor import ctrader_executor
+
+            start_utc = self._ts_to_iso_utc(start_ts)
+            end_utc = self._ts_to_iso_utc(end_ts)
+            payload = ctrader_executor.get_lane_stats(symbol=symbol_up, start_utc=start_utc, end_utc=end_utc)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            return out
+        return out
+
+    def _build_signal_monitor_payload(self, symbol: str, window_mode: str = "today", days: int = 1) -> dict:
+        from api.signal_store import signal_store
+        from api.scalp_signal_store import scalp_store
+        from scanners.xauusd import xauusd_scanner
+        from scanners.scalping_scanner import scalping_scanner
+        from scanners.fx_major_scanner import fx_major_scanner
+        from market.data_fetcher import xauusd_provider, crypto_provider, fx_provider, session_manager
+
+        symbol_up = str(symbol or "XAUUSD").strip().upper() or "XAUUSD"
+        window = str(window_mode or "today").strip().lower()
+        span_days = max(1, int(days or 1))
+        session_info = session_manager.get_session_info() or {}
+        active_sessions = ", ".join(list(session_info.get("active_sessions", []) or [])) or "unknown"
+
+        payload = {
+            "symbol": symbol_up,
+            "window_mode": window,
+            "days": span_days,
+            "session": active_sessions,
+            "status": "unknown",
+            "unmet": [],
+            "notes": [],
+            "price": None,
+            "confidence": None,
+            "confidence_raw": None,
+            "confidence_threshold": None,
+            "tf": "",
+        }
+
+        if symbol_up == "XAUUSD":
+            signal = xauusd_scanner.scan()
+            diag = dict(xauusd_scanner.get_last_scan_diagnostics() or {})
+            payload["status"] = str(diag.get("status") or "no_signal")
+            payload["unmet"] = [str(x) for x in list(diag.get("unmet") or []) if str(x).strip()]
+            payload["notes"] = [str(x) for x in list(diag.get("notes") or []) if str(x).strip()]
+            fallback = dict(diag.get("fallback") or {})
+            fb_reason = str(fallback.get("reason", "") or "").strip()
+            if fb_reason:
+                fb_note = f"fallback:{fb_reason}"
+                if fb_note not in payload["notes"]:
+                    payload["notes"].append(fb_note)
+            price = diag.get("current_price")
+            if price is None:
+                price = xauusd_provider.get_current_price()
+            payload["price"] = price
+
+            threshold = float(getattr(config, "MIN_SIGNAL_CONFIDENCE", 70.0) or 70.0)
+            payload["confidence_threshold"] = threshold
+            if signal is not None:
+                conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+                payload["confidence"] = conf
+                raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                trend_tf = str(raw_scores.get("trend_tf") or "").strip().upper()
+                structure_tf = str(raw_scores.get("structure_tf") or "").strip().upper()
+                entry_tf = str(raw_scores.get("entry_tf") or "").strip().upper()
+                if trend_tf and structure_tf and entry_tf:
+                    payload["tf"] = f"{trend_tf}/{structure_tf}/{entry_tf}"
+                raw_conf = raw_scores.get("confidence_pre_neural")
+                if raw_conf is not None:
+                    try:
+                        payload["confidence_raw"] = float(raw_conf)
+                    except Exception:
+                        payload["confidence_raw"] = None
+                if payload["price"] is None:
+                    try:
+                        payload["price"] = float(getattr(signal, "entry", 0.0) or 0.0)
+                    except Exception:
+                        payload["price"] = None
+                payload["status"] = "ready" if conf >= threshold else "below_confidence"
+            else:
+                if payload["status"] in {"scan_started", "signal_eval"}:
+                    payload["status"] = "no_signal"
+                if payload["status"] == "no_signal" and not payload["unmet"]:
+                    payload["unmet"] = ["base_setup"]
+            if not payload["tf"]:
+                fallback_diag = dict(diag.get("fallback_diag") or {})
+                tf_map = dict(fallback_diag.get("timeframes") or {})
+                trend_tf = str(tf_map.get("trend") or "").strip().upper()
+                structure_tf = str(tf_map.get("structure") or "").strip().upper()
+                entry_tf = str(tf_map.get("entry") or "").strip().upper()
+                if trend_tf and structure_tf and entry_tf:
+                    payload["tf"] = f"{trend_tf}/{structure_tf}/{entry_tf}"
+        else:
+            row = None
+            market_symbol = ""
+            fx_symbol = ""
+            if symbol_up == "ETHUSD":
+                row = scalping_scanner.scan_eth(require_enabled=False)
+                market_symbol = str(getattr(config, "SCALPING_ETH_SYMBOL", "ETH/USDT") or "ETH/USDT").strip().upper()
+            elif symbol_up == "BTCUSD":
+                row = scalping_scanner.scan_btc(require_enabled=False)
+                market_symbol = str(getattr(config, "SCALPING_BTC_SYMBOL", "BTC/USDT") or "BTC/USDT").strip().upper()
+            elif symbol_up in {str(x).upper() for x in (config.get_fx_major_symbols() or [])}:
+                fx_symbol = symbol_up
+            else:
+                payload["status"] = "unsupported_symbol"
+                payload["notes"].append("supported_monitor_symbols:XAUUSD,ETHUSD,BTCUSD,+FX_majors")
+
+            if row is not None:
+                payload["status"] = str(getattr(row, "status", "unknown") or "unknown")
+                reason = str(getattr(row, "reason", "") or "").strip()
+                if reason:
+                    payload["notes"].append(reason)
+                trigger = dict(getattr(row, "trigger", {}) or {})
+                fb = dict(trigger.get("fallback") or {})
+                tf_map = dict(fb.get("timeframes") or {})
+                trend_tf = str(tf_map.get("trend") or "").strip().upper()
+                structure_tf = str(tf_map.get("structure") or "").strip().upper()
+                entry_tf = str(tf_map.get("entry") or "").strip().upper()
+                if trend_tf and structure_tf and entry_tf:
+                    payload["tf"] = f"{trend_tf}/{structure_tf}/{entry_tf}"
+                xau_unmet = [str(x) for x in list(trigger.get("xau_unmet") or []) if str(x).strip()]
+                if xau_unmet:
+                    payload["unmet"] = xau_unmet
+                signal = getattr(row, "signal", None)
+                if signal is not None:
+                    try:
+                        payload["price"] = float(getattr(signal, "entry", 0.0) or 0.0)
+                    except Exception:
+                        payload["price"] = None
+                    payload["confidence"] = float(getattr(signal, "confidence", 0.0) or 0.0)
+                    if not payload["tf"]:
+                        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                        trend_tf = str(raw_scores.get("trend_tf") or "").strip().upper()
+                        structure_tf = str(raw_scores.get("structure_tf") or "").strip().upper()
+                        entry_tf = str(raw_scores.get("entry_tf") or "").strip().upper()
+                        if trend_tf and structure_tf and entry_tf:
+                            payload["tf"] = f"{trend_tf}/{structure_tf}/{entry_tf}"
+                        else:
+                            scalp_entry_tf = str(raw_scores.get("scalping_entry_tf") or "").strip().upper()
+                            scalp_trigger_tf = str(raw_scores.get("scalping_trigger_tf") or "").strip().upper()
+                            if scalp_entry_tf and scalp_trigger_tf:
+                                payload["tf"] = f"ENTRY {scalp_entry_tf} / TRIGGER {scalp_trigger_tf}"
+                m = re.search(r"confidence<(\d+(?:\.\d+)?)", reason)
+                if m:
+                    try:
+                        payload["confidence_threshold"] = float(m.group(1))
+                    except Exception:
+                        payload["confidence_threshold"] = None
+                if payload["price"] is None and market_symbol:
+                    payload["price"] = crypto_provider.get_current_price(market_symbol)
+            elif fx_symbol:
+                opps = fx_major_scanner.scan(symbols=[fx_symbol])
+                if opps:
+                    opp = None
+                    for cand in opps:
+                        sig_sym = str(getattr(getattr(cand, "signal", None), "symbol", "") or "").strip().upper()
+                        if sig_sym == fx_symbol:
+                            opp = cand
+                            break
+                    if opp is None:
+                        opp = opps[0]
+                    sig_fx = getattr(opp, "signal", None)
+                    if sig_fx is not None:
+                        conf_fx = float(getattr(sig_fx, "confidence", 0.0) or 0.0)
+                        th_fx = float(getattr(config, "MT5_MIN_SIGNAL_CONFIDENCE_FX", getattr(config, "MIN_SIGNAL_CONFIDENCE", 70.0)) or 70.0)
+                        payload["confidence"] = conf_fx
+                        payload["confidence_threshold"] = th_fx
+                        payload["status"] = "ready" if conf_fx >= th_fx else "below_confidence"
+                        try:
+                            payload["price"] = float(getattr(sig_fx, "entry", 0.0) or 0.0)
+                        except Exception:
+                            payload["price"] = fx_provider.get_current_price(fx_symbol)
+                        raw_scores = dict(getattr(sig_fx, "raw_scores", {}) or {})
+                        trend_tf = str(raw_scores.get("trend_tf") or "").strip().upper()
+                        entry_tf = str(raw_scores.get("entry_tf") or "").strip().upper()
+                        if trend_tf and entry_tf:
+                            payload["tf"] = f"{trend_tf}/{entry_tf}"
+                        else:
+                            payload["tf"] = f"{str(getattr(config, 'FX_TREND_TF', '4h')).upper()}/{str(getattr(config, 'FX_ENTRY_TF', '1h')).upper()}"
+                    if payload["status"] == "unknown":
+                        payload["status"] = "no_signal"
+                else:
+                    payload["status"] = "no_signal"
+                    try:
+                        diag = dict(fx_major_scanner.get_last_scan_diagnostics() or {})
+                        reject = dict(diag.get("reject_reasons", {}) or {})
+                        top_reason = ""
+                        top_count = 0
+                        for k, v in reject.items():
+                            vv = int(v or 0)
+                            if vv > top_count:
+                                top_reason = str(k)
+                                top_count = vv
+                        if top_reason:
+                            payload["notes"].append(f"fx_reject:{top_reason}")
+                    except Exception:
+                        pass
+                    if payload["price"] is None:
+                        payload["price"] = fx_provider.get_current_price(fx_symbol)
+
+        # De-duplicate diagnostics while preserving order to reduce noisy repeats.
+        if payload.get("unmet"):
+            payload["unmet"] = list(dict.fromkeys(str(x) for x in list(payload.get("unmet") or []) if str(x).strip()))
+        if payload.get("notes"):
+            payload["notes"] = list(dict.fromkeys(str(x) for x in list(payload.get("notes") or []) if str(x).strip()))
+
+        start_ts, end_ts = self._monitor_window_bounds(window, span_days)
+        payload["main_stats"] = signal_store.get_performance_stats_filtered(
+            symbol=symbol_up,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        payload["scalp_stats"] = scalp_store.get_stats_filtered(
+            symbol=symbol_up,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            last_n=None,
+        )
+        payload["mt5_exec_stats"] = self._load_mt5_exec_stats_filtered(
+            symbol=symbol_up,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        if symbol_up in {"BTCUSD", "ETHUSD"}:
+            payload["crypto_lane_stats"] = self._load_crypto_lane_stats_filtered(
+                symbol=symbol_up,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        if symbol_up in {"BTCUSD", "ETHUSD", "XAUUSD"}:
+            payload["ctrader_lane_stats"] = self._load_ctrader_lane_stats_filtered(
+                symbol=symbol_up,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        return payload
+
+    def _format_signal_monitor_text(self, payload: dict, lang: str = "en", chat_id: Optional[int] = None) -> str:
+        ui = str(lang or "en").lower()
+
+        def t(en: str, th: str, de: Optional[str] = None) -> str:
+            if ui == "th":
+                return th
+            if ui == "de":
+                return de or en
+            return en
+
+        symbol = str(payload.get("symbol") or "XAUUSD").strip().upper()
+        status_key = str(payload.get("status") or "unknown")
+        status_label = self._signal_monitor_status_label(status_key, lang=ui)
+        price = payload.get("price")
+        price_text = "-"
+        if price is not None:
+            try:
+                price_text = f"${float(price):.2f}"
+            except Exception:
+                price_text = str(price)
+
+        local_time = self._monitor_local_time_text(chat_id)
+        lines = [
+            f"[{price_text}] [{local_time}]",
+            f"Price: {price_text}",
+            f"Status: {status_label}",
+        ]
+
+        unmet = [str(x) for x in list(payload.get("unmet") or []) if str(x).strip()]
+        if unmet:
+            lines.append("Unmet: " + ", ".join(unmet[:5]))
+        notes = [str(x) for x in list(payload.get("notes") or []) if str(x).strip()]
+        if notes:
+            lines.append("Notes: " + " | ".join(notes[:3]))
+
+        main_stats = dict(payload.get("main_stats") or {})
+        scalp_stats = dict(payload.get("scalp_stats") or {})
+        main_total = int(main_stats.get("total_signals", 0) or 0)
+        main_done = int(main_stats.get("completed_signals", 0) or 0)
+        main_pending = max(0, main_total - main_done)
+        scalp_done = int(scalp_stats.get("count", 0) or 0)
+        scalp_total = int(scalp_stats.get("total_signals", scalp_done) or scalp_done)
+        scalp_pending = max(0, int(scalp_stats.get("pending_count", scalp_total - scalp_done) or 0))
+        signal_closed_label = t("Signal closed (model)", "Signal ปิดผล (model)", "Signal geschlossen (Modell)")
+        scalp_closed_label = t("Scalp closed (model)", "Scalp ปิดผล (model)", "Scalp geschlossen (Modell)")
+        lines.append(
+            self._format_monitor_perf_line(
+                signal_closed_label,
+                main_done,
+                int(main_stats.get("wins", 0) or 0),
+                int(main_stats.get("losses", 0) or 0),
+                float(main_stats.get("total_pnl_usd", 0.0) or 0.0),
+            )
+        )
+        lines.append(
+            self._format_monitor_perf_line(
+                scalp_closed_label,
+                scalp_done,
+                int(scalp_stats.get("wins", 0) or 0),
+                int(scalp_stats.get("losses", 0) or 0),
+                float(scalp_stats.get("total_usd", 0.0) or 0.0),
+            )
+        )
+        lines.append(
+            f"{t('Track (model)', 'ติดตาม (model)', 'Tracking (Modell)')}: "
+            f"Signal sent {main_total} (pending {main_pending}) | "
+            f"Scalp sent {scalp_total} (pending {scalp_pending})"
+        )
+        mt5_stats = dict(payload.get("mt5_exec_stats") or {})
+        if bool(mt5_stats.get("enabled")) and bool(mt5_stats.get("available")):
+            lines.append(
+                f"{t('MT5 exec', 'MT5 ส่งคำสั่งจริง', 'MT5 Ausführung')}: "
+                f"sent {int(mt5_stats.get('sent', 0) or 0)} | "
+                f"filled {int(mt5_stats.get('filled', 0) or 0)} | "
+                f"skipped {int(mt5_stats.get('skipped', 0) or 0)} | "
+                f"blocked {int(mt5_stats.get('guard_blocked', 0) or 0)} | "
+                f"fill {float(mt5_stats.get('fill_rate_pct', 0.0) or 0.0):.1f}%"
+            )
+            top_block = str(mt5_stats.get("top_block_reason", "") or "").strip()
+            if top_block:
+                lines.append(f"{t('MT5 top block', 'MT5 เหตุผลบล็อกหลัก', 'MT5 Hauptblock')}: {top_block}")
+            lane_stats = dict(mt5_stats.get("lanes") or {})
+            lane_keys = [
+                ("main", t("main", "main", "main")),
+                ("winner", t("winner", "winner", "winner")),
+                ("bypass", t("bypass", "bypass", "bypass")),
+            ]
+            lane_parts = []
+            for key, label in lane_keys:
+                ls = dict(lane_stats.get(key) or {})
+                lane_parts.append(
+                    f"{label} {int(ls.get('sent', 0) or 0)}/"
+                    f"{int(ls.get('filled', 0) or 0)}/"
+                    f"{int(ls.get('skipped', 0) or 0)}/"
+                    f"{int(ls.get('guard_blocked', 0) or 0)}"
+                )
+            lines.append(
+                f"{t('MT5 lanes', 'MT5 แยก lane', 'MT5 Lanes')}: "
+                + " | ".join(lane_parts)
+            )
+        crypto_lane_stats = dict(payload.get("crypto_lane_stats") or {})
+        if bool(crypto_lane_stats.get("available")) and symbol in {"BTCUSD", "ETHUSD"}:
+            lanes = dict(crypto_lane_stats.get("lanes") or {})
+            main_lane = dict(lanes.get("main") or {})
+            winner_lane = dict(lanes.get("winner") or {})
+            lines.append(
+                f"{t('Crypto lanes', 'Crypto แยก lane', 'Krypto-Lanes')}: "
+                f"main S{int(main_lane.get('sent', 0) or 0)} "
+                f"F{int(main_lane.get('filled', 0) or 0)} "
+                f"R{int(main_lane.get('resolved', 0) or 0)} "
+                f"W{int(main_lane.get('wins', 0) or 0)}/L{int(main_lane.get('losses', 0) or 0)} "
+                f"P={float(main_lane.get('pnl', 0.0) or 0.0):.2f}$ | "
+                f"winner S{int(winner_lane.get('sent', 0) or 0)} "
+                f"F{int(winner_lane.get('filled', 0) or 0)} "
+                f"R{int(winner_lane.get('resolved', 0) or 0)} "
+                f"W{int(winner_lane.get('wins', 0) or 0)}/L{int(winner_lane.get('losses', 0) or 0)} "
+                f"P={float(winner_lane.get('pnl', 0.0) or 0.0):.2f}$"
+            )
+        ctrader_lane_stats = dict(payload.get("ctrader_lane_stats") or {})
+        if bool(ctrader_lane_stats.get("available")) and symbol in {"BTCUSD", "ETHUSD", "XAUUSD"}:
+            lanes = dict(ctrader_lane_stats.get("lanes") or {})
+            main_lane = dict(lanes.get("main") or {})
+            winner_lane = dict(lanes.get("winner") or {})
+            lines.append(
+                f"{t('cTrader lanes', 'cTrader แยก lane', 'cTrader-Lanes')}: "
+                f"main S{int(main_lane.get('sent', 0) or 0)} "
+                f"F{int(main_lane.get('filled', 0) or 0)} "
+                f"O{int(main_lane.get('open', 0) or 0)} "
+                f"R{int(main_lane.get('resolved', 0) or 0)} "
+                f"W{int(main_lane.get('wins', 0) or 0)}/L{int(main_lane.get('losses', 0) or 0)} "
+                f"P={float(main_lane.get('pnl', 0.0) or 0.0):.2f}$ | "
+                f"winner S{int(winner_lane.get('sent', 0) or 0)} "
+                f"F{int(winner_lane.get('filled', 0) or 0)} "
+                f"O{int(winner_lane.get('open', 0) or 0)} "
+                f"R{int(winner_lane.get('resolved', 0) or 0)} "
+                f"W{int(winner_lane.get('wins', 0) or 0)}/L{int(winner_lane.get('losses', 0) or 0)} "
+                f"P={float(winner_lane.get('pnl', 0.0) or 0.0):.2f}$"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _signal_dashboard_window_label(mode: str, days: int, lang: str = "en") -> str:
+        ui = str(lang or "en").lower()
+        m = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+        labels = {
+            "today": {"en": "today", "th": "วันนี้", "de": "heute"},
+            "yesterday": {"en": "yesterday", "th": "เมื่อวาน", "de": "gestern"},
+            "this_week": {"en": "this week", "th": "สัปดาห์นี้", "de": "diese Woche"},
+            "this_month": {"en": "this month", "th": "เดือนนี้", "de": "dieser Monat"},
+            "rolling_days": {
+                "en": f"last {int(days or 1)} days",
+                "th": f"ย้อนหลัง {int(days or 1)} วัน",
+                "de": f"letzte {int(days or 1)} Tage",
+            },
+        }
+        rec = labels.get(m, labels["rolling_days"])
+        return str(rec.get(ui) or rec.get("en"))
+
+    @staticmethod
+    def _signal_dashboard_market_label(market: str, lang: str = "en") -> str:
+        ui = str(lang or "en").lower()
+        m = str(market or "").strip().lower().replace("-", "_").replace(" ", "_")
+        table = {
+            "gold": {"en": "Gold", "th": "ทอง (Gold)", "de": "Gold"},
+            "thai": {"en": "Thailand Stocks", "th": "หุ้นไทย", "de": "Thailand-Aktien"},
+            "thai_stocks": {"en": "Thailand Stocks", "th": "หุ้นไทย", "de": "Thailand-Aktien"},
+            "us": {"en": "US Stocks", "th": "หุ้นสหรัฐ", "de": "US-Aktien"},
+            "us_stocks": {"en": "US Stocks", "th": "หุ้นสหรัฐ", "de": "US-Aktien"},
+            "global": {"en": "Global Stocks", "th": "หุ้นต่างประเทศ", "de": "Globale Aktien"},
+            "global_stocks": {"en": "Global Stocks", "th": "หุ้นต่างประเทศ", "de": "Globale Aktien"},
+            "crypto": {"en": "Crypto", "th": "คริปโต (Crypto)", "de": "Krypto"},
+            "other": {"en": "Other", "th": "อื่นๆ", "de": "Andere"},
+        }
+        rec = table.get(m)
+        if rec:
+            return str(rec.get(ui) or rec.get("en"))
+        return str(market or "-")
+
+    @staticmethod
+    def _normalize_signal_filter_symbol(token: str) -> str:
+        t = str(token or "").strip().upper().replace(" ", "")
+        if not t:
+            return ""
+        alias = {
+            "GOLD": "XAUUSD",
+            "XAU": "XAUUSD",
+            "BTCUSDT": "BTC/USDT",
+            "ETHUSDT": "ETH/USDT",
+        }
+        if t in alias:
+            return alias[t]
+        if t.endswith("USDT") and "/" not in t and len(t) > 4:
+            return f"{t[:-4]}/USDT"
+        return t
+
+    @classmethod
+    def _parse_signal_filter_symbols(cls, raw: str) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for part in re.split(r"[,\s]+", str(raw or "").strip()):
+            token = cls._normalize_signal_filter_symbol(part)
+            if not token or token in {"ALL", "*"}:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    @classmethod
+    def _extract_signal_filter_symbols_from_text(cls, raw_text: str) -> list[str]:
+        """
+        Extract signal symbols from natural-language text without requiring strict command format.
+        Example: "show only gold btc eth" -> ["XAUUSD", "BTC/USDT", "ETH/USDT"].
+        """
+        raw = str(raw_text or "").strip()
+        q = raw.lower()
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(sym: str) -> None:
+            token = cls._normalize_signal_filter_symbol(sym)
+            if not token or token in seen:
+                return
+            seen.add(token)
+            out.append(token)
+
+        def _looks_symbol(token: str) -> bool:
+            t = str(token or "").strip().upper()
+            if not t:
+                return False
+            return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9/._-]{1,23}", t))
+
+        # Keep exact symbol parsing support first (e.g., BTC/USDT, XAUUSD).
+        for token in cls._parse_signal_filter_symbols(raw):
+            if _looks_symbol(token):
+                _add(token)
+
+        # Human-friendly aliases.
+        alias_keywords = {
+            "XAUUSD": ("gold", "xau", "xauusd", "ทอง"),
+            "BTC/USDT": ("btc", "bitcoin", "บิทคอยน์", "บิท"),
+            "ETH/USDT": ("eth", "ethereum", "อีเธอเรียม"),
+            "SOL/USDT": ("sol", "solana"),
+            "XRP/USDT": ("xrp", "ripple"),
+            "BNB/USDT": ("bnb",),
+            "DOGE/USDT": ("doge", "dogecoin"),
+            "ADA/USDT": ("ada", "cardano"),
+        }
+
+        def _kw_hit(keyword: str) -> bool:
+            k = str(keyword or "").strip().lower()
+            if not k:
+                return False
+            if re.search(r"[a-z0-9/]", k):
+                return bool(re.search(rf"(^|[^a-z0-9/]){re.escape(k)}([^a-z0-9/]|$)", q))
+            return k in q
+
+        for sym, keys in alias_keywords.items():
+            if any(_kw_hit(k) for k in keys):
+                _add(sym)
+        return out
+
+    @staticmethod
+    def _normalize_scalping_symbol(token: str) -> str:
+        t = str(token or "").strip().upper().replace(" ", "")
+        if not t:
+            return ""
+        alias = {
+            "GOLD": "XAUUSD",
+            "XAU": "XAUUSD",
+            "XAUUSD": "XAUUSD",
+            "ETH": "ETHUSD",
+            "ETHUSD": "ETHUSD",
+            "ETHUSDT": "ETHUSD",
+            "ETH/USDT": "ETHUSD",
+            "BTC": "BTCUSD",
+            "BTCUSD": "BTCUSD",
+            "BTCUSDT": "BTCUSD",
+            "BTC/USDT": "BTCUSD",
+        }
+        return alias.get(t, "")
+
+    @classmethod
+    def _parse_scalping_symbols(cls, raw: str) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        txt = str(raw or "").strip()
+        for part in re.split(r"[\s,;|]+", txt):
+            sym = cls._normalize_scalping_symbol(part)
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            out.append(sym)
+
+        q = txt.lower()
+        keyword_aliases = {
+            "XAUUSD": ("gold", "xau", "ทอง"),
+            "BTCUSD": ("btc", "bitcoin", "บิทคอยน์", "บิท"),
+            "ETHUSD": ("eth", "ethereum", "อีเธอเรียม"),
+        }
+        for sym, keys in keyword_aliases.items():
+            if sym in seen:
+                continue
+            if any(k in q for k in keys):
+                seen.add(sym)
+                out.append(sym)
+        return out
+
+    @classmethod
+    def _infer_scalping_symbol_from_text(cls, raw: str, default: str = "") -> str:
+        syms = cls._parse_scalping_symbols(raw)
+        if syms:
+            return syms[0]
+        return cls._normalize_scalping_symbol(default) or ""
 
     @staticmethod
     def _contains_us_market_token(q: str) -> bool:
@@ -821,6 +2141,366 @@ class TelegramAdminBot:
         if m:
             return max(1, min(24 * 30, int(m.group(1)) * 24))
         return 24
+
+    @staticmethod
+    def _parse_run_trace_args(text: str) -> dict:
+        raw = str(text or "").strip()
+        token = raw.split(maxsplit=1)[0] if raw else ""
+        token = str(token or "").strip().replace("#", "")
+        out = {"valid": False, "raw": token, "run_tag": "", "run_id": "", "run_no": 0}
+        if not token:
+            return out
+
+        t_up = token.upper()
+        m_id = re.search(r"(20\d{12}-\d{1,8})", t_up)
+        if m_id:
+            out["run_id"] = str(m_id.group(1))
+            out["valid"] = True
+            m_num = re.search(r"-(\d{1,8})$", out["run_id"])
+            if m_num:
+                try:
+                    out["run_no"] = int(m_num.group(1))
+                except Exception:
+                    out["run_no"] = 0
+
+        m_tag = re.search(r"\bR(\d{1,8})\b", t_up)
+        if m_tag:
+            try:
+                out["run_no"] = int(m_tag.group(1))
+                out["valid"] = True
+            except Exception:
+                pass
+
+        if (not out["valid"]) and t_up.isdigit():
+            try:
+                out["run_no"] = int(t_up)
+                out["valid"] = True
+            except Exception:
+                pass
+
+        if int(out.get("run_no", 0) or 0) > 0:
+            out["run_tag"] = f"R{int(out['run_no']):06d}"
+        return out
+
+    @staticmethod
+    def _safe_json_dict(raw: str) -> dict:
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _extract_trace_meta(extra_json: str, source: str = "") -> dict:
+        obj = TelegramAdminBot._safe_json_dict(extra_json)
+        raw = dict(obj.get("raw_scores", {}) or {})
+        if not isinstance(raw, dict):
+            raw = {}
+        run_id = str(raw.get("signal_run_id") or obj.get("signal_run_id") or "").strip()
+        run_tag = str(raw.get("signal_trace_tag") or obj.get("signal_trace_tag") or "").strip().upper()
+        run_no = 0
+        for cand in (raw.get("signal_run_no"), obj.get("signal_run_no")):
+            try:
+                if cand is not None:
+                    run_no = int(cand)
+                    if run_no > 0:
+                        break
+            except Exception:
+                continue
+        if run_no <= 0:
+            m = re.search(r"-(\d{1,8})$", run_id)
+            if m:
+                try:
+                    run_no = int(m.group(1))
+                except Exception:
+                    run_no = 0
+        if not run_tag and run_no > 0:
+            run_tag = f"R{run_no:06d}"
+        if run_no <= 0 and run_tag:
+            m = re.search(r"R(\d{1,8})", run_tag)
+            if m:
+                try:
+                    run_no = int(m.group(1))
+                except Exception:
+                    run_no = 0
+
+        bypass = False
+        bypass_raw = raw.get("mt5_bypass_test_enabled", obj.get("mt5_bypass_test_enabled", False))
+        if isinstance(bypass_raw, bool):
+            bypass = bypass_raw
+        else:
+            bypass = str(bypass_raw).strip().lower() in {"1", "true", "yes", "on"}
+        source_txt = str(source or obj.get("source") or raw.get("mt5_bypass_source") or "").lower()
+        if ":bypass" in source_txt or "bypass" == str(source_txt).strip():
+            bypass = True
+        return {"run_id": run_id, "run_tag": run_tag, "run_no": int(run_no or 0), "bypass": bool(bypass)}
+
+    @staticmethod
+    def _trace_match(meta: dict, query: dict) -> bool:
+        rid = str(query.get("run_id") or "").strip().upper()
+        rtag = str(query.get("run_tag") or "").strip().upper()
+        rno = int(query.get("run_no", 0) or 0)
+        mid = str(meta.get("run_id") or "").strip().upper()
+        mtag = str(meta.get("run_tag") or "").strip().upper()
+        mno = int(meta.get("run_no", 0) or 0)
+        if rid and mid and (rid == mid):
+            return True
+        if rtag and mtag and (rtag == mtag):
+            return True
+        if rno > 0 and mno > 0 and (rno == mno):
+            return True
+        return False
+
+    @staticmethod
+    def _fmt_trace_ts(ts_text: str) -> str:
+        s = str(ts_text or "").strip()
+        if not s:
+            return "-"
+        if "T" in s and s.endswith("Z"):
+            return s.replace("T", " ").replace("Z", " UTC")
+        if "T" in s:
+            return s.replace("T", " ")
+        return s
+
+    @staticmethod
+    def _outcome_label(outcome, pnl) -> str:
+        try:
+            if outcome is not None:
+                ov = int(outcome)
+                if ov > 0:
+                    return "WIN"
+                if ov < 0:
+                    return "LOSS"
+        except Exception:
+            pass
+        try:
+            pv = float(pnl)
+            if pv > 0:
+                return "WIN"
+            if pv < 0:
+                return "LOSS"
+        except Exception:
+            pass
+        return "PENDING"
+
+    def _lookup_run_trace(self, query: dict) -> dict:
+        from learning.neural_brain import neural_brain
+        from learning.mt5_autopilot_core import mt5_autopilot_core
+
+        report = {
+            "ok": True,
+            "query": dict(query or {}),
+            "signal_rows": [],
+            "journal_rows": [],
+            "errors": [],
+            "limits": {"signal_scan_limit": 2500, "journal_scan_limit": 3500},
+            "db": {
+                "signal_learning": str(getattr(neural_brain, "db_path", "") or ""),
+                "mt5_autopilot": str(getattr(mt5_autopilot_core, "db_path", "") or ""),
+            },
+        }
+
+        q = dict(query or {})
+        if not bool(q.get("valid")):
+            report["ok"] = False
+            report["errors"].append("invalid_run_query")
+            return report
+
+        signal_path = str(report["db"].get("signal_learning") or "").strip()
+        if signal_path and os.path.exists(signal_path):
+            try:
+                with sqlite3.connect(signal_path) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT id, created_at, source, signal_symbol, broker_symbol, direction, confidence,
+                               mt5_status, mt5_message, ticket, position_id, resolved, outcome, pnl, closed_at, extra_json
+                        FROM signal_events
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (int(report["limits"]["signal_scan_limit"]),),
+                    ).fetchall()
+                for row in rows:
+                    meta = self._extract_trace_meta(str(row[15] or ""), source=str(row[2] or ""))
+                    if not self._trace_match(meta, q):
+                        continue
+                    report["signal_rows"].append(
+                        {
+                            "id": int(row[0] or 0),
+                            "created_at": str(row[1] or ""),
+                            "source": str(row[2] or ""),
+                            "signal_symbol": str(row[3] or ""),
+                            "broker_symbol": str(row[4] or ""),
+                            "direction": str(row[5] or ""),
+                            "confidence": row[6],
+                            "mt5_status": str(row[7] or ""),
+                            "mt5_message": str(row[8] or ""),
+                            "ticket": row[9],
+                            "position_id": row[10],
+                            "resolved": int(row[11] or 0),
+                            "outcome": row[12],
+                            "pnl": row[13],
+                            "closed_at": str(row[14] or ""),
+                            "bypass": bool(meta.get("bypass", False)),
+                            "run_id": str(meta.get("run_id") or ""),
+                            "run_tag": str(meta.get("run_tag") or ""),
+                            "run_no": int(meta.get("run_no", 0) or 0),
+                        }
+                    )
+            except Exception as e:
+                report["errors"].append(f"signal_db_error:{e}")
+        else:
+            report["errors"].append("signal_db_missing")
+
+        journal_path = str(report["db"].get("mt5_autopilot") or "").strip()
+        if journal_path and os.path.exists(journal_path):
+            try:
+                with sqlite3.connect(journal_path) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT id, created_at, source, signal_symbol, broker_symbol, direction, confidence,
+                               mt5_status, mt5_message, ticket, position_id, resolved, outcome, pnl, close_reason, closed_at, extra_json
+                        FROM mt5_execution_journal
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (int(report["limits"]["journal_scan_limit"]),),
+                    ).fetchall()
+                for row in rows:
+                    meta = self._extract_trace_meta(str(row[16] or ""), source=str(row[2] or ""))
+                    if not self._trace_match(meta, q):
+                        continue
+                    report["journal_rows"].append(
+                        {
+                            "id": int(row[0] or 0),
+                            "created_at": str(row[1] or ""),
+                            "source": str(row[2] or ""),
+                            "signal_symbol": str(row[3] or ""),
+                            "broker_symbol": str(row[4] or ""),
+                            "direction": str(row[5] or ""),
+                            "confidence": row[6],
+                            "mt5_status": str(row[7] or ""),
+                            "mt5_message": str(row[8] or ""),
+                            "ticket": row[9],
+                            "position_id": row[10],
+                            "resolved": int(row[11] or 0),
+                            "outcome": row[12],
+                            "pnl": row[13],
+                            "close_reason": str(row[14] or ""),
+                            "closed_at": str(row[15] or ""),
+                            "bypass": bool(meta.get("bypass", False)),
+                            "run_id": str(meta.get("run_id") or ""),
+                            "run_tag": str(meta.get("run_tag") or ""),
+                            "run_no": int(meta.get("run_no", 0) or 0),
+                        }
+                    )
+            except Exception as e:
+                report["errors"].append(f"journal_db_error:{e}")
+        else:
+            report["errors"].append("journal_db_missing")
+
+        report["signal_rows"].sort(key=lambda x: (str(x.get("created_at") or ""), int(x.get("id", 0))))
+        report["journal_rows"].sort(key=lambda x: (str(x.get("created_at") or ""), int(x.get("id", 0))))
+        report["matched"] = int(len(report["signal_rows"]) + len(report["journal_rows"]))
+        return report
+
+    def _format_run_trace_report(self, report: dict, lang: str = "en") -> str:
+        q = dict((report or {}).get("query") or {})
+        run_tag = str(q.get("run_tag") or "").strip()
+        run_id = str(q.get("run_id") or "").strip()
+        base_key = run_tag or run_id or str(q.get("raw") or "-")
+        if not bool((report or {}).get("ok", False)):
+            return (
+                "Run Trace\n"
+                f"query={base_key}\n"
+                "status=invalid_query\n"
+                "usage=/run R000123  or  /run 20260306010101-000123"
+            )
+
+        sig_rows = list((report or {}).get("signal_rows") or [])
+        j_rows = list((report or {}).get("journal_rows") or [])
+        if not sig_rows and not j_rows:
+            return (
+                "Run Trace\n"
+                f"query={base_key}\n"
+                "status=not_found\n"
+                "hint=try exact tag like R000123 or full run_id"
+            )
+
+        all_rows = sig_rows + j_rows
+        bypass = any(bool(r.get("bypass")) or (":bypass" in str(r.get("source", "")).lower()) for r in all_rows)
+        first = all_rows[0]
+        symbol = str(first.get("signal_symbol") or first.get("broker_symbol") or "-")
+        direction = str(first.get("direction") or "-").upper()
+
+        lines = ["Run Trace"]
+        lines.append(f"query={base_key}")
+        if run_tag:
+            lines.append(f"tag={run_tag}")
+        if run_id:
+            lines.append(f"run_id={run_id}")
+        lines.append(f"symbol={symbol} direction={direction}")
+        lines.append(f"lane={'BYPASS' if bypass else 'MAIN'}")
+        lines.append(f"matches: signal_events={len(sig_rows)} mt5_journal={len(j_rows)}")
+        lines.append("")
+
+        lines.append("Signal Path:")
+        for r in sig_rows[:8]:
+            label = self._outcome_label(r.get("outcome"), r.get("pnl"))
+            pnl = r.get("pnl")
+            pnl_txt = "-" if pnl is None else f"{float(pnl):.2f}"
+            lines.append(
+                f"- [{self._fmt_trace_ts(r.get('created_at'))}] {r.get('mt5_status') or '-'} "
+                f"src={r.get('source') or '-'} ticket={r.get('ticket') or '-'} pos={r.get('position_id') or '-'} "
+                f"outcome={label} pnl={pnl_txt}"
+                + (" [BYPASS]" if bool(r.get("bypass")) else "")
+            )
+
+        lines.append("")
+        lines.append("MT5 Journal:")
+        for r in j_rows[:8]:
+            label = self._outcome_label(r.get("outcome"), r.get("pnl"))
+            pnl = r.get("pnl")
+            pnl_txt = "-" if pnl is None else f"{float(pnl):.2f}"
+            lines.append(
+                f"- [{self._fmt_trace_ts(r.get('created_at'))}] {r.get('mt5_status') or '-'} "
+                f"src={r.get('source') or '-'} ticket={r.get('ticket') or '-'} pos={r.get('position_id') or '-'} "
+                f"outcome={label} pnl={pnl_txt}"
+                + (" [BYPASS]" if bool(r.get("bypass")) or (":bypass" in str(r.get("source", "")).lower()) else "")
+            )
+
+        model_resolved = [r for r in sig_rows if int(r.get("resolved", 0) or 0) == 1]
+        mt5_resolved = [r for r in j_rows if int(r.get("resolved", 0) or 0) == 1]
+        lines.append("")
+        lines.append("Final Outcome:")
+        if model_resolved:
+            mr = model_resolved[-1]
+            mr_pnl = mr.get("pnl")
+            mr_pnl_txt = "-" if mr_pnl is None else f"{float(mr_pnl):.2f}"
+            lines.append(
+                f"- model: {self._outcome_label(mr.get('outcome'), mr.get('pnl'))} "
+                f"pnl={mr_pnl_txt} closed={self._fmt_trace_ts(mr.get('closed_at'))}"
+            )
+        else:
+            lines.append("- model: PENDING")
+        if mt5_resolved:
+            jr = mt5_resolved[-1]
+            jr_pnl = jr.get("pnl")
+            jr_pnl_txt = "-" if jr_pnl is None else f"{float(jr_pnl):.2f}"
+            lines.append(
+                f"- mt5: {self._outcome_label(jr.get('outcome'), jr.get('pnl'))} "
+                f"pnl={jr_pnl_txt} closed={self._fmt_trace_ts(jr.get('closed_at'))}"
+            )
+        else:
+            lines.append("- mt5: PENDING")
+
+        errs = list((report or {}).get("errors") or [])
+        if errs:
+            lines.append("")
+            lines.append("diag=" + " | ".join(str(x) for x in errs[:3]))
+        return "\n".join(lines)[:3900]
 
     @staticmethod
     def _parse_mt5_pm_learning_args(text: str) -> dict:
@@ -996,6 +2676,172 @@ class TelegramAdminBot:
             return None
         return rec
 
+    def _set_pending_intent_confirm(self, chat_id: int, command: str, args: str = "", source_text: str = "") -> None:
+        try:
+            cid = int(chat_id)
+        except Exception:
+            return
+        self._chat_pending_intent_confirm[cid] = {
+            "command": str(command or "").strip().lower(),
+            "args": str(args or "").strip(),
+            "source_text": str(source_text or "").strip()[:400],
+            "ts": time.time(),
+        }
+
+    def _clear_pending_intent_confirm(self, chat_id: int) -> None:
+        try:
+            self._chat_pending_intent_confirm.pop(int(chat_id), None)
+        except Exception:
+            return
+
+    def _pending_intent_confirm(self, chat_id: int, max_age_sec: int = 300) -> Optional[dict]:
+        try:
+            rec = self._chat_pending_intent_confirm.get(int(chat_id))
+        except Exception:
+            return None
+        if not rec:
+            return None
+        ts = float(rec.get("ts", 0.0) or 0.0)
+        if ts <= 0 or (time.time() - ts) > max(60, int(max_age_sec)):
+            self._clear_pending_intent_confirm(chat_id)
+            return None
+        return rec
+
+    @staticmethod
+    def _parse_confirmation_answer(text: str) -> Optional[bool]:
+        q = str(text or "").strip().lower()
+        if not q:
+            return None
+        yes_tokens = {
+            "y", "yes", "yeah", "yep", "ok", "okay", "sure", "do it", "confirm", "correct",
+            "ใช่", "ใช่ครับ", "ใช่ค่ะ", "ถูกต้อง", "ตกลง", "โอเค", "เอาเลย", "ทำเลย",
+            "ja", "jawohl", "genau", "richtig", "bestätigen",
+        }
+        no_tokens = {
+            "n", "no", "nope", "not", "wrong", "cancel", "stop",
+            "ไม่", "ไม่ใช่", "ไม่เอา", "ยกเลิก", "หยุด", "ไม่ถูก",
+            "nein", "falsch", "abbrechen", "stopp",
+        }
+        compact = " ".join(q.split())
+        if compact in yes_tokens:
+            return True
+        if compact in no_tokens:
+            return False
+        # Accept short Thai confirmations embedded in sentence.
+        if any(x in compact for x in ("ใช่", "ถูกต้อง", "เอาเลย")):
+            return True
+        if any(x in compact for x in ("ไม่ใช่", "ไม่เอา", "ยกเลิก")):
+            return False
+        return None
+
+    def _human_intent_label(self, command: str, args: str, lang: str = "en") -> str:
+        cmd = str(command or "").strip().lower()
+        arg = str(args or "").strip()
+        if (lang or "en").lower() == "th":
+            mapping = {
+                "scan_gold": "สแกนทองคำ",
+                "scan_crypto": "สแกนคริปโต",
+                "scan_fx": "สแกนฟอเร็กซ์",
+                "scan_stocks": "สแกนหุ้น",
+                "scan_thai": "สแกนหุ้นไทย",
+                "scan_us_open": "สแกนหุ้นสหรัฐช่วงเปิดตลาด",
+                "scan_vi": "สแกนหุ้นแนว VI",
+                "scan_all": "สแกนทุกตลาด",
+                "signal_monitor": "ติดตามสถานะสัญญาณ",
+                "signal_filter": "ดูสถานะตัวกรองสัญญาณ",
+                "show_clear": "ล้างตัวกรองและแสดงทุกสัญญาณ",
+            }
+            if cmd == "show_only":
+                return f"แสดงสัญญาณเฉพาะ {arg}" if arg else "ตั้งตัวกรองสัญญาณแบบเฉพาะ"
+            if cmd == "show_add":
+                return f"เพิ่มตัวกรองสัญญาณ: {arg}" if arg else "เพิ่มตัวกรองสัญญาณ"
+            return mapping.get(cmd, f"ทำงานคำสั่ง {cmd}")
+        if (lang or "en").lower() == "de":
+            mapping = {
+                "scan_gold": "Gold scannen",
+                "scan_crypto": "Krypto scannen",
+                "scan_fx": "FX scannen",
+                "scan_stocks": "Aktien scannen",
+                "scan_thai": "Thai-Aktien scannen",
+                "scan_us_open": "US-Open-Aktien scannen",
+                "scan_vi": "VI-Aktien scannen",
+                "scan_all": "alle Märkte scannen",
+                "signal_monitor": "Signal-Monitor anzeigen",
+                "signal_filter": "Signalfilter-Status anzeigen",
+                "show_clear": "Filter löschen und alle Signale anzeigen",
+            }
+            if cmd == "show_only":
+                return f"nur diese Signale anzeigen: {arg}" if arg else "Signalfilter festlegen"
+            if cmd == "show_add":
+                return f"Signalfilter erweitern: {arg}" if arg else "Signalfilter erweitern"
+            return mapping.get(cmd, f"Befehl ausführen: {cmd}")
+        mapping = {
+            "scan_gold": "scan gold",
+            "scan_crypto": "scan crypto",
+            "scan_fx": "scan FX",
+            "scan_stocks": "scan stocks",
+            "scan_thai": "scan Thai stocks",
+            "scan_us_open": "scan US-open stocks",
+            "scan_vi": "run VI stock scan",
+            "scan_all": "scan all markets",
+            "signal_monitor": "show signal monitor snapshot",
+            "signal_filter": "show your signal filter status",
+            "show_clear": "clear signal filter and show all signals",
+        }
+        if cmd == "show_only":
+            return f"show only these signals: {arg}" if arg else "set a signal filter"
+        if cmd == "show_add":
+            return f"add these symbols to your filter: {arg}" if arg else "add symbols to signal filter"
+        return mapping.get(cmd, f"run command {cmd}")
+
+    def _intent_confirm_prompt(self, command: str, args: str, lang: str = "en") -> str:
+        label = self._human_intent_label(command, args, lang=lang)
+        if (lang or "en").lower() == "th":
+            return (
+                f"ขอยืนยันก่อนครับ: คุณต้องการให้ผม{label} ใช่ไหม?\n"
+                "ตอบ: ใช่ / ไม่ใช่"
+            )
+        if (lang or "en").lower() == "de":
+            return (
+                f"Zur Bestätigung: Soll ich {label}?\n"
+                "Antwort: ja / nein"
+            )
+        return (
+            f"Quick confirmation: should I {label}?\n"
+            "Reply: yes / no"
+        )
+
+    @staticmethod
+    def _intent_rephrase_prompt(lang: str = "en") -> str:
+        if (lang or "en").lower() == "th":
+            return (
+                "ได้เลยครับ บอกใหม่อีกครั้งแบบสั้นๆ ได้เลย เช่น\n"
+                "• หาหุ้นไทย\n"
+                "• แสดงแค่ทองคำ\n"
+                "• แสดงเฉพาะ BTC ETH"
+            )
+        if (lang or "en").lower() == "de":
+            return (
+                "Okay. Formuliere es bitte kurz neu, zum Beispiel:\n"
+                "• Thai-Aktien suchen\n"
+                "• nur Gold anzeigen\n"
+                "• nur BTC ETH anzeigen"
+            )
+        return (
+            "Okay. Please rephrase briefly, for example:\n"
+            "• find Thai stocks\n"
+            "• show only gold\n"
+            "• show only BTC ETH"
+        )
+
+    @staticmethod
+    def _intent_missing_filter_symbols_prompt(lang: str = "en") -> str:
+        if (lang or "en").lower() == "th":
+            return "ต้องการให้แสดงเฉพาะอะไรครับ? เช่น ทองคำ, BTC ETH หรือพิมพ์ว่า แสดงทุกสัญญาณ"
+        if (lang or "en").lower() == "de":
+            return "Welche Signale soll ich zeigen? Z.B. Gold, BTC ETH oder 'alle Signale'."
+        return "Which signals should I show? Example: gold, BTC ETH, or say 'show all signals'."
+
     def _try_handle_pending_slot(self, chat_id: int, user_id: int, text: str, is_admin: bool, lang: str) -> bool:
         rec = self._pending_slot(chat_id)
         if not rec:
@@ -1059,11 +2905,22 @@ class TelegramAdminBot:
                 "/scan_vi\n"
                 "/scan_vi_buffett\n"
                 "/scan_vi_turnaround\n"
+                "/scalping_status\n"
+                "/scalping_on [xauusd ethusd btcusd]\n"
+                "/scalping_off\n"
+                "/scalping_scan [xauusd|ethusd|btcusd]\n"
+                "/scalping_logic [xauusd|ethusd|btcusd]\n"
                 "/monitor_us\n"
                 "/us_open_report\n"
                 "/us_open_dashboard\n"
                 "/us_open_guard_status\n"
-                "/signal_dashboard\n"
+                "/signal_dashboard [gold|XAUUSD|ETHUSD] [today|yesterday|this week|this month] [top5]\n"
+                "/signal_monitor [gold|XAUUSD|ETHUSD|BTCUSD] [today|yesterday|this week|this month]\n"
+                "/run <R000123|run_id>\n"
+                "/signal_filter [status|only|add|clear]\n"
+                "/show_only <gold|xauusd|btc eth ...>\n"
+                "/show_add <symbol ...>\n"
+                "/show_clear\n"
                 "/calendar\n"
                 "/macro [*|**|***]\n"
                 "/macro_report [*|**|***] [24h]\n"
@@ -1116,11 +2973,22 @@ class TelegramAdminBot:
                 "/scan_vi\n"
                 "/scan_vi_buffett\n"
                 "/scan_vi_turnaround\n"
+                "/scalping_status\n"
+                "/scalping_on [xauusd ethusd btcusd]\n"
+                "/scalping_off\n"
+                "/scalping_scan [xauusd|ethusd|btcusd]\n"
+                "/scalping_logic [xauusd|ethusd|btcusd]\n"
                 "/monitor_us\n"
                 "/us_open_report\n"
                 "/us_open_dashboard\n"
                 "/us_open_guard_status\n"
-                "/signal_dashboard\n"
+                "/signal_dashboard [gold|XAUUSD|ETHUSD] [today|yesterday|this week|this month] [top5]\n"
+                "/signal_monitor [gold|XAUUSD|ETHUSD|BTCUSD] [today|yesterday|this week|this month]\n"
+                "/run <R000123|run_id>\n"
+                "/signal_filter [status|only|add|clear]\n"
+                "/show_only <gold|xauusd|btc eth ...>\n"
+                "/show_add <symbol ...>\n"
+                "/show_clear\n"
                 "/calendar\n"
                 "/macro [*|**|***]\n"
                 "/macro_report [*|**|***] [24h]\n"
@@ -1169,11 +3037,22 @@ class TelegramAdminBot:
             "/scan_us\n"
             "/scan_us_open\n"
             "/scan_vi\n"
+            "/scalping_status\n"
+            "/scalping_on [xauusd ethusd btcusd]\n"
+            "/scalping_off\n"
+            "/scalping_scan [xauusd|ethusd|btcusd]\n"
+            "/scalping_logic [xauusd|ethusd|btcusd]\n"
             "/monitor_us\n"
             "/us_open_report\n"
             "/us_open_dashboard\n"
             "/us_open_guard_status\n"
-            "/signal_dashboard\n"
+            "/signal_dashboard [gold|XAUUSD|ETHUSD] [today|yesterday|this week|this month] [top5]\n"
+            "/signal_monitor [gold|XAUUSD|ETHUSD|BTCUSD] [today|yesterday|this week|this month]\n"
+            "/run <R000123|run_id>\n"
+            "/signal_filter [status|only|add|clear]\n"
+            "/show_only <gold|xauusd|btc eth ...>\n"
+            "/show_add <symbol ...>\n"
+            "/show_clear\n"
             "/calendar\n"
             "/macro [*|**|***]\n"
             "/macro_report [*|**|***] [24h]\n"
@@ -1276,21 +3155,31 @@ class TelegramAdminBot:
         lines.append("Result: scan completed.")
         return "\n".join(lines)
 
-    def _ai_intent_endpoint(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    def _ai_intent_endpoint(self) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
         provider = config.resolve_ai_provider()
         if provider == "groq" and config.GROQ_API_KEY:
             return (
+                "groq_openai",
                 "https://api.groq.com/openai/v1/chat/completions",
                 config.GROQ_API_KEY,
                 config.model_for_provider("groq"),
             )
-        if provider == "gemini" and config.GEMINI_API_KEY:
+        if provider == "gemini" and config.has_gemini_key():
+            model = config.model_for_provider("gemini")
+            if config.gemini_mode() == "vertex":
+                return (
+                    "gemini_native",
+                    f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent",
+                    config.GEMINI_VERTEX_AI_API_KEY,
+                    model,
+                )
             return (
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                "gemini_native",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 config.GEMINI_API_KEY,
-                config.model_for_provider("gemini"),
+                model,
             )
-        return None, None, None
+        return None, None, None, None
 
     def _infer_command_ai(self, text: str) -> Optional[tuple[str, str]]:
         """
@@ -1300,37 +3189,73 @@ class TelegramAdminBot:
         if not config.ADMIN_AI_INTENT_ENABLED:
             return None
 
-        endpoint, api_key, model = self._ai_intent_endpoint()
-        if not endpoint or not api_key or not model:
+        intent_mode, endpoint, api_key, model = self._ai_intent_endpoint()
+        if not intent_mode or not endpoint or not api_key or not model:
             return None
 
         system = (
             "You classify a user message into ONE bot command.\n"
             "Output STRICT JSON only: {\"command\":\"...\",\"args\":\"...\"}\n"
             "Allowed command values: help,status,scan_gold,scan_crypto,scan_fx,scan_stocks,"
-            "scan_thai,scan_thai_vi,scan_us_open,scan_vi,scan_vi_buffett,scan_vi_turnaround,monitor_us,us_open_guard_status,calendar,macro,macro_report,macro_weights,tz,mt5_status,mt5_affordable,mt5_exec_reasons,stock_mt5_filter,mt5_history,mt5_backtest,mt5_train,mt5_autopilot,mt5_walkforward,mt5_manage,mt5_pm_learning,mt5_plan,mt5_policy,scan_all,markets,gold_overview,plan,upgrade,research,none.\n"
+            "scan_thai,scan_thai_vi,scan_us_open,scan_vi,scan_vi_buffett,scan_vi_turnaround,monitor_us,us_open_guard_status,signal_dashboard,signal_monitor,signal_filter,show_only,show_add,show_clear,scalping_status,scalping_on,scalping_off,scalping_scan,scalping_logic,calendar,macro,macro_report,macro_weights,tz,mt5_status,mt5_affordable,mt5_exec_reasons,stock_mt5_filter,mt5_history,mt5_backtest,mt5_train,mt5_autopilot,mt5_walkforward,mt5_manage,mt5_pm_learning,mt5_plan,mt5_policy,run,scan_all,markets,gold_overview,plan,upgrade,research,none.\n"
             "If unclear, choose research.\n"
             "If command is research, put original user question in args."
         )
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": text[:800]},
-            ],
-            "temperature": 0,
-            "max_tokens": 140,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
         try:
-            resp = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+            if intent_mode == "groq_openai":
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": text[:800]},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 140,
+                }
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+                if resp.status_code >= 400:
+                    return None
+                data = resp.json()
+                content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            else:
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": text[:800]}],
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 160,
+                    },
+                }
+                resp = requests.post(
+                    endpoint,
+                    params={"key": api_key},
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=20,
+                )
+                if resp.status_code >= 400:
+                    return None
+                data = resp.json()
+                parts = ((data.get("candidates") or [{}])[0].get("content", {}) or {}).get("parts", []) or []
+                texts: list[str] = []
+                for part in parts:
+                    if isinstance(part, dict):
+                        t = str(part.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+                content = "\n".join(texts).strip()
+
             if resp.status_code >= 400:
                 return None
-            data = resp.json()
-            content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
             if not content:
                 return None
             start = content.find("{")
@@ -1342,7 +3267,10 @@ class TelegramAdminBot:
             args = str(obj.get("args", "")).strip()
             allowed = {
                 "help", "status", "scan_gold", "scan_crypto", "scan_fx", "scan_stocks", "scan_thai",
-                "scan_us_open", "scan_thai_vi", "scan_vi", "scan_vi_buffett", "scan_vi_turnaround", "monitor_us", "us_open_guard_status", "calendar", "macro", "macro_report", "macro_weights", "tz", "mt5_status", "mt5_affordable", "mt5_exec_reasons", "stock_mt5_filter", "mt5_history", "mt5_backtest", "mt5_train", "mt5_autopilot", "mt5_walkforward", "mt5_manage", "mt5_pm_learning", "mt5_plan", "mt5_policy", "scan_all", "markets",
+                "scan_us_open", "scan_thai_vi", "scan_vi", "scan_vi_buffett", "scan_vi_turnaround", "monitor_us", "us_open_guard_status",
+                "signal_dashboard", "signal_monitor", "signal_filter", "show_only", "show_add", "show_clear",
+                "scalping_status", "scalping_on", "scalping_off", "scalping_scan", "scalping_logic",
+                "calendar", "macro", "macro_report", "macro_weights", "tz", "mt5_status", "mt5_affordable", "mt5_exec_reasons", "stock_mt5_filter", "mt5_history", "mt5_backtest", "mt5_train", "mt5_autopilot", "mt5_walkforward", "mt5_manage", "mt5_pm_learning", "mt5_plan", "mt5_policy", "scan_all", "markets",
                 "gold_overview", "plan", "upgrade", "research", "none",
             }
             if cmd not in allowed or cmd == "none":
@@ -1788,31 +3716,49 @@ class TelegramAdminBot:
         sb = dict(rb.get("summary") or {})
         sima = dict(ra.get("simulation") or {})
         simb = dict(rb.get("simulation") or {})
-        la = str(ra.get("market_filter_label") or ra.get("market_filter") or "A")
-        lb = str(rb.get("market_filter_label") or rb.get("market_filter") or "B")
+        ui = str(lang or "en").lower()
+        la = self._signal_dashboard_market_label(
+            str(ra.get("market_filter") or ra.get("market_filter_label") or "A"),
+            lang=ui,
+        )
+        lb = self._signal_dashboard_market_label(
+            str(rb.get("market_filter") or rb.get("market_filter_label") or "B"),
+            lang=ui,
+        )
         days = int(ra.get("days", rb.get("days", 1)) or 1)
-        lines = ["Signal Dashboard Compare", f"lookback={days}d"]
+        mode = str(ra.get("window_mode") or rb.get("window_mode") or "rolling_days")
+        period = self._signal_dashboard_window_label(mode, days, lang=ui)
+
+        def t(en: str, th: str, de: Optional[str] = None) -> str:
+            if ui == "th":
+                return th
+            if ui == "de":
+                return de or en
+            return en
+
+        lines = [t("Signal Dashboard Compare", "Signal Dashboard เปรียบเทียบ", "Signal-Dashboard Vergleich")]
+        lines.append(f"{t('period', 'ช่วงเวลา', 'Zeitraum')}={period}")
         lines.append(f"A={la} | B={lb}")
         lines.append("")
-        lines.append("Metric                 | A               | B")
+        lines.append(f"{t('Metric', 'ตัวชี้วัด', 'Metrik'):<22} | A               | B")
         lines.append("-" * 54)
         def _row(name, va, vb):
             lines.append(f"{name:<22} | {str(va):<15} | {str(vb):<15}")
-        _row("sent", sa.get("sent",0), sb.get("sent",0))
-        _row("resolved", sa.get("resolved",0), sb.get("resolved",0))
-        _row("pending", sa.get("pending",0), sb.get("pending",0))
-        _row("wins/losses", f"{sa.get('wins',0)}/{sa.get('losses',0)}", f"{sb.get('wins',0)}/{sb.get('losses',0)}")
+        _row(t("sent", "ส่ง", "gesendet"), sa.get("sent",0), sb.get("sent",0))
+        _row(t("resolved", "ปิดผลแล้ว", "aufgelöst"), sa.get("resolved",0), sb.get("resolved",0))
+        _row(t("pending", "ค้างอยู่", "offen"), sa.get("pending",0), sb.get("pending",0))
+        _row(t("wins/losses", "ชนะ/แพ้", "Gewinn/Verlust"), f"{sa.get('wins',0)}/{sa.get('losses',0)}", f"{sb.get('wins',0)}/{sb.get('losses',0)}")
         _row("WR%", sa.get("win_rate",0.0), sb.get("win_rate",0.0))
         _row("netR", sa.get("net_r",0.0), sb.get("net_r",0.0))
         _row("pendingMarkR", sa.get("pending_mark_r",0.0), sb.get("pending_mark_r",0.0))
-        _row("sim balance", sima.get("marked_balance", "-"), simb.get("marked_balance", "-"))
+        _row(t("sim balance", "ยอดจำลอง", "Sim-Saldo"), sima.get("marked_balance", "-"), simb.get("marked_balance", "-"))
         best_a = list(ra.get("best_symbols") or [])
         best_b = list(rb.get("best_symbols") or [])
         lines.append("")
         if best_a:
-            lines.append(f"best {la}: " + ", ".join([f"{x.get('symbol')}({x.get('session_r')})" for x in best_a[:3]]))
+            lines.append(f"{t('best', 'เด่นสุด', 'beste')} {la}: " + ", ".join([f"{x.get('symbol')}({x.get('session_r')})" for x in best_a[:3]]))
         if best_b:
-            lines.append(f"best {lb}: " + ", ".join([f"{x.get('symbol')}({x.get('session_r')})" for x in best_b[:3]]))
+            lines.append(f"{t('best', 'เด่นสุด', 'beste')} {lb}: " + ", ".join([f"{x.get('symbol')}({x.get('session_r')})" for x in best_b[:3]]))
         return "\n".join(lines)[:3900]
 
     def _format_mt5_affordable_snapshot(self, snap: dict, lang: str = "en") -> str:
@@ -2602,6 +4548,217 @@ class TelegramAdminBot:
             return f"/{command} is admin-only."
         return f"Access denied for /{command}."
 
+    def _resolve_local_intent(self, text: str, lang: str = "en") -> Optional[dict]:
+        """
+        Local (no external API) natural-language intent resolver.
+        """
+        msg = str(text or "").strip()
+        if not msg:
+            return None
+
+        learned = self._lookup_learned_intent(msg)
+        if learned:
+            cmd, args = learned
+            return {"mode": "run", "command": cmd, "args": args, "source": "memory"}
+
+        q = self._normalize_intent_text(msg)
+        q_pad = f" {q} "
+
+        def has_any(*parts: str) -> bool:
+            return any(p and p in q for p in parts)
+
+        # ----- Scalping operation intents -----
+        scalpingish = has_any(
+            "scalp", "scalping", "สแกลป์", "สแคลป์", "สกัลป์", "สกาล์ป", "สแคลป", "สเกลป์",
+        )
+        if scalpingish:
+            if has_any("status", "state", "mode", "สถานะ", "เปิดอยู่ไหม", "ทำงานไหม"):
+                return {"mode": "run", "command": "scalping_status", "args": "", "source": "heuristic"}
+
+            inferred_symbols = self._parse_scalping_symbols(msg)
+            symbol_args = " ".join(inferred_symbols).strip()
+
+            if has_any("on", "enable", "start", "เปิด", "ใช้งาน", "activate"):
+                return {"mode": "run", "command": "scalping_on", "args": symbol_args, "source": "heuristic"}
+
+            if has_any("off", "disable", "stop", "pause", "ปิด", "หยุด", "ยกเลิก"):
+                return {"mode": "run", "command": "scalping_off", "args": "", "source": "heuristic"}
+
+            if has_any("logic", "algorithm", "strategy", "entry", "tp", "sl", "วิเคราะห์", "ตรรกะ", "กลยุทธ์"):
+                sym = self._infer_scalping_symbol_from_text(msg, default="BTCUSD")
+                return {"mode": "run", "command": "scalping_logic", "args": sym, "source": "heuristic"}
+
+            if has_any("scan", "run", "now", "ทันที", "ตอนนี้", "ลงมือ", "ทำเลย"):
+                sym = self._infer_scalping_symbol_from_text(msg)
+                return {"mode": "run", "command": "scalping_scan", "args": sym, "source": "heuristic"}
+
+            return {"mode": "run", "command": "scalping_status", "args": "", "source": "heuristic"}
+
+        # ----- Signal filter intents -----
+        filterish = has_any(
+            "show only", "only show", "show add", "show all", "signal filter", "filter signal",
+            "กรองสัญญาณ", "ตัวกรอง", "แสดงแค่", "แสดงเฉพาะ", "ส่งเฉพาะ", "เอาแค่", "ขอแค่",
+            "เฉพาะ", "filter",
+        )
+        if filterish:
+            if has_any(
+                "show all", "all signals", "clear filter", "reset filter",
+                "แสดงทุกสัญญาณ", "แสดงทั้งหมด", "ล้างตัวกรอง", "ยกเลิกตัวกรอง",
+            ):
+                return {"mode": "run", "command": "show_clear", "args": "", "source": "heuristic"}
+
+            add_mode = has_any("show add", "add symbol", "add filter", "เพิ่มสัญญาณ", "เพิ่มตัวกรอง", "เพิ่มคู่", "เพิ่มเหรียญ")
+            status_mode = has_any("status", "สถานะ", "ตอนนี้", "ปัจจุบัน", "ตอนนี้เหลือ") and not (
+                has_any("only", "แค่", "เฉพาะ", "add", "เพิ่ม")
+            )
+            if status_mode:
+                return {"mode": "run", "command": "signal_filter", "args": "status", "source": "heuristic"}
+
+            symbols = self._extract_signal_filter_symbols_from_text(msg)
+            if symbols:
+                cmd = "show_add" if add_mode else "show_only"
+                return {"mode": "run", "command": cmd, "args": " ".join(symbols), "source": "heuristic"}
+            return {"mode": "missing", "kind": "signal_filter_symbols"}
+
+        # ----- Signal monitor snapshot intents -----
+        monitorish = has_any(
+            "signal monitor", "monitor signal", "monitor dashboard",
+            "ติดตามสัญญาณ", "สถานะสัญญาณ", "สรุปสัญญาณ",
+        ) or bool(
+            re.search(
+                r"(?i)\b(gold|xau|xauusd|eth|ethusd|ethusdt|btc|btcusd|btcusdt)\s+monitor\b",
+                msg,
+            )
+        )
+        if monitorish:
+            args = re.sub(
+                r"(?i)(signal\s*monitor|monitor\s*signal|monitor\s*dashboard|ติดตามสัญญาณ|สถานะสัญญาณ|สรุปสัญญาณ)",
+                " ",
+                msg,
+            ).strip()
+            if not args:
+                args = msg.strip()
+            return {"mode": "run", "command": "signal_monitor", "args": args, "source": "heuristic"}
+
+        # ----- Signal dashboard intents -----
+        dashboardish = has_any(
+            "signal dashboard", "signaldashboard", "dashboard signal",
+            "แดชบอร์ดสัญญาณ", "สรุปสัญญาณ", "dashboard สัญญาณ",
+        )
+        if dashboardish:
+            args = re.sub(
+                r"(?i)(signal\s*dashboard|dashboard\s*signal|signaldashboard|แดชบอร์ดสัญญาณ|สรุปสัญญาณ)",
+                " ",
+                msg,
+            )
+            return {"mode": "run", "command": "signal_dashboard", "args": args.strip(), "source": "heuristic"}
+
+        scanish = has_any(
+            "scan", "search", "find", "analy", "analyse", "analyze", "monitor",
+            "สแกน", "หา", "ค้นหา", "วิเคราะห์", "เช็ค", "ดู",
+        )
+        logicish = has_any(
+            "logic", "algorithm", "strategy", "entry", "tp", "sl",
+            "วิเคราะห์", "ตรรกะ", "กลยุทธ์", "เข้าออก", "จุดเข้า", "จุดออก",
+        )
+        if logicish:
+            sym = self._infer_scalping_symbol_from_text(msg)
+            if sym:
+                return {"mode": "run", "command": "scalping_logic", "args": sym, "source": "heuristic"}
+        if not scanish:
+            return None
+
+        if has_any("scan all", "all markets", "ทุกตลาด", "ทั้งหมด"):
+            return {"mode": "run", "command": "scan_all", "args": "", "source": "heuristic"}
+
+        vi_cmd = self._parse_vi_scan_intent(q)
+        if vi_cmd:
+            return {"mode": "run", "command": vi_cmd, "args": "", "source": "heuristic"}
+
+        if self._contains_gold_token(q):
+            stockish = (
+                self._contains_vi_scan_token(q)
+                or self._contains_us_market_token(q)
+                or self._contains_thai_market_token(q)
+                or has_any("stock", "stocks", "หุ้น", "market", "markets", "ตลาด")
+            )
+            if stockish:
+                return {"mode": "confirm", "command": "scan_gold", "args": "", "source": "heuristic"}
+            return {"mode": "run", "command": "scan_gold", "args": "", "source": "heuristic"}
+
+        if has_any("crypto", "coin", "coins", "คริปโต", "เหรียญ"):
+            return {"mode": "run", "command": "scan_crypto", "args": "", "source": "heuristic"}
+
+        if (
+            re.search(r"(^|[^a-z])fx([^a-z]|$)", q)
+            or has_any("forex", "ฟอเร็กซ์", "devisen", "ค่าเงิน")
+        ):
+            return {"mode": "run", "command": "scan_fx", "args": "", "source": "heuristic"}
+
+        stockish = has_any("stock", "stocks", "หุ้น", "market", "markets", "ตลาด")
+        if stockish:
+            thai = self._contains_thai_market_token(q) or (" th stock " in q_pad)
+            us = self._contains_us_market_token(q)
+            if thai and us:
+                return {"mode": "confirm", "command": "scan_thai", "args": "", "source": "heuristic"}
+            if thai:
+                return {"mode": "run", "command": "scan_thai", "args": "", "source": "heuristic"}
+            if us:
+                return {"mode": "run", "command": "scan_us_open", "args": "", "source": "heuristic"}
+            return {"mode": "confirm", "command": "scan_stocks", "args": "", "source": "heuristic"}
+
+        return None
+
+    def _try_handle_pending_intent_confirm(self, chat_id: int, user_id: int, text: str, is_admin: bool, lang: str) -> bool:
+        rec = self._pending_intent_confirm(chat_id)
+        if not rec:
+            return False
+
+        cmd = str(rec.get("command") or "").strip().lower()
+        args = str(rec.get("args") or "").strip()
+        source_text = str(rec.get("source_text") or "").strip()
+
+        answer = self._parse_confirmation_answer(text)
+        if answer is True:
+            self._clear_pending_intent_confirm(chat_id)
+            self._handle_admin_command(chat_id, user_id, cmd, args, is_admin, lang=lang)
+            if source_text:
+                self._remember_intent_phrase(source_text, cmd, args, source="confirm_yes")
+            self._record_intent_event(chat_id, user_id, source_text or text, "confirmed_run", cmd, args, source="confirm_yes")
+            return True
+        if answer is False:
+            self._clear_pending_intent_confirm(chat_id)
+            self._record_intent_event(chat_id, user_id, source_text or text, "confirm_rejected", cmd, args, source="confirm_no")
+            self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
+            return True
+
+        # User may answer with a corrected request.
+        nxt = self._resolve_local_intent(text, lang=lang)
+        if nxt:
+            mode = str(nxt.get("mode") or "")
+            if mode == "run":
+                ncmd = str(nxt.get("command") or "").strip().lower()
+                nargs = str(nxt.get("args") or "").strip()
+                self._clear_pending_intent_confirm(chat_id)
+                self._handle_admin_command(chat_id, user_id, ncmd, nargs, is_admin, lang=lang)
+                self._remember_intent_phrase(text, ncmd, nargs, source="confirm_override")
+                self._record_intent_event(chat_id, user_id, text, "confirm_override_run", ncmd, nargs, source=str(nxt.get("source") or "heuristic"))
+                return True
+            if mode == "confirm":
+                ncmd = str(nxt.get("command") or "").strip().lower()
+                nargs = str(nxt.get("args") or "").strip()
+                self._set_pending_intent_confirm(chat_id, ncmd, nargs, source_text=text)
+                self._record_intent_event(chat_id, user_id, text, "confirm_reask", ncmd, nargs, source=str(nxt.get("source") or "heuristic"))
+                self._send_text(chat_id, self._intent_confirm_prompt(ncmd, nargs, lang=lang))
+                return True
+            if mode == "missing" and str(nxt.get("kind") or "") == "signal_filter_symbols":
+                self._send_text(chat_id, self._intent_missing_filter_symbols_prompt(lang=lang))
+                self._record_intent_event(chat_id, user_id, text, "missing_symbols", cmd, args, source="heuristic")
+                return True
+
+        self._send_text(chat_id, self._intent_confirm_prompt(cmd, args, lang=lang))
+        return True
+
     def _handle_natural_language(self, chat_id: int, user_id: int, text: str, is_admin: bool, lang: str = "en") -> None:
         """Intent-style natural language command routing."""
         msg = (text or "").strip()
@@ -2615,6 +4772,52 @@ class TelegramAdminBot:
 
         if any(k in q for k in ("help", "what can you do", "commands", "คำสั่ง", "ช่วยหน่อย", "ทำอะไรได้บ้าง")):
             self._send_text(chat_id, self._help_text(lang=lang))
+            return
+
+        local_intent = self._resolve_local_intent(msg, lang=lang)
+        if local_intent:
+            mode = str(local_intent.get("mode") or "")
+            if mode == "run":
+                cmd = str(local_intent.get("command") or "").strip().lower()
+                args = str(local_intent.get("args") or "").strip()
+                self._handle_admin_command(chat_id, user_id, cmd, args, is_admin, lang=lang)
+                self._remember_intent_phrase(msg, cmd, args, source=str(local_intent.get("source") or "heuristic"))
+                self._record_intent_event(
+                    chat_id,
+                    user_id,
+                    msg,
+                    "run",
+                    cmd,
+                    args,
+                    source=str(local_intent.get("source") or "heuristic"),
+                )
+                return
+            if mode == "confirm":
+                cmd = str(local_intent.get("command") or "").strip().lower()
+                args = str(local_intent.get("args") or "").strip()
+                self._set_pending_intent_confirm(chat_id, cmd, args, source_text=msg)
+                self._record_intent_event(
+                    chat_id,
+                    user_id,
+                    msg,
+                    "confirm_requested",
+                    cmd,
+                    args,
+                    source=str(local_intent.get("source") or "heuristic"),
+                )
+                self._send_text(chat_id, self._intent_confirm_prompt(cmd, args, lang=lang))
+                return
+            if mode == "missing" and str(local_intent.get("kind") or "") == "signal_filter_symbols":
+                self._record_intent_event(chat_id, user_id, msg, "missing_symbols", source="heuristic")
+                self._send_text(chat_id, self._intent_missing_filter_symbols_prompt(lang=lang))
+                return
+
+        if any(k in q for k in ("show only", "signal filter", "filter signal", "show signal", "กรองสัญญาณ", "เลือกสัญญาณ", "show only")):
+            tokens = self._parse_signal_filter_symbols(msg)
+            if tokens:
+                self._handle_admin_command(chat_id, user_id, "show_only", " ".join(tokens), is_admin, lang=lang)
+            else:
+                self._handle_admin_command(chat_id, user_id, "signal_filter", "status", is_admin, lang=lang)
             return
 
         # Signal explanation intent (e.g. "why AVGO short signal?")
@@ -2662,6 +4865,11 @@ class TelegramAdminBot:
             "ถืออยู่", "ค้างอยู่",
         )):
             self._handle_admin_command(chat_id, user_id, "mt5_status", symbol_hint, is_admin, lang=lang)
+            return
+
+        run_m = re.search(r"(20\d{12}-\d{1,8}|r\d{1,8})", q, flags=re.IGNORECASE)
+        if run_m and any(k in q for k in ("run", "trace", "ย้อน", "รัน", "signal id", "run id", "run_id")):
+            self._handle_admin_command(chat_id, user_id, "run", str(run_m.group(1)).upper(), is_admin, lang=lang)
             return
 
         # MT5-specific intents should be evaluated before generic "status".
@@ -2742,24 +4950,9 @@ class TelegramAdminBot:
             return
 
         if self._is_ambiguous_gold_stock_intent(q):
-            if lang == "th":
-                self._send_text(
-                    chat_id,
-                    "ผมเห็นคำที่เกี่ยวกับทองคำและหุ้น/VI ปนกันอยู่ ต้องการให้ผมทำอะไรครับ?\n"
-                    "ตัวอย่าง: `scan_gold` / `gold_overview` / `scan_vi` / `scan_thai_vi`",
-                )
-            elif lang == "de":
-                self._send_text(
-                    chat_id,
-                    "Ich sehe gemischte Begriffe zu Gold und Aktien/VI. Was genau soll ich tun?\n"
-                    "Beispiele: `scan_gold` / `gold_overview` / `scan_vi` / `scan_thai_vi`",
-                )
-            else:
-                self._send_text(
-                    chat_id,
-                    "I see mixed gold and stock/VI keywords. What do you want me to run?\n"
-                    "Examples: `scan_gold` / `gold_overview` / `scan_vi` / `scan_thai_vi`",
-                )
+            self._set_pending_intent_confirm(chat_id, "scan_gold", "", source_text=msg)
+            self._record_intent_event(chat_id, user_id, msg, "confirm_requested", "scan_gold", "", source="heuristic")
+            self._send_text(chat_id, self._intent_confirm_prompt("scan_gold", "", lang=lang))
             return
 
         gold_actionish = any(
@@ -2864,21 +5057,12 @@ class TelegramAdminBot:
             self._handle_admin_command(chat_id, user_id, "upgrade", "", is_admin, lang=lang)
             return
 
-        ai_allowed = self._ai_api_allowed(user_id, is_admin)
-        if ai_allowed:
-            # AI-based multilingual intent parser (paid/admin only).
-            inferred = self._infer_command_ai(msg)
-            if inferred:
-                cmd, args = inferred
-                self._handle_admin_command(chat_id, user_id, cmd, args, is_admin, lang=lang)
-                return
-
-            # Fallback to AI research for open-ended natural language questions.
-            self._handle_admin_command(chat_id, user_id, "research", msg, is_admin, lang=lang)
+        # No automatic AI fallback here: keep natural-language control local and zero-credit.
+        self._record_intent_event(chat_id, user_id, msg, "unmapped", source="heuristic")
+        if not self._ai_api_allowed(user_id, is_admin):
+            self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
             return
-
-        # Trial/free users: no AI API fallback to avoid burning credits.
-        self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
+        self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
 
     def _handle_admin_command(self, chat_id: int, user_id: int, command: str, args: str, is_admin: bool, lang: str = "en") -> None:
         from scheduler import scheduler
@@ -2902,6 +5086,16 @@ class TelegramAdminBot:
             command = "mt5_pm_learning"
         if command in {"mt5affordable", "mt5_affordble"}:
             command = "mt5_affordable"
+        if command in {"scalp_status", "scalpstat", "scalping_mode", "scalp_mode"}:
+            command = "scalping_status"
+        if command in {"scalp_on", "scalping_enable", "enable_scalping"}:
+            command = "scalping_on"
+        if command in {"scalp_off", "scalping_disable", "disable_scalping"}:
+            command = "scalping_off"
+        if command in {"scalp_scan", "scan_scalping"}:
+            command = "scalping_scan"
+        if command in {"scalp_logic", "scalping_algo", "scalping_algorithm"}:
+            command = "scalping_logic"
         if command not in self._known_commands():
             suggestion = self._suggest_command(command)
             if suggestion and suggestion != command:
@@ -2925,6 +5119,298 @@ class TelegramAdminBot:
 
         if command == "plan":
             self._send_text(chat_id, self._format_plan_text(user_id, is_admin=is_admin, lang=lang))
+            return
+
+        if command == "scalping_status":
+            enabled = bool(getattr(config, "SCALPING_ENABLED", False))
+            symbols = sorted(list(config.get_scalping_symbols()))
+            if lang == "th":
+                self._send_text(
+                    chat_id,
+                    "Scalping Status\n"
+                    f"enabled={enabled}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    f"entry_tf={getattr(config, 'SCALPING_ENTRY_TF', '5m')} trigger_tf={getattr(config, 'SCALPING_M1_TRIGGER_TF', '1m')}\n"
+                    f"scan_interval={int(getattr(config, 'SCALPING_SCAN_INTERVAL_SEC', 300) or 300)}s min_conf={float(getattr(config, 'SCALPING_MIN_CONFIDENCE', 70.0) or 70.0):.1f}\n"
+                    f"notify={bool(getattr(config, 'SCALPING_NOTIFY_TELEGRAM', True))} execute_mt5={bool(getattr(config, 'SCALPING_EXECUTE_MT5', True))}",
+                )
+            elif lang == "de":
+                self._send_text(
+                    chat_id,
+                    "Scalping-Status\n"
+                    f"enabled={enabled}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    f"entry_tf={getattr(config, 'SCALPING_ENTRY_TF', '5m')} trigger_tf={getattr(config, 'SCALPING_M1_TRIGGER_TF', '1m')}\n"
+                    f"scan_interval={int(getattr(config, 'SCALPING_SCAN_INTERVAL_SEC', 300) or 300)}s min_conf={float(getattr(config, 'SCALPING_MIN_CONFIDENCE', 70.0) or 70.0):.1f}\n"
+                    f"notify={bool(getattr(config, 'SCALPING_NOTIFY_TELEGRAM', True))} execute_mt5={bool(getattr(config, 'SCALPING_EXECUTE_MT5', True))}",
+                )
+            else:
+                self._send_text(
+                    chat_id,
+                    "Scalping Status\n"
+                    f"enabled={enabled}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    f"entry_tf={getattr(config, 'SCALPING_ENTRY_TF', '5m')} trigger_tf={getattr(config, 'SCALPING_M1_TRIGGER_TF', '1m')}\n"
+                    f"scan_interval={int(getattr(config, 'SCALPING_SCAN_INTERVAL_SEC', 300) or 300)}s min_conf={float(getattr(config, 'SCALPING_MIN_CONFIDENCE', 70.0) or 70.0):.1f}\n"
+                    f"notify={bool(getattr(config, 'SCALPING_NOTIFY_TELEGRAM', True))} execute_mt5={bool(getattr(config, 'SCALPING_EXECUTE_MT5', True))}",
+                )
+            return
+
+        if command in {"scalping_on", "scalping_off"}:
+            if not bool(is_admin):
+                self._send_text(chat_id, self._access_denied_text("admin_only", user_id, command, lang=lang))
+                return
+            turn_on = command == "scalping_on"
+            config.SCALPING_ENABLED = bool(turn_on)
+            parsed_symbols = self._parse_scalping_symbols(args)
+            if parsed_symbols:
+                config.SCALPING_SYMBOLS = ",".join(parsed_symbols)
+            symbols = sorted(list(config.get_scalping_symbols()))
+            mode_txt = "ON" if turn_on else "OFF"
+            if lang == "th":
+                self._send_text(
+                    chat_id,
+                    f"Scalping mode: {mode_txt}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    "หมายเหตุ: ค่านี้เป็น runtime และจะรีเซ็ตหลังรีสตาร์ต ถ้าไม่บันทึกใน .env.local",
+                )
+            elif lang == "de":
+                self._send_text(
+                    chat_id,
+                    f"Scalping-Modus: {mode_txt}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    "Hinweis: Runtime-Override; nach Neustart zurückgesetzt, wenn nicht in .env.local gespeichert.",
+                )
+            else:
+                self._send_text(
+                    chat_id,
+                    f"Scalping mode: {mode_txt}\n"
+                    f"symbols={', '.join(symbols) if symbols else '-'}\n"
+                    "Note: this is a runtime override and resets after restart unless persisted in .env.local.",
+                )
+            return
+
+        if command in {"scalping_scan", "scalping_logic"}:
+            from scanners.scalping_scanner import scalping_scanner
+
+            target_symbol = self._infer_scalping_symbol_from_text(args, default="BTCUSD" if command == "scalping_logic" else "")
+            if command == "scalping_scan":
+                if target_symbol in {"XAUUSD", "ETHUSD", "BTCUSD"}:
+                    if target_symbol == "XAUUSD":
+                        rows = [scalping_scanner.scan_xauusd(require_enabled=False)]
+                    elif target_symbol == "ETHUSD":
+                        rows = [scalping_scanner.scan_eth(require_enabled=False)]
+                    else:
+                        rows = [scalping_scanner.scan_btc(require_enabled=False)]
+                else:
+                    rpt = scheduler.run_once("scalping")
+                    rows = []
+                    for item in ((rpt or {}).get("scalping", {}) or {}).get("results", []):
+                        rows.append(
+                            {
+                                "symbol": str(item.get("symbol", "")),
+                                "status": str(item.get("status", "")),
+                                "reason": str(item.get("reason", "")),
+                                "signal_sent": bool(item.get("signal_sent")),
+                                "executed_mt5": bool(item.get("executed_mt5")),
+                            }
+                        )
+                    if not rows:
+                        rows = [{"symbol": "-", "status": "no_rows", "reason": "scheduler_returned_empty"}]
+                lines = ["Scalping Scan"]
+                if target_symbol:
+                    lines.append(f"target={target_symbol}")
+                for row in rows:
+                    if isinstance(row, dict):
+                        lines.append(
+                            f"- {row.get('symbol', '-')} | {row.get('status', '-')} | {row.get('reason', '-')}"
+                            + (f" | sent={row.get('signal_sent')} exec={row.get('executed_mt5')}" if "signal_sent" in row else "")
+                        )
+                    else:
+                        lines.append(
+                            f"- {getattr(row, 'symbol', '-')} | {getattr(row, 'status', '-')} | {getattr(row, 'reason', '-')}"
+                        )
+                self._send_text(chat_id, "\n".join(lines))
+                return
+
+            # command == scalping_logic
+            if target_symbol == "XAUUSD":
+                row = scalping_scanner.scan_xauusd(require_enabled=False)
+            elif target_symbol == "ETHUSD":
+                row = scalping_scanner.scan_eth(require_enabled=False)
+            else:
+                target_symbol = "BTCUSD"
+                row = scalping_scanner.scan_btc(require_enabled=False)
+            sig = getattr(row, "signal", None)
+            trigger = dict(getattr(row, "trigger", {}) or {})
+            lines = [
+                f"Scalping Logic ({target_symbol})",
+                f"status={getattr(row, 'status', '-')}",
+                f"reason={getattr(row, 'reason', '-')}",
+            ]
+            if sig is not None:
+                lines.append(
+                    f"signal={str(getattr(sig, 'direction', '')).upper()} conf={float(getattr(sig, 'confidence', 0.0) or 0.0):.1f}%"
+                )
+                lines.append(
+                    f"entry={float(getattr(sig, 'entry', 0.0) or 0.0):.5f} "
+                    f"sl={float(getattr(sig, 'stop_loss', 0.0) or 0.0):.5f} "
+                    f"tp1={float(getattr(sig, 'take_profit_1', 0.0) or 0.0):.5f} "
+                    f"tp2={float(getattr(sig, 'take_profit_2', 0.0) or 0.0):.5f}"
+                )
+                reasons = list(getattr(sig, "reasons", []) or [])
+                if reasons:
+                    lines.append("logic=" + "; ".join(str(x) for x in reasons[:3]))
+            if trigger:
+                lines.append(
+                    "m1_trigger="
+                    + ", ".join(
+                        [
+                            f"ok={trigger.get('ok')}",
+                            f"reason={trigger.get('reason')}",
+                            f"rsi={trigger.get('rsi14')}",
+                            f"ema9={trigger.get('ema9')}",
+                            f"ema21={trigger.get('ema21')}",
+                        ]
+                    )
+                )
+            self._send_text(chat_id, "\n".join(lines))
+            return
+
+        if command == "signal_monitor":
+            parsed = self._parse_signal_monitor_args(args)
+            symbols = [str(x or "").strip().upper() for x in list(parsed.get("symbols") or []) if str(x or "").strip()]
+            if not symbols:
+                try:
+                    user_filter = access_manager.get_user_signal_symbol_filter(user_id)
+                except Exception:
+                    user_filter = []
+                for item in user_filter:
+                    sym = self._normalize_dashboard_symbol(str(item or ""))
+                    if not sym:
+                        continue
+                    if sym in symbols:
+                        continue
+                    symbols.append(sym)
+            if not symbols:
+                symbols = ["XAUUSD"]
+
+            window_mode = str(parsed.get("window_mode") or "today").strip().lower()
+            days = int(parsed.get("days", 1) or 1)
+
+            for symbol in symbols:
+                payload = self._build_signal_monitor_payload(symbol=symbol, window_mode=window_mode, days=days)
+                self._send_text(chat_id, self._format_signal_monitor_text(payload, lang=lang, chat_id=chat_id))
+            return
+
+        if command in {"signal_filter", "show_only", "show_add", "show_clear", "show_all"}:
+            raw = str((args or "").strip())
+            op = "status"
+            payload = raw
+
+            if command == "show_only":
+                op = "only"
+            elif command == "show_add":
+                op = "add"
+            elif command in {"show_clear", "show_all"}:
+                op = "clear"
+            elif raw:
+                parts = raw.split(maxsplit=1)
+                head = str(parts[0]).strip().lower()
+                tail = str(parts[1]).strip() if len(parts) > 1 else ""
+                if head in {"status", "show", "list", "get"}:
+                    op = "status"
+                    payload = ""
+                elif head in {"only", "set", "replace"}:
+                    op = "only"
+                    payload = tail
+                elif head in {"add", "append", "+"}:
+                    op = "add"
+                    payload = tail
+                elif head in {"clear", "reset", "all", "*"}:
+                    op = "clear"
+                    payload = ""
+                else:
+                    op = "only"
+                    payload = raw
+
+            current = access_manager.get_user_signal_symbol_filter(user_id)
+            if op == "status":
+                if current:
+                    if lang == "th":
+                        self._send_text(chat_id, "ตัวกรองสัญญาณปัจจุบัน: " + ", ".join(current))
+                    elif lang == "de":
+                        self._send_text(chat_id, "Aktueller Signal-Filter: " + ", ".join(current))
+                    else:
+                        self._send_text(chat_id, "Current signal filter: " + ", ".join(current))
+                else:
+                    if lang == "th":
+                        self._send_text(chat_id, "ตอนนี้แสดงทุกสัญญาณ (ยังไม่ได้ตั้ง filter)")
+                    elif lang == "de":
+                        self._send_text(chat_id, "Aktuell werden alle Signale angezeigt (kein Filter gesetzt).")
+                    else:
+                        self._send_text(chat_id, "Currently showing all signals (no filter set).")
+                return
+
+            if op == "clear":
+                access_manager.set_user_signal_symbol_filter(user_id, [])
+                if lang == "th":
+                    self._send_text(chat_id, "ล้างตัวกรองแล้ว จากนี้จะแสดงทุกสัญญาณ")
+                elif lang == "de":
+                    self._send_text(chat_id, "Signal-Filter gelöscht. Ab jetzt werden alle Signale angezeigt.")
+                else:
+                    self._send_text(chat_id, "Signal filter cleared. You will now receive all signals.")
+                return
+
+            symbols = self._parse_signal_filter_symbols(payload)
+            if not symbols:
+                if lang == "th":
+                    self._send_text(
+                        chat_id,
+                        "วิธีใช้:\n"
+                        "/show_only gold\n"
+                        "/show_only btc eth\n"
+                        "/show_add xauusd\n"
+                        "/show_clear\n"
+                        "/signal_filter status",
+                    )
+                elif lang == "de":
+                    self._send_text(
+                        chat_id,
+                        "Nutzung:\n"
+                        "/show_only gold\n"
+                        "/show_only btc eth\n"
+                        "/show_add xauusd\n"
+                        "/show_clear\n"
+                        "/signal_filter status",
+                    )
+                else:
+                    self._send_text(
+                        chat_id,
+                        "Usage:\n"
+                        "/show_only gold\n"
+                        "/show_only btc eth\n"
+                        "/show_add xauusd\n"
+                        "/show_clear\n"
+                        "/signal_filter status",
+                    )
+                return
+
+            if op == "add":
+                merged = list(current or [])
+                for sym in symbols:
+                    if sym not in merged:
+                        merged.append(sym)
+                saved = access_manager.set_user_signal_symbol_filter(user_id, merged)
+            else:
+                saved = access_manager.set_user_signal_symbol_filter(user_id, symbols)
+
+            if lang == "th":
+                self._send_text(chat_id, "ตั้งค่าตัวกรองสัญญาณแล้ว: " + ", ".join(saved))
+            elif lang == "de":
+                self._send_text(chat_id, "Signal-Filter gespeichert: " + ", ".join(saved))
+            else:
+                self._send_text(chat_id, "Signal filter saved: " + ", ".join(saved))
             return
 
         if command in ("tz", "timezone"):
@@ -3173,6 +5659,27 @@ class TelegramAdminBot:
                 self._send_text(chat_id, f"Analyzing MT5 execute/skip reasons for last {hours}h" + (f" ({symbol_arg})" if symbol_arg else "") + "...")
             rep = mt5_autopilot_core.execution_reasons_report(hours=hours, symbol=symbol_arg)
             self._send_text(chat_id, self._format_mt5_exec_reasons_report(rep, lang=lang))
+            return
+
+        if command == "run":
+            parsed = self._parse_run_trace_args(args)
+            if not bool(parsed.get("valid")):
+                self._send_text(
+                    chat_id,
+                    "Run Trace usage:\n"
+                    "/run R000123\n"
+                    "/run 20260306010101-000123",
+                )
+                return
+            query_key = str(parsed.get("run_tag") or parsed.get("run_id") or parsed.get("raw") or "").strip()
+            if lang == "th":
+                self._send_text(chat_id, f"กำลัง trace เส้นทาง run={query_key} ...")
+            elif lang == "de":
+                self._send_text(chat_id, f"Trace wird geladen run={query_key} ...")
+            else:
+                self._send_text(chat_id, f"Loading run trace for {query_key} ...")
+            rpt = self._lookup_run_trace(parsed)
+            self._send_text(chat_id, self._format_run_trace_report(rpt, lang=lang))
             return
 
         if command == "stock_mt5_filter":
@@ -3717,30 +6224,71 @@ class TelegramAdminBot:
             days = int(parsed.get("days", 1) or 1)
             top_n = int(parsed.get("top", 5) or 5)
             market_filter = parsed.get("market_filter")
+            symbol_filter = str(parsed.get("symbol_filter") or "").strip().upper() or None
+            window_mode = str(parsed.get("window_mode") or "today").strip().lower()
             if parsed.get("compare"):
                 left = str(parsed.get("left") or "us")
                 right = str(parsed.get("right") or "thai")
+                period = self._signal_dashboard_window_label(window_mode, days, lang=lang)
+                left_label = self._signal_dashboard_market_label(left, lang=lang)
+                right_label = self._signal_dashboard_market_label(right, lang=lang)
                 if lang == "th":
-                    self._send_text(chat_id, f"กำลังเทียบ dashboard สัญญาณ {left} vs {right} ({days}d)...")
+                    self._send_text(chat_id, f"กำลังเทียบ Signal Dashboard: {left_label} vs {right_label} (ช่วง {period})...")
                 elif lang == "de":
-                    self._send_text(chat_id, f"Vergleiche Signal-Dashboard {left} vs {right} ({days}d)...")
+                    self._send_text(chat_id, f"Vergleiche Signal-Dashboard: {left_label} vs {right_label} (Zeitraum {period})...")
                 else:
-                    self._send_text(chat_id, f"Comparing signal dashboard {left} vs {right} ({days}d)...")
-                ra = neural_brain.daily_signal_trader_dashboard(days=days, risk_pct=1.0, start_balance=1000.0, market_filter=left)
-                rb = neural_brain.daily_signal_trader_dashboard(days=days, risk_pct=1.0, start_balance=1000.0, market_filter=right)
+                    self._send_text(chat_id, f"Comparing signal dashboard: {left_label} vs {right_label} (period {period})...")
+                ra = neural_brain.daily_signal_trader_dashboard(
+                    days=days, risk_pct=1.0, start_balance=1000.0, market_filter=left, window_mode=window_mode
+                )
+                rb = neural_brain.daily_signal_trader_dashboard(
+                    days=days, risk_pct=1.0, start_balance=1000.0, market_filter=right, window_mode=window_mode
+                )
                 self._send_text(chat_id, self._format_signal_dashboard_compare(ra, rb, lang=lang))
                 return
 
+            period = self._signal_dashboard_window_label(window_mode, days, lang=lang)
+            market_label = self._signal_dashboard_market_label(str(market_filter or ""), lang=lang) if market_filter else ""
             if lang == "th":
-                label = f" ({days}d" + (f", {market_filter}" if market_filter else "") + (f", top{top_n}" if top_n else "") + ")"
-                self._send_text(chat_id, f"กำลังสร้าง dashboard สรุปสัญญาณทุกตลาด{label}...")
+                label = f" (ช่วง={period}"
+                if market_filter:
+                    label += f", ตลาด={market_label}"
+                if symbol_filter:
+                    label += f", คู่={symbol_filter}"
+                if top_n:
+                    label += f", top{top_n}"
+                label += ")"
+                self._send_text(chat_id, f"กำลังสร้าง Signal Dashboard{label}...")
             elif lang == "de":
-                self._send_text(chat_id, "Erstelle das All-Signals-Trader-Dashboard...")
+                label = f" (Zeitraum={period}"
+                if market_filter:
+                    label += f", Markt={market_label}"
+                if symbol_filter:
+                    label += f", Symbol={symbol_filter}"
+                if top_n:
+                    label += f", top{top_n}"
+                label += ")"
+                self._send_text(chat_id, f"Erstelle Signal-Dashboard{label}...")
             else:
-                self._send_text(chat_id, "Building all-signals trader dashboard...")
-            rpt = neural_brain.daily_signal_trader_dashboard(days=days, risk_pct=1.0, start_balance=1000.0, market_filter=market_filter)
+                label = f" (period={period}"
+                if market_filter:
+                    label += f", market={market_label}"
+                if symbol_filter:
+                    label += f", pair={symbol_filter}"
+                if top_n:
+                    label += f", top{top_n}"
+                label += ")"
+                self._send_text(chat_id, f"Building signal dashboard{label}...")
+            rpt = neural_brain.daily_signal_trader_dashboard(
+                days=days,
+                risk_pct=1.0,
+                start_balance=1000.0,
+                market_filter=market_filter,
+                symbol_filter=symbol_filter,
+                window_mode=window_mode,
+            )
             rpt["display_top_n"] = top_n
-            notifier.send_signal_trader_dashboard(rpt, chat_id=chat_id)
+            notifier.send_signal_trader_dashboard(rpt, chat_id=chat_id, lang=lang)
             return
 
         if command == "us_open_dashboard":
@@ -4158,6 +6706,11 @@ class TelegramAdminBot:
         else:
             detected_lang = self._remember_chat_lang(cid, lang_source or text)
         reply_lang = self._lang_for_chat(cid) or detected_lang
+
+        if not command:
+            if self._try_handle_pending_intent_confirm(cid, uid, text, is_admin, reply_lang):
+                self._maybe_offer_language_preference(cid, text, None, reply_lang)
+                return
 
         if not command:
             if self._try_handle_pending_slot(cid, uid, text, is_admin, reply_lang):

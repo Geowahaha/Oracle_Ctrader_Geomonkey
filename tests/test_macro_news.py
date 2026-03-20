@@ -49,6 +49,49 @@ class MacroNewsTests(unittest.TestCase):
         self.assertAlmostEqual(float(snap["tariff_trade"]["weight_mult"]), 2.0, places=2)
         self.assertGreaterEqual(adj_score, 1)
 
+    def test_macro_feed_assigns_source_quality_and_verified_state(self):
+        mon = MacroNewsMonitor()
+        now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        xml = f"""
+<rss><channel>
+  <item>
+    <title>Fed announces emergency liquidity action in official statement</title>
+    <link>https://example.com/fed</link>
+    <pubDate>{now}</pubDate>
+    <source>Reuters</source>
+  </item>
+</channel></rss>
+""".strip()
+        with patch.object(mon, "_download", return_value=xml):
+            heads = mon.fetch_headlines(force=True)
+        self.assertEqual(len(heads), 1)
+        h = heads[0]
+        self.assertGreaterEqual(float(h.source_quality), 0.9)
+        self.assertEqual(str(h.source_tier), "trusted")
+        self.assertEqual(str(h.verification), "confirmed")
+
+    def test_macro_feed_marks_rumor_and_penalizes_score(self):
+        mon = MacroNewsMonitor()
+        now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        title = "Unconfirmed reports say missile strike may expand conflict"
+        xml = f"""
+<rss><channel>
+  <item>
+    <title>{title}</title>
+    <link>https://example.com/rumor</link>
+    <pubDate>{now}</pubDate>
+    <source>randomblog</source>
+  </item>
+</channel></rss>
+""".strip()
+        base_score, _ = mon._score_themes(title)
+        with patch.object(mon, "_download", return_value=xml):
+            heads = mon.fetch_headlines(force=True)
+        self.assertEqual(len(heads), 1)
+        h = heads[0]
+        self.assertIn(str(h.verification), {"rumor", "mixed"})
+        self.assertLessEqual(int(h.score), int(base_score))
+
     def test_scheduler_dedupes_macro_alerts(self):
         dexter = scheduler_module.DexterScheduler()
         h = MacroHeadline(

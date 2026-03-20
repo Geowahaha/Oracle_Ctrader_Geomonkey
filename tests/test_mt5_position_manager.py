@@ -297,6 +297,95 @@ class MT5PositionManagerTests(unittest.TestCase):
         self.assertEqual(draft.get("account_key"), "TEST-MT5|123")
         self.assertTrue("global_overrides" in draft)
 
+    def test_dynamic_trail_gap_adjusts_for_progress_spread_and_age(self):
+        with patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_ENABLED", True), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_STEP_R", 0.8), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_TIGHTEN_PCT_PER_STEP", 0.12), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_MAX_TIGHTEN_PCT", 0.35), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_SPREAD_WIDEN_PCT", 0.18), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_MAX_WIDEN_PCT", 0.24), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_YOUNG_AGE_MIN", 6.0), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_YOUNG_WIDEN_PCT", 0.10), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_MIN_GAP_R", 0.28), \
+             patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_MAX_GAP_R", 1.10):
+            gap, info = self.pm._dynamic_trail_gap_r(
+                base_gap_r=0.60,
+                trail_start_r=1.2,
+                r_now=3.0,
+                spread_pct=0.36,
+                spread_spike_pct=0.18,
+                age_min=2.0,
+            )
+        self.assertTrue(info["applied"])
+        self.assertGreater(float(info.get("tighten_pct", 0.0)), 0.0)
+        self.assertGreater(float(info.get("widen_pct", 0.0)), 0.0)
+        self.assertGreater(float(info.get("young_widen_pct", 0.0)), 0.0)
+        self.assertGreaterEqual(float(gap), 0.28)
+        self.assertLessEqual(float(gap), 1.10)
+
+    def test_dynamic_trail_gap_returns_base_when_disabled(self):
+        with patch("learning.mt5_position_manager.config.MT5_PM_TRAIL_DYNAMIC_ENABLED", False):
+            gap, info = self.pm._dynamic_trail_gap_r(
+                base_gap_r=0.57,
+                trail_start_r=1.2,
+                r_now=1.8,
+                spread_pct=0.10,
+                spread_spike_pct=0.18,
+                age_min=20.0,
+            )
+        self.assertFalse(info["applied"])
+        self.assertEqual(float(gap), 0.57)
+
+    def test_partial_close_forces_breakeven_lock_after_success(self):
+        status = {
+            "enabled": True,
+            "connected": True,
+            "account_login": 123,
+            "account_server": "TEST-MT5",
+        }
+        snap = {
+            "connected": True,
+            "positions": [
+                {
+                    "ticket": 1011,
+                    "symbol": "XAUUSD",
+                    "type": "buy",
+                    "volume": 0.10,
+                    "price_open": 100.0,
+                    "price_current": 104.0,
+                    "sl": 95.0,
+                    "tp": 112.0,
+                    "profit": 0.4,
+                    "time": 0,
+                    "time_msc": 0,
+                    "magic": 0,
+                    "comment": "",
+                }
+            ],
+            "orders": [],
+        }
+        close_ok = MT5ExecutionResult(ok=True, status="partial_closed", message="ok", broker_symbol="XAUUSD", ticket=1011, volume=0.05)
+        mod_ok = MT5ExecutionResult(ok=True, status="modified", message="ok", broker_symbol="XAUUSD", ticket=1011)
+        with patch("learning.mt5_position_manager.config.MT5_ENABLED", True), \
+             patch("learning.mt5_position_manager.config.MT5_POSITION_MANAGER_ENABLED", True), \
+             patch("learning.mt5_position_manager.config.MT5_PM_MANAGE_ENABLED", True), \
+             patch("learning.mt5_position_manager.config.MT5_PM_BREAK_EVEN_R", 1.5), \
+             patch("learning.mt5_position_manager.config.MT5_PM_PARTIAL_TP_R", 0.75), \
+             patch("learning.mt5_position_manager.config.MT5_PM_FORCE_BE_AFTER_PARTIAL", True), \
+             patch("learning.mt5_position_manager.config.MT5_PM_FORCE_BE_AFTER_PARTIAL_BUFFER_R", 0.05), \
+             patch("learning.mt5_position_manager.mt5_executor.status", return_value=status), \
+             patch("learning.mt5_position_manager.mt5_executor.open_positions_snapshot", return_value=snap), \
+             patch("learning.mt5_position_manager.mt5_executor.close_position_partial", return_value=close_ok) as p_close, \
+             patch("learning.mt5_position_manager.mt5_executor.modify_position_sltp", return_value=mod_ok) as p_mod:
+            report = self.pm.run_cycle(source="test")
+
+        self.assertTrue(report["ok"])
+        self.assertTrue(p_close.called)
+        self.assertTrue(p_mod.called)
+        actions = list(report.get("actions", []) or [])
+        self.assertTrue(any(str(a.get("action")) == "partial_close" for a in actions))
+        self.assertTrue(any(str(a.get("action")) == "breakeven_after_partial" for a in actions))
+
 
 if __name__ == "__main__":
     unittest.main()

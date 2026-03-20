@@ -213,6 +213,37 @@ class AccessControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.manager.set_user_macro_risk_filter(self.user_id, "****")
 
+    def test_user_signal_symbol_filter_persists_and_filters_entitled_delivery(self):
+        u_gold = 1101
+        u_crypto = 2202
+        self.manager.grant_plan(u_gold, plan="b", days=30)
+        self.manager.grant_plan(u_crypto, plan="b", days=30)
+
+        self.assertEqual(self.manager.set_user_signal_symbol_filter(u_gold, ["gold"]), ["XAUUSD"])
+        self.assertEqual(self.manager.set_user_signal_symbol_filter(u_crypto, ["btc", "eth"]), ["BTC", "ETH"])
+
+        ids_gold = self.manager.list_entitled_user_ids("scan_gold", signal_symbol="XAUUSD")
+        ids_btc = self.manager.list_entitled_user_ids("scan_crypto", signal_symbol="BTC/USDT")
+
+        self.assertIn(u_gold, ids_gold)
+        self.assertNotIn(u_crypto, ids_gold)
+        self.assertIn(u_crypto, ids_btc)
+        self.assertNotIn(u_gold, ids_btc)
+
+        self.assertEqual(self.manager.set_user_signal_symbol_filter(u_gold, []), [])
+        ids_btc_after_clear = self.manager.list_entitled_user_ids("scan_crypto", signal_symbol="BTCUSD")
+        self.assertIn(u_gold, ids_btc_after_clear)
+
+    def test_user_signal_symbol_filter_coexists_with_other_preferences(self):
+        self.manager.set_user_language_preference(self.user_id, "de", metadata={"source": "test"})
+        self.manager.set_user_macro_risk_filter(self.user_id, "**")
+        saved_filter = self.manager.set_user_signal_symbol_filter(self.user_id, ["xauusd", "ethusdt"])
+        self.assertEqual(saved_filter, ["XAUUSD", "ETH/USDT"])
+
+        self.assertEqual(self.manager.get_user_language_preference(self.user_id), "de")
+        self.assertEqual(self.manager.get_user_macro_risk_filter(self.user_id), "**")
+        self.assertEqual(self.manager.get_user_signal_symbol_filter(self.user_id), ["XAUUSD", "ETH/USDT"])
+
     def test_user_news_timezone_persists_and_coexists_with_other_preferences(self):
         self.assertIsNone(self.manager.get_user_news_utc_offset(self.user_id))
         self.assertEqual(self.manager.set_user_news_utc_offset(self.user_id, "+07:00"), "+07:00")

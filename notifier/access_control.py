@@ -58,7 +58,13 @@ class AccessManager:
             "c": int(getattr(config, "PLAN_C_DAILY_LIMIT", 500)),
         }
 
-        common = {"start", "help", "status", "scan_gold", "scan_fx", "markets", "gold_overview", "calendar", "macro", "macro_report", "macro_weights", "signal_dashboard", "us_open_guard_status", "tz", "plan", "upgrade"}
+        common = {
+            "start", "help", "status", "scan_gold", "scan_fx", "markets", "gold_overview",
+            "calendar", "macro", "macro_report", "macro_weights", "signal_dashboard", "signal_monitor",
+            "monitor_sub", "monitor_unsub", "monitor_status",
+            "us_open_guard_status", "tz", "plan", "upgrade",
+            "scalping_status", "scalping_scan", "scalping_logic",
+        }
         self.plan_features = {
             "trial": set(common) | {"scan_us", "scan_us_open", "scan_vi", "scan_vi_buffett", "scan_vi_turnaround", "scan_thai_vi", "monitor_us", "us_open_report", "us_open_dashboard"},
             "a": set(common) | {"scan_crypto"},
@@ -89,14 +95,37 @@ class AccessManager:
                 "mt5_pm_learning",
                 "mt5_plan",
                 "mt5_policy",
+                "run",
                 "mt5_backtest",
                 "mt5_train",
+                "scalping_on",
+                "scalping_off",
             },
         }
 
         # Commands that never consume daily quota.
-        self.non_metered = {"start", "help", "tz", "plan", "upgrade"}
-        self.admin_only = {"grant", "revoke", "setplan", "block", "unblock", "stock_mt5_filter", "admin_add", "admin_del", "admin_list", "user_list"}
+        self.non_metered = {
+            "start",
+            "help",
+            "tz",
+            "plan",
+            "upgrade",
+            "scalping_status",
+            "signal_monitor",
+            "monitor_sub",
+            "monitor_unsub",
+            "monitor_status",
+            "signal_filter",
+            "show_only",
+            "show_add",
+            "show_clear",
+            "show_all",
+        }
+        self.admin_only = {
+            "grant", "revoke", "setplan", "block", "unblock",
+            "stock_mt5_filter", "admin_add", "admin_del", "admin_list", "user_list",
+            "scalping_on", "scalping_off",
+        }
         self.ai_api_commands = {"research"}
         self.mt5_sensitive_commands = {cmd for feats in self.plan_features.values() for cmd in feats if str(cmd).startswith("mt5_")}
         if bool(getattr(config, "TRIAL_NO_AI_ALL", False)):
@@ -120,6 +149,61 @@ class AccessManager:
             base = s[:-3]
             out.add(f"{base}/USDT")
             out.add(f"{base}USD")
+        return {x for x in out if x}
+
+    @staticmethod
+    def _normalize_signal_symbol_token(symbol: str) -> str:
+        s = str(symbol or "").strip().upper().replace(" ", "")
+        if not s:
+            return ""
+        if s in {"GOLD", "XAU"}:
+            return "XAUUSD"
+        if s.endswith("USDT") and "/" not in s and len(s) > 4:
+            return f"{s[:-4]}/USDT"
+        return s
+
+    @staticmethod
+    def _normalize_monitor_symbol_token(symbol: str) -> str:
+        s = AccessManager._normalize_signal_symbol_token(symbol)
+        if not s:
+            return ""
+        if s in {"GOLD", "XAU"}:
+            return "XAUUSD"
+        if s == "XAUUSD":
+            return "XAUUSD"
+        if s.endswith("/USDT") and len(s) > 5:
+            return f"{s[:-5]}USD"
+        if s.endswith("USDT") and len(s) > 4:
+            return f"{s[:-4]}USD"
+        if s.endswith("USD") and len(s) > 3:
+            return s
+        return s
+
+    @classmethod
+    def _expand_signal_filter_aliases(cls, symbols: list[str] | set[str] | tuple[str, ...]) -> set[str]:
+        out: set[str] = set()
+        for raw in (symbols or []):
+            token = cls._normalize_signal_symbol_token(str(raw or ""))
+            if not token:
+                continue
+            out.add(token)
+            out.update(cls._symbol_aliases(token))
+
+            base = ""
+            if "/" in token:
+                base = token.split("/", 1)[0]
+            elif token.endswith("USDT") and len(token) > 4:
+                base = token[:-4]
+            elif token.endswith("USD") and len(token) > 3:
+                base = token[:-3]
+            elif token.isalpha() and 2 <= len(token) <= 8:
+                base = token
+            if base:
+                out.add(base)
+                out.add(f"{base}/USDT")
+                out.add(f"{base}USD")
+            if token == "XAUUSD":
+                out.update({"XAU", "GOLD"})
         return {x for x in out if x}
 
     def _enable_trial_non_ai_all(self) -> None:
@@ -454,16 +538,36 @@ class AccessManager:
             if self._is_expired(u):
                 continue
             plan = str(u.get("plan", "")).lower()
+            entitled = False
             if self._has_feature(plan, cmd):
-                ids.add(uid)
-                continue
+                entitled = True
             # Trial special lane for selected crypto symbols (e.g., BTC/ETH only).
-            if plan == "trial" and cmd == "scan_crypto" and symbol_pool:
+            elif plan == "trial" and cmd == "scan_crypto" and symbol_pool:
                 if symbol_pool.intersection(trial_crypto_allowed):
-                    ids.add(uid)
+                    entitled = True
+            if not entitled:
+                continue
+            if not self._user_signal_filter_allows(
+                uid,
+                signal_symbol=signal_symbol,
+                signal_symbols=signal_symbols,
+            ):
+                continue
+            ids.add(uid)
 
-        # Admins always receive alerts.
-        ids.update(self.get_admin_ids())
+        # Admins receive alerts too, but still respect their personal symbol filter if set.
+        for admin_uid in self.get_admin_ids():
+            try:
+                auid = int(admin_uid)
+            except Exception:
+                continue
+            if not self._user_signal_filter_allows(
+                auid,
+                signal_symbol=signal_symbol,
+                signal_symbols=signal_symbols,
+            ):
+                continue
+            ids.add(auid)
         return sorted(ids)
 
     def grant_plan(
@@ -975,6 +1079,79 @@ class AccessManager:
                 )
                 conn.commit()
         return self.get_user_language_preference(uid)
+
+    def get_user_signal_symbol_filter(self, user_id: int) -> list[str]:
+        row = self._get_user_preferences_row(user_id)
+        if not row:
+            return []
+        meta = self._parse_user_pref_metadata(row[1] if len(row) > 1 else "")
+        raw = meta.get("signal_symbol_filter", [])
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            token = self._normalize_signal_symbol_token(str(item or ""))
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    def set_user_signal_symbol_filter(self, user_id: int, symbols: Optional[list[str]]) -> list[str]:
+        items = list(symbols or [])
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            token = self._normalize_signal_symbol_token(str(item or ""))
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        row = self._get_user_preferences_row(user_id)
+        meta = self._parse_user_pref_metadata(row[1] if row else "")
+        if normalized:
+            meta["signal_symbol_filter"] = normalized
+        else:
+            meta.pop("signal_symbol_filter", None)
+        self._upsert_user_preferences_metadata(user_id, meta)
+        return self.get_user_signal_symbol_filter(user_id)
+
+    def _user_signal_filter_allows(
+        self,
+        user_id: int,
+        signal_symbol: str = "",
+        signal_symbols: Optional[list[str]] = None,
+    ) -> bool:
+        user_filter = self.get_user_signal_symbol_filter(user_id)
+        if not user_filter:
+            return True
+        signal_pool: set[str] = set()
+        signal_pool.update(self._symbol_aliases(signal_symbol))
+        for sym in (signal_symbols or []):
+            signal_pool.update(self._symbol_aliases(sym))
+        if not signal_pool:
+            return True
+        filter_aliases = self._expand_signal_filter_aliases(user_filter)
+        signal_aliases = self._expand_signal_filter_aliases(list(signal_pool))
+        return bool(filter_aliases.intersection(signal_aliases))
+
+    def user_signal_filter_allows(
+        self,
+        user_id: int,
+        signal_symbol: str = "",
+        signal_symbols: Optional[list[str]] = None,
+    ) -> bool:
+        """Public wrapper for notifier layer to check per-user signal visibility filter."""
+        try:
+            uid = int(user_id)
+        except Exception:
+            return True
+        return self._user_signal_filter_allows(
+            uid,
+            signal_symbol=signal_symbol,
+            signal_symbols=signal_symbols,
+        )
 
     def get_user_macro_risk_filter(self, user_id: int) -> Optional[str]:
         row = self._get_user_preferences_row(user_id)

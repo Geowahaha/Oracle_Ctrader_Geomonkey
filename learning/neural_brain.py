@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
+import time as time_module
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time
 from pathlib import Path
@@ -18,6 +20,7 @@ import numpy as np
 
 from config import config
 from execution.mt5_executor import mt5_executor
+from learning.symbol_normalizer import canonical_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,13 @@ class NeuralBrain:
         "src_stocks",
         "src_us_open",
         "src_manual",
+        # --- NEW features (added for enhanced adaptive TP/SL learning) ---
+        "hour_sin",       # time-of-day sine encoding
+        "hour_cos",       # time-of-day cosine encoding
+        "sl_ratio",       # |entry - SL| / entry  (tight SL => more SL hits)
+        "tp_sl_ratio",    # |TP2 - entry| / |entry - SL|  (actual proposed RR)
+        "mae_hist",       # historical mean adverse excursion from autopilot DB (0 if unknown)
+        "resolve_age_h",  # hours until signal resolved (0 at prediction time)
     ]
 
     def __init__(self):
@@ -80,6 +90,9 @@ class NeuralBrain:
         self.model_path = data_dir / "neural_brain.npz"
         self._lock = threading.Lock()
         self._model_cache: Optional[dict] = None
+        self._reason_study_cache: Optional[dict] = None
+        self._reason_study_cache_key: tuple[int, int] | None = None
+        self._reason_study_cache_ts: float = 0.0
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -137,6 +150,17 @@ class NeuralBrain:
                 conn.execute("ALTER TABLE signal_events ADD COLUMN take_profit_1 REAL")
             if "take_profit_3" not in cols:
                 conn.execute("ALTER TABLE signal_events ADD COLUMN take_profit_3 REAL")
+            # New feature columns (added for enhanced neural training)
+            if "feat_hour_sin" not in cols:
+                conn.execute("ALTER TABLE signal_events ADD COLUMN feat_hour_sin REAL")
+            if "feat_hour_cos" not in cols:
+                conn.execute("ALTER TABLE signal_events ADD COLUMN feat_hour_cos REAL")
+            if "feat_sl_ratio" not in cols:
+                conn.execute("ALTER TABLE signal_events ADD COLUMN feat_sl_ratio REAL")
+            if "feat_tp_sl_ratio" not in cols:
+                conn.execute("ALTER TABLE signal_events ADD COLUMN feat_tp_sl_ratio REAL")
+            if "feat_mae_hist" not in cols:
+                conn.execute("ALTER TABLE signal_events ADD COLUMN feat_mae_hist REAL")
             conn.commit()
 
     def _safe_float(self, value, default: float = 0.0) -> float:
@@ -166,10 +190,16 @@ class NeuralBrain:
             "src_manual": 1.0 if "manual" in s else 0.0,
         }
 
-    def _signal_feature_dict(self, signal, source: str) -> dict[str, float]:
+    def _signal_feature_dict(self, signal, source: str, now_utc: Optional[datetime] = None) -> dict[str, float]:
         entry = max(1e-12, self._safe_float(getattr(signal, "entry", 0.0), 0.0))
         atr = self._safe_float(getattr(signal, "atr", 0.0), 0.0)
         raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        sl = self._safe_float(getattr(signal, "stop_loss", 0.0), 0.0)
+        tp2 = self._safe_float(getattr(signal, "take_profit_2", 0.0), 0.0)
+        # Time-of-day encoding (cyclic)
+        now = now_utc or _utc_now()
+        hour_frac = (now.hour + now.minute / 60.0) / 24.0
+        import math
         fd = {
             "confidence": np.clip(self._safe_float(getattr(signal, "confidence", 0.0), 0.0) / 100.0, 0.0, 1.5),
             "risk_reward": np.clip(self._safe_float(getattr(signal, "risk_reward", 0.0), 0.0) / 5.0, 0.0, 2.0),
@@ -179,6 +209,16 @@ class NeuralBrain:
             "long_score": np.clip(self._safe_float(raw_scores.get("long", 0.0), 0.0) / 100.0, 0.0, 3.0),
             "short_score": np.clip(self._safe_float(raw_scores.get("short", 0.0), 0.0) / 100.0, 0.0, 3.0),
             "is_long": 1.0 if str(getattr(signal, "direction", "")).lower() == "long" else 0.0,
+            # Time of day
+            "hour_sin": float(math.sin(2 * math.pi * hour_frac)),
+            "hour_cos": float(math.cos(2 * math.pi * hour_frac)),
+            # SL quality features
+            "sl_ratio": float(np.clip(abs(entry - sl) / entry, 0.0, 0.20)) if sl > 0 else 0.0,
+            "tp_sl_ratio": float(np.clip(abs(tp2 - entry) / max(abs(entry - sl), 1e-12), 0.0, 5.0)) if (sl > 0 and tp2 > 0) else 0.0,
+            # MAE from autopilot (filled in from DB for training rows; 0 for live prediction)
+            "mae_hist": 0.0,
+            # Hours to resolution (0 at prediction time)
+            "resolve_age_h": 0.0,
         }
         fd.update(self._pattern_flags(str(getattr(signal, "pattern", ""))))
         fd.update(self._source_flags(source))
@@ -193,11 +233,19 @@ class NeuralBrain:
         if signal is None or result is None:
             return
 
+        raw_signal_symbol = str(getattr(signal, "symbol", "") or "")
+        raw_broker_symbol = str(getattr(result, "broker_symbol", "") or "")
+        signal_symbol = canonical_symbol(raw_signal_symbol) or raw_signal_symbol.strip().upper()
+        broker_symbol = canonical_symbol(raw_broker_symbol) or raw_broker_symbol.strip().upper()
         raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
         extra = {
             "raw_scores": raw_scores,
             "reasons": list(getattr(signal, "reasons", []) or []),
             "warnings": list(getattr(signal, "warnings", []) or []),
+            "raw_signal_symbol": raw_signal_symbol,
+            "raw_broker_symbol": raw_broker_symbol,
+            "canonical_signal_symbol": signal_symbol,
+            "canonical_broker_symbol": broker_symbol,
         }
         now_iso = _iso(_utc_now())
         with self._lock:
@@ -215,8 +263,8 @@ class NeuralBrain:
                     (
                         now_iso,
                         str(source or ""),
-                        str(getattr(signal, "symbol", "") or ""),
-                        str(getattr(result, "broker_symbol", "") or ""),
+                        signal_symbol,
+                        broker_symbol,
                         str(getattr(signal, "direction", "") or ""),
                         self._safe_float(getattr(signal, "confidence", 0.0), 0.0),
                         self._safe_float(getattr(signal, "risk_reward", 0.0), 0.0),
@@ -237,13 +285,14 @@ class NeuralBrain:
                         str(getattr(result, "message", "") or "")[:300],
                         int(getattr(result, "ticket", 0) or 0),
                         int(getattr(result, "position_id", 0) or 0),
-                        json.dumps(extra, ensure_ascii=True)[:4000],
+                        json.dumps(extra, ensure_ascii=True),
                     ),
                 )
                 conn.commit()
 
     def _is_recent_duplicate(self, conn: sqlite3.Connection, signal, source: str, minutes: int = 5) -> bool:
-        symbol = str(getattr(signal, "symbol", "") or "")
+        raw_symbol = str(getattr(signal, "symbol", "") or "")
+        symbol = canonical_symbol(raw_symbol) or raw_symbol.strip().upper()
         direction = str(getattr(signal, "direction", "") or "")
         if not symbol:
             return False
@@ -279,12 +328,16 @@ class NeuralBrain:
             return
         if signal is None:
             return
+        raw_signal_symbol = str(getattr(signal, "symbol", "") or "")
+        signal_symbol = canonical_symbol(raw_signal_symbol) or raw_signal_symbol.strip().upper()
         raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
         extra = {
             "kind": "telegram_signal",
             "raw_scores": raw_scores,
             "reasons": list(getattr(signal, "reasons", []) or []),
             "warnings": list(getattr(signal, "warnings", []) or []),
+            "raw_signal_symbol": raw_signal_symbol,
+            "canonical_signal_symbol": signal_symbol,
         }
         now_iso = _iso(_utc_now())
         with self._lock:
@@ -304,7 +357,7 @@ class NeuralBrain:
                     (
                         now_iso,
                         str(source or ""),
-                        str(getattr(signal, "symbol", "") or ""),
+                        signal_symbol,
                         str(getattr(signal, "direction", "") or ""),
                         self._safe_float(getattr(signal, "confidence", 0.0), 0.0),
                         self._safe_float(getattr(signal, "risk_reward", 0.0), 0.0),
@@ -321,7 +374,7 @@ class NeuralBrain:
                         self._safe_float(raw_scores.get("long", 0.0), 0.0),
                         self._safe_float(raw_scores.get("short", 0.0), 0.0),
                         self._safe_float(raw_scores.get("edge", 0.0), 0.0),
-                        json.dumps(extra, ensure_ascii=True)[:4000],
+                        json.dumps(extra, ensure_ascii=True),
                     ),
                 )
                 conn.commit()
@@ -336,10 +389,123 @@ class NeuralBrain:
         except Exception:
             return {}
 
+    @staticmethod
+    def _normalize_reason_tag(value: str) -> str:
+        token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+        token = re.sub(r"_+", "_", token).strip("_")
+        return token[:80]
+
+    @classmethod
+    def _append_reason_tag(cls, out: list[str], seen: set[str], prefix: str, value: str) -> None:
+        token = cls._normalize_reason_tag(value)
+        if not token:
+            return
+        tag = f"{prefix}:{token}"
+        if tag in seen:
+            return
+        seen.add(tag)
+        out.append(tag)
+
+    def _signal_reason_tags(self, signal, source: str) -> list[str]:
+        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        tags: list[str] = []
+        seen: set[str] = set()
+        self._append_reason_tag(tags, seen, "source", source)
+        self._append_reason_tag(tags, seen, "symbol", canonical_symbol(str(getattr(signal, "symbol", "") or "")) or str(getattr(signal, "symbol", "") or ""))
+        self._append_reason_tag(tags, seen, "pattern", str(getattr(signal, "pattern", "") or ""))
+        self._append_reason_tag(tags, seen, "session", str(getattr(signal, "session", "") or ""))
+        self._append_reason_tag(tags, seen, "timeframe", str(getattr(signal, "timeframe", "") or ""))
+        entry_type = (
+            getattr(signal, "entry_type", "")
+            or raw_scores.get("entry_type")
+            or raw_scores.get("scalp_m1_entry_order_type")
+            or raw_scores.get("scalp_m1_entry_type")
+        )
+        self._append_reason_tag(tags, seen, "entry", str(entry_type or ""))
+        family = (
+            raw_scores.get("strategy_family")
+            or raw_scores.get("family")
+            or raw_scores.get("scalp_family")
+            or raw_scores.get("scalping_source")
+        )
+        self._append_reason_tag(tags, seen, "family", str(family or ""))
+        for item in list(getattr(signal, "reasons", []) or []):
+            self._append_reason_tag(tags, seen, "reason", str(item or ""))
+        for item in list(getattr(signal, "warnings", []) or []):
+            self._append_reason_tag(tags, seen, "warning", str(item or ""))
+        for item in list(raw_scores.get("gate_reasons") or []):
+            self._append_reason_tag(tags, seen, "gate", str(item or ""))
+        return tags
+
+    def _row_reason_tags(self, row: sqlite3.Row) -> list[str]:
+        row_obj = dict(row)
+        extra = self._safe_json_load(str(row_obj.get("extra_json", "") or ""))
+        raw_scores = dict(extra.get("raw_scores", {}) or {})
+        tags: list[str] = []
+        seen: set[str] = set()
+        self._append_reason_tag(tags, seen, "source", str(row_obj.get("source", "") or ""))
+        self._append_reason_tag(
+            tags,
+            seen,
+            "symbol",
+            canonical_symbol(str(row_obj.get("signal_symbol", "") or row_obj.get("broker_symbol", "") or ""))
+            or str(row_obj.get("signal_symbol", "") or row_obj.get("broker_symbol", "") or ""),
+        )
+        self._append_reason_tag(tags, seen, "pattern", str(row_obj.get("pattern", "") or ""))
+        self._append_reason_tag(tags, seen, "session", str(row_obj.get("session", "") or ""))
+        self._append_reason_tag(tags, seen, "timeframe", str(row_obj.get("timeframe", "") or ""))
+        entry_type = (
+            raw_scores.get("entry_type")
+            or extra.get("entry_type")
+            or raw_scores.get("scalp_m1_entry_order_type")
+            or raw_scores.get("scalp_m1_entry_type")
+        )
+        self._append_reason_tag(tags, seen, "entry", str(entry_type or ""))
+        family = (
+            raw_scores.get("strategy_family")
+            or raw_scores.get("family")
+            or raw_scores.get("scalp_family")
+            or raw_scores.get("scalping_source")
+        )
+        self._append_reason_tag(tags, seen, "family", str(family or ""))
+        for item in list(extra.get("reasons", []) or []):
+            self._append_reason_tag(tags, seen, "reason", str(item or ""))
+        for item in list(extra.get("warnings", []) or []):
+            self._append_reason_tag(tags, seen, "warning", str(item or ""))
+        for item in list(raw_scores.get("gate_reasons") or []):
+            self._append_reason_tag(tags, seen, "gate", str(item or ""))
+        return tags
+
+    def _extract_exit_state(self, row: sqlite3.Row) -> str:
+        row_obj = dict(row)
+        extra = self._safe_json_load(str(row_obj.get("extra_json", "") or ""))
+        market_eval = dict(extra.get("market_eval", {}) or {})
+        close_resolution = dict(extra.get("close_resolution", {}) or {})
+        state = str(market_eval.get("state") or close_resolution.get("state") or "").strip().lower()
+        if state:
+            return state
+        msg = str(row_obj.get("mt5_message", "") or "").strip().lower()
+        if msg.startswith("mt5_close:"):
+            return self._normalize_reason_tag(msg.split(":", 1)[1])
+        pnl = self._safe_float(row_obj.get("pnl"), 0.0)
+        if "ctrader_reconciled_close" in msg:
+            return "win" if pnl > 0 else ("loss" if pnl < 0 else "flat")
+        return "win" if pnl > 0 else ("loss" if pnl < 0 else "flat")
+
+    @staticmethod
+    def _reason_bucket_score(resolved: int, win_rate: float, avg_r: float) -> float:
+        if resolved <= 0:
+            return 0.0
+        sample_factor = min(1.0, float(np.log1p(resolved) / np.log1p(24.0)))
+        win_edge = (float(win_rate) - 0.5) * 2.0
+        pnl_edge = float(np.clip(avg_r, -1.5, 1.5) / 1.5)
+        return float((0.65 * win_edge + 0.35 * pnl_edge) * sample_factor)
+
     def _market_fetch(self, symbol: str, timeframe: str, bars: int = 1200):
         tf = (timeframe or "1h").strip().lower()
         tf = tf if tf in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"} else "1h"
-        sym = str(symbol or "").strip().upper()
+        raw_sym = str(symbol or "").strip().upper()
+        sym = canonical_symbol(raw_sym) or raw_sym
         try:
             if sym == "XAUUSD":
                 from market.data_fetcher import xauusd_provider
@@ -355,7 +521,7 @@ class NeuralBrain:
                 pass
             from scanners.stock_scanner import fetch_stock_ohlcv
             tf_stock = tf if tf in {"1h", "4h", "1d", "1wk"} else "1h"
-            return fetch_stock_ohlcv(sym, tf_stock, bars=bars)
+            return fetch_stock_ohlcv(raw_sym or sym, tf_stock, bars=bars)
         except Exception:
             return None
 
@@ -559,7 +725,7 @@ class NeuralBrain:
                                 resolved_r,
                                 resolved_at,
                                 f"market_eval:{state}",
-                                json.dumps(extra, ensure_ascii=True)[:4000],
+                                json.dumps(extra, ensure_ascii=True),
                                 row_id,
                             ),
                         )
@@ -596,7 +762,7 @@ class NeuralBrain:
                                     current_r,
                                     resolved_at,
                                     "market_eval:pseudo_label",
-                                    json.dumps(extra, ensure_ascii=True)[:4000],
+                                    json.dumps(extra, ensure_ascii=True),
                                     row_id,
                                 ),
                             )
@@ -606,7 +772,7 @@ class NeuralBrain:
                         else:
                             conn.execute(
                                 "UPDATE signal_events SET extra_json = ? WHERE id = ?",
-                                (json.dumps(extra, ensure_ascii=True)[:4000], row_id),
+                                (json.dumps(extra, ensure_ascii=True), row_id),
                             )
                             updated += 1
                 conn.commit()
@@ -726,6 +892,192 @@ class NeuralBrain:
             "avg_r_resolved": round(float(np.mean(r_resolved)) if r_resolved else 0.0, 4),
             "avg_r_pending": round(float(np.mean(r_pending)) if r_pending else 0.0, 4),
             "top_symbols": top_symbols,
+        }
+
+    def build_reason_study_report(
+        self,
+        *,
+        days: Optional[int] = None,
+        min_resolved: Optional[int] = None,
+    ) -> dict:
+        if not config.NEURAL_BRAIN_ENABLED:
+            return {"ok": False, "status": "disabled", "message": "neural brain disabled"}
+        if not bool(getattr(config, "NEURAL_BRAIN_REASON_STUDY_ENABLED", True)):
+            return {"ok": False, "status": "disabled", "message": "reason study disabled"}
+
+        days_i = max(1, int(days if days is not None else getattr(config, "NEURAL_BRAIN_REASON_STUDY_LOOKBACK_DAYS", 120)))
+        min_n = max(1, int(min_resolved if min_resolved is not None else getattr(config, "NEURAL_BRAIN_REASON_STUDY_MIN_RESOLVED", 8)))
+        cache_key = (days_i, min_n)
+        now_ts = time_module.time()
+        cache_ttl = max(5, int(getattr(config, "NEURAL_BRAIN_REASON_STUDY_CACHE_SEC", 120) or 120))
+        if (
+            self._reason_study_cache is not None
+            and self._reason_study_cache_key == cache_key
+            and (now_ts - float(self._reason_study_cache_ts or 0.0)) <= cache_ttl
+        ):
+            return dict(self._reason_study_cache)
+
+        since_iso = _iso(_utc_now() - timedelta(days=days_i))
+        with self._lock:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT created_at, source, signal_symbol, broker_symbol, pattern, session, timeframe,
+                           mt5_message, outcome, pnl, extra_json
+                    FROM signal_events
+                    WHERE resolved = 1
+                      AND outcome IN (0, 1)
+                      AND created_at >= ?
+                    ORDER BY id DESC
+                    """,
+                    (since_iso,),
+                ).fetchall()
+
+        tag_stats: dict[str, dict] = {}
+        exit_state_counts: dict[str, int] = {}
+        for row in rows:
+            exit_state = self._extract_exit_state(row)
+            exit_state_counts[exit_state] = int(exit_state_counts.get(exit_state, 0) or 0) + 1
+            pnl = self._safe_float(row["pnl"], 0.0)
+            outcome = int(row["outcome"] or 0)
+            for tag in self._row_reason_tags(row):
+                rec = tag_stats.setdefault(
+                    tag,
+                    {
+                        "tag": tag,
+                        "resolved": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "net_r": 0.0,
+                        "tp_like": 0,
+                        "sl_like": 0,
+                        "other_exit": 0,
+                    },
+                )
+                rec["resolved"] += 1
+                rec["wins"] += 1 if outcome == 1 else 0
+                rec["losses"] += 1 if outcome == 0 else 0
+                rec["net_r"] += pnl
+                if exit_state.startswith("tp") or exit_state == "win":
+                    rec["tp_like"] += 1
+                elif exit_state in {"sl", "loss"}:
+                    rec["sl_like"] += 1
+                else:
+                    rec["other_exit"] += 1
+
+        tag_rows: list[dict] = []
+        tag_index: dict[str, dict] = {}
+        for tag, rec in tag_stats.items():
+            resolved = int(rec["resolved"] or 0)
+            wins = int(rec["wins"] or 0)
+            win_rate = (wins / resolved) if resolved else 0.0
+            avg_r = (float(rec["net_r"] or 0.0) / resolved) if resolved else 0.0
+            row = {
+                "tag": tag,
+                "resolved": resolved,
+                "wins": wins,
+                "losses": int(rec["losses"] or 0),
+                "win_rate": round(win_rate, 4),
+                "avg_r": round(avg_r, 4),
+                "net_r": round(float(rec["net_r"] or 0.0), 4),
+                "tp_like": int(rec["tp_like"] or 0),
+                "sl_like": int(rec["sl_like"] or 0),
+                "other_exit": int(rec["other_exit"] or 0),
+                "eligible": bool(resolved >= min_n),
+                "score": round(self._reason_bucket_score(resolved, win_rate, avg_r), 4),
+            }
+            tag_rows.append(row)
+            tag_index[tag] = row
+
+        tag_rows.sort(key=lambda item: (abs(float(item.get("score", 0.0) or 0.0)), int(item.get("resolved", 0) or 0)), reverse=True)
+        eligible_rows = [dict(row) for row in tag_rows if bool(row.get("eligible"))]
+        report = {
+            "ok": True,
+            "status": "ok",
+            "days": days_i,
+            "min_resolved": min_n,
+            "resolved_rows": len(rows),
+            "eligible_tags": len(eligible_rows),
+            "exit_state_counts": dict(sorted(exit_state_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "top_positive_tags": [
+                row
+                for row in sorted(
+                    eligible_rows,
+                    key=lambda item: (float(item.get("score", 0.0) or 0.0), int(item.get("resolved", 0) or 0)),
+                    reverse=True,
+                )
+                if float(row.get("score", 0.0) or 0.0) > 0
+            ][:12],
+            "top_negative_tags": [
+                row
+                for row in sorted(
+                    eligible_rows,
+                    key=lambda item: (float(item.get("score", 0.0) or 0.0), -int(item.get("resolved", 0) or 0)),
+                )
+                if float(row.get("score", 0.0) or 0.0) < 0
+            ][:12],
+            "tag_rows": tag_rows[:80],
+            "tag_index": tag_index,
+        }
+        self._reason_study_cache = dict(report)
+        self._reason_study_cache_key = cache_key
+        self._reason_study_cache_ts = now_ts
+        return report
+
+    def reason_confidence_adjustment(self, signal, source: str) -> dict:
+        if not config.NEURAL_BRAIN_ENABLED:
+            return {"applied": False, "reason": "neural_disabled"}
+        if not bool(getattr(config, "NEURAL_BRAIN_REASON_STUDY_ENABLED", True)):
+            return {"applied": False, "reason": "reason_study_disabled"}
+
+        report = self.build_reason_study_report()
+        if not bool(report.get("ok")):
+            return {"applied": False, "reason": str(report.get("status") or "reason_study_unavailable")}
+
+        tag_index = dict(report.get("tag_index") or {})
+        matched = []
+        for tag in self._signal_reason_tags(signal, source):
+            row = dict(tag_index.get(tag) or {})
+            if row and bool(row.get("eligible")):
+                matched.append(row)
+        if not matched:
+            return {"applied": False, "reason": "no_reason_history"}
+
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for row in matched:
+            resolved = max(1.0, float(row.get("resolved", 0) or 0))
+            weight = float(np.sqrt(resolved))
+            weighted_sum += float(row.get("score", 0.0) or 0.0) * weight
+            weight_sum += weight
+        if weight_sum <= 0:
+            return {"applied": False, "reason": "no_reason_weight"}
+
+        avg_score = weighted_sum / weight_sum
+        mult = max(0.0, float(getattr(config, "NEURAL_BRAIN_REASON_STUDY_WEIGHT", 0.20) or 0.20))
+        max_delta = abs(float(getattr(config, "NEURAL_BRAIN_REASON_STUDY_MAX_DELTA", 4.0) or 4.0))
+        delta = float(np.clip(avg_score * 10.0 * mult, -max_delta, max_delta))
+        if abs(delta) < 0.05:
+            return {
+                "applied": False,
+                "reason": "reason_delta_too_small",
+                "matched_tags": [row.get("tag") for row in matched[:5]],
+            }
+        matched_sorted = sorted(
+            matched,
+            key=lambda item: (abs(float(item.get("score", 0.0) or 0.0)), int(item.get("resolved", 0) or 0)),
+            reverse=True,
+        )
+        return {
+            "applied": True,
+            "reason": "applied",
+            "delta": round(delta, 3),
+            "avg_score": round(float(avg_score), 4),
+            "matched_count": len(matched),
+            "matched_tags": [dict(row) for row in matched_sorted[:5]],
+            "study_days": int(report.get("days", 0) or 0),
+            "study_resolved_rows": int(report.get("resolved_rows", 0) or 0),
         }
 
     def us_open_trader_dashboard(self, risk_pct: float = 1.0, start_balance: float = 1000.0) -> dict:
@@ -1214,6 +1566,8 @@ class NeuralBrain:
         start_balance: float = 1000.0,
         timezone_name: str = "Asia/Bangkok",
         market_filter: Optional[str] = None,
+        symbol_filter: Optional[str] = None,
+        window_mode: Optional[str] = None,
     ) -> dict:
         """Build daily all-signals trader dashboard using signal_events (telegram_sent rows)."""
         if not config.NEURAL_BRAIN_ENABLED:
@@ -1227,8 +1581,39 @@ class NeuralBrain:
 
         now_utc = _utc_now()
         now_local = now_utc.astimezone(user_tz)
-        end_local = datetime(now_local.year, now_local.month, now_local.day, tzinfo=user_tz) + timedelta(days=1)
-        start_local = end_local - timedelta(days=days_i)
+        day_start_local = datetime(now_local.year, now_local.month, now_local.day, tzinfo=user_tz)
+        next_day_local = day_start_local + timedelta(days=1)
+
+        mode_raw = str(window_mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if mode_raw in {"today", "d1", "1d"}:
+            mode = "today"
+        elif mode_raw in {"yesterday", "yday"}:
+            mode = "yesterday"
+        elif mode_raw in {"this_week", "week", "wtd"}:
+            mode = "this_week"
+        elif mode_raw in {"this_month", "month", "mtd"}:
+            mode = "this_month"
+        elif mode_raw in {"rolling_days", "rolling", "days"}:
+            mode = "rolling_days"
+        else:
+            mode = "rolling_days" if days_i > 1 else "today"
+
+        if mode == "today":
+            start_local = day_start_local
+            end_local = next_day_local
+        elif mode == "yesterday":
+            start_local = day_start_local - timedelta(days=1)
+            end_local = day_start_local
+        elif mode == "this_week":
+            start_local = day_start_local - timedelta(days=day_start_local.weekday())
+            end_local = next_day_local
+        elif mode == "this_month":
+            start_local = day_start_local.replace(day=1)
+            end_local = next_day_local
+        else:
+            end_local = next_day_local
+            start_local = end_local - timedelta(days=days_i)
+
         start_utc = start_local.astimezone(timezone.utc)
         end_utc = end_local.astimezone(timezone.utc)
 
@@ -1306,6 +1691,37 @@ class NeuralBrain:
             key = aliases.get(raw)
             return (key, bucket_labels.get(key, key)) if key else (None, None)
 
+        def _dashboard_symbol(raw: str) -> str:
+            token = str(raw or "").strip().upper().replace(" ", "")
+            if not token:
+                return ""
+            alias = {
+                "GOLD": "XAUUSD",
+                "XAU": "XAUUSD",
+                "XAUUSD": "XAUUSD",
+                "ETH": "ETHUSD",
+                "ETHUSD": "ETHUSD",
+                "ETHUSDT": "ETHUSD",
+                "ETH/USDT": "ETHUSD",
+                "BTC": "BTCUSD",
+                "BTCUSD": "BTCUSD",
+                "BTCUSDT": "BTCUSD",
+                "BTC/USDT": "BTCUSD",
+            }
+            if token in alias:
+                return alias[token]
+            compact = token.replace("/", "")
+            if compact in alias:
+                return alias[compact]
+            if token.endswith("/USDT") and len(token) > 5:
+                return f"{token[:-5]}USD"
+            if token.endswith("USDT") and len(token) > 4:
+                return f"{token[:-4]}USD"
+            return token
+
+        def _symbol_key(raw: str) -> str:
+            return "".join(ch for ch in str(raw or "").upper() if ch.isalnum())
+
         def _base_setup(pattern: str) -> str:
             p = str(pattern or "").upper().strip()
             for pref in ("BULLISH_", "BEARISH_"):
@@ -1374,14 +1790,27 @@ class NeuralBrain:
         selected_bucket, selected_bucket_label = _normalize_market_filter(market_filter)
         if selected_bucket:
             events = [r for r in events if str(r.get("bucket")) == selected_bucket]
+        selected_symbol = _dashboard_symbol(str(symbol_filter or ""))
+        if selected_symbol:
+            selected_key = _symbol_key(selected_symbol)
+            events = [
+                r for r in events
+                if _symbol_key(_dashboard_symbol(str(r.get("symbol") or ""))) == selected_key
+            ]
 
         if not events:
-            suffix = f" (market={selected_bucket_label})" if selected_bucket_label else ""
+            filters = []
+            if selected_bucket_label:
+                filters.append(f"market={selected_bucket_label}")
+            if selected_symbol:
+                filters.append(f"symbol={selected_symbol}")
+            suffix = f" ({', '.join(filters)})" if filters else ""
             return {
                 "ok": True,
                 "status": "no_data",
                 "days": days_i,
                 "timezone": str(getattr(user_tz, 'key', 'UTC')),
+                "window_mode": mode,
                 "window": {
                     "start_local": start_local.strftime("%Y-%m-%d %H:%M"),
                     "end_local": end_local.strftime("%Y-%m-%d %H:%M"),
@@ -1389,6 +1818,8 @@ class NeuralBrain:
                 "message": f"No signal_events found in selected day window{suffix}.",
                 "market_filter": selected_bucket,
                 "market_filter_label": selected_bucket_label,
+                "symbol_filter": selected_symbol or None,
+                "symbol_filter_label": selected_symbol or None,
             }
 
         def _summarize_bucket(bucket_rows: list[dict]) -> dict:
@@ -1494,6 +1925,7 @@ class NeuralBrain:
             "status": "ok",
             "days": days_i,
             "timezone": str(getattr(user_tz, 'key', 'UTC')),
+            "window_mode": mode,
             "local_date": str(now_local.date()),
             "window": {
                 "start_local": start_local.strftime("%Y-%m-%d %H:%M"),
@@ -1511,20 +1943,22 @@ class NeuralBrain:
             "events_count": len(events),
             "market_filter": selected_bucket,
             "market_filter_label": selected_bucket_label,
+            "symbol_filter": selected_symbol or None,
+            "symbol_filter_label": selected_symbol or None,
         }
 
-    def _collect_mt5_closed_positions(self, days: int) -> tuple[bool, str, dict[int, dict]]:
+    def _collect_mt5_closed_positions(self, days: int) -> tuple[bool, str, dict[int, dict], dict]:
         ok, state = mt5_executor._ensure_connection()
         if not ok:
-            return False, state, {}
+            return False, state, {}, {}
         mt5 = mt5_executor._mt5
 
         now = _utc_now()
         start = now - timedelta(days=max(1, int(days)))
         try:
-            deals = mt5.history_deals_get(start, now) or []
+            deals, query_mode = mt5_executor._history_deals_get_robust(start, now)
         except Exception as e:
-            return False, f"history_deals_get failed: {e}", {}
+            return False, f"history_deals_get failed: {e}", {}, {}
 
         entry_out = {
             int(getattr(mt5, "DEAL_ENTRY_OUT", 1)),
@@ -1533,7 +1967,7 @@ class NeuralBrain:
         }
         magic_expected = int(config.MT5_MAGIC)
 
-        positions: dict[int, dict] = {}
+        grouped: dict[int, dict] = {}
         for d in deals:
             try:
                 magic = int(getattr(d, "magic", 0) or 0)
@@ -1543,7 +1977,9 @@ class NeuralBrain:
                 if entry not in entry_out:
                     continue
                 position_id = int(getattr(d, "position_id", 0) or 0)
-                if position_id <= 0:
+                deal_ticket = int(getattr(d, "ticket", 0) or 0)
+                group_id = position_id if position_id > 0 else deal_ticket
+                if group_id <= 0:
                     continue
                 symbol = str(getattr(d, "symbol", "") or "")
                 close_ts = int(getattr(d, "time", 0) or 0)
@@ -1552,10 +1988,12 @@ class NeuralBrain:
                     + self._safe_float(getattr(d, "swap", 0.0), 0.0)
                     + self._safe_float(getattr(d, "commission", 0.0), 0.0)
                 )
-                rec = positions.setdefault(
-                    position_id,
+                rec = grouped.setdefault(
+                    group_id,
                     {
-                        "position_id": position_id,
+                        "group_id": group_id,
+                        "position_id": (position_id if position_id > 0 else None),
+                        "ticket": (deal_ticket if deal_ticket > 0 else None),
                         "symbol": symbol,
                         "pnl": 0.0,
                         "close_time": close_ts,
@@ -1564,42 +2002,152 @@ class NeuralBrain:
                 )
                 rec["pnl"] += pnl
                 rec["deals"] += 1
-                rec["close_time"] = max(int(rec["close_time"]), close_ts)
+                if close_ts >= int(rec.get("close_time", 0) or 0):
+                    rec["close_time"] = close_ts
+                    if symbol:
+                        rec["symbol"] = symbol
+                    if position_id > 0:
+                        rec["position_id"] = position_id
+                    if deal_ticket > 0:
+                        rec["ticket"] = deal_ticket
             except Exception:
                 continue
-        return True, "", positions
+
+        # Key the lookup by both position_id and ticket for resilient matching against
+        # signal_events rows that may store one or the other depending on bridge response.
+        positions: dict[int, dict] = {}
+        for rec in grouped.values():
+            pid = int(rec.get("position_id", 0) or 0)
+            tk = int(rec.get("ticket", 0) or 0)
+            if pid > 0:
+                positions.setdefault(pid, rec)
+            if tk > 0:
+                positions.setdefault(tk, rec)
+
+        meta = {
+            "query_mode": str(query_mode or ""),
+            "deals_total": len(deals),
+            "closed_positions": len(grouped),
+            "lookup_keys": len(positions),
+        }
+        return True, "", positions, meta
 
     def sync_outcomes_from_mt5(self, days: int = 90) -> dict:
         if not config.NEURAL_BRAIN_ENABLED:
             return {"ok": False, "status": "disabled", "message": "neural brain disabled", "updated": 0}
 
-        ok, msg, mt5_positions = self._collect_mt5_closed_positions(days=days)
+        ok, msg, mt5_positions, mt5_meta = self._collect_mt5_closed_positions(days=days)
         if not ok:
             return {"ok": False, "status": "error", "message": msg, "updated": 0}
 
         updated = 0
+        matched_by_id = 0
+        matched_by_symbol_time = 0
+        # Build a de-duplicated list of closed positions for fallback matching.
+        unique_closed: list[dict] = []
+        seen_group_ids: set[int] = set()
+        for rec in mt5_positions.values():
+            gid = int(rec.get("group_id", 0) or 0)
+            if gid <= 0 or gid in seen_group_ids:
+                continue
+            seen_group_ids.add(gid)
+            unique_closed.append(rec)
+
         with self._lock:
             with self._connect() as conn:
+                consumed_groups: set[int] = set()
+                prev = conn.execute(
+                    """
+                    SELECT mt5_message
+                    FROM signal_events
+                    WHERE resolved = 1
+                      AND mt5_status = 'filled'
+                      AND mt5_message LIKE 'synced_mt5_history:%'
+                    """
+                ).fetchall()
+                for row_prev in prev:
+                    msg_prev = str(row_prev[0] or "")
+                    try:
+                        gid_prev = int(msg_prev.rsplit(":", 1)[-1])
+                        if gid_prev > 0:
+                            consumed_groups.add(gid_prev)
+                    except Exception:
+                        continue
+
                 rows = conn.execute(
                     """
-                    SELECT id, position_id, ticket
+                    SELECT id, position_id, ticket, signal_symbol, created_at
                     FROM signal_events
                     WHERE resolved = 0 AND mt5_status = 'filled'
                     """
                 ).fetchall()
 
+                # Candidate tuple:
+                # (priority, delta_seconds, neg_row_id, row_id, group_id, mode, rec)
+                # priority: 0=position_id, 1=ticket, 2=symbol_time fallback.
+                candidates: list[tuple[int, int, int, int, int, str, dict]] = []
+
                 for row in rows:
                     row_id = int(row[0])
                     position_id = int(row[1] or 0)
                     ticket = int(row[2] or 0)
-                    match = None
-                    if position_id > 0:
-                        match = mt5_positions.get(position_id)
-                    if match is None and ticket > 0:
-                        match = mt5_positions.get(ticket)
-                    if not match:
-                        continue
+                    signal_symbol = str(row[3] or "")
+                    created_at_raw = str(row[4] or "")
+                    created_at_dt = _parse_iso(created_at_raw)
+                    created_ts = int(created_at_dt.timestamp()) if created_at_dt is not None else 0
+                    has_direct = False
 
+                    if position_id > 0:
+                        rec = mt5_positions.get(position_id)
+                        if rec is not None:
+                            gid = int(rec.get("group_id", 0) or 0)
+                            if gid > 0 and gid not in consumed_groups:
+                                close_ts = int(rec.get("close_time", 0) or 0)
+                                delta = abs(close_ts - created_ts) if (close_ts > 0 and created_ts > 0) else 0
+                                candidates.append((0, int(delta), -row_id, row_id, gid, "position_id", rec))
+                                has_direct = True
+
+                    if ticket > 0:
+                        rec = mt5_positions.get(ticket)
+                        if rec is not None:
+                            gid = int(rec.get("group_id", 0) or 0)
+                            if gid > 0 and gid not in consumed_groups:
+                                close_ts = int(rec.get("close_time", 0) or 0)
+                                delta = abs(close_ts - created_ts) if (close_ts > 0 and created_ts > 0) else 0
+                                candidates.append((1, int(delta), -row_id, row_id, gid, "ticket", rec))
+                                has_direct = True
+
+                    # Fallback only when no reliable direct key match exists for this row.
+                    if not has_direct:
+                        target_sym = canonical_symbol(signal_symbol)
+                        for rec in unique_closed:
+                            gid = int(rec.get("group_id", 0) or 0)
+                            if gid <= 0 or gid in consumed_groups:
+                                continue
+                            if canonical_symbol(str(rec.get("symbol", "") or "")) != target_sym:
+                                continue
+                            close_ts = int(rec.get("close_time", 0) or 0)
+                            if close_ts <= 0:
+                                continue
+                            delta = abs(close_ts - created_ts) if created_ts > 0 else 0
+                            # Keep fallback strict to avoid accidental cross-matches.
+                            if created_ts > 0 and delta > 7 * 24 * 3600:
+                                continue
+                            candidates.append((2, int(delta), -row_id, row_id, gid, "symbol_time", rec))
+
+                candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+
+                used_rows: set[int] = set()
+                used_groups: set[int] = set()
+                assignments: dict[int, tuple[str, dict]] = {}
+                for prio, _delta, _neg_row_id, row_id, gid, mode, rec in candidates:
+                    if row_id in used_rows or gid in used_groups:
+                        continue
+                    assignments[row_id] = (mode, rec)
+                    used_rows.add(row_id)
+                    used_groups.add(gid)
+
+                for row_id, (mode, match) in assignments.items():
                     pnl = float(match.get("pnl", 0.0))
                     close_time = int(match.get("close_time", 0) or 0)
                     closed_at = _iso(datetime.fromtimestamp(close_time, tz=timezone.utc)) if close_time > 0 else _iso(_utc_now())
@@ -1610,11 +2158,16 @@ class NeuralBrain:
                         SET resolved = 1,
                             outcome = ?,
                             pnl = ?,
-                            closed_at = ?
+                            closed_at = ?,
+                            mt5_message = ?
                         WHERE id = ?
                         """,
-                        (outcome, pnl, closed_at, row_id),
+                        (outcome, pnl, closed_at, f"synced_mt5_history:{int(match.get('group_id', 0) or 0)}", row_id),
                     )
+                    if mode in {"position_id", "ticket"}:
+                        matched_by_id += 1
+                    else:
+                        matched_by_symbol_time += 1
                     updated += 1
                 conn.commit()
 
@@ -1623,7 +2176,12 @@ class NeuralBrain:
             "status": "ok",
             "message": "",
             "updated": updated,
-            "closed_positions": len(mt5_positions),
+            "closed_positions": int(mt5_meta.get("closed_positions", len(unique_closed))),
+            "query_mode": str(mt5_meta.get("query_mode", "")),
+            "history_deals": int(mt5_meta.get("deals_total", 0)),
+            "lookup_keys": int(mt5_meta.get("lookup_keys", len(mt5_positions))),
+            "matched_by_id": matched_by_id,
+            "matched_by_symbol_time": matched_by_symbol_time,
         }
 
     def backtest_report(self, days: int = 30) -> dict:
@@ -1718,23 +2276,45 @@ class NeuralBrain:
                     FROM signal_events
                     WHERE resolved = 1
                       AND outcome IN (0, 1)
-                      AND closed_at >= ?
-                    ORDER BY closed_at DESC
+                      AND COALESCE(closed_at, created_at) >= ?
+                    ORDER BY COALESCE(closed_at, created_at) ASC
                     """,
                     (since_iso,),
                 ).fetchall()
         return rows
 
-    def _rows_to_xy(self, rows: list[sqlite3.Row]) -> tuple[np.ndarray, np.ndarray]:
+    def _rows_to_xy(self, rows: list[sqlite3.Row], recency_weight_days: int = 30) -> tuple[np.ndarray, np.ndarray]:
         xs = []
         ys = []
+        ws = []  # sample weights for recency
+        now_utc = _utc_now()
+        import math
+        recency_cutoff = now_utc - timedelta(days=max(1, int(recency_weight_days)))
         for r in rows:
+            entry = max(1e-12, self._safe_float(r["entry"], 1.0))
+            sl = self._safe_float(r["stop_loss"], 0.0)
+            tp2 = self._safe_float(r["take_profit_2"], 0.0)
+            # Time-of-day from created_at
+            created_at = _parse_iso(str(r["created_at"] or ""))
+            hour_frac = 0.5  # default = noon
+            if created_at:
+                hour_frac = (created_at.hour + created_at.minute / 60.0) / 24.0
+            # MAE from extra_json
+            extra = self._safe_json_load(str(r["extra_json"] or ""))
+            mae_hist = float(np.clip(self._safe_float(
+                (extra.get("market_eval") or {}).get("mae_hist", 0.0), 0.0
+            ), 0.0, 1.0))
+            # Resolve age
+            resolved_at = _parse_iso(str(r["closed_at"] or "")) if r["closed_at"] else None
+            resolve_age_h = 0.0
+            if created_at and resolved_at:
+                resolve_age_h = float(np.clip((resolved_at - created_at).total_seconds() / 3600.0, 0.0, 96.0))
             feature_dict = {
                 "confidence": np.clip(self._safe_float(r["confidence"], 0.0) / 100.0, 0.0, 1.5),
                 "risk_reward": np.clip(self._safe_float(r["risk_reward"], 0.0) / 5.0, 0.0, 2.0),
                 "rsi": np.clip(self._safe_float(r["rsi"], 50.0) / 100.0, 0.0, 1.0),
                 "atr_pct": np.clip(
-                    self._safe_float(r["atr"], 0.0) / max(1e-12, self._safe_float(r["entry"], 1.0)),
+                    self._safe_float(r["atr"], 0.0) / entry,
                     0.0,
                     0.5,
                 ),
@@ -1742,12 +2322,24 @@ class NeuralBrain:
                 "long_score": np.clip(self._safe_float(r["score_long"], 0.0) / 100.0, 0.0, 3.0),
                 "short_score": np.clip(self._safe_float(r["score_short"], 0.0) / 100.0, 0.0, 3.0),
                 "is_long": 1.0 if str(r["direction"] or "").lower() == "long" else 0.0,
+                "hour_sin": float(math.sin(2 * math.pi * hour_frac)),
+                "hour_cos": float(math.cos(2 * math.pi * hour_frac)),
+                "sl_ratio": float(np.clip(abs(entry - sl) / entry, 0.0, 0.20)) if sl > 0 else 0.0,
+                "tp_sl_ratio": float(np.clip(abs(tp2 - entry) / max(abs(entry - sl), 1e-12), 0.0, 5.0)) if (sl > 0 and tp2 > 0) else 0.0,
+                "mae_hist": float(np.clip(mae_hist, 0.0, 1.0)),
+                "resolve_age_h": float(np.clip(resolve_age_h / 96.0, 0.0, 1.0)),  # normalized to 96h
             }
             feature_dict.update(self._pattern_flags(str(r["pattern"] or "")))
             feature_dict.update(self._source_flags(str(r["source"] or "")))
             xs.append(self._to_vector(feature_dict))
             ys.append(float(r["outcome"]))
-        return np.vstack(xs), np.array(ys, dtype=np.float64)
+            # Recency weight: 2x for recent data, 1x for older
+            w = 2.0 if (created_at and created_at >= recency_cutoff) else 1.0
+            ws.append(w)
+        X = np.vstack(xs)
+        y = np.array(ys, dtype=np.float64)
+        sample_weights = np.array(ws, dtype=np.float64)
+        return X, y, sample_weights
 
     @staticmethod
     def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -1768,17 +2360,15 @@ class NeuralBrain:
                 samples=len(rows),
             )
 
-        X, y = self._rows_to_xy(rows)
+        X, y, sample_weights = self._rows_to_xy(rows)
         n, d = X.shape
-        rng = np.random.default_rng(42)
-        idx = np.arange(n)
-        rng.shuffle(idx)
-        X = X[idx]
-        y = y[idx]
-
-        split = max(1, int(0.8 * n))
+        val_size = max(1, int(round(0.2 * n)))
+        split = max(1, n - val_size)
+        if split >= n:
+            split = n - 1
         X_train, y_train = X[:split], y[:split]
         X_val, y_val = X[split:], y[split:]
+        w_train = sample_weights[:split]
         if len(X_val) == 0:
             X_val, y_val = X_train, y_train
 
@@ -1792,6 +2382,7 @@ class NeuralBrain:
         epochs = max(50, int(config.NEURAL_BRAIN_EPOCHS))
         lr = float(config.NEURAL_BRAIN_LR)
         l2 = 1e-4
+        rng = np.random.default_rng(42)
 
         w1 = rng.normal(0.0, 0.15, size=(d, hidden))
         b1 = np.zeros((1, hidden))
@@ -1799,13 +2390,17 @@ class NeuralBrain:
         b2 = np.zeros((1, 1))
 
         y_train_col = y_train.reshape(-1, 1)
+        # Normalize sample weights for stable gradients
+        w_norm = w_train / max(w_train.mean(), 1e-8)
+        w_col = w_norm.reshape(-1, 1)
         for _ in range(epochs):
             z1 = X_train @ w1 + b1
             a1 = np.maximum(0.0, z1)
             z2 = a1 @ w2 + b2
             y_hat = self._sigmoid(z2)
 
-            dz2 = (y_hat - y_train_col) / len(X_train)
+            # Recency-weighted loss gradient
+            dz2 = (y_hat - y_train_col) * w_col / len(X_train)
             dw2 = (a1.T @ dz2) + l2 * w2
             db2 = dz2.sum(axis=0, keepdims=True)
             da1 = dz2 @ w2.T
@@ -2001,7 +2596,7 @@ class NeuralBrain:
 
     def confidence_adjustment(self, signal, source: str) -> dict:
         """
-        Soft-adjust signal confidence using neural probability.
+        Soft-adjust signal confidence using neural probability and reason-study memory.
         Never blocks a signal by itself.
         """
         if not config.NEURAL_BRAIN_ENABLED:
@@ -2009,33 +2604,64 @@ class NeuralBrain:
         if not config.NEURAL_BRAIN_SOFT_ADJUST:
             return {"applied": False, "reason": "soft_adjust_disabled"}
 
-        model = self.model_status()
-        if not model.get("available"):
-            return {"applied": False, "reason": "model_unavailable"}
-
-        prob = self.predict_probability(signal, source=source)
-        if prob is None:
-            return {"applied": False, "reason": "prob_unavailable"}
-
         base = self._safe_float(getattr(signal, "confidence", 0.0), 0.0)
-        model_conf = float(np.clip(prob * 100.0, 0.0, 100.0))
         weight = float(np.clip(float(config.NEURAL_BRAIN_SOFT_ADJUST_WEIGHT), 0.0, 1.0))
         max_delta = abs(float(config.NEURAL_BRAIN_SOFT_ADJUST_MAX_DELTA))
-        blended = ((1.0 - weight) * base) + (weight * model_conf)
-        delta = float(np.clip(blended - base, -max_delta, max_delta))
+        prob = None
+        model_conf = None
+        neural_delta = 0.0
+        components = {}
+
+        model = self.model_status()
+        if model.get("available"):
+            prob = self.predict_probability(signal, source=source)
+            if prob is not None:
+                model_conf = float(np.clip(prob * 100.0, 0.0, 100.0))
+                blended = ((1.0 - weight) * base) + (weight * model_conf)
+                neural_delta = float(blended - base)
+                components["neural"] = {
+                    "prob": round(float(prob), 4),
+                    "model_confidence": round(model_conf, 3),
+                    "delta": round(neural_delta, 3),
+                    "weight": round(weight, 3),
+                }
+
+        reason_study = self.reason_confidence_adjustment(signal, source=source)
+        reason_delta = float(reason_study.get("delta", 0.0) or 0.0) if reason_study.get("applied") else 0.0
+        if reason_study.get("applied"):
+            components["reason_study"] = {
+                "delta": round(reason_delta, 3),
+                "matched_count": int(reason_study.get("matched_count", 0) or 0),
+                "matched_tags": list(reason_study.get("matched_tags") or []),
+                "avg_score": round(float(reason_study.get("avg_score", 0.0) or 0.0), 4),
+            }
+
+        if not components:
+            fallback_reason = "model_unavailable"
+            if model.get("available") and prob is None:
+                fallback_reason = "prob_unavailable"
+            if reason_study and str(reason_study.get("reason", "") or "") not in {"", "applied"}:
+                fallback_reason = f"{fallback_reason}|{str(reason_study.get('reason') or '')}"
+            return {"applied": False, "reason": fallback_reason}
+
+        delta = float(np.clip(neural_delta + reason_delta, -max_delta, max_delta))
         adjusted = float(np.clip(base + delta, 0.0, 100.0))
 
-        return {
+        out = {
             "applied": True,
             "reason": "applied",
-            "prob": float(prob),
+            "prob": None if prob is None else float(prob),
             "base_confidence": round(base, 3),
             "adjusted_confidence": round(adjusted, 3),
             "delta": round(delta, 3),
             "weight": round(weight, 3),
             "max_delta": round(max_delta, 3),
-            "model_confidence": round(model_conf, 3),
+            "model_confidence": round(model_conf, 3) if model_conf is not None else None,
+            "components": components,
         }
+        if reason_study:
+            out["reason_study"] = reason_study
+        return out
 
     def predict_probability(self, signal, source: str) -> Optional[float]:
         if not config.NEURAL_BRAIN_ENABLED:
@@ -2043,15 +2669,88 @@ class NeuralBrain:
         model = self._load_model()
         if not model:
             return None
-        x = self._to_vector(self._signal_feature_dict(signal, source)).reshape(1, -1)
+        fnames_saved = list(model.get("feature_names", self.FEATURE_NAMES) or self.FEATURE_NAMES)
+        fd = self._signal_feature_dict(signal, source)
+        # Build vector respecting the saved feature order (handles model/code version mismatch)
+        x = np.array([float(fd.get(k, 0.0)) for k in fnames_saved], dtype=np.float64).reshape(1, -1)
         mu = model["mu"]
         sigma = model["sigma"]
+        # Pad/trim if feature count changed between model save and current code
+        expected_d = mu.shape[0]
+        actual_d = x.shape[1]
+        if actual_d < expected_d:
+            x = np.pad(x, ((0, 0), (0, expected_d - actual_d)))
+        elif actual_d > expected_d:
+            x = x[:, :expected_d]
         x = (x - mu) / sigma
         z1 = x @ model["w1"] + model["b1"]
         a1 = np.maximum(0.0, z1)
         z2 = a1 @ model["w2"] + model["b2"]
         p = float(self._sigmoid(z2).ravel()[0])
         return p
+
+    def label_from_mt5_close(
+        self,
+        ticket: int,
+        close_reason: str,
+        pnl_r: float,
+        symbol: str = "",
+        direction: str = "",
+    ) -> bool:
+        """
+        Instantly label a signal_events row from a real MT5 close outcome.
+        Called by mt5_position_manager when a close action succeeds.
+        close_reason: 'TP', 'SL', 'time_stop', 'partial', etc.
+        pnl_r: realized R multiple (positive = win)
+        Returns True if a row was updated.
+        """
+        if not config.NEURAL_BRAIN_ENABLED:
+            return False
+        outcome = 1 if float(pnl_r) > 0 else 0
+        closed_at = _iso(_utc_now())
+        label_msg = f"mt5_close:{close_reason}"
+        ticket_i = int(ticket or 0)
+        with self._lock:
+            with self._connect() as conn:
+                # First try by ticket
+                if ticket_i > 0:
+                    row = conn.execute(
+                        "SELECT id FROM signal_events WHERE (ticket=? OR position_id=?) AND resolved=0 ORDER BY id DESC LIMIT 1",
+                        (ticket_i, ticket_i),
+                    ).fetchone()
+                    if row:
+                        conn.execute(
+                            "UPDATE signal_events SET resolved=1, outcome=?, pnl=?, closed_at=?, mt5_message=? WHERE id=?",
+                            (outcome, float(pnl_r), closed_at, label_msg, int(row[0])),
+                        )
+                        conn.commit()
+                        logger.debug("[NeuralBrain] label_from_mt5_close ticket=%s reason=%s R=%.3f", ticket_i, close_reason, pnl_r)
+                        return True
+                # Fallback: match by symbol+direction in recent unresolved rows
+                if symbol and direction:
+                    sym_upper = str(symbol).upper()
+                    dir_lower = str(direction).lower()
+                    since = _iso(_utc_now() - timedelta(hours=48))
+                    row = conn.execute(
+                        """
+                        SELECT id FROM signal_events
+                        WHERE resolved=0
+                          AND created_at >= ?
+                          AND (UPPER(signal_symbol)=? OR UPPER(broker_symbol)=?)
+                          AND direction=?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (since, sym_upper, sym_upper, dir_lower),
+                    ).fetchone()
+                    if row:
+                        conn.execute(
+                            "UPDATE signal_events SET resolved=1, outcome=?, pnl=?, closed_at=?, mt5_message=? WHERE id=?",
+                            (outcome, float(pnl_r), closed_at, label_msg, int(row[0])),
+                        )
+                        conn.commit()
+                        logger.debug("[NeuralBrain] label_from_mt5_close sym=%s dir=%s reason=%s R=%.3f", symbol, direction, close_reason, pnl_r)
+                        return True
+        return False
 
 
 neural_brain = NeuralBrain()

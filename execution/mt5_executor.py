@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 MT5_RETCODE_HINTS = {
     10014: "invalid volume for this symbol/account",
     10016: "invalid stops (SL/TP too close or wrong side)",
+    10018: "market closed",
     10019: "not enough money",
     10021: "price changed/off quotes",
     10027: "autotrading blocked by terminal settings",
@@ -52,6 +53,20 @@ def _retcode_detail(retcode: int) -> str:
     if hint:
         return f"order rejected retcode={retcode} ({hint})"
     return f"order rejected retcode={retcode}"
+
+
+def _fmt_mt5_last_error(err) -> str:
+    try:
+        if isinstance(err, (list, tuple)):
+            parts = [str(x).strip() for x in list(err) if str(x).strip()]
+            if parts:
+                return " | ".join(parts)
+        text = str(err or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return "unknown"
 
 
 def _normalize_symbol_key(symbol: str) -> str:
@@ -116,6 +131,7 @@ class MT5Executor:
         self._symbols_cache: list[str] = []
         self._symbols_cache_ts = 0.0
         self._symbols_ttl_sec = 300.0
+        self._market_closed_cache: dict[str, float] = {}
         self._symbol_map = config.get_mt5_symbol_map()
         self._allow_symbols = config.get_mt5_allow_symbols()
         self._block_symbols = config.get_mt5_block_symbols()
@@ -137,6 +153,26 @@ class MT5Executor:
     @property
     def available(self) -> bool:
         return rpyc is not None
+
+    def set_runtime_allow_symbols(self, symbols) -> dict:
+        """
+        Replace runtime allowlist without requiring process restart.
+        Symbols are normalized to uppercase and de-duplicated.
+        """
+        vals = set()
+        try:
+            for raw in (list(symbols or []) if symbols is not None else []):
+                s = str(raw or "").strip().upper()
+                if s:
+                    vals.add(s)
+        except Exception:
+            vals = set()
+        self._allow_symbols = vals
+        return {
+            "ok": True,
+            "allow_count": len(self._allow_symbols),
+            "allow_symbols": sorted(self._allow_symbols),
+        }
 
     def _disconnect(self) -> None:
         try:
@@ -248,17 +284,20 @@ class MT5Executor:
                 cached_pct = float(row.get("margin_budget_pct", 0.0) or 0.0)
             except Exception:
                 cached_pct = 0.0
-            try:
-                current_pct, _ = self._mt5_margin_budget_pct_for_signal(
-                    None,
-                    source,
-                    broker_symbol=str(broker_symbol or ""),
-                    signal_symbol=str(signal_symbol or ""),
-                )
-            except Exception:
-                current_pct = 0.0
-            if current_pct > max(0.0, cached_pct) + 1e-9:
-                return None
+            # Backward-compatible cache rows may not include margin_budget_pct yet.
+            # Only invalidate deny_margin when we have a concrete cached budget.
+            if cached_pct > 0.0:
+                try:
+                    current_pct, _ = self._mt5_margin_budget_pct_for_signal(
+                        None,
+                        source,
+                        broker_symbol=str(broker_symbol or ""),
+                        signal_symbol=str(signal_symbol or ""),
+                    )
+                except Exception:
+                    current_pct = 0.0
+                if current_pct > max(0.0, cached_pct) + 1e-9:
+                    return None
         updated = float(row.get("updated_ts", 0.0) or 0.0)
         age = max(0.0, now - updated) if updated > 0 else 9e9
         ttl = min(hard_cap, self._micro_status_ttl_sec(status))
@@ -754,6 +793,43 @@ class MT5Executor:
             return self._mt5.ORDER_FILLING_FOK
         return self._mt5.ORDER_FILLING_RETURN
 
+    @staticmethod
+    def _comment_token(value: str, fallback: str, limit: int) -> str:
+        tok = re.sub(r"[^A-Za-z0-9]+", "", str(value or "").strip()).upper()
+        if not tok:
+            tok = str(fallback or "").strip().upper()
+        return tok[: max(1, int(limit))]
+
+    def _build_order_comment(self, signal, source: str, signal_symbol: str) -> str:
+        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        run_no = 0
+        try:
+            run_no = int(raw_scores.get("signal_run_no", 0) or 0)
+        except Exception:
+            run_no = 0
+        run_id = str(raw_scores.get("signal_run_id", "") or "").strip()
+
+        src_text = str(source or "")
+        if ":bypass" in src_text.lower():
+            src_text = "bypass"
+        elif ":canary" in src_text.lower():
+            src_text = "canary"
+        trace_text = f"R{run_no:06d}" if run_no > 0 else str(run_id or "R0")
+
+        prefix_tok = self._comment_token(getattr(config, "MT5_COMMENT_PREFIX", "DEX"), "DEX", 12)
+        trace_tok = self._comment_token(trace_text, "R0", 7)
+        if trace_tok and not trace_tok.startswith("R"):
+            trace_tok = f"R{trace_tok}"[:7]
+        if str(src_text).strip().lower() == "bypass":
+            source_tok = "BYPASS"
+        else:
+            source_budget = max(3, 31 - (len(prefix_tok) + 6 + len(trace_tok) + 3))
+            source_tok = self._comment_token(src_text, "SRC", min(9, source_budget))
+        symbol_budget = max(3, 31 - (len(prefix_tok) + len(source_tok) + len(trace_tok) + 3))
+        symbol_tok = self._comment_token(signal_symbol, "SYM", symbol_budget)
+        # Some MT5 Python bridges/brokers reject comments with punctuation even inside 31 chars.
+        return f"{prefix_tok}{source_tok}{symbol_tok}{trace_tok}"[:31]
+
     def _is_bot_position_like(self, pos_obj) -> bool:
         try:
             pmagic = int(getattr(pos_obj, "magic", 0) or 0)
@@ -766,11 +842,15 @@ class MT5Executor:
             pref = str(getattr(config, "MT5_COMMENT_PREFIX", "DEX") or "").strip()
             if pref and c.startswith(pref + ":"):
                 return True
+            if pref and ":" in c:
+                head = str(c.split(":", 1)[0] or "").strip().upper()
+                if head and str(pref).upper().startswith(head):
+                    return True
         except Exception:
             pass
         return False
 
-    def _resolve_filled_position_id(self, broker_symbol: str, is_long: bool, comment: str) -> Optional[int]:
+    def _resolve_filled_position_id(self, broker_symbol: str, is_long: bool, comment: str, magic_override: Optional[int] = None) -> Optional[int]:
         """
         Resolve live position ticket after a successful fill.
         This improves post-trade outcome syncing against MT5 history.
@@ -778,7 +858,7 @@ class MT5Executor:
         try:
             positions = self._mt5.positions_get(symbol=broker_symbol) or []
             side_type = int(self._mt5.ORDER_TYPE_BUY if is_long else self._mt5.ORDER_TYPE_SELL)
-            magic = int(config.MT5_MAGIC)
+            magic = int(magic_override if magic_override is not None else config.MT5_MAGIC)
             candidates = []
             for p in positions:
                 try:
@@ -804,7 +884,9 @@ class MT5Executor:
         except Exception:
             return None
 
-    def _position_limits_ok(self, broker_symbol: str, direction: str) -> tuple[bool, str]:
+    def _position_limits_ok(self, broker_symbol: str, direction: str, *, ignore_open_positions: bool = False) -> tuple[bool, str]:
+        if bool(ignore_open_positions):
+            return True, "bypass_ignore_open_positions"
         try:
             all_positions_raw = self._mt5.positions_get() or []
             sym_positions_raw = self._mt5.positions_get(symbol=broker_symbol) or []
@@ -821,9 +903,9 @@ class MT5Executor:
             if bool(getattr(config, "MT5_MICRO_MODE_ENABLED", False)) and bool(getattr(config, "MT5_MICRO_SINGLE_POSITION_ONLY", True)):
                 max_open_positions = min(max_open_positions, 1)
                 max_per_symbol = min(max_per_symbol, 1)
-                if len(all_positions) >= 1:
-                    if bot_only_limits:
-                        return False, "micro mode: single bot position only"
+                # Micro account guard: enforce single live position globally,
+                # independent from bot-only position filtering.
+                if len(all_positions_raw) >= 1:
                     return False, "micro mode: single open position only"
 
             if len(all_positions) >= max_open_positions:
@@ -915,7 +997,41 @@ class MT5Executor:
             return val, f"symbol_override_mapped:{c}<-{base_sym}"
         return None, ""
 
+    def _get_neural_prob(self, signal, source: str) -> "Optional[float]":
+        """
+        Retrieve neural win probability using full fallback chain:
+          1. Per-symbol model (e.g. XAUUSD, AAPL.NAS) via SymbolNeuralBrain
+          2. Per-family model (e.g. _family_gold, _family_stock) via SymbolNeuralBrain
+          3. Global model via NeuralBrain (original shared model)
+        Returns None if neural brain is disabled or any error occurs.
+        """
+        try:
+            from learning.symbol_neural_brain import symbol_neural_brain
+            prob, model_source, quality = symbol_neural_brain.predict_for_signal_with_quality(
+                signal,
+                source=str(source or ""),
+                enforce_quality=True,
+            )
+            if prob is not None:
+                logger.debug(
+                    "[NeuralBrain] _get_neural_prob prob=%.3f source=%s quality=%s",
+                    prob,
+                    model_source,
+                    str((quality or {}).get("reason", "n/a")),
+                )
+                return float(prob)
+        except Exception:
+            pass
+        # Fallback: global NeuralBrain (existing shared model)
+        try:
+            from learning.neural_brain import neural_brain
+            prob = neural_brain.predict_probability(signal, source=str(source or ""))
+            return float(prob) if prob is not None else None
+        except Exception:
+            return None
+
     def _maybe_apply_fx_confidence_soft_filter(self, signal, source: str, min_conf: float) -> tuple[bool, dict]:
+
         info = {
             "applied": False,
             "hard_block": False,
@@ -1063,12 +1179,55 @@ class MT5Executor:
         sig_symbol = str(getattr(signal, "symbol", "") or "")
         if not self.enabled:
             return MT5ExecutionResult(False, "disabled", "MT5 disabled", signal_symbol=sig_symbol)
+        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        entry_type_raw = str(getattr(signal, "entry_type", "") or "").strip().lower()
+        planned_entry_original = _safe_float(getattr(signal, "entry", 0.0), 0.0)
+        is_limit_entry_requested = (entry_type_raw in {"limit", "patience"}) and bool(getattr(config, "MT5_LIMIT_ENTRY_ENABLED", True))
+        is_stop_entry_requested = (entry_type_raw in {"buy_stop", "sell_stop", "stop"}) and bool(getattr(config, "MT5_PENDING_ENTRY_ENABLED", True))
+        is_pending_entry_requested = bool(is_limit_entry_requested or is_stop_entry_requested)
+        limit_adaptive_exits_only = bool(getattr(config, "MT5_LIMIT_ADAPTIVE_EXITS_SIZE_ONLY", True))
+        allow_limit_market_fallback = bool(getattr(config, "MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", False))
+        fb_override = raw_scores.get("mt5_limit_allow_market_fallback", None)
+        if fb_override is not None:
+            if isinstance(fb_override, str):
+                v = str(fb_override).strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    allow_limit_market_fallback = True
+                elif v in {"0", "false", "no", "off"}:
+                    allow_limit_market_fallback = False
+            else:
+                allow_limit_market_fallback = bool(fb_override)
+        bypass_mode = bool(raw_scores.get("mt5_bypass_test_enabled", False)) and bool(getattr(config, "MT5_BYPASS_TEST_ENABLED", False))
+        bypass_confidence = bool(raw_scores.get("mt5_bypass_skip_confidence", False)) and bool(getattr(config, "MT5_BYPASS_TEST_ENABLED", False))
+        generic_ignore_open_positions = bool(raw_scores.get("mt5_ignore_open_positions", False))
+        bypass_ignore_open_positions = (
+            bool(raw_scores.get("mt5_bypass_ignore_open_positions", getattr(config, "MT5_BYPASS_TEST_IGNORE_OPEN_POSITIONS", False)))
+            and bool(bypass_mode)
+        ) or generic_ignore_open_positions
+        try:
+            bypass_magic_offset = int(raw_scores.get("mt5_bypass_magic_offset", getattr(config, "MT5_BYPASS_TEST_MAGIC_OFFSET", 500)) or 0)
+        except Exception:
+            bypass_magic_offset = int(getattr(config, "MT5_BYPASS_TEST_MAGIC_OFFSET", 500) or 0)
+        try:
+            generic_magic_offset = int(raw_scores.get("mt5_magic_offset", 0) or 0)
+        except Exception:
+            generic_magic_offset = 0
+        exec_magic = int(config.MT5_MAGIC)
+        if bypass_mode and bypass_magic_offset:
+            exec_magic = int(exec_magic + bypass_magic_offset)
+        elif generic_magic_offset:
+            exec_magic = int(exec_magic + generic_magic_offset)
         min_conf, min_conf_reason = self._mt5_min_conf_for_signal(signal, source)
         conf_soft_applied, conf_soft_info = self._maybe_apply_fx_confidence_soft_filter(signal, source, min_conf)
         try:
-            raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
             raw_scores["mt5_min_conf_threshold"] = round(float(min_conf), 3)
             raw_scores["mt5_min_conf_reason"] = str(min_conf_reason or "")
+            raw_scores["mt5_bypass_confidence"] = bool(bypass_confidence)
+            raw_scores["mt5_bypass_mode"] = bool(bypass_mode)
+            raw_scores["mt5_bypass_ignore_open_positions"] = bool(bypass_ignore_open_positions)
+            raw_scores["mt5_bypass_magic"] = int(exec_magic)
+            raw_scores["mt5_ignore_open_positions"] = bool(generic_ignore_open_positions)
+            raw_scores["mt5_magic_offset"] = int(generic_magic_offset)
             raw_scores["mt5_conf_soft_filter_source"] = str(source or "")
             raw_scores["mt5_conf_soft_filter_applied"] = bool(conf_soft_info.get("applied"))
             raw_scores["mt5_conf_soft_filter_reason"] = str(conf_soft_info.get("reason", ""))
@@ -1082,10 +1241,22 @@ class MT5Executor:
             raw_scores["mt5_fx_conf_soft_filter_band_floor"] = conf_soft_info.get("band_floor")
             raw_scores["mt5_fx_conf_soft_filter_band_ceiling"] = conf_soft_info.get("band_ceiling")
             raw_scores["mt5_fx_conf_soft_filter_learned"] = bool(conf_soft_info.get("learned_band_applied"))
+            raw_scores["mt5_entry_type"] = entry_type_raw or "market"
+            raw_scores["mt5_limit_entry_requested"] = bool(is_limit_entry_requested)
+            raw_scores["mt5_stop_entry_requested"] = bool(is_stop_entry_requested)
+            raw_scores["mt5_pending_entry_requested"] = bool(is_pending_entry_requested)
+            raw_scores["mt5_limit_adaptive_exits_size_only"] = bool(limit_adaptive_exits_only)
+            raw_scores["mt5_limit_allow_market_fallback"] = bool(allow_limit_market_fallback)
+            if planned_entry_original > 0:
+                raw_scores["mt5_planned_entry_price"] = round(float(planned_entry_original), 8)
             signal.raw_scores = raw_scores
         except Exception:
             pass
-        if float(getattr(signal, "confidence", 0) or 0) < float(min_conf) and (not bool(conf_soft_info.get("applied"))):
+        if (
+            float(getattr(signal, "confidence", 0) or 0) < float(min_conf)
+            and (not bool(conf_soft_info.get("applied")))
+            and (not bypass_confidence)
+        ):
             extra = ""
             if conf_soft_info.get("reason"):
                 extra = f" [{str(conf_soft_info.get('reason'))}]"
@@ -1095,6 +1266,17 @@ class MT5Executor:
                 f"below MT5 confidence threshold ({float(min_conf):.1f}) ({min_conf_reason}){extra}",
                 signal_symbol=sig_symbol,
             )
+        if (
+            float(getattr(signal, "confidence", 0) or 0) < float(min_conf)
+            and (not bool(conf_soft_info.get("applied")))
+            and bool(bypass_confidence)
+        ):
+            try:
+                raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                raw_scores["mt5_conf_bypass_applied"] = True
+                signal.raw_scores = raw_scores
+            except Exception:
+                pass
 
         ok, state = self._ensure_connection()
         if not ok:
@@ -1114,7 +1296,9 @@ class MT5Executor:
         try:
             adaptive_meta = None
             adaptive_size_mult = 1.0
+            adaptive_plan_applied = False
             conf_soft_size_mult = float((conf_soft_info or {}).get("size_multiplier", 1.0) or 1.0)
+            htf_ltf_size_mult = 1.0
 
             def _attach_meta(res: MT5ExecutionResult) -> MT5ExecutionResult:
                 try:
@@ -1136,11 +1320,43 @@ class MT5Executor:
             if direction not in ("long", "short"):
                 return MT5ExecutionResult(False, "error", "invalid signal direction", sig_symbol, broker_symbol)
 
-            allowed, reason = self._position_limits_ok(broker_symbol, direction)
+            allowed, reason = self._position_limits_ok(
+                broker_symbol,
+                direction,
+                ignore_open_positions=bool(bypass_ignore_open_positions),
+            )
             if not allowed:
                 return MT5ExecutionResult(False, "skipped", reason, sig_symbol, broker_symbol)
 
             is_long = direction == "long"
+            
+            # --- Entry Confirmation & HTF/LTF Gates ---
+            from execution.entry_confirmation import check_m5_confirmation, check_htf_ltf_convergence
+            
+            entry_price = float(getattr(signal, "entry", 0.0))
+            atr = float(getattr(signal, "atr", 0.0))
+            
+            # 1. M5 Confirmation
+            if entry_price > 0 and atr > 0:
+                m5_res = check_m5_confirmation(self._mt5, broker_symbol, direction, entry_price, atr)
+                if not m5_res.ok:
+                    return MT5ExecutionResult(
+                        False, "m5_blocked", f"M5 confirmation failed: {m5_res.reason}", sig_symbol, broker_symbol
+                    )
+                if m5_res.status != "disabled" and not m5_res.skipped_due_to_distance:
+                    logger.info(f"[EntryConfirm] {broker_symbol} M5 gate: {m5_res.status} ({m5_res.reason})")
+                    
+            # 2. HTF/LTF Convergence
+            conv_res = check_htf_ltf_convergence(self._mt5, broker_symbol, direction)
+            if not conv_res.ok:
+                return MT5ExecutionResult(
+                    False, "htf_blocked", f"HTF/LTF filter blocked: {conv_res.reason}", sig_symbol, broker_symbol
+                )
+            if conv_res.status != "disabled":
+                if conv_res.status != "neutral":
+                    logger.info(f"[HTFFilter] {broker_symbol} convergence: {conv_res.status} ({conv_res.reason})")
+                htf_ltf_size_mult = conv_res.size_mult
+
             order_type = self._mt5.ORDER_TYPE_BUY if is_long else self._mt5.ORDER_TYPE_SELL
             account = self._mt5.account_info()
             if account is None:
@@ -1163,10 +1379,21 @@ class MT5Executor:
 
             ask = float(getattr(tick, "ask", 0.0) or 0.0)
             bid = float(getattr(tick, "bid", 0.0) or 0.0)
+            spread_now = max(0.0, ask - bid) if (ask > 0 and bid > 0) else 0.0
+            mid_now = ((ask + bid) / 2.0) if (ask > 0 and bid > 0) else max(ask, bid, 0.0)
+            spread_pct_now = ((spread_now / mid_now) * 100.0) if mid_now > 0 else 0.0
+            confidence_now = float(getattr(signal, "confidence", 0.0) or 0.0)
+            atr_now = abs(float(getattr(signal, "atr", 0.0) or 0.0))
             price = float(ask if is_long else bid)
+            
+            if price <= 0.0:
+                self._market_closed_cache[broker_symbol] = time.time()
+                return MT5ExecutionResult(False, "market_closed", f"market closed / off quotes (price 0.0)", sig_symbol, broker_symbol, retcode=10018)
+
             sl = self._price_round(float(signal.stop_loss), symbol_info)
             tp = self._price_round(float(signal.take_profit_2), symbol_info)
             price = self._price_round(price, symbol_info)
+            requested_entry_price = self._price_round(float(planned_entry_original if planned_entry_original > 0 else price), symbol_info)
 
             if bool(getattr(config, "MT5_MICRO_MODE_ENABLED", False)):
                 mid = (ask + bid) / 2.0 if (ask > 0 and bid > 0) else max(ask, bid, price, 0.0)
@@ -1193,27 +1420,42 @@ class MT5Executor:
             # Adaptive execution planner (bounded): adjust RR/SL/TP/size using
             # symbol behavior stats + volatility + spread + session/confidence.
             try:
-                if bool(getattr(config, "MT5_ADAPTIVE_EXECUTION_ENABLED", True)):
+                adaptive_enabled = bool(getattr(config, "MT5_ADAPTIVE_EXECUTION_ENABLED", True))
+                allow_limit_adaptive = bool(limit_adaptive_exits_only and is_limit_entry_requested)
+                if adaptive_enabled and ((not is_pending_entry_requested) or allow_limit_adaptive):
                     acct_login = int(getattr(account, "login", 0) or 0)
                     st2 = self.status()
                     acct_server = str(st2.get("account_server", "") or "")
                     account_key = f"{acct_server}|{acct_login}" if acct_login and acct_server else ""
+                    plan_exec_price = float(requested_entry_price) if is_pending_entry_requested else float(price)
                     plan = mt5_adaptive_trade_planner.plan_execution(
                         signal=signal,
                         account_key=account_key,
                         broker_symbol=broker_symbol,
-                        execution_price=float(price),
+                        execution_price=plan_exec_price,
                         bid=float(bid),
                         ask=float(ask),
                         point=float(getattr(symbol_info, "point", 0.0) or 0.0),
+                        source=str(source or ""),
+                        neural_prob=self._get_neural_prob(signal, source),
                     )
                     if plan and bool(plan.ok):
                         adaptive_size_mult = max(0.25, float(plan.size_multiplier or 1.0))
                         adaptive_meta = plan.to_dict()
                         adaptive_meta["source"] = str(source or "")
+                        plan_factors = dict(getattr(plan, "factors", {}) or {})
+                        if bool(plan_factors.get("direction_blocked")):
+                            block_reason = str(
+                                plan_factors.get("direction_block_reason")
+                                or "adaptive directional guard blocked this setup"
+                            )
+                            return _attach_meta(
+                                MT5ExecutionResult(False, "skipped", block_reason, sig_symbol, broker_symbol)
+                            )
                         if bool(plan.applied):
+                            adaptive_plan_applied = True
                             # Mutate execution-facing signal fields so journaling/notifications reflect actual plan used.
-                            signal.entry = float(plan.entry or price)
+                            signal.entry = float(requested_entry_price) if is_pending_entry_requested else float(plan.entry or price)
                             signal.stop_loss = float(plan.stop_loss or signal.stop_loss)
                             if getattr(plan, "take_profit_1", None) is not None:
                                 signal.take_profit_1 = float(plan.take_profit_1)
@@ -1234,6 +1476,7 @@ class MT5Executor:
                                 "size_multiplier": plan.size_multiplier,
                                 "factors": dict(plan.factors or {}),
                             }
+                            raw_scores["mt5_adaptive_mode"] = "limit_exits_size_only" if is_limit_entry_requested else "full"
                             signal.raw_scores = raw_scores
                             warnings = list(getattr(signal, "warnings", []) or [])
                             warnings.append(
@@ -1253,17 +1496,20 @@ class MT5Executor:
                                 float((plan.factors or {}).get("spread_pct", 0.0) or 0.0),
                                 float((plan.factors or {}).get("atr_pct", 0.0) or 0.0),
                             )
+                elif is_pending_entry_requested:
+                    logger.debug("[MT5AdaptiveExec] skipped for limit entry (exits/size mode disabled) %s", sig_symbol)
             except Exception as e:
                 logger.debug("[MT5AdaptiveExec] execute integration error: %s", e, exc_info=True)
 
             point = float(getattr(symbol_info, "point", 0.0) or 0.0)
             stops_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
             min_gap = max(point, point * max(1, stops_level)) if point > 0 else 0
+            stops_ref_price = float(requested_entry_price) if bool(is_pending_entry_requested) else float(price)
             if is_long:
-                if not (sl < price - min_gap and tp > price + min_gap):
+                if not (sl < stops_ref_price - min_gap and tp > stops_ref_price + min_gap):
                     return _attach_meta(MT5ExecutionResult(False, "invalid_stops", "long stops invalid for current price", sig_symbol, broker_symbol))
             else:
-                if not (sl > price + min_gap and tp < price - min_gap):
+                if not (sl > stops_ref_price + min_gap and tp < stops_ref_price - min_gap):
                     return _attach_meta(MT5ExecutionResult(False, "invalid_stops", "short stops invalid for current price", sig_symbol, broker_symbol))
 
             # ── Tiger Risk Governor: Quality-Based Lot Sizing ─────────────
@@ -1323,11 +1569,11 @@ class MT5Executor:
                     logger.debug("[MT5Tiger] governor integration error: %s", e, exc_info=True)
 
             vm_in = 1.0 if volume_multiplier is None else max(0.05, float(volume_multiplier))
-            vm = max(0.05, float(vm_in) * float(adaptive_size_mult or 1.0) * float(conf_soft_size_mult or 1.0))
+            vm = max(0.05, float(vm_in) * float(adaptive_size_mult or 1.0) * float(conf_soft_size_mult or 1.0) * float(htf_ltf_size_mult))
 
             if tiger_lot is not None and tiger_lot > 0:
                 # Use Tiger Risk Governor lot as base, still apply adaptive multipliers
-                desired_volume = self._normalize_volume(float(tiger_lot) * float(adaptive_size_mult or 1.0), symbol_info)
+                desired_volume = self._normalize_volume(float(tiger_lot) * float(adaptive_size_mult or 1.0) * float(htf_ltf_size_mult), symbol_info)
             else:
                 # Fallback: original static lot sizing
                 desired_volume = self._normalize_volume(float(config.MT5_LOT_SIZE) * vm, symbol_info)
@@ -1389,11 +1635,151 @@ class MT5Executor:
                 margin_budget_pct=max_usage_pct,
             )
 
-            comment = f"{config.MT5_COMMENT_PREFIX}:{source}:{up_signal}"[:31]
+            comment = self._build_order_comment(signal=signal, source=source, signal_symbol=up_signal)
             if fit_reason and fit_reason != "ok":
                 logger.info("[MT5] %s", fit_reason)
+
+            now = time.time()
+            if broker_symbol in self._market_closed_cache:
+                if now - self._market_closed_cache[broker_symbol] < 300:
+                    return _attach_meta(MT5ExecutionResult(False, "market_closed", f"{broker_symbol} market closed (cached)", sig_symbol, broker_symbol))
+
+            is_limit_entry = bool(is_limit_entry_requested)
+            is_stop_entry = bool(is_stop_entry_requested)
+            if is_pending_entry_requested:
+                price = float(requested_entry_price)
+
+            def _limit_fallback_guard(market_price: float) -> tuple[bool, str, dict]:
+                meta = {
+                    "market_price": float(market_price),
+                "requested_entry_price": float(requested_entry_price),
+                "spread_pct": float(spread_pct_now),
+                "confidence": float(confidence_now),
+            }
+                if not bool(allow_limit_market_fallback):
+                    return False, "fallback_disabled", meta
+                min_conf_fb = max(0.0, float(getattr(config, "MT5_LIMIT_FALLBACK_MIN_CONFIDENCE", 82.0) or 82.0))
+                max_spread_fb = max(0.0, float(getattr(config, "MT5_LIMIT_FALLBACK_MAX_SPREAD_PCT", 0.03) or 0.03))
+                max_slip_atr = max(0.0, float(getattr(config, "MT5_LIMIT_FALLBACK_MAX_SLIPPAGE_ATR", 0.20) or 0.20))
+                slip_abs = abs(float(market_price) - float(requested_entry_price))
+                slip_atr = (slip_abs / float(atr_now)) if float(atr_now) > 0 else 9_999.0
+                meta["slippage_abs"] = float(slip_abs)
+                meta["slippage_atr"] = float(slip_atr)
+                if float(confidence_now) < float(min_conf_fb):
+                    return False, f"confidence<{min_conf_fb:.1f}", meta
+                if float(spread_pct_now) > float(max_spread_fb):
+                    return False, f"spread>{max_spread_fb:.4f}%", meta
+                if float(atr_now) <= 0:
+                    return False, "atr_unavailable", meta
+                if float(slip_atr) > float(max_slip_atr):
+                    return False, f"slippage_atr>{max_slip_atr:.3f}", meta
+                return True, "ok", meta
+            
+            action = self._mt5.TRADE_ACTION_PENDING if is_pending_entry_requested else self._mt5.TRADE_ACTION_DEAL
+
+            if is_limit_entry:
+                order_type = self._mt5.ORDER_TYPE_BUY_LIMIT if is_long else self._mt5.ORDER_TYPE_SELL_LIMIT
+            elif is_stop_entry:
+                order_type = self._mt5.ORDER_TYPE_BUY_STOP if is_long else self._mt5.ORDER_TYPE_SELL_STOP
+            else:
+                order_type = self._mt5.ORDER_TYPE_BUY if is_long else self._mt5.ORDER_TYPE_SELL
+
+            # Pending entry validation against current market.
+            if is_limit_entry:
+                if is_long and price <= ask:
+                    pass # price is valid limit
+                elif not is_long and price >= bid:
+                    pass # price is valid limit
+                else:
+                    market_px = self._price_round(float(ask if is_long else bid), symbol_info)
+                    allow_fb, fb_reason, fb_meta = _limit_fallback_guard(float(market_px))
+                    try:
+                        rs_fb = dict(getattr(signal, "raw_scores", {}) or {})
+                        rs_fb["mt5_limit_fallback_guard_reason"] = str(fb_reason)
+                        rs_fb["mt5_limit_fallback_guard"] = dict(fb_meta or {})
+                        signal.raw_scores = rs_fb
+                    except Exception:
+                        pass
+                    if not allow_fb:
+                        return _attach_meta(
+                            MT5ExecutionResult(
+                                False,
+                                "skipped",
+                                (
+                                    f"strict limit: entry {price} crossed market (bid={bid}, ask={ask}) "
+                                    f"| fallback_guard:{fb_reason}"
+                                ),
+                                sig_symbol,
+                                broker_symbol,
+                            )
+                        )
+                    # Guarded fallback mode: preserve cadence only when quality conditions are met.
+                    logger.warning(
+                        "[MT5] limit entry %s invalid vs market (bid=%s ask=%s); guarded fallback -> market (%s)",
+                        price,
+                        bid,
+                        ask,
+                        fb_reason,
+                    )
+                    action = self._mt5.TRADE_ACTION_DEAL
+                    order_type = self._mt5.ORDER_TYPE_BUY if is_long else self._mt5.ORDER_TYPE_SELL
+                    price = float(market_px)
+                    try:
+                        rs_fb = dict(getattr(signal, "raw_scores", {}) or {})
+                        rs_fb["mt5_limit_fallback_market"] = True
+                        rs_fb["mt5_limit_fallback_reason"] = str(fb_reason)
+                        signal.raw_scores = rs_fb
+                    except Exception:
+                        pass
+            elif is_stop_entry:
+                if is_long and price >= ask:
+                    pass
+                elif (not is_long) and price <= bid:
+                    pass
+                else:
+                    return _attach_meta(
+                        MT5ExecutionResult(
+                            False,
+                            "skipped",
+                            f"strict stop: entry {price} not beyond market (bid={bid}, ask={ask})",
+                            sig_symbol,
+                            broker_symbol,
+                        )
+                    )
+
+            # --- Phase 6: High-Precision Exits (Dynamic TP Padding) ---
+            if bool(getattr(config, "MT5_EXIT_DYNAMIC_TP_SPREAD_PAD", True)) and (not adaptive_plan_applied):
+                # Calculate real-time spread + estimated commission padding
+                real_spread = max(0.0, ask - bid)
+                comm_pips = float(getattr(config, "MT5_EXIT_DYNAMIC_TP_COMM_PIPS", 0.5))
+                # pip value multiplier based on digits
+                pip_mult = 10.0 if "JPY" in broker_symbol else 10000.0 if "XAU" not in broker_symbol else 10.0
+                if "BTC" in up_broker or "ETH" in up_broker or "CRYPTO" in up_broker:
+                    pip_mult = 1.0
+                comm_pad = (comm_pips / pip_mult) if pip_mult > 0 else 0.0
+                
+                total_pad = real_spread + comm_pad
+                if total_pad > 0.0:
+                    original_tp = tp
+                    if is_long:
+                        tp = self._price_round(tp + total_pad, symbol_info)
+                    else:
+                        tp = self._price_round(tp - total_pad, symbol_info)
+                    logger.info("[MT5-Padding] %s Padding TP by %.5f (spread: %.5f, comm: %.5f). Original TP: %.5f -> New TP: %.5f", broker_symbol, total_pad, real_spread, comm_pad, original_tp, tp)
+
+            try:
+                rs_req = dict(getattr(signal, "raw_scores", {}) or {})
+                rs_req["mt5_req_action"] = int(action)
+                rs_req["mt5_order_type"] = int(order_type)
+                rs_req["mt5_req_price"] = round(float(price), 8)
+                rs_req["mt5_req_spread_pct"] = round(float(spread_pct_now), 6)
+                rs_req["mt5_entry_mode"] = "limit" if bool(is_limit_entry) else ("stop" if bool(is_stop_entry) else "market")
+                signal.raw_scores = rs_req
+            except Exception:
+                pass
+
             request = {
-                "action": self._mt5.TRADE_ACTION_DEAL,
+                "action": action,
                 "symbol": broker_symbol,
                 "volume": volume,
                 "type": order_type,
@@ -1401,11 +1787,17 @@ class MT5Executor:
                 "sl": sl,
                 "tp": tp,
                 "deviation": int(config.MT5_DEVIATION),
-                "magic": int(config.MT5_MAGIC),
+                "magic": int(exec_magic),
                 "comment": comment,
-                "type_time": self._mt5.ORDER_TIME_GTC,
+                "type_time": self._mt5.ORDER_TIME_SPECIFIED if is_pending_entry_requested else self._mt5.ORDER_TIME_GTC,
                 "type_filling": self._pick_filling_mode(symbol_info),
             }
+
+            if is_pending_entry_requested:
+                # Set expiration time for Pending Orders
+                expiration_mins = int(getattr(config, "MT5_LIMIT_TIMEOUT_MINS", 60))
+                request["expiration"] = int(time.time() + (expiration_mins * 60))
+
 
             if self.dry_run:
                 return _attach_meta(MT5ExecutionResult(
@@ -1424,18 +1816,127 @@ class MT5Executor:
                 else:
                     result = self._mt5.order_send(request)
 
-            if result is None:
-                return _attach_meta(MT5ExecutionResult(False, "error", "order_send returned None", sig_symbol, broker_symbol))
+                if result is None:
+                    try:
+                        if hasattr(self._conn.root, "exposed_last_error"):
+                            err = self._conn.root.exposed_last_error()
+                        else:
+                            err = self._mt5.last_error()
+                    except Exception:
+                        err = None
+                    req_ctx = {
+                        "action": int(request.get("action", 0) or 0),
+                        "type": int(request.get("type", 0) or 0),
+                        "volume": float(request.get("volume", 0.0) or 0.0),
+                        "price": float(request.get("price", 0.0) or 0.0),
+                        "sl": float(request.get("sl", 0.0) or 0.0),
+                        "tp": float(request.get("tp", 0.0) or 0.0),
+                        "type_filling": int(request.get("type_filling", 0) or 0),
+                    }
+                    return _attach_meta(
+                        MT5ExecutionResult(
+                            False,
+                            "error",
+                            f"order_send returned None | last_error={_fmt_mt5_last_error(err)} | request={json.dumps(req_ctx, ensure_ascii=True, separators=(',', ':'))}",
+                            sig_symbol,
+                            broker_symbol,
+                        )
+                    )
 
             retcode = int(getattr(result, "retcode", -1))
+
+            # For scalp-like limit entries, some brokers reject pending requests with
+            # transient price/expiration validation errors. Retry once as market order
+            # so cadence does not break.
+            if is_limit_entry and retcode in {10015, 10022}:
+                market_px = self._price_round(float(ask if is_long else bid), symbol_info)
+                allow_fb, fb_reason, fb_meta = _limit_fallback_guard(float(market_px))
+                try:
+                    rs_fb = dict(getattr(signal, "raw_scores", {}) or {})
+                    rs_fb["mt5_limit_fallback_guard_reason"] = str(fb_reason)
+                    rs_fb["mt5_limit_fallback_guard"] = dict(fb_meta or {})
+                    signal.raw_scores = rs_fb
+                except Exception:
+                    pass
+                if not allow_fb:
+                    return _attach_meta(
+                        MT5ExecutionResult(
+                            False,
+                            "skipped",
+                            f"limit fallback blocked after retcode={retcode}: {fb_reason}",
+                            sig_symbol,
+                            broker_symbol,
+                        )
+                    )
+                try:
+                    logger.warning(
+                        "[MT5] limit order rejected retcode=%s for %s; guarded fallback retry -> market (%s)",
+                        retcode,
+                        broker_symbol,
+                        fb_reason,
+                    )
+                    fallback_req = dict(request)
+                    fallback_req["action"] = self._mt5.TRADE_ACTION_DEAL
+                    fallback_req["type"] = self._mt5.ORDER_TYPE_BUY if is_long else self._mt5.ORDER_TYPE_SELL
+                    fallback_req["price"] = float(market_px)
+                    fallback_req["type_time"] = self._mt5.ORDER_TIME_GTC
+                    fallback_req.pop("expiration", None)
+                    with self._lock:
+                        if hasattr(self._conn.root, "exposed_order_send"):
+                            fallback_result = self._conn.root.exposed_order_send(fallback_req)
+                        else:
+                            fallback_result = self._mt5.order_send(fallback_req)
+                    if fallback_result is not None:
+                        result = fallback_result
+                        retcode = int(getattr(result, "retcode", -1))
+                        try:
+                            rs_fb = dict(getattr(signal, "raw_scores", {}) or {})
+                            rs_fb["mt5_limit_fallback_market"] = True
+                            rs_fb["mt5_limit_fallback_reason"] = str(fb_reason)
+                            signal.raw_scores = rs_fb
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning("[MT5] fallback market retry failed: %s", e)
+
+            if retcode == 10018 or retcode == getattr(self._mt5, "TRADE_RETCODE_MARKET_CLOSED", 10018):
+                self._market_closed_cache[broker_symbol] = time.time()
+                return _attach_meta(MT5ExecutionResult(False, "market_closed", f"market closed retcode={retcode}", sig_symbol, broker_symbol, retcode=retcode))
+
             done_codes = {
                 int(getattr(self._mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self._mt5, "TRADE_RETCODE_PLACED", 10008)),
                 int(getattr(self._mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
             }
+            done_fill_codes = {
+                int(getattr(self._mt5, "TRADE_RETCODE_DONE", 10009)),
+                int(getattr(self._mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
+            }
             ticket = getattr(result, "order", None) or getattr(result, "deal", None)
             if retcode in done_codes:
-                position_id = self._resolve_filled_position_id(broker_symbol, is_long, comment)
+                position_id = self._resolve_filled_position_id(
+                    broker_symbol,
+                    is_long,
+                    comment,
+                    magic_override=exec_magic,
+                )
+                try:
+                    rs_done = dict(getattr(signal, "raw_scores", {}) or {})
+                    rs_done["mt5_retcode"] = int(retcode)
+                    rs_done["mt5_ticket"] = int(ticket) if ticket else None
+                    rs_done["mt5_request_price"] = round(float(request.get("price", 0.0) or 0.0), 8)
+                    fill_price = _safe_float(getattr(result, "price", 0.0), 0.0)
+                    if int(retcode) in done_fill_codes and fill_price > 0:
+                        rs_done["mt5_actual_fill_price"] = round(float(fill_price), 8)
+                        if planned_entry_original > 0:
+                            delta = float(fill_price) - float(planned_entry_original)
+                            rs_done["mt5_fill_vs_planned"] = round(delta, 8)
+                            rs_done["mt5_fill_vs_planned_pct"] = round((delta / float(planned_entry_original)) * 100.0, 6)
+                    elif is_limit_entry:
+                        rs_done["mt5_pending_order_price"] = round(float(request.get("price", 0.0) or 0.0), 8)
+                    signal.raw_scores = rs_done
+                except Exception:
+                    pass
 
                 # ── Tiger: Record signal in Signal Store ─────────────────
                 try:
@@ -1674,6 +2175,8 @@ class MT5Executor:
                 bid=float(bid),
                 ask=float(ask),
                 point=float(point),
+                source=str(source or ""),
+                neural_prob=self._get_neural_prob(signal, source),
             )
             adaptive_plan = self._apply_preview_scenario_to_adaptive_plan(
                 scenario=scenario,
@@ -1700,6 +2203,13 @@ class MT5Executor:
             if adaptive_plan and bool(adaptive_plan.ok):
                 adaptive_size_mult = max(0.25, float(adaptive_plan.size_multiplier or 1.0))
                 adaptive_meta = adaptive_plan.to_dict()
+                plan_factors = dict(getattr(adaptive_plan, "factors", {}) or {})
+                if bool(plan_factors.get("direction_blocked")):
+                    out["direction_blocked"] = True
+                    out["direction_block_reason"] = str(
+                        plan_factors.get("direction_block_reason")
+                        or "adaptive directional guard would block this setup"
+                    )
                 if bool(adaptive_plan.applied):
                     final_entry = float(adaptive_plan.entry or final_entry)
                     final_sl = float(adaptive_plan.stop_loss or final_sl)
@@ -1816,6 +2326,11 @@ class MT5Executor:
             if symbol_info is None:
                 return MT5ExecutionResult(False, "error", "symbol info unavailable", broker_symbol=broker_symbol)
 
+            now = time.time()
+            if broker_symbol in self._market_closed_cache:
+                if now - self._market_closed_cache[broker_symbol] < 300:
+                    return MT5ExecutionResult(False, "market_closed", f"{broker_symbol} market closed (cached)", broker_symbol=broker_symbol, ticket=int(position_ticket))
+
             req = {
                 "action": getattr(self._mt5, "TRADE_ACTION_SLTP", 6),
                 "symbol": broker_symbol,
@@ -1840,9 +2355,28 @@ class MT5Executor:
                     res = self._conn.root.exposed_order_send(req)
                 else:
                     res = self._mt5.order_send(req)
-            if res is None:
-                return MT5ExecutionResult(False, "error", "order_send returned None", broker_symbol=broker_symbol, ticket=int(position_ticket))
+                if res is None:
+                    try:
+                        if hasattr(self._conn.root, "exposed_last_error"):
+                            err = self._conn.root.exposed_last_error()
+                        else:
+                            err = self._mt5.last_error()
+                    except Exception:
+                        err = None
+                    return MT5ExecutionResult(
+                        False,
+                        "error",
+                        f"order_send returned None | last_error={_fmt_mt5_last_error(err)}",
+                        broker_symbol=broker_symbol,
+                        ticket=int(position_ticket),
+                    )
+            
             retcode = int(getattr(res, "retcode", -1))
+            
+            if retcode == 10018 or retcode == getattr(self._mt5, "TRADE_RETCODE_MARKET_CLOSED", 10018):
+                self._market_closed_cache[broker_symbol] = time.time()
+                return MT5ExecutionResult(False, "market_closed", f"market closed retcode={retcode}", broker_symbol=broker_symbol, ticket=int(position_ticket), retcode=retcode)
+
             done_codes = {
                 int(getattr(self._mt5, "TRADE_RETCODE_DONE", 10009)),
                 int(getattr(self._mt5, "TRADE_RETCODE_PLACED", 10008)),
@@ -1887,9 +2421,33 @@ class MT5Executor:
             if cv <= 0:
                 return MT5ExecutionResult(False, "error", "close volume normalized to zero", broker_symbol=broker_symbol, ticket=int(position_ticket))
 
-            is_buy_position = str(position_type or "").lower() in {"buy", "long"}
+            now = time.time()
+            if broker_symbol in self._market_closed_cache:
+                if now - self._market_closed_cache[broker_symbol] < 300:
+                    return MT5ExecutionResult(False, "market_closed", f"{broker_symbol} market closed (cached)", broker_symbol=broker_symbol, ticket=int(position_ticket))
+
+            # Determine position direction by querying live MT5 position (most reliable).
+            # The 'position_type' string arg is a hint only and may be a raw int like "0".
+            # POSITION_TYPE_BUY == 0, POSITION_TYPE_SELL == 1.
+            is_buy_position = None
+            try:
+                live_positions = self._mt5.positions_get(ticket=int(position_ticket)) or []
+                if live_positions:
+                    live_pos_type = int(getattr(live_positions[0], "type", -1))
+                    is_buy_position = (live_pos_type == int(getattr(self._mt5, "POSITION_TYPE_BUY", 0)))
+            except Exception:
+                pass
+            if is_buy_position is None:
+                # Fallback to string hint if live lookup fails
+                is_buy_position = str(position_type or "").lower() in {"buy", "long", "0", "0.0"}
             order_type = self._mt5.ORDER_TYPE_SELL if is_buy_position else self._mt5.ORDER_TYPE_BUY
             price = float(getattr(tick, "bid" if is_buy_position else "ask", 0.0) or 0.0)
+            
+            # If tick price is 0.0, the market is closed or off-quotes. Sending 0.0 yields 10013 Invalid Request.
+            if price <= 0.0:
+                self._market_closed_cache[broker_symbol] = time.time()
+                return MT5ExecutionResult(False, "market_closed", f"market closed / off quotes (price 0.0)", broker_symbol=broker_symbol, ticket=int(position_ticket), retcode=10018)
+
             price = self._price_round(price, symbol_info)
             req = {
                 "action": self._mt5.TRADE_ACTION_DEAL,
@@ -1939,7 +2497,28 @@ class MT5Executor:
 
             res, retcode, broker_comment = _parse_res(_send_req(req))
             if res is None:
-                return MT5ExecutionResult(False, "error", "order_send returned None", broker_symbol=broker_symbol, ticket=int(position_ticket))
+                try:
+                    if hasattr(self._conn.root, "exposed_last_error"):
+                        err = self._conn.root.exposed_last_error()
+                    else:
+                        err = self._mt5.last_error()
+                except Exception:
+                    err = None
+                return MT5ExecutionResult(
+                    False,
+                    "error",
+                    f"order_send returned None | last_error={_fmt_mt5_last_error(err)}",
+                    broker_symbol=broker_symbol,
+                    ticket=int(position_ticket),
+                )
+            
+            if retcode == 10018 or retcode == getattr(self._mt5, "TRADE_RETCODE_MARKET_CLOSED", 10018):
+                self._market_closed_cache[broker_symbol] = time.time()
+                return MT5ExecutionResult(False, "market_closed", f"market closed retcode={retcode}", broker_symbol=broker_symbol, ticket=int(position_ticket), retcode=retcode, volume=None)
+
+            if retcode == 10013:
+                logger.error(f"[MT5 DEEP DEBUG] 10013 Invalid Request. Request payload was: {req} | MT5 tick price: {price} | Order Type: {order_type} | Filling: {req.get('type_filling')}")
+
             if retcode in done_codes:
                 return MT5ExecutionResult(True, "partial_closed", f"partial close accepted retcode={retcode}", broker_symbol=broker_symbol, ticket=int(position_ticket), retcode=retcode, volume=float(cv))
 
@@ -1964,9 +2543,15 @@ class MT5Executor:
                         "volume": req["volume"],
                         "type": req["type"],
                         "price": req["price"],
-                        "deviation": req["deviation"],
+                        "magic": req.get("magic", int(config.MT5_MAGIC)),
                         "type_filling": tf,
                     }
+                    if "deviation" in req:
+                        alt["deviation"] = req["deviation"]
+                    if "comment" in req:
+                        alt["comment"] = req["comment"]
+                    if "type_time" in req:
+                        alt["type_time"] = req["type_time"]
                     res2, rc2, bcomment2 = _parse_res(_send_req(alt))
                     if res2 is None:
                         continue
@@ -2272,10 +2857,6 @@ class MT5Executor:
             "account_login": None,
             "account_server": None,
         }
-        if not self.enabled:
-            out["error"] = "MT5 disabled"
-            return out
-
         ok, msg = self._ensure_connection()
         if not ok:
             out["error"] = msg
@@ -2325,17 +2906,19 @@ class MT5Executor:
                 position_id = int(_mt5_attr(d, "position_id", 0) or 0)
                 deal_ticket = int(_mt5_attr(d, "ticket", 0) or 0)
                 group_id = position_id if position_id > 0 else (deal_ticket if deal_ticket > 0 else close_ts)
-                pnl = (
-                    float(_mt5_attr(d, "profit", 0.0) or 0.0)
-                    + float(_mt5_attr(d, "swap", 0.0) or 0.0)
-                    + float(_mt5_attr(d, "commission", 0.0) or 0.0)
-                )
+                deal_profit = float(_mt5_attr(d, "profit", 0.0) or 0.0)
+                deal_swap = float(_mt5_attr(d, "swap", 0.0) or 0.0)
+                deal_commission = float(_mt5_attr(d, "commission", 0.0) or 0.0)
+                pnl = deal_profit + deal_swap + deal_commission
                 rec = grouped.setdefault(
                     int(group_id),
                     {
                         "position_id": int(position_id) if position_id > 0 else None,
                         "symbol": symbol,
                         "pnl": 0.0,
+                        "profit": 0.0,
+                        "swap": 0.0,
+                        "commission": 0.0,
                         "close_time": close_ts,
                         "close_price": float(_mt5_attr(d, "price", 0.0) or 0.0),
                         "volume": float(_mt5_attr(d, "volume", 0.0) or 0.0),
@@ -2352,6 +2935,9 @@ class MT5Executor:
                     },
                 )
                 rec["pnl"] = float(rec.get("pnl", 0.0) or 0.0) + pnl
+                rec["profit"] = float(rec.get("profit", 0.0) or 0.0) + deal_profit
+                rec["swap"] = float(rec.get("swap", 0.0) or 0.0) + deal_swap
+                rec["commission"] = float(rec.get("commission", 0.0) or 0.0) + deal_commission
                 rec["deals"] = int(rec.get("deals", 0) or 0) + 1
                 if close_ts >= int(rec.get("close_time", 0) or 0):
                     rec["close_time"] = close_ts

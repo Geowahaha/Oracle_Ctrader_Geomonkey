@@ -206,6 +206,72 @@ class MT5ExecutorTests(unittest.TestCase):
         self.assertIn("retcode=10027", res.message)
         self.assertIn("autotrading", res.message.lower())
 
+    def test_execute_signal_supports_buy_stop_pending_order(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="long")
+        sig.entry = 5102.0
+        sig.stop_loss = 5098.0
+        sig.take_profit_2 = 5108.0
+        sig.entry_type = "buy_stop"
+
+        seen = {}
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TYPE_BUY_STOP = 4
+        fake_mt5.ORDER_TYPE_SELL_STOP = 5
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.TRADE_RETCODE_PLACED = 10008
+        fake_mt5.TRADE_RETCODE_DONE_PARTIAL = 10010
+        fake_mt5.account_info.return_value = MagicMock(margin_free=1000.0, login=1, balance=1000.0, equity=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5100.0, bid=5099.9)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+
+        def _order_send(req):
+            seen["request"] = dict(req)
+            return MagicMock(retcode=10008, order=4321, deal=None, comment="ok")
+
+        fake_mt5.order_send.side_effect = _order_send
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_PENDING_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bs:canary")
+
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, "filled")
+        self.assertEqual(int(seen["request"]["action"]), int(fake_mt5.TRADE_ACTION_PENDING))
+        self.assertEqual(int(seen["request"]["type"]), int(fake_mt5.ORDER_TYPE_BUY_STOP))
+        self.assertEqual(int(seen["request"]["type_time"]), int(fake_mt5.ORDER_TIME_SPECIFIED))
+        self.assertIn("expiration", seen["request"])
+
     def test_closed_trades_snapshot_aggregates_recent_exit_deals(self):
         fake_mt5 = MagicMock()
         fake_mt5.account_info.return_value = MagicMock(login=123456, server="TEST-MT5")
@@ -426,6 +492,291 @@ class MT5ExecutorTests(unittest.TestCase):
         # lot 0.10 * sizex0.8 => 0.08 (then normalized by step stays 0.08)
         self.assertAlmostEqual(float(sent_req["volume"]), 0.08, places=2)
 
+    def test_execute_limit_entry_keeps_original_entry_and_skips_adaptive_plan(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="short")
+        sig.entry_type = "limit"
+        sig.entry = 5114.98
+        sig.stop_loss = 5118.36
+        sig.take_profit_1 = 5111.85
+        sig.take_profit_2 = 5110.80
+        sig.take_profit_3 = 5109.41
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.TRADE_RETCODE_PLACED = 10008
+        fake_mt5.TRADE_RETCODE_DONE_PARTIAL = 10010
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5110.50, bid=5110.35)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+        fake_mt5.order_send.return_value = MagicMock(retcode=10008, order=1234, deal=None)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ADAPTIVE_EXITS_SIZE_ONLY", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", False), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", True), \
+             patch("execution.mt5_executor.mt5_adaptive_trade_planner.plan_execution", return_value=AdaptiveExecutionPlan(ok=False, applied=False, reason="noop")) as plan_call:
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bypass")
+
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, "filled")
+        self.assertTrue(plan_call.called)
+        sent_req = fake_mt5.order_send.call_args.args[0]
+        self.assertEqual(int(sent_req["action"]), int(fake_mt5.TRADE_ACTION_PENDING))
+        self.assertEqual(int(sent_req["type"]), int(fake_mt5.ORDER_TYPE_SELL_LIMIT))
+        self.assertAlmostEqual(float(sent_req["price"]), 5114.98, places=2)
+        self.assertAlmostEqual(float(sig.entry), 5114.98, places=2)
+
+    def test_execute_limit_entry_strict_skips_when_market_crossed(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="short")
+        sig.entry_type = "limit"
+        sig.entry = 5099.00  # crossed below current bid -> invalid SELL LIMIT
+        sig.stop_loss = 5102.00
+        sig.take_profit_2 = 5095.00
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5110.50, bid=5110.35)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", False), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", False):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bypass")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("strict limit", res.message.lower())
+        self.assertFalse(fake_mt5.order_send.called)
+
+    def test_limit_fallback_guard_blocks_when_confidence_low(self):
+        sig = make_signal("XAUUSD", confidence=75.0, direction="short")
+        sig.entry_type = "limit"
+        sig.entry = 5099.0  # crossed for short
+        sig.stop_loss = 5102.0
+        sig.take_profit_2 = 5095.0
+        sig.atr = 6.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2, point=0.01, trade_stops_level=1, volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=0
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5110.50, bid=5110.35)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MIN_CONFIDENCE", 82.0), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MAX_SPREAD_PCT", 0.03), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MAX_SLIPPAGE_ATR", 0.20), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", False):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bypass")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("fallback_guard", res.message.lower())
+        self.assertFalse(fake_mt5.order_send.called)
+
+    def test_limit_fallback_guard_allows_market_retry_when_quality_ok(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="short")
+        sig.entry_type = "limit"
+        sig.entry = 5110.20  # crossed for short (below bid=5110.35), but tiny slip
+        sig.stop_loss = 5113.20
+        sig.take_profit_2 = 5106.20
+        sig.atr = 10.0
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.TRADE_RETCODE_PLACED = 10008
+        fake_mt5.TRADE_RETCODE_DONE_PARTIAL = 10010
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2, point=0.01, trade_stops_level=1, volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=0
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5110.50, bid=5110.35)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+        fake_mt5.order_send.return_value = MagicMock(retcode=10009, order=3333, deal=4444, price=5110.35)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MIN_CONFIDENCE", 82.0), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MAX_SPREAD_PCT", 0.03), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_FALLBACK_MAX_SLIPPAGE_ATR", 0.20), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", False), \
+             patch.object(self.exec, "_resolve_filled_position_id", return_value=999):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bypass")
+
+        self.assertTrue(res.ok)
+        self.assertEqual(res.status, "filled")
+        sent_req = fake_mt5.order_send.call_args.args[0]
+        self.assertEqual(int(sent_req["action"]), int(fake_mt5.TRADE_ACTION_DEAL))
+        self.assertEqual(int(sent_req["type"]), int(fake_mt5.ORDER_TYPE_SELL))
+
+    def test_limit_fallback_respects_per_signal_override_disabled(self):
+        sig = make_signal("XAUUSD", confidence=90.0, direction="short")
+        sig.entry_type = "limit"
+        sig.entry = 5099.0  # crossed for short (below bid), would normally fallback
+        sig.stop_loss = 5102.0
+        sig.take_profit_2 = 5095.0
+        sig.atr = 8.0
+        sig.raw_scores = {"mt5_limit_allow_market_fallback": False}
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        fake_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_TIME_SPECIFIED = 1
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_ACTION_PENDING = 5
+        fake_mt5.account_info.return_value = MagicMock(login=123, margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2, point=0.01, trade_stops_level=1, volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=0
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=5110.50, bid=5110.35)
+        fake_mt5.positions_get.return_value = []
+        fake_mt5.order_calc_margin.return_value = 10.0
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 70), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_LIMIT_ENTRY_ALLOW_MARKET_FALLBACK", True), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", False):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:winner:bypass")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("fallback_disabled", str(res.message).lower())
+        self.assertFalse(fake_mt5.order_send.called)
+
     def test_preview_adaptive_execution_returns_plan_without_sending_order(self):
         sig = make_signal("ETH/USDT", confidence=90.0, direction="long")
         sig.stop_loss = 1900.0
@@ -525,6 +876,81 @@ class MT5ExecutorTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("single open position", reason.lower())
+
+    def test_position_limits_can_be_ignored_for_bypass_lane(self):
+        fake_mt5 = MagicMock()
+        fake_mt5.positions_get.return_value = [SimpleNamespace(ticket=1)]
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        self.exec._mt5 = fake_mt5
+
+        with patch("execution.mt5_executor.config.MT5_MAX_OPEN_POSITIONS", 1), \
+             patch("execution.mt5_executor.config.MT5_MAX_POSITIONS_PER_SYMBOL", 1), \
+             patch("execution.mt5_executor.config.MT5_MICRO_MODE_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_MICRO_SINGLE_POSITION_ONLY", True):
+            ok, reason = self.exec._position_limits_ok("ETHUSD", "long", ignore_open_positions=True)
+
+        self.assertTrue(ok)
+        self.assertIn("bypass_ignore_open_positions", reason)
+
+    def test_execute_signal_bypass_lane_uses_offset_magic_and_ignores_open_positions(self):
+        sig = make_signal("XAUUSD", confidence=69.0, direction="long")
+        sig.raw_scores.update(
+            {
+                "mt5_bypass_test_enabled": True,
+                "mt5_bypass_skip_confidence": True,
+                "mt5_bypass_ignore_open_positions": True,
+                "mt5_bypass_magic_offset": 500,
+                "signal_run_no": 77,
+            }
+        )
+
+        fake_mt5 = MagicMock()
+        fake_mt5.initialize.return_value = True
+        fake_mt5.symbol_select.return_value = True
+        fake_mt5.ORDER_TYPE_BUY = 0
+        fake_mt5.ORDER_TYPE_SELL = 1
+        fake_mt5.ORDER_TIME_GTC = 0
+        fake_mt5.ORDER_FILLING_RETURN = 0
+        fake_mt5.TRADE_ACTION_DEAL = 1
+        fake_mt5.TRADE_RETCODE_DONE = 10009
+        fake_mt5.account_info.return_value = MagicMock(margin_free=1000.0)
+        fake_mt5.symbol_info.return_value = MagicMock(
+            digits=2,
+            point=0.01,
+            trade_stops_level=1,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            filling_mode=0,
+        )
+        fake_mt5.symbol_info_tick.return_value = MagicMock(ask=100.0, bid=99.9)
+        fake_mt5.positions_get.return_value = [SimpleNamespace(ticket=1, magic=770100, comment="DEXTER:main:XAUUSD")]
+        fake_mt5.order_calc_margin.return_value = 5.0
+        fake_mt5.order_send.return_value = MagicMock(retcode=10009, order=9876, deal=9877)
+
+        self.exec._conn = MagicMock()
+        self.exec._conn.root = object()
+        self.exec._mt5 = fake_mt5
+        self.exec._symbols_cache = ["XAUUSD"]
+        self.exec._symbols_cache_ts = 9e9
+        self.exec._symbol_map = {}
+
+        with patch("execution.mt5_executor.config.MT5_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_DRY_RUN", False), \
+             patch("execution.mt5_executor.config.MT5_MIN_SIGNAL_CONFIDENCE", 75), \
+             patch("execution.mt5_executor.config.MT5_BYPASS_TEST_ENABLED", True), \
+             patch("execution.mt5_executor.config.MT5_BYPASS_TEST_MAGIC_OFFSET", 500), \
+             patch("execution.mt5_executor.config.MT5_ADAPTIVE_EXECUTION_ENABLED", False), \
+             patch("execution.mt5_executor.config.MT5_MAX_MARGIN_USAGE_PCT", 90), \
+             patch("execution.mt5_executor.config.MT5_MIN_FREE_MARGIN_AFTER_TRADE", 1), \
+             patch.object(self.exec, "_resolve_filled_position_id", return_value=555):
+            res = self.exec.execute_signal(sig, source="scalp_xauusd:bypass")
+
+        self.assertTrue(res.ok)
+        sent_req = fake_mt5.order_send.call_args.args[0]
+        self.assertEqual(int(sent_req.get("magic")), 770600)
+        self.assertIn("BYPASS", str(sent_req.get("comment", "")).upper())
 
     def test_micro_whitelist_learner_records_and_reports_status(self):
         with tempfile.TemporaryDirectory() as td:

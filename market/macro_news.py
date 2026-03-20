@@ -30,6 +30,10 @@ class MacroHeadline:
     score: int
     themes: list[str]
     impact_hint: str
+    source_quality: float = 0.5
+    source_tier: str = "standard"
+    verification: str = "unverified"
+    source_key: str = ""
 
 
 class MacroNewsMonitor:
@@ -78,6 +82,45 @@ class MacroNewsMonitor:
         ("**", 5),
         ("*", 1),
     )
+    SOURCE_QUALITY_DEFAULTS: dict[str, float] = {
+        "REUTERS": 0.96,
+        "BLOOMBERG": 0.95,
+        "WSJ": 0.93,
+        "CNBC": 0.84,
+        "FXSTREET": 0.83,
+        "FOREXLIVE": 0.79,
+        "INVESTINGCOM": 0.72,
+        "MARKETWATCH": 0.74,
+        "YAHOOFINANCE": 0.66,
+    }
+    RUMOR_KEYWORDS: tuple[str, ...] = (
+        "rumor",
+        "rumour",
+        "unconfirmed",
+        "according to sources",
+        "sources say",
+        "reportedly",
+        "alleged",
+        "could",
+        "might",
+        "may ",
+        "speculation",
+        "social media post",
+        "unverified",
+    )
+    CONFIRMED_KEYWORDS: tuple[str, ...] = (
+        "confirmed",
+        "official statement",
+        "officially",
+        "announced",
+        "announcement",
+        "press release",
+        "ministry said",
+        "central bank said",
+        "white house said",
+        "reuters",
+        "bloomberg",
+    )
 
     def __init__(self):
         self.feed_url = str(getattr(config, "MACRO_NEWS_FEED_URL", "") or "").strip()
@@ -86,6 +129,84 @@ class MacroNewsMonitor:
         self._cache_ts: float = 0.0
         self._dynamic_theme_weight_mult: dict[str, float] = {}
         self._dynamic_theme_meta: dict[str, dict] = {}
+        self._source_quality_overrides = self._load_source_quality_overrides()
+
+    @staticmethod
+    def _parse_float_map(raw: str) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for chunk in str(raw or "").split(","):
+            item = chunk.strip()
+            if (not item) or ("=" not in item):
+                continue
+            left, right = item.split("=", 1)
+            key = str(left or "").strip()
+            if not key:
+                continue
+            try:
+                out[key] = float(right.strip())
+            except Exception:
+                continue
+        return out
+
+    @classmethod
+    def _normalize_source_key(cls, source: str) -> str:
+        raw = "".join(ch for ch in str(source or "").upper() if ch.isalnum())
+        aliases = {
+            "REUTERSCOM": "REUTERS",
+            "BLOOMBERGCOM": "BLOOMBERG",
+            "FXSTREETCOM": "FXSTREET",
+            "FOREXLIVECOM": "FOREXLIVE",
+            "INVESTINGCOM": "INVESTINGCOM",
+            "YAHOOFINANCE": "YAHOOFINANCE",
+            "WALLSTREETJOURNAL": "WSJ",
+        }
+        return aliases.get(raw, raw)
+
+    def _load_source_quality_overrides(self) -> dict[str, float]:
+        raw_map: dict[str, float] = {}
+        try:
+            getter = getattr(config, "get_macro_news_source_quality_overrides", None)
+            if callable(getter):
+                raw_map = dict(getter() or {})
+            else:
+                raw_map = self._parse_float_map(str(getattr(config, "MACRO_NEWS_SOURCE_QUALITY_OVERRIDES", "") or ""))
+        except Exception:
+            raw_map = {}
+        out: dict[str, float] = {}
+        for k, v in raw_map.items():
+            key = self._normalize_source_key(str(k or ""))
+            if not key:
+                continue
+            try:
+                out[key] = max(0.0, min(1.0, float(v)))
+            except Exception:
+                continue
+        return out
+
+    def _source_quality(self, source: str) -> tuple[float, str, str]:
+        key = self._normalize_source_key(source)
+        quality = float(self._source_quality_overrides.get(key, self.SOURCE_QUALITY_DEFAULTS.get(key, 0.55)) or 0.55)
+        quality = max(0.0, min(1.0, quality))
+        trusted_min = float(getattr(config, "MACRO_NEWS_TRUSTED_MIN_QUALITY", 0.80) or 0.80)
+        if quality >= trusted_min:
+            tier = "trusted"
+        elif quality >= 0.65:
+            tier = "standard"
+        else:
+            tier = "low"
+        return quality, tier, key
+
+    def _verification_state(self, text: str) -> str:
+        body = str(text or "").lower()
+        rumor_hit = any(k in body for k in self.RUMOR_KEYWORDS)
+        confirmed_hit = any(k in body for k in self.CONFIRMED_KEYWORDS)
+        if rumor_hit and confirmed_hit:
+            return "mixed"
+        if confirmed_hit:
+            return "confirmed"
+        if rumor_hit:
+            return "rumor"
+        return "unverified"
 
     @staticmethod
     def _safe_text(node: ET.Element, tag: str) -> str:
@@ -222,10 +343,34 @@ class MacroNewsMonitor:
             return None
         link = self._safe_text(node, "link")
         source = self._safe_text(node, "source") or "news"
+        description = self._safe_text(node, "description")
         published = self._parse_pubdate(self._safe_text(node, "pubDate"))
-        score, themes = self._score_themes(title)
+        scoring_text = f"{title} {description}".strip()
+        base_score, themes = self._score_themes(scoring_text)
+        if base_score <= 0:
+            return None
+        source_quality, source_tier, source_key = self._source_quality(source)
+        verification = self._verification_state(f"{source} {scoring_text}")
+        score_adj = float(base_score) * (0.80 + (0.40 * float(source_quality)))
+        rumor_penalty = float(getattr(config, "MACRO_NEWS_RUMOR_SCORE_PENALTY", 2.0) or 2.0)
+        unverified_penalty = float(getattr(config, "MACRO_NEWS_UNVERIFIED_SCORE_PENALTY", 1.0) or 1.0)
+        confirmed_bonus = float(getattr(config, "MACRO_NEWS_CONFIRMED_SCORE_BONUS", 0.8) or 0.8)
+        if verification == "rumor":
+            score_adj -= rumor_penalty
+        elif verification == "mixed":
+            score_adj -= max(0.5, rumor_penalty * 0.5)
+        elif verification == "confirmed":
+            score_adj += confirmed_bonus
+        else:
+            score_adj -= unverified_penalty
+        score = max(0, int(round(score_adj)))
         if score <= 0:
             return None
+        impact_hint = self._impact_hint(themes, title)
+        if verification == "rumor":
+            impact_hint = f"{impact_hint} Treat as rumor until confirmed by trusted source."
+        elif verification == "confirmed":
+            impact_hint = f"{impact_hint} Confirmed headline from a trusted/public source."
         key = f"{title}|{link}|{published.isoformat()}"
         hid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
         return MacroHeadline(
@@ -236,7 +381,11 @@ class MacroNewsMonitor:
             published_utc=published,
             score=score,
             themes=themes,
-            impact_hint=self._impact_hint(themes, title),
+            impact_hint=impact_hint,
+            source_quality=round(float(source_quality), 3),
+            source_tier=source_tier,
+            verification=verification,
+            source_key=source_key,
         )
 
     def _download(self) -> str:
@@ -278,8 +427,31 @@ class MacroNewsMonitor:
             h for h in self.fetch_headlines()
             if h.published_utc >= lookback and int(h.score) >= int(min_score)
         ]
-        out.sort(key=lambda x: (x.score, x.published_utc), reverse=True)
+        out.sort(
+            key=lambda x: (
+                int(getattr(x, "score", 0) or 0),
+                float(getattr(x, "source_quality", 0.5) or 0.5),
+                getattr(x, "published_utc", lookback),
+            ),
+            reverse=True,
+        )
         return out[: max(1, int(limit))]
+
+    def is_trusted_source(self, headline: MacroHeadline, min_quality: float | None = None) -> bool:
+        if headline is None:
+            return False
+        threshold = float(
+            min_quality
+            if min_quality is not None
+            else getattr(config, "MACRO_NEWS_TRUSTED_MIN_QUALITY", 0.80)
+        )
+        q = float(getattr(headline, "source_quality", 0.0) or 0.0)
+        return q >= max(0.0, min(1.0, threshold))
+
+    @staticmethod
+    def is_rumor_headline(headline: MacroHeadline) -> bool:
+        state = str(getattr(headline, "verification", "") or "").strip().lower()
+        return state in {"rumor", "mixed"}
 
     @classmethod
     def is_priority_theme(cls, headline: MacroHeadline) -> bool:

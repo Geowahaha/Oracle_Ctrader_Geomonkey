@@ -3,8 +3,11 @@ notifier/telegram_bot.py - Professional Telegram Signal Delivery
 Sends beautifully formatted trade signals, market updates, scan summaries
 """
 import asyncio
+import json
 import logging
+import os
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 import math
 
@@ -21,16 +24,13 @@ logger = logging.getLogger(__name__)
 def _run_async(coro):
     """Run async code from sync context safely."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
 
 
 class TelegramNotifier:
@@ -61,17 +61,35 @@ class TelegramNotifier:
         signal_symbol: str = "",
         signal_symbols: Optional[list[str]] = None,
     ) -> list[int]:
+        def _passes_symbol_filter(uid: int) -> bool:
+            try:
+                return access_manager.user_signal_filter_allows(
+                    int(uid),
+                    signal_symbol=signal_symbol,
+                    signal_symbols=signal_symbols,
+                )
+            except Exception:
+                return True
+
         targets: set[int] = set()
         if chat_id is not None:
             try:
-                targets.add(int(chat_id))
+                cid = int(chat_id)
+                if _passes_symbol_filter(cid):
+                    targets.add(cid)
+                else:
+                    logger.info("[Telegram] direct target filtered out by signal filter chat=%s feature=%s", cid, feature or "-")
             except Exception:
                 pass
             return sorted(targets)
 
         raw_owner = str(getattr(config, "TELEGRAM_CHAT_ID", "") or "").strip()
         if raw_owner and raw_owner.lstrip("-").isdigit():
-            targets.add(int(raw_owner))
+            owner_id = int(raw_owner)
+            if _passes_symbol_filter(owner_id):
+                targets.add(owner_id)
+            else:
+                logger.info("[Telegram] owner target filtered out by signal filter owner=%s feature=%s", owner_id, feature or "-")
 
         if self.broadcast_enabled and feature:
             try:
@@ -225,6 +243,10 @@ class TelegramNotifier:
         signal_symbols: Optional[list[str]] = None,
     ) -> bool:
         """Send a message to one chat or all entitled subscribers."""
+        # Prevent accidental live sends while running test suites in a real environment.
+        if self.enabled and bool(str(os.getenv("PYTEST_CURRENT_TEST", "") or "").strip()):
+            logger.debug("[Telegram][TEST] send suppressed feature=%s", feature or "-")
+            return False
         if not self.enabled:
             print("\n" + "═" * 60)
             print(text)
@@ -340,14 +362,32 @@ class TelegramNotifier:
             return f"{v / 1_000:.2f}K"
         return f"{v:.2f}"
 
+    @staticmethod
+    def _signal_trace(signal) -> dict:
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+        except Exception:
+            raw = {}
+        run_no = 0
+        try:
+            run_no = int(raw.get("signal_run_no", 0) or 0)
+        except Exception:
+            run_no = 0
+        run_id = str(raw.get("signal_run_id", "") or "").strip()
+        trace_tag = str(raw.get("signal_trace_tag", "") or "").strip()
+        if not trace_tag:
+            if run_no > 0:
+                trace_tag = f"R{run_no:06d}"
+            elif run_id:
+                trace_tag = str(run_id)[-12:]
+        return {"run_no": run_no, "run_id": run_id, "tag": trace_tag}
+
     # ─── Trade Signal Formatter (Tiger Hunter) ──────────────────────────────
     def send_signal(self, signal, chat_id: Optional[int] = None) -> bool:
-        """Send a beautifully formatted Tiger Hunter trade signal."""
+        """Send a compact mobile-first Tiger Hunter trade signal."""
         e = self._escape
         direction_emoji = "🟢 LONG" if signal.direction == "long" else "🔴 SHORT"
         conf_emoji = signal.confidence_emoji()
-        bars = int(signal.confidence / 10)
-        conf_bar = "█" * bars + "░" * (10 - bars)
 
         # Tiger Hunter metadata (backward-compatible)
         sl_type = str(getattr(signal, "sl_type", "") or "")
@@ -355,62 +395,62 @@ class TelegramNotifier:
         entry_type = str(getattr(signal, "entry_type", "") or "")
         sl_mapped = bool(getattr(signal, "sl_liquidity_mapped", False))
         lp_count = int(getattr(signal, "liquidity_pools_count", 0) or 0)
+        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        scalping_source = str(raw_scores.get("scalping_source", "") or "")
+        is_scalping = bool(raw_scores.get("scalping")) or scalping_source.startswith("scalp_")
+        entry_mode_label = "Limit Entry" if entry_type == "limit" else "Market Entry"
+        trace = self._signal_trace(signal)
+        trace_tag = str(trace.get("tag", "") or "").strip()
+        trace_suffix = f" \\| `#{e(trace_tag)}`" if trace_tag else ""
+        top_snapshot = (
+            f"🎯 `{e(self._fmt_price(signal.entry))}` {direction_emoji} {e(entry_mode_label)} "
+            f"\\| 🎯 *CONFIDENCE* `{e(signal.confidence)}%`{trace_suffix}"
+        )
 
-        sep1 = "═" * 35
-        sep2 = "─" * 30
+        def _short(items, max_items: int = 2, max_len: int = 84) -> list[str]:
+            out: list[str] = []
+            for raw in list(items or [])[: max(0, int(max_items))]:
+                txt = str(raw or "").strip()
+                if not txt:
+                    continue
+                if len(txt) > max_len:
+                    txt = txt[: max_len - 3].rstrip() + "..."
+                out.append(txt)
+            return out
+
         lines = [
-            sep1,
             f"🐯 *TIGER HUNTER SIGNAL* {conf_emoji}",
-            sep1,
-            "",
-            f"*Symbol:* `{e(signal.symbol)}`",
-            f"*Direction:* {direction_emoji}",
-            f"*Pattern:* `{e(signal.pattern)}`",
-            f"*Timeframe:* `{e(signal.timeframe)}`",
-            f"*Session:* `{e(signal.session)}`",
-            "",
-            sep2,
-            "📊 *TRADE LEVELS*",
-            sep2,
-            f"🎯 *Entry:*   `{e(self._fmt_price(signal.entry))}`",
+            top_snapshot,
+            f"`{e(signal.symbol)}` \\| `{e(signal.pattern)}` \\| `{e(signal.timeframe)}` \\| `{e(signal.session)}`",
         ]
-
-        if entry_type == "limit":
-            lines.append("   _🎯 Limit order \\(patience entry\\)_")
-
+        if is_scalping:
+            lines.append("*Signal Type:* `SCALPING`")
+        lines += [
+            f"🎯 *Entry:* `{e(self._fmt_price(signal.entry))}`   🛑 *SL:* `{e(self._fmt_price(signal.stop_loss))}`",
+            (
+                f"✅ *TP1:* `{e(self._fmt_price(signal.take_profit_1))}`   "
+                f"✅ *TP2:* `{e(self._fmt_price(signal.take_profit_2))}`   "
+                f"🚀 *TP3:* `{e(self._fmt_price(signal.take_profit_3))}`"
+            ),
+        ]
         sl_badge = " 🛡️ _Anti\\-Sweep_" if (sl_mapped or sl_type == "anti_sweep") else ""
-        lines.append(f"🛑 *Stop:*    `{e(self._fmt_price(signal.stop_loss))}`{sl_badge}")
-
         tp_badge = " ⚡ _Liq Target_" if tp_type == "liquidity" else ""
-        lines += [
-            f"✅ *TP1 \\(1R\\):* `{e(self._fmt_price(signal.take_profit_1))}`",
-            f"✅ *TP2 \\(2R\\):* `{e(self._fmt_price(signal.take_profit_2))}`{tp_badge}",
-            f"🚀 *TP3 \\(3R\\):* `{e(self._fmt_price(signal.take_profit_3))}`",
-            "",
-            f"⚖️ *R:R Ratio:* `1:{e(signal.risk_reward)}`",
-            f"📏 *ATR:* `{e(self._fmt_price(signal.atr))}`",
-        ]
+        lines.append(
+            f"⚖️ *R:R* `1:{e(signal.risk_reward)}` \\| 📏 *ATR* `{e(self._fmt_price(signal.atr))}`{sl_badge}{tp_badge}"
+        )
         if lp_count > 0:
-            lines.append(f"🌊 *Liquidity Pools:* `{e(lp_count)}` mapped")
+            lines.append(f"🌊 *Liquidity Pools:* `{e(lp_count)}`")
 
-        lines += [
-            "",
-            sep2,
-            "🧠 *ANALYSIS*",
-            sep2,
-            f"📈 *Trend:* `{e(signal.trend)}`",
-            f"📊 *RSI:* `{e(signal.rsi)}`",
-            "",
-            sep2,
-            "✅ *REASONS*",
-        ]
-        for reason in signal.reasons[:6]:
-            lines.append(f"• {e(reason)}")
-        if signal.warnings:
-            lines.append("")
-            lines.append("⚠️ *WARNINGS*")
-            for warn in signal.warnings[:3]:
-                lines.append(f"• {e(warn)}")
+        lines.append(f"🧠 *Trend/RSI:* `{e(signal.trend)}` \\| `{e(signal.rsi)}`")
+
+        reasons = _short(getattr(signal, "reasons", []) or [], max_items=2)
+        if reasons:
+            lines.append("✅ *Reasons:*")
+            for reason in reasons:
+                lines.append(f"• {e(reason)}")
+        warns = _short(getattr(signal, "warnings", []) or [], max_items=1)
+        if warns:
+            lines.append(f"⚠️ *Warning:* {e(warns[0])}")
 
         # Tiger quality badges
         tiger_badges = []
@@ -421,23 +461,10 @@ class TelegramNotifier:
         if entry_type == "limit":
             tiger_badges.append("🎯 Limit Entry")
         if tiger_badges:
-            lines += [
-                "",
-                sep2,
-                "🐯 *TIGER QUALITY*",
-                sep2,
-                "  ".join(tiger_badges),
-            ]
+            lines.append(f"🐯 *TIGER QUALITY:* {' \\| '.join(tiger_badges)}")
 
         lines += [
-            "",
-            sep2,
-            "🎯 *CONFIDENCE*",
-            f"`{conf_bar}` `{e(signal.confidence)}%`",
-            "",
-            f"🕐 _{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
-            sep1,
-            "_🐯 Tiger Hunter AI \\| Dexter Pro V3_",
+            f"🕐 `{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}`",
             "_⚠️ Not financial advice\\._",
         ]
 
@@ -446,6 +473,73 @@ class TelegramNotifier:
             chat_id=chat_id,
             feature=self._feature_from_signal(signal),
             signal_symbol=str(getattr(signal, "symbol", "") or ""),
+        )
+
+    # ─── Behavior-Based Scalp Signal (1M/5M) ─────────────────────────────────
+    def send_scalp_signal_behavior(self, setup, chat_id: Optional[int] = None) -> bool:
+        """
+        Send behavior-based XAUUSD scalp signal (1M/5M scanner).
+        Uses plain Markdown (not MarkdownV2) for simplicity.
+        """
+        from scanners.xauusd_scalp_1m5m import ScalpSetup
+        if not isinstance(setup, ScalpSetup):
+            return False
+
+        direction_emoji = "🟢 LONG" if setup.direction == "long" else "🔴 SHORT"
+        conf = setup.confidence
+
+        # Sweep info
+        sweep_line = "—"
+        if setup.sweep:
+            s = setup.sweep
+            sweep_line = (
+                f"{s.side.replace('_', ' ').title()} | "
+                f"wick {s.wick_ratio:.0%} | "
+                f"swept {s.ref_level} @ {s.ref_price:.2f} | "
+                f"{s.bars_ago} bar(s) ago"
+            )
+
+        # FVG info
+        fvg_line = "—"
+        if setup.fvg:
+            f = setup.fvg
+            fvg_line = f"{f.direction.title()} FVG ${f.lower:.2f}–${f.upper:.2f} (${f.size:.2f})"
+
+        # Macro
+        macro_emoji = "✅" if setup.macro_shock == "neutral" else "⚠️"
+        kill_zone_label = setup.kill_zone.replace("_", " ").title()
+
+        now_utc = datetime.now(timezone.utc)
+        lines = [
+            "⚡ XAUUSD SCALP SIGNAL",
+            f"{setup.entry:.2f} {direction_emoji} | CONF {conf:.1f}%",
+            f"Pattern: {setup.pattern} | Session: {setup.session}",
+            f"Kill Zone: {kill_zone_label} | Macro: {setup.macro_shock}",
+            f"Entry {setup.entry:.2f} | SL {setup.stop_loss:.2f} | TP1 {setup.take_profit_1:.2f}",
+            f"TP2 {setup.take_profit_2:.2f} | TP3 {setup.take_profit_3:.2f}",
+            f"RR 1:{setup.risk_reward:.1f} | ATR M5 {setup.atr_m5:.2f}",
+            f"Sweep: {sweep_line}",
+            f"FVG: {fvg_line}",
+        ]
+
+        # Warnings
+        if setup.warnings:
+            lines.append("Warnings:")
+            for w in setup.warnings[:2]:
+                lines.append(f"- {w}")
+
+        lines += [
+            f"UTC: {now_utc.strftime('%Y-%m-%d %H:%M')}",
+            "Not financial advice.",
+        ]
+
+        msg = "\n".join(lines)
+        return self._send(
+            msg,
+            chat_id=chat_id,
+            feature="scalp_xauusd",
+            signal_symbol="XAUUSD",
+            parse_mode=None,
         )
 
     # ─── Market Summary ────────────────────────────────────────────────────────
@@ -464,6 +558,7 @@ class TelegramNotifier:
             "no_signal": "No new signal this round",
             "no_setup": "No setup passed base engine",
             "no_h1_data": "Missing H1 data",
+            "market_closed": "Market closed for XAUUSD",
             "trap_guard_blocked": "Blocked by XAU trap guard",
             "below_confidence": "Signal below confidence threshold",
             "cooldown_suppressed": "Signal suppressed by cooldown",
@@ -491,6 +586,35 @@ class TelegramNotifier:
             except Exception:
                 pass
 
+            # One-line gate summary so below-threshold causes are visible at a glance.
+            gate_bits = []
+            try:
+                direction = str(sig.get("direction", "") or "").strip().lower()
+                fb = dict(diag.get("fallback") or {})
+                side = dict(fb.get(direction) or {}) if direction in ("long", "short") else {}
+                model_conf = side.get("confidence")
+                if model_conf is not None:
+                    gate_bits.append(f"{direction} model {float(model_conf):.1f}%")
+                if side.get("trigger") is False:
+                    gate_bits.append("trigger=off")
+                sweep = dict(fb.get("sweep") or {})
+                if sweep.get("detected") is False:
+                    gate_bits.append("no_sweep")
+                if str(fb.get("kill_zone", "") or "") == "off_kill_zone":
+                    gate_bits.append("off_kill_zone")
+                if conf is not None and th is not None:
+                    gap = float(th) - float(conf)
+                    if gap > 0:
+                        gate_bits.append(f"gap {gap:.1f}%")
+            except Exception:
+                gate_bits = []
+            if not gate_bits:
+                if unmet:
+                    gate_bits.append("unmet=" + ",".join(unmet[:2]))
+                else:
+                    gate_bits.append("post-filter confidence too low")
+            lines.append("Gate: " + " | ".join(gate_bits[:3]))
+
         if x_status == "cooldown_suppressed":
             cd = dict(s.get("cooldown") or {})
             if cd:
@@ -499,6 +623,37 @@ class TelegramNotifier:
         if unmet:
             lines.append("Unmet: " + ", ".join(unmet[:5]))
         elif x_status == "no_signal":
+            gate_parts = []
+            try:
+                fb = dict(diag.get("fallback") or {})
+                gate = dict((fb.get("gating") or {}))
+                if not gate:
+                    gate = dict(diag.get("gating") or {})
+                if not gate:
+                    gate = {
+                        "long": dict(fb.get("long") or {}),
+                        "short": dict(fb.get("short") or {}),
+                    }
+                for side_key, label in (("long", "L"), ("short", "S")):
+                    side = dict(gate.get(side_key) or {})
+                    if not side:
+                        continue
+                    conf = side.get("confidence")
+                    min_conf = side.get("min_confidence")
+                    trig = side.get("trigger")
+                    if conf is None and min_conf is None and trig is None:
+                        continue
+                    conf_txt = "-"
+                    if conf is not None:
+                        conf_txt = f"{float(conf):.1f}%"
+                    if min_conf is not None:
+                        conf_txt = f"{conf_txt}/{float(min_conf):.1f}%"
+                    trig_txt = "on" if bool(trig) else "off"
+                    gate_parts.append(f"{label} trg={trig_txt} conf={conf_txt}")
+            except Exception:
+                gate_parts = []
+            if gate_parts:
+                lines.append("Gate: " + " | ".join(gate_parts[:2]))
             lines.append("Unmet: base_setup")
 
         prev = dict(s.get("previous_signal") or {})
@@ -755,7 +910,7 @@ class TelegramNotifier:
         e = self._escape
         if not opportunities:
             return self._send(
-                "💱 *FX MAJOR SCAN*\n\nNo high\-probability FX setups found right now\.",
+                "💱 *FX MAJOR SCAN*\n\nNo high\\-probability FX setups found right now\\.",
                 chat_id=chat_id,
                 feature="scan_fx",
             )
@@ -776,7 +931,7 @@ class TelegramNotifier:
                 fx_vol_text = "-"
             lines += [
                 "",
-                f"*{e(i)}\. {dir_emoji} {e(getattr(s, 'symbol', '-'))}*",
+                f"*{e(i)}\\. {dir_emoji} {e(getattr(s, 'symbol', '-'))}*",
                 f"   Setup: `{e(getattr(opp, 'setup_type', getattr(s, 'pattern', '-')) or '-')}`  Score: `{e(round(float(getattr(opp, 'composite_score', 0.0) or 0.0),1))}`",
                 f"   Entry: `{e(self._fmt_price(getattr(s, 'entry', 0)))}`  SL: `{e(self._fmt_price(getattr(s, 'stop_loss', 0)))}`  TP2: `{e(self._fmt_price(getattr(s, 'take_profit_2', 0)))}`",
                 f"   R:R `1:{e(getattr(s, 'risk_reward', '-'))}`  Conf: `{e(round(float(getattr(s, 'confidence', 0.0) or 0.0),1))}%`  Vol: `{e(fx_vol_text)}`",
@@ -927,10 +1082,12 @@ class TelegramNotifier:
             f"_🕐 {e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
             f"{'═' * 35}",
         ]
+        symbols = [str(getattr(getattr(opp, "signal", None), "symbol", "") or "") for opp in opportunities[:7]]
         return self._send(
             "\n".join(lines),
             chat_id=chat_id,
             feature=self._feature_from_stock_label(market_label),
+            signal_symbols=symbols,
         )
 
     def send_us_open_daytrade_summary(self, opportunities: list, chat_id: Optional[int] = None) -> bool:
@@ -973,7 +1130,8 @@ class TelegramNotifier:
             "_⚠️ For informational purposes only\\. Not financial advice\\._",
             f"{'═' * 35}",
         ]
-        return self._send("\n".join(lines), chat_id=chat_id, feature="scan_us_open")
+        symbols = [str(getattr(getattr(opp, "signal", None), "symbol", "") or "") for opp in opportunities[:10]]
+        return self._send("\n".join(lines), chat_id=chat_id, feature="scan_us_open", signal_symbols=symbols)
 
     def send_us_open_monitor_update(
         self,
@@ -1029,7 +1187,8 @@ class TelegramNotifier:
             f"_🕐 {e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
             f"{'═' * 35}",
         ]
-        return self._send("\n".join(lines), chat_id=chat_id, feature="monitor_us")
+        symbols = [str(getattr(getattr(opp, "signal", None), "symbol", "") or "") for opp in opportunities[:3]]
+        return self._send("\n".join(lines), chat_id=chat_id, feature="monitor_us", signal_symbols=symbols)
 
     def send_us_open_session_checkin(
         self,
@@ -1157,7 +1316,7 @@ class TelegramNotifier:
         top_symbols = list(rpt.get("top_symbols", []) or [])
 
         title = "🇺🇸 *US OPEN SIGNAL QUALITY*"
-        subtitle = f"Today session recap \({e(days)}d filter: `{e(src)}`\)"
+        subtitle = f"Today session recap \\({e(days)}d filter: `{e(src)}`\\)"
         lines = [
             f"{'═' * 35}",
             title,
@@ -1167,13 +1326,13 @@ class TelegramNotifier:
             f"Signals sent: `{e(sent)}`  Resolved: `{e(resolved)}`  Pending: `{e(pending)}`",
             f"Wins: `{e(wins)}`  SL: `{e(sl)}`  WinRate: `{e(round(win_rate,1))}%`",
             f"TP1/TP2/TP3: `{e(tp1)}` / `{e(tp2)}` / `{e(tp3)}`",
-            f"Avg R \(resolved\): `{e(avg_r_resolved)}`  Avg R \(pending\): `{e(avg_r_pending)}`",
+            f"Avg R \\(resolved\\): `{e(avg_r_resolved)}`  Avg R \\(pending\\): `{e(avg_r_pending)}`",
         ]
         if top_symbols:
             lines += ["", "*Top symbols today:*"]
             for i, row in enumerate(top_symbols[:5], 1):
                 lines.append(
-                    f"{e(i)}\. `{e(str(row.get('symbol','-')) )}` "
+                    f"{e(i)}\\. `{e(str(row.get('symbol','-')) )}` "
                     f"sent `{e(int(row.get('sent',0) or 0))}` "
                     f"resolved `{e(int(row.get('resolved',0) or 0))}` "
                     f"WR `{e(float(row.get('win_rate',0.0) or 0.0))}%` "
@@ -1181,7 +1340,7 @@ class TelegramNotifier:
                 )
         lines += [
             "",
-            "Tip: `/monitor_us` live \| `/scan_us_open` refresh \| `/us_open_dashboard` dashboard",
+            "Tip: `/monitor_us` live \\| `/scan_us_open` refresh \\| `/us_open_dashboard` dashboard",
             f"_🕐 {e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}_",
             f"{'═' * 35}",
         ]
@@ -1314,18 +1473,89 @@ class TelegramNotifier:
         ]
         return self._send("\n".join(lines), chat_id=chat_id, feature="monitor_us")
 
-    def send_signal_trader_dashboard(self, report: dict, chat_id: Optional[int] = None) -> bool:
-        """Daily all-signals trader dashboard (gold/thai/us/global/crypto)."""
+    def send_signal_trader_dashboard(self, report: dict, chat_id: Optional[int] = None, lang: Optional[str] = None) -> bool:
+        """Signal dashboard with period/market/symbol filters (localized by user language)."""
         e = self._escape
         rpt = dict(report or {})
         title_line = "=" * 35
+        ui_lang = str(lang or "").lower().strip()
+        if ui_lang not in {"th", "en", "de"} and chat_id is not None:
+            try:
+                pref = access_manager.get_user_language_preference(int(chat_id))
+            except Exception:
+                pref = None
+            ui_lang = str(pref or "en").lower().strip()
+        if ui_lang not in {"th", "en", "de"}:
+            ui_lang = "en"
+
+        def t(en: str, th: str, de: Optional[str] = None) -> str:
+            if ui_lang == "th":
+                return th
+            if ui_lang == "de":
+                return de or en
+            return en
+
+        def _window_label(mode: str, days: int) -> str:
+            m = str(mode or "").strip().lower()
+            if m == "today":
+                return t("today", "วันนี้", "heute")
+            if m == "yesterday":
+                return t("yesterday", "เมื่อวาน", "gestern")
+            if m == "this_week":
+                return t("this week", "สัปดาห์นี้", "diese Woche")
+            if m == "this_month":
+                return t("this month", "เดือนนี้", "dieser Monat")
+            return t(f"last {days} days", f"ย้อนหลัง {days} วัน", f"letzte {days} Tage")
+
+        def _market_label_ui(raw: str) -> str:
+            token = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+            by_key = {
+                "gold": ("Gold", "ทอง (Gold)", "Gold"),
+                "thai": ("Thailand Stocks", "หุ้นไทย", "Thailand-Aktien"),
+                "thai_stocks": ("Thailand Stocks", "หุ้นไทย", "Thailand-Aktien"),
+                "us": ("US Stocks", "หุ้นสหรัฐ", "US-Aktien"),
+                "us_stocks": ("US Stocks", "หุ้นสหรัฐ", "US-Aktien"),
+                "global": ("Global Stocks", "หุ้นต่างประเทศ", "Globale Aktien"),
+                "global_stocks": ("Global Stocks", "หุ้นต่างประเทศ", "Globale Aktien"),
+                "crypto": ("Crypto", "คริปโต (Crypto)", "Krypto"),
+                "other": ("Other", "อื่นๆ", "Andere"),
+                "th_stocks": ("TH Stocks", "หุ้นไทย", "TH-Aktien"),
+                "us stocks": ("US Stocks", "หุ้นสหรัฐ", "US-Aktien"),
+            }
+            if token in by_key:
+                en_v, th_v, de_v = by_key[token]
+                return {"th": th_v, "de": de_v}.get(ui_lang, en_v)
+            raw_title = str(raw or "").strip()
+            # Handle report labels (e.g., "Thailand Stocks")
+            title_key = raw_title.lower().replace("-", "_").replace(" ", "_")
+            if title_key in by_key:
+                en_v, th_v, de_v = by_key[title_key]
+                return {"th": th_v, "de": de_v}.get(ui_lang, en_v)
+            return raw_title or "-"
+
+        window_mode = str(rpt.get("window_mode") or "").strip().lower()
+        days = int(rpt.get("days", 1) or 1)
+        period_label = _window_label(window_mode, days)
+
+        raw_filter_label = str(rpt.get("market_filter_label") or rpt.get("market_filter") or "").strip()
+        filter_label = _market_label_ui(raw_filter_label) if raw_filter_label else ""
+        symbol_label = str(rpt.get("symbol_filter_label") or "").strip()
+        window = dict(rpt.get("window") or {})
 
         if str(rpt.get("status")) == "no_data":
-            msg = str(rpt.get("message") or "No data.")
+            msg = str(rpt.get("message") or t("No data.", "ไม่พบข้อมูล", "Keine Daten."))
             lines = [
                 title_line,
-                "*ALL SIGNALS TRADER DASHBOARD*",
+                t("*SIGNAL DASHBOARD*", "*แดชบอร์ดสัญญาณ*", "*SIGNAL DASHBOARD*"),
                 title_line,
+                f"{t('Period', 'ช่วงเวลา', 'Zeitraum')}: `{e(period_label)}`",
+            ]
+            if filter_label:
+                lines.append(f"{t('Market', 'ตลาด', 'Markt')}: `{e(filter_label)}`")
+            if symbol_label:
+                lines.append(f"{t('Pair', 'คู่', 'Symbol')}: `{e(symbol_label)}`")
+            lines += [
+                f"{t('Window', 'ช่วงข้อมูล', 'Fenster')}: `{e(window.get('start_local','-'))}` -> `{e(window.get('end_local','-'))}`",
                 "",
                 e(msg),
                 "",
@@ -1341,59 +1571,58 @@ class TelegramNotifier:
         best = list(rpt.get("best_symbols") or [])
         worst = list(rpt.get("worst_symbols") or [])
         setup_rows = list(rpt.get("win_rate_by_setup") or [])
-
         conf_bands = dict(rpt.get("confidence_bands") or {})
         source_counts = dict(rpt.get("source_counts") or {})
-        window = dict(rpt.get("window") or {})
-        filter_label = str(rpt.get("market_filter_label") or "").strip()
+
         try:
             top_n = max(1, min(20, int(rpt.get("display_top_n", 5) or 5)))
         except Exception:
             top_n = 5
 
-        if int(rpt.get("days", 1) or 1) == 1:
-            subtitle = f"Today {rpt.get('local_date','-')} | {rpt.get('timezone','UTC')}"
-        else:
-            subtitle = f"Last {rpt.get('days',1)}d | {rpt.get('timezone','UTC')}"
-
         lines = [
             title_line,
-            "*ALL SIGNALS TRADER DASHBOARD*",
-            e(subtitle),
+            t("*SIGNAL DASHBOARD*", "*แดชบอร์ดสัญญาณ*", "*SIGNAL DASHBOARD*"),
             title_line,
+            f"{t('Period', 'ช่วงเวลา', 'Zeitraum')}: `{e(period_label)}` | `{e(str(rpt.get('timezone','UTC')) )}`",
         ]
         if filter_label:
-            lines += [f"Filter: `{e(filter_label)}`"]
+            lines.append(f"{t('Market', 'ตลาด', 'Markt')}: `{e(filter_label)}`")
+        if symbol_label:
+            lines.append(f"{t('Pair', 'คู่', 'Symbol')}: `{e(symbol_label)}`")
         lines += [
+            f"{t('Window', 'ช่วงข้อมูล', 'Fenster')}: `{e(window.get('start_local','-'))}` -> `{e(window.get('end_local','-'))}`",
             "",
-            f"Window: `{e(window.get('start_local','-'))}` -> `{e(window.get('end_local','-'))}`",
-            "",
-            "*Overall*",
-            f"sent `{e(summary.get('sent',0))}`  resolved `{e(summary.get('resolved',0))}`  pending `{e(summary.get('pending',0))}`",
+            t("*Overview*", "*ภาพรวม*", "*Überblick*"),
+            f"{t('sent', 'ส่ง', 'gesendet')} `{e(summary.get('sent',0))}`  "
+            f"{t('resolved', 'ปิดผลแล้ว', 'aufgelöst')} `{e(summary.get('resolved',0))}`  "
+            f"{t('pending', 'ค้างอยู่', 'offen')} `{e(summary.get('pending',0))}`",
             f"netR `{e(summary.get('net_r',0.0))}`  pendingMarkR `{e(summary.get('pending_mark_r',0.0))}`  WR `{e(summary.get('win_rate',0.0))}%`",
             "",
-            "*Simulation ($1000, fixed risk)*",
-            f"risk/trade `{e(sim.get('risk_pct',1.0))}%` (approx ${e(sim.get('risk_amount_per_trade',0.0))})",
-            f"realized `{e(sim.get('realized_balance',0.0))}`  marked `{e(sim.get('marked_balance',0.0))}`",
+            t("*Simulation ($1000, fixed risk)*", "*จำลองพอร์ต ($1000, ความเสี่ยงคงที่)*", "*Simulation ($1000, fixes Risiko)*"),
+            f"{t('risk/trade', 'ความเสี่ยง/ไม้', 'Risiko/Trade')} `{e(sim.get('risk_pct',1.0))}%` "
+            f"(~${e(sim.get('risk_amount_per_trade',0.0))})",
+            f"{t('realized', 'ยอดจริง', 'realisiert')} `{e(sim.get('realized_balance',0.0))}`  "
+            f"{t('marked', 'ยอดประเมิน', 'markiert')} `{e(sim.get('marked_balance',0.0))}`",
             "",
-            "*By Market Bucket*",
+            t("*By Market Bucket*", "*แยกตามตลาด*", "*Nach Markt-Bucket*"),
         ]
 
         header = f"{'Bucket':<14} {'S':>3} {'R':>3} {'P':>3} {'WR%':>5} {'netR':>8} {'markR':>8}"
-        table_lines = [header, '-' * len(header)]
+        table_lines = [header, "-" * len(header)]
         label_map = {
-            'Gold': 'Gold',
-            'Thailand Stocks': 'TH Stocks',
-            'US Stocks': 'US Stocks',
-            'Global Stocks': 'Global',
-            'Crypto': 'Crypto',
-            'Other': 'Other',
+            "Gold": "Gold",
+            "Thailand Stocks": "TH Stocks",
+            "US Stocks": "US Stocks",
+            "Global Stocks": "Global",
+            "Crypto": "Crypto",
+            "Other": "Other",
         }
         for key in bucket_order:
             b = dict(buckets.get(key) or {})
             if not b:
                 continue
-            short = label_map.get(str(b.get('label') or key), str(b.get('label') or key))
+            base_label = label_map.get(str(b.get("label") or key), str(b.get("label") or key))
+            short = _market_label_ui(base_label)
             table_lines.append(
                 f"{short:<14} {int(b.get('sent',0) or 0):>3} {int(b.get('resolved',0) or 0):>3} {int(b.get('pending',0) or 0):>3} "
                 f"{float(b.get('win_rate',0.0) or 0.0):>5.1f} {float(b.get('net_r',0.0) or 0.0):>8.3f} {float(b.get('pending_mark_r',0.0) or 0.0):>8.3f}"
@@ -1403,41 +1632,42 @@ class TelegramNotifier:
         lines.append("```")
 
         def _bucket_label_for(row: dict) -> str:
-            bkey = str(row.get('bucket') or '')
-            return str((dict(buckets.get(bkey) or {})).get('label') or bkey or '-')
+            bkey = str(row.get("bucket") or "")
+            return _market_label_ui(str((dict(buckets.get(bkey) or {})).get("label") or bkey or "-"))
 
         if best:
-            lines += ["", "*Best symbols (session R)*"]
+            lines += ["", t("*Best symbols (session R)*", "*สัญลักษณ์เด่น (session R)*", "*Beste Symbole (Session-R)*")]
             for i, row in enumerate(best[:top_n], 1):
                 blabel = _bucket_label_for(row)
                 lines.append(f"{e(i)}\\. `{e(row.get('symbol','-'))}` ({e(blabel)}) R `{e(row.get('session_r',0.0))}`")
 
         if worst:
-            lines += ["", "*Worst symbols (session R)*"]
+            lines += ["", t("*Worst symbols (session R)*", "*สัญลักษณ์อ่อน (session R)*", "*Schwächste Symbole (Session-R)*")]
             for i, row in enumerate(worst[:top_n], 1):
                 blabel = _bucket_label_for(row)
                 lines.append(f"{e(i)}\\. `{e(row.get('symbol','-'))}` ({e(blabel)}) R `{e(row.get('session_r',0.0))}`")
 
         if setup_rows:
-            lines += ["", "*Win rate by setup (resolved)*"]
+            lines += ["", t("*Win rate by setup (resolved)*", "*อัตราชนะตาม setup (ที่ปิดผลแล้ว)*", "*Trefferquote je Setup (aufgelöst)*")]
             for row in setup_rows[:top_n]:
                 lines.append(
-                    f"`{e(str(row.get('setup','-')) )}` sent `{e(row.get('sent',0))}` res `{e(row.get('resolved',0))}` "
-                    f"WR `{e(row.get('win_rate',0.0))}%` netR `{e(row.get('net_r',0.0))}`"
+                    f"`{e(str(row.get('setup','-')) )}` {t('sent', 'ส่ง', 'ges')} `{e(row.get('sent',0))}` "
+                    f"{t('res', 'ปิด', 'res')} `{e(row.get('resolved',0))}` WR `{e(row.get('win_rate',0.0))}%` netR `{e(row.get('net_r',0.0))}`"
                 )
 
         lines += [
             "",
-            "*Confidence bands*",
-            f"`<70/70-74/75-79/80+` = `{e(conf_bands.get('<70',0))}` / `{e(conf_bands.get('70-74',0))}` / `{e(conf_bands.get('75-79',0))}` / `{e(conf_bands.get('80+',0))}`",
+            t("*Confidence bands*", "*ช่วงความมั่นใจ*", "*Konfidenz-Bänder*"),
+            f"`<70/70-74/75-79/80+` = `{e(conf_bands.get('<70',0))}` / `{e(conf_bands.get('70-74',0))}` / "
+            f"`{e(conf_bands.get('75-79',0))}` / `{e(conf_bands.get('80+',0))}`",
         ]
         if source_counts:
             parts = [f"{k}:{v}" for k, v in list(source_counts.items())[:6]]
-            lines.append(f"Sources: `{e(' | '.join(parts))}`")
+            lines.append(f"{t('Sources', 'แหล่งสัญญาณ', 'Quellen')}: `{e(' | '.join(parts))}`")
 
         lines += [
             "",
-            e("Tip: /signal_dashboard daily all-markets | /us_open_dashboard US-open only"),
+            e(t("Tip: /signal_dashboard gold today | /signal_dashboard ETHUSD this week", "ตัวอย่าง: /signal_dashboard gold today | /signal_dashboard ETHUSD this week")),
             f"_UTC {e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'))}_",
             title_line,
         ]
@@ -1453,6 +1683,9 @@ class TelegramNotifier:
         direction = str(getattr(signal, "direction", "") or "").lower()
         dir_text = "🟢 LONG" if direction == "long" else ("🔴 SHORT" if direction == "short" else "⚪ N/A")
         title = "✅ *MT5 EXECUTED*" if ok else "⚠️ *MT5 EXECUTION UPDATE*"
+        trace = self._signal_trace(signal)
+        trace_tag = str(trace.get("tag", "") or "").strip()
+        trace_id = str(trace.get("run_id", "") or "").strip()
 
         lines = [
             f"{'═' * 35}",
@@ -1466,6 +1699,42 @@ class TelegramNotifier:
             f"*Entry:* `{e(self._fmt_price(getattr(signal, 'entry', 0)))}`",
             f"*SL/TP2:* `{e(self._fmt_price(getattr(signal, 'stop_loss', 0)))}` / `{e(self._fmt_price(getattr(signal, 'take_profit_2', 0)))}`",
         ]
+        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+        planned_entry = raw_scores.get("mt5_planned_entry_price")
+        req_entry = raw_scores.get("mt5_request_price", raw_scores.get("mt5_req_price"))
+        fill_entry = raw_scores.get("mt5_actual_fill_price")
+        try:
+            p = float(planned_entry) if planned_entry is not None else None
+        except Exception:
+            p = None
+        try:
+            r = float(req_entry) if req_entry is not None else None
+        except Exception:
+            r = None
+        try:
+            f = float(fill_entry) if fill_entry is not None else None
+        except Exception:
+            f = None
+        if (p is not None) and (f is not None) and (f > 0):
+            delta = f - p
+            lines.append(
+                f"*Planned/Fill:* `{e(self._fmt_price(p))} -> {e(self._fmt_price(f))} (Δ {e(f'{delta:+.4f}')})`"
+            )
+        elif (p is not None) and (r is not None) and (r > 0):
+            delta = r - p
+            lines.append(
+                f"*Planned/Order:* `{e(self._fmt_price(p))} -> {e(self._fmt_price(r))} (Δ {e(f'{delta:+.4f}')})`"
+            )
+        if bool(raw_scores.get("mt5_limit_fallback_market", False)):
+            fb_reason = str(raw_scores.get("mt5_limit_fallback_reason", "") or "").strip()
+            if fb_reason:
+                lines.append(f"*Limit Fallback:* `market ({e(fb_reason)})`")
+            else:
+                lines.append("*Limit Fallback:* `market`")
+        if trace_tag and trace_id:
+            lines.append(f"*Run:* `#{e(trace_tag)}` \\| *ID:* `{e(trace_id)}`")
+        elif trace_tag:
+            lines.append(f"*Run:* `#{e(trace_tag)}`")
         exec_meta = dict(getattr(result, "execution_meta", {}) or {})
         if exec_meta:
             rr_base = exec_meta.get("rr_base")
@@ -1503,6 +1772,35 @@ class TelegramNotifier:
             f"{'═' * 35}",
         ]
         return self._send("\n".join(lines), chat_id=chat_id, feature="mt5_status")
+
+    def send_mt5_bypass_quick_tp_update(
+        self,
+        *,
+        symbol: str,
+        ticket: int,
+        profit_usd: float,
+        target_usd: float,
+        balance_usd: float,
+        chat_id: Optional[int] = None,
+    ) -> bool:
+        """Short realtime alert when bypass quick-TP closes a position."""
+        sym = str(symbol or "-").strip().upper() or "-"
+        tkt = int(ticket or 0)
+        pnl = float(profit_usd or 0.0)
+        tgt = float(target_usd or 0.0)
+        bal = float(balance_usd or 0.0)
+        lines = [
+            "⚡ BYPASS QUICK-TP CLOSED",
+            f"{sym} | ticket #{tkt}",
+            f"PnL {pnl:+.2f}$ (target >= {tgt:.2f}$) | bal {bal:.2f}$",
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        ]
+        return self._send(
+            "\n".join(lines),
+            chat_id=chat_id,
+            feature="mt5_status",
+            parse_mode=None,
+        )
 
     def send_mt5_backtest_report(self, report: dict, chat_id: Optional[int] = None) -> bool:
         """Send compact MT5 backtest and neural-brain status report."""
@@ -1561,6 +1859,151 @@ class TelegramNotifier:
         ]
         return self._send("\n".join(lines), chat_id=chat_id, feature="mt5_backtest")
 
+    def _latest_mission_report(self) -> dict:
+        """Load the latest mission report from data/mission_reports if available."""
+        try:
+            base = Path(__file__).resolve().parent.parent / "data" / "mission_reports"
+            files = sorted(base.glob("mission_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not files:
+                return {}
+            return json.loads(files[0].read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def send_signal_outcome_update(
+        self,
+        signal_row: dict,
+        *,
+        initial_balance: float = 1000.0,
+        chat_id: Optional[int] = None,
+        feature: str = "signal_monitor",
+    ) -> bool:
+        """
+        Transparent TP/SL outcome notification in human language.
+        Also reports virtual equity progression from an initial balance.
+        """
+        row = dict(signal_row or {})
+        symbol = str(row.get("symbol", "-") or "-").upper()
+        direction = str(row.get("direction", "") or "").lower()
+        entry = float(row.get("entry", 0.0) or 0.0)
+        exit_price = float(row.get("exit_price", 0.0) or 0.0)
+        outcome = str(row.get("outcome", "unknown") or "unknown").lower()
+        pnl_pips = float(row.get("pnl_pips", 0.0) or 0.0)
+        pnl_usd = float(row.get("pnl_usd", 0.0) or 0.0)
+        hold_min = float(row.get("holding_time_minutes", 0.0) or 0.0)
+
+        if direction == "long":
+            dir_text = "🟢 LONG"
+        elif direction == "short":
+            dir_text = "🔴 SHORT"
+        else:
+            dir_text = "⚪ N/A"
+
+        outcome_map = {
+            "tp1_hit": ("✅", "TP1 HIT"),
+            "tp2_hit": ("✅", "TP2 HIT"),
+            "tp3_hit": ("✅", "TP3 HIT"),
+            "sl_hit": ("❌", "SL HIT"),
+            "expired": ("⏱️", "EXPIRED"),
+            "cancelled": ("🚫", "CANCELLED"),
+        }
+        emo, label = outcome_map.get(outcome, ("ℹ️", outcome.upper()))
+
+        # Aggregate performance snapshot for transparent equity progression.
+        total_stats = {}
+        sym_stats = {}
+        try:
+            from api.signal_store import signal_store as _store
+
+            total_stats = dict(_store.get_performance_stats() or {})
+            sym_stats = dict(_store.get_performance_stats_filtered(symbol=symbol) or {})
+        except Exception:
+            total_stats = {}
+            sym_stats = {}
+
+        init_bal = float(initial_balance or 1000.0)
+        net_total = float(total_stats.get("total_pnl_usd", 0.0) or 0.0)
+        eq = init_bal + net_total
+        roi = ((eq - init_bal) / max(init_bal, 1e-9)) * 100.0
+        total_trades = int(total_stats.get("completed_signals", 0) or 0)
+        total_wr = float(total_stats.get("win_rate", 0.0) or 0.0)
+        total_pf = float(total_stats.get("profit_factor", 0.0) or 0.0)
+        sym_trades = int(sym_stats.get("completed_signals", 0) or 0)
+        sym_wr = float(sym_stats.get("win_rate", 0.0) or 0.0)
+        sym_pf = float(sym_stats.get("profit_factor", 0.0) or 0.0)
+
+        mission = self._latest_mission_report()
+        mission_line = "ยังไม่มี mission report ล่าสุด"
+        try:
+            if mission:
+                goal_met = bool(mission.get("goal_met", False))
+                it_done = int(mission.get("iterations_done", 0) or 0)
+                recs = dict((mission.get("final", {}) or {}).get("recommendations", {}) or {})
+                rec = dict(recs.get(symbol, {}) or {})
+                if rec:
+                    mission_line = (
+                        f"{symbol}: {rec.get('status','-')} | minProb {rec.get('neural_min_prob','-')} | "
+                        f"risk {rec.get('risk_multiplier_min','-')}->{rec.get('risk_multiplier_max','-')}"
+                    )
+                else:
+                    mission_line = f"goal_met={goal_met} | iterations={it_done}"
+        except Exception:
+            pass
+
+        lines = [
+            f"{'=' * 40}",
+            f"{emo} SIGNAL OUTCOME UPDATE",
+            f"{'=' * 40}",
+            f"Signal: {symbol} {dir_text}",
+            f"Outcome: {label}",
+            f"Entry -> Exit: {self._fmt_price(entry)} -> {self._fmt_price(exit_price)}",
+            f"P/L: {pnl_pips:+.1f} pips | ${pnl_usd:+.2f}",
+            f"Holding: {hold_min:.1f} min",
+            "",
+            "Transparent virtual balance (start $1000):",
+            f"${init_bal:,.2f} -> ${eq:,.2f} (ROI {roi:+.2f}%)",
+            f"All symbols: trades {total_trades} | WR {total_wr:.1f}% | PF {total_pf:.2f}",
+            f"{symbol}: trades {sym_trades} | WR {sym_wr:.1f}% | PF {sym_pf:.2f}",
+            "",
+            "Neural Mission Loop (real-data):",
+            "ตรวจผลจริง -> เก็บ label -> train -> backtest -> tune threshold/risk",
+            f"ล่าสุด: {mission_line}",
+            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            f"{'=' * 40}",
+        ]
+        return self._send(
+            "\n".join(lines),
+            chat_id=chat_id,
+            feature=feature,
+            signal_symbol=symbol,
+            parse_mode=None,
+        )
+
+    def send_neural_mission_report(self, report: dict, chat_id: Optional[int] = None) -> bool:
+        """Send human-readable mission loop report from mt5_neural_mission.run()."""
+        rpt = dict(report or {})
+        if not rpt:
+            return self._send("Neural mission report unavailable.", chat_id=chat_id, feature="mt5_train", parse_mode=None)
+
+        goal_met = bool(rpt.get("goal_met", False))
+        done = int(rpt.get("iterations_done", 0) or 0)
+        symbols = list(rpt.get("symbols", []) or [])
+        target = dict(rpt.get("target", {}) or {})
+        lines = [
+            f"{'=' * 40}",
+            "NEURAL MISSION UPDATE",
+            f"{'=' * 40}",
+            f"Status: {'GOAL MET' if goal_met else 'IN PROGRESS'}",
+            f"Iterations: {done}",
+            f"Symbols: {', '.join(symbols)}",
+            (
+                f"Target: WR {target.get('win_rate_pct', '-')}% | "
+                f"PF {target.get('profit_factor', '-')} | "
+                f"min trades {target.get('min_trades', '-')}"
+            ),
+        ]
+        return self._send("\n".join(lines), chat_id=chat_id, feature="mt5_train", parse_mode=None)
+
     def send_mt5_position_manager_update(self, report: dict, source: str = "scheduler", chat_id: Optional[int] = None) -> bool:
         """Notify MT5 Position Manager actions (BE / partial / trail / time-stop)."""
         e = self._escape
@@ -1588,7 +2031,7 @@ class TelegramNotifier:
             spread_pct = a.get("spread_pct")
             lines += [
                 "",
-                f"{e(i)}\. `{e(a.get('symbol','-'))}` ticket `{e(a.get('ticket','-'))}`",
+                f"{e(i)}\\. `{e(a.get('symbol','-'))}` ticket `{e(a.get('ticket','-'))}`",
                 f"Action: `{e(a.get('action','-'))}`  Status: `{e(a.get('status','-'))}`",
                 f"Note: `{e(str(a.get('message','') or '')[:220])}`",
             ]
@@ -1775,6 +2218,83 @@ class TelegramNotifier:
             any_sent = self._send(_render_for_target(int(target)), chat_id=int(target), feature="calendar") or any_sent
         return any_sent
 
+    @staticmethod
+    def _xau_guard_reason_brief(title: str) -> str:
+        raw = str(title or "").strip()
+        low = raw.lower()
+        mapping = [
+            ("cpi", "CPI"),
+            ("nfp", "NFP"),
+            ("nonfarm", "NFP"),
+            ("fomc", "FOMC"),
+            ("powell", "Powell"),
+            ("pce", "PCE"),
+            ("jobless", "Jobless"),
+            ("claims", "Claims"),
+            ("fed", "Fed"),
+            ("rate-cut", "Fed"),
+            ("rate cut", "Fed"),
+            ("oil", "Oil"),
+            ("opec", "OPEC"),
+            ("tariff", "Tariff"),
+            ("trade", "Trade"),
+            ("war", "War"),
+            ("missile", "Missile"),
+            ("geopolitical", "Geopolitics"),
+        ]
+        labels: list[str] = []
+        for needle, label in mapping:
+            if needle in low and label not in labels:
+                labels.append(label)
+        if labels:
+            return "/".join(labels[:2])
+        trimmed = raw.split(" - ")[0].strip()
+        if len(trimmed) > 28:
+            trimmed = trimmed[:28].rstrip() + "..."
+        return trimmed or "news"
+
+    def format_xau_guard_transition_alert(self, payload: dict) -> str:
+        row = dict(payload or {})
+        kind = str(row.get("kind") or "").strip().lower()
+        action = str(row.get("action") or "").strip().lower()
+        title = str(row.get("title") or row.get("event_title") or "").strip()
+        brief = self._xau_guard_reason_brief(title)
+        normal_after_clear = bool(row.get("normal_after_clear", False))
+        if kind == "news_freeze":
+            nearest = int(row.get("nearest_min", -1) or -1)
+            if action == "activated":
+                suffix = f" | T-{nearest}m" if nearest >= 0 else ""
+                return f"XAU guard | NEWS FREEZE ACTIVE | blocked because {brief}{suffix}"
+            if normal_after_clear:
+                return f"XAU guard | UNFREEZE | {brief} cleared"
+            return f"XAU guard | NEWS FREEZE CLEARED | {brief} cleared"
+        if kind == "kill_switch":
+            shock_score = float(row.get("shock_score", 0.0) or 0.0)
+            if action == "activated":
+                suffix = f" | shock {shock_score:.2f}" if shock_score > 0 else ""
+                return f"XAU guard | KILL SWITCH ACTIVE | blocked because {brief}{suffix}"
+            if normal_after_clear:
+                return f"XAU guard | UNFREEZE | {brief} cleared"
+            return f"XAU guard | KILL SWITCH CLEARED | {brief} cleared"
+        return "XAU guard | state changed"
+
+    def send_xau_guard_transition_alert(self, payload: dict, chat_id: Optional[int] = None) -> bool:
+        """Send compact XAU guard state transitions for news freeze and event-shock kill switch."""
+        row = dict(payload or {})
+        kind = str(row.get("kind") or "").strip().lower()
+        action = str(row.get("action") or "").strip().lower()
+        if kind not in {"news_freeze", "kill_switch"} or action not in {"activated", "cleared"}:
+            return False
+        feature = "calendar" if kind == "news_freeze" else "macro"
+        text = self.format_xau_guard_transition_alert(row)
+        return self._send(
+            text,
+            parse_mode=None,
+            chat_id=chat_id,
+            feature=feature,
+            signal_symbol="XAUUSD",
+        )
+
     def send_macro_news_alert(self, headlines: list, chat_id: Optional[int] = None) -> bool:
         """Send high-impact macro/policy headline alerts."""
         e = self._escape
@@ -1798,11 +2318,15 @@ class TelegramNotifier:
                 risk_stars = macro_news.score_to_stars(getattr(h, "score", 0))
                 local_time = self._fmt_dt_for_chat(getattr(h, "published_utc"), target, with_date=False)
                 phase = self._macro_impact_phase(age_sec)
+                src = str(getattr(h, "source", "") or "news")
+                src_q = float(getattr(h, "source_quality", 0.5) or 0.5)
+                verification = str(getattr(h, "verification", "unverified") or "unverified")
                 lines += [
                     "",
                     f"*{e(i)}\\. Risk {e(risk_stars)}*  `{e(local_time)}` \\(Age {e(age_hms)}\\)",
                     f"{e(h.title)}",
                     f"Themes: `{e(themes)}`",
+                    f"Source: `{e(src)}`  Q: `{e(f'{src_q:.2f}')}`  Verify: `{e(verification)}`",
                     f"Phase: `{e(phase)}`",
                     f"Impact: {e(h.impact_hint)}",
                 ]
@@ -1884,11 +2408,15 @@ class TelegramNotifier:
                 age_sec = max(0, int((datetime.now(timezone.utc) - getattr(h, "published_utc")).total_seconds()))
                 age_hms = self._fmt_duration_hms(age_sec)
                 phase = self._macro_impact_phase(age_sec)
+                src = str(getattr(h, "source", "") or "news")
+                src_q = float(getattr(h, "source_quality", 0.5) or 0.5)
+                verification = str(getattr(h, "verification", "unverified") or "unverified")
                 lines += [
                     "",
                     f"*{e(i)}\\. Risk {e(risk_stars)}*  `{e(local_time)}`",
                     f"{e(h.title)}",
                     f"Age: `{e(age_hms)}`  Phase: `{e(phase)}`",
+                    f"Source: `{e(src)}`  Q: `{e(f'{src_q:.2f}')}`  Verify: `{e(verification)}`",
                     f"Impact: {e(h.impact_hint)}",
                 ]
             lines += [

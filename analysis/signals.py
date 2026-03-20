@@ -38,7 +38,7 @@ class TradeSignal:
     smc_context: Optional[SMCContext] = None
     raw_scores: dict = field(default_factory=dict)
     # ── Tiger Hunter fields ──
-    entry_type: str = "market"          # "market" | "limit" | "patience"
+    entry_type: str = "market"          # "market" | "limit" | "patience" | "buy_stop" | "sell_stop" | "stop"
     sl_type: str = "atr"                # "atr" | "anti_sweep" | "structure"
     sl_reason: str = ""                 # human-readable SL placement reason
     tp_type: str = "rr"                 # "rr" | "liquidity" | "structure"

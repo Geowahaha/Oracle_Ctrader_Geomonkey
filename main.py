@@ -13,6 +13,7 @@ import argparse
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Make console output resilient on Windows code pages (e.g., cp1252).
 for _stream in (sys.stdout, sys.stderr):
@@ -79,6 +80,88 @@ def _owner_chat_id() -> int | None:
     return None
 
 
+def _monitor_lock_path() -> Path:
+    return Path(__file__).resolve().parent / "data" / "runtime" / "monitor.lock"
+
+
+def _pid_running(pid: int) -> bool:
+    pid_i = int(pid or 0)
+    if pid_i <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid_i}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            out = str(proc.stdout or "").strip()
+            if (not out) or ("no tasks are running" in out.lower()):
+                return False
+            first = out.splitlines()[0].strip().strip('"')
+            if not first or first.lower().startswith("info:"):
+                return False
+            parts = [x.strip().strip('"') for x in out.splitlines()[0].split('","')]
+            if len(parts) < 2:
+                return False
+            try:
+                return int(parts[1]) == pid_i
+            except Exception:
+                return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid_i, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_monitor_lock() -> Path | None:
+    path = _monitor_lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    pid = int(os.getpid())
+    payload = f"{pid}\n{int(time.time())}\n"
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            return path
+        except FileExistsError:
+            existing_pid = None
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if lines:
+                    existing_pid = int((lines[0] or "").strip())
+            except Exception:
+                existing_pid = None
+            if existing_pid and existing_pid != pid and _pid_running(existing_pid):
+                return None
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                return None
+        except Exception:
+            return None
+    return None
+
+
+def _release_monitor_lock(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_monitor():
@@ -87,41 +170,88 @@ def cmd_monitor():
     from notifier.telegram_bot import notifier
     from notifier.admin_bot import admin_bot
     from notifier.billing_webhook import billing_webhook_server
+    from learning.signal_simulator import signal_simulator
+
+    lock_path = _acquire_monitor_lock()
+    if lock_path is None:
+        console.print("[yellow]⚠️ Monitor already running (lock active). Skip duplicate start.[/]")
+        return
 
     console.print(Panel(BANNER, border_style="cyan", title="[bold cyan]DEXTER PRO[/]"))
     console.print("\n[green]Starting 24/7 monitor mode...[/]\n")
 
     missing = check_config()
     if not config.has_any_ai_key():
-        console.print("[red]Cannot start without an AI key (GROQ_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY)[/]")
+        console.print(
+            "[red]Cannot start without an AI key "
+            "(GROQ_API_KEY / GEMINI_API_KEY / GEMINI_VERTEX_AI_API_KEY / ANTHROPIC_API_KEY)[/]"
+        )
         sys.exit(1)
 
-    notifier.send_startup_message()
-    scheduler.start()
-    admin_bot.start()
-    if config.BILLING_ENABLED and config.BILLING_AUTOSTART_IN_MONITOR:
-        started = billing_webhook_server.start()
-        if started:
-            console.print(
-                f"[green]✅ Billing webhook active[/] [dim]({config.BILLING_WEBHOOK_HOST}:{config.BILLING_WEBHOOK_PORT})[/]"
-            )
-        else:
-            console.print("[yellow]⚠️ Billing webhook failed to start (check logs/port).[/]")
-
-    console.print("[green]✅ Monitor mode active[/]")
-    console.print("[dim]Press Ctrl+C to stop[/]\n")
-
     try:
-        while True:
-            now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-            console.print(f"[dim]💓 {now} — Scanner heartbeat[/]", end="\r")
-            time.sleep(60)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Shutting down...[/]")
-        billing_webhook_server.stop()
-        admin_bot.stop()
-        scheduler.stop()
-        console.print("[green]Goodbye! 🦞[/]")
+        telegram_disabled = bool(getattr(config, "MONITOR_DISABLE_TELEGRAM", False))
+        if telegram_disabled:
+            notifier.enabled = False
+            admin_bot.enabled = False
+            console.print("[yellow]Telegram runtime disabled for this monitor session.[/]")
+        else:
+            notifier.send_startup_message()
+        if bool(getattr(config, "SIM_ENABLED", True)):
+            signal_simulator.start()
+        scheduler.start()
+        if not telegram_disabled:
+            admin_bot.start()
+        if config.BILLING_ENABLED and config.BILLING_AUTOSTART_IN_MONITOR:
+            started = billing_webhook_server.start()
+            if started:
+                console.print(
+                    f"[green]✅ Billing webhook active[/] [dim]({config.BILLING_WEBHOOK_HOST}:{config.BILLING_WEBHOOK_PORT})[/]"
+                )
+            else:
+                console.print("[yellow]⚠️ Billing webhook failed to start (check logs/port).[/]")
+
+        # Start the Tiger Bridge API server for Web3 Dashboard
+        try:
+            import asyncio
+            from api.bridge_server import bridge_server
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(bridge_server.start())
+            import threading
+            threading.Thread(target=loop.run_forever, daemon=True).start()
+            console.print(
+                f"[green]✅ Bridge API active[/] [dim](http://{bridge_server.host}:{bridge_server.port})[/]"
+            )
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Bridge API failed to start: {e}[/]")
+
+        try:
+            shock = scheduler._xau_event_shock_state()
+            console.print(
+                "[cyan]XAU shock guard:[/] "
+                f"active={bool(shock.get('active', False))} "
+                f"kill={bool(shock.get('kill_switch', False))} "
+                f"reason={str(shock.get('reason', '-'))}"
+            )
+        except Exception:
+            pass
+
+        console.print("[green]✅ Monitor mode active[/]")
+        console.print("[dim]Press Ctrl+C to stop[/]\n")
+
+        try:
+            while True:
+                now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                console.print(f"[dim]💓 {now} — Scanner heartbeat[/]", end="\r")
+                time.sleep(60)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Shutting down...[/]")
+            signal_simulator.stop()
+            billing_webhook_server.stop()
+            admin_bot.stop()
+            scheduler.stop()
+            console.print("[green]Goodbye! 🦞[/]")
+    finally:
+        _release_monitor_lock(lock_path)
 
 
 def cmd_scan(target: str = "all"):
@@ -559,6 +689,14 @@ def cmd_mt5(
     scope: str = "quick",
     days: int = 30,
     sync_days: int = 120,
+    symbols: str = "XAUUSD,ETHUSD,BTCUSD,GBPUSD",
+    iterations: int = 3,
+    target_win_rate: float = 58.0,
+    target_profit_factor: float = 1.2,
+    min_trades: int = 12,
+    continuous: bool = False,
+    interval_min: int = 30,
+    max_cycles: int = 0,
     key: str = "",
     value: str = "",
     symbol: str = "",
@@ -1172,6 +1310,54 @@ def cmd_mt5(
             console.print(sm)
         return
 
+    if action == "scalping_report":
+        from learning.scalping_forward import scalping_forward_analyzer
+
+        lookback_days = max(3, min(30, int(days or 7)))
+        rpt = scalping_forward_analyzer.build_report(days=lookback_days)
+        table = Table(title=f"Scalping Forward Report ({lookback_days}d)", box=box.ROUNDED, style="cyan")
+        table.add_column("Field", style="bold white")
+        table.add_column("Value", style="yellow")
+        table.add_row("ok", str(rpt.get("ok", False)))
+        table.add_row("db_path", str(rpt.get("db_path", "")))
+        table.add_row("since_utc", str(rpt.get("since_utc", "")))
+        table.add_row("rows", str(rpt.get("rows", 0)))
+        if rpt.get("error"):
+            table.add_row("error", str(rpt.get("error")))
+        best = dict(rpt.get("best_pair") or {})
+        if best:
+            table.add_row("best_pair.symbol", str(best.get("symbol", "-")))
+            table.add_row("best_pair.trades", str(best.get("trades", 0)))
+            table.add_row("best_pair.win_rate", f"{float(best.get('win_rate', 0.0) or 0.0) * 100:.1f}%")
+            table.add_row("best_pair.pnl_net_usd", str(best.get("pnl_net_usd", 0.0)))
+        console.print(table)
+
+        rows = list(rpt.get("pairs", []) or [])
+        if rows:
+            rt = Table(title="By Pair (Net After Real Costs)", box=box.ROUNDED, style="cyan")
+            rt.add_column("Pair", style="yellow")
+            rt.add_column("Trades", style="white")
+            rt.add_column("WinRate", style="green")
+            rt.add_column("NetUSD", style="magenta")
+            rt.add_column("AvgUSD", style="white")
+            rt.add_column("MDD", style="red")
+            rt.add_column("AvgDur(min)", style="white")
+            rt.add_column("PF", style="white")
+            for row in rows[:10]:
+                pf = row.get("profit_factor")
+                rt.add_row(
+                    str(row.get("symbol", "-")),
+                    str(row.get("trades", 0)),
+                    f"{float(row.get('win_rate', 0.0) or 0.0) * 100:.1f}%",
+                    str(row.get("pnl_net_usd", 0.0)),
+                    str(row.get("avg_net_usd", 0.0)),
+                    str(row.get("max_drawdown_usd", 0.0)),
+                    str(row.get("avg_duration_min", 0.0)),
+                    ("-" if pf is None else str(pf)),
+                )
+            console.print(rt)
+        return
+
     if action == "policy":
         from learning.mt5_orchestrator import mt5_orchestrator
 
@@ -1269,6 +1455,13 @@ def cmd_mt5(
             days=max(1, int(days)),
             min_samples=train_min_samples,
         )
+        # ── Per-symbol training ───────────────────────────────────────────────
+        try:
+            from learning.symbol_neural_brain import symbol_neural_brain
+            sym_results = symbol_neural_brain.train_all(days=max(1, int(days)))
+        except Exception as _e_sym:
+            sym_results = {}
+            logger.debug("[SymbolBrain] train_all error: %s", _e_sym)
         table = Table(title="Neural Brain Train", box=box.ROUNDED, style="cyan")
         table.add_column("Field", style="bold white")
         table.add_column("Value", style="yellow")
@@ -1288,10 +1481,122 @@ def cmd_mt5(
             table.add_row("train_accuracy", f"{train.train_accuracy * 100:.1f}%")
             table.add_row("val_accuracy", f"{train.val_accuracy * 100:.1f}%")
             table.add_row("win_rate", f"{train.win_rate * 100:.1f}%")
+        # Per-symbol summary
+        sym_ok = [k for k, r in sym_results.items() if r.ok]
+        sym_skip = [k for k, r in sym_results.items() if not r.ok]
+        table.add_row("symbol_models.trained", str(len(sym_ok)))
+        table.add_row("symbol_models.skipped", str(len(sym_skip)))
+        if sym_ok:
+            table.add_row("symbol_models.keys", ", ".join(sorted(sym_ok)[:8]))
         console.print(table)
         return
 
-    console.print("[yellow]Unknown mt5 action. Use: status | symbols | bootstrap | backtest | brain | train | autopilot | orchestrator | walkforward | manage | policy[/]")
+    if action == "mission":
+        from learning.mt5_neural_mission import mt5_neural_mission
+
+        cycle = 0
+        while True:
+            cycle += 1
+            rpt = mt5_neural_mission.run(
+                symbols=str(symbols or "XAUUSD,ETHUSD,BTCUSD,GBPUSD"),
+                iterations=max(1, int(iterations)),
+                train_days=max(1, int(days)),
+                backtest_days=max(1, int(days)),
+                sync_days=max(1, int(sync_days)),
+                target_win_rate=float(target_win_rate),
+                target_profit_factor=float(target_profit_factor),
+                min_trades=max(3, int(min_trades)),
+                apply_policy_draft=bool(draft),
+            )
+
+            summary = Table(title="MT5 Neural Mission", box=box.ROUNDED, style="cyan")
+            summary.add_column("Field", style="bold white")
+            summary.add_column("Value", style="yellow")
+            summary.add_row("cycle", str(cycle))
+            summary.add_row("ok", str(rpt.get("ok", False)))
+            summary.add_row("goal_met", str(rpt.get("goal_met", False)))
+            summary.add_row("iterations_done", str(rpt.get("iterations_done", 0)))
+            summary.add_row("symbols", ", ".join(list(rpt.get("symbols", []) or [])))
+            target = dict(rpt.get("target", {}) or {})
+            summary.add_row("target.win_rate_pct", str(target.get("win_rate_pct", "")))
+            summary.add_row("target.profit_factor", str(target.get("profit_factor", "")))
+            summary.add_row("target.min_trades", str(target.get("min_trades", "")))
+            summary.add_row("report_path", str(rpt.get("report_path", "")))
+            dr = dict(rpt.get("policy_draft_result", {}) or {})
+            if dr:
+                summary.add_row("draft.saved", str(dr.get("ok", False)))
+                summary.add_row("draft.account_key", str(dr.get("account_key", "")))
+            console.print(summary)
+
+            final = dict(rpt.get("final", {}) or {})
+            recs = dict(final.get("recommendations", {}) or {})
+            if recs:
+                rt = Table(title="Per-Symbol Recommendations", box=box.ROUNDED, style="cyan")
+                for c in ("Symbol", "Status", "Pass", "MinProb", "RiskMin", "RiskMax", "Canary", "TP/SL Profile"):
+                    rt.add_column(c, style="yellow" if c == "Symbol" else "white")
+                for sym in sorted(recs.keys()):
+                    rec = dict(recs.get(sym, {}) or {})
+                    tp = dict(rec.get("tp_sl_profile", {}) or {})
+                    rt.add_row(
+                        str(sym),
+                        str(rec.get("status", "")),
+                        str(rec.get("target_pass", False)),
+                        str(rec.get("neural_min_prob", "")),
+                        str(rec.get("risk_multiplier_min", "")),
+                        str(rec.get("risk_multiplier_max", "")),
+                        str(rec.get("canary_force", "")),
+                        str(tp.get("profile", "balanced")),
+                    )
+                console.print(rt)
+
+            auto_allow = dict(final.get("auto_allowlist", {}) or {})
+            if auto_allow:
+                at = Table(title="Auto-Allowlist From Backtest", box=box.ROUNDED, style="cyan")
+                at.add_column("Field", style="bold white")
+                at.add_column("Value", style="yellow")
+                at.add_row("enabled", str(auto_allow.get("enabled", False)))
+                at.add_row("status", str(auto_allow.get("status", "")))
+                cr = dict(auto_allow.get("criteria", {}) or {})
+                if cr:
+                    at.add_row(
+                        "criteria",
+                        (
+                            f"trades>={cr.get('min_trades','-')}, "
+                            f"wr>={cr.get('min_win_rate','-')}%, "
+                            f"pf>={cr.get('min_profit_factor','-')}, "
+                            f"net>={cr.get('min_net_pnl','-')}, "
+                            f"max_add={cr.get('max_add_per_cycle','-')}"
+                        ),
+                    )
+                added = list(auto_allow.get("added_symbols", []) or [])
+                at.add_row("added_symbols", ", ".join([str(x) for x in added]) if added else "-")
+                console.print(at)
+
+            ob = dict(final.get("override_bundle", {}) or {})
+            env_lines = dict(ob.get("env_lines", {}) or {})
+            if env_lines:
+                et = Table(title="Suggested ENV Overrides", box=box.ROUNDED, style="cyan")
+                et.add_column("Key", style="bold white")
+                et.add_column("Value", style="yellow")
+                for k in sorted(env_lines.keys()):
+                    et.add_row(str(k), str(env_lines.get(k, "")))
+                console.print(et)
+
+            if not bool(continuous):
+                break
+            if bool(rpt.get("goal_met", False)):
+                console.print("[green]Neural mission goal reached. Continuous loop stopped.[/]")
+                break
+            if int(max_cycles or 0) > 0 and cycle >= int(max_cycles):
+                console.print("[yellow]Reached --max-cycles limit. Continuous loop stopped.[/]")
+                break
+            wait_min = max(1, int(interval_min or 30))
+            console.print(f"[dim]Waiting {wait_min} minute(s) before next mission cycle...[/]")
+            time.sleep(wait_min * 60)
+        return
+
+
+    console.print("[yellow]Unknown mt5 action. Use: status | symbols | bootstrap | backtest | brain | train | mission | autopilot | orchestrator | walkforward | manage | exec_reasons | scalping_report | policy[/]")
 
 
 def cmd_billing(action: str = "status"):
@@ -1367,14 +1672,20 @@ def cmd_setup():
     checks = [
         ("GROQ_API_KEY",       config.GROQ_API_KEY,       "gsk_..."),
         ("GEMINI_API_KEY",     config.GEMINI_API_KEY,     "AIza..."),
+        ("GEMINI_VERTEX_AI_API_KEY", config.GEMINI_VERTEX_AI_API_KEY, "AQ...."),
         ("ANTHROPIC_API_KEY",  config.ANTHROPIC_API_KEY,  "sk-ant-..."),
         ("TELEGRAM_BOT_TOKEN", config.TELEGRAM_BOT_TOKEN, "token"),
         ("TELEGRAM_CHAT_ID",   config.TELEGRAM_CHAT_ID,   "numeric ID"),
         ("CRYPTO_EXCHANGE",    config.CRYPTO_EXCHANGE,     ""),
         ("MIN_SIGNAL_CONFIDENCE", str(config.MIN_SIGNAL_CONFIDENCE), ""),
     ]
-    ai_keys = {"GROQ_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"}
-    ai_any = bool(config.GROQ_API_KEY or config.GEMINI_API_KEY or config.ANTHROPIC_API_KEY)
+    ai_keys = {"GROQ_API_KEY", "GEMINI_API_KEY", "GEMINI_VERTEX_AI_API_KEY", "ANTHROPIC_API_KEY"}
+    ai_any = bool(
+        config.GROQ_API_KEY
+        or config.GEMINI_API_KEY
+        or config.GEMINI_VERTEX_AI_API_KEY
+        or config.ANTHROPIC_API_KEY
+    )
     for key, val, hint in checks:
         is_placeholder = (not val
                           or "your_" in val.lower()
@@ -1475,7 +1786,7 @@ def cmd_setup():
     console.print(Panel(
         "[bold green]Setup complete![/]\n\n"
         "Next steps:\n"
-        "  1. Set at least one AI key: [bold]GROQ_API_KEY[/] or [bold]GEMINI_API_KEY[/] or [bold]ANTHROPIC_API_KEY[/]\n"
+        "  1. Set at least one AI key: [bold]GROQ_API_KEY[/] or [bold]GEMINI_API_KEY[/] or [bold]GEMINI_VERTEX_AI_API_KEY[/] or [bold]ANTHROPIC_API_KEY[/]\n"
         "  2. Make sure [bold]TELEGRAM_CHAT_ID[/] is set in .env.local\n"
         "  3. Run: [bold cyan]python main.py monitor[/]",
         title="✅ Done",
@@ -1502,6 +1813,7 @@ Examples:
   python main.py scan vi                        # US value + trend candidates
   python main.py scan us_open                   # US open top-10 daytrade plan
   python main.py scan us_open_monitor           # US open smart monitor snapshot
+  python main.py scan scalping                  # Dedicated scalping (M5+M1) XAUUSD/ETH
   python main.py research "Is gold bullish?"    # AI research
   python main.py overview                       # Gold market overview
   python main.py status                         # System status
@@ -1519,6 +1831,9 @@ Examples:
   python main.py mt5 affordable fx --top 10     # live affordable symbols for this account
   python main.py mt5 affordable ok --top 10     # only symbols passing margin+spread+policy
   python main.py mt5 exec_reasons --symbol ETHUSD --days 1   # why orders were skipped/filled
+  python main.py mt5 scalping_report --days 7   # net-after-cost forward summary (scalping only)
+  python main.py mt5 mission --symbols XAUUSD,ETHUSD,BTCUSD,GBPUSD --iterations 3 --days 120
+  python main.py mt5 mission --continuous --interval-min 30 --max-cycles 0
   python main.py mt5 policy show                # Show per-account canary/risk policy
   python main.py mt5 policy set --key canary_force --value false
   python main.py mt5 policy reset               # Reset per-account policy to defaults
@@ -1538,7 +1853,7 @@ Examples:
         "target",
         nargs="?",
         default="all",
-        choices=["all", "gold", "xauusd", "crypto", "fx", "stocks", "thai", "thai_vi", "us", "us_open", "us_open_monitor", "calendar", "macro", "macro_report", "macro_weights", "vi", "vi_buffett", "vi_turnaround"],
+        choices=["all", "gold", "xauusd", "crypto", "fx", "stocks", "thai", "thai_vi", "us", "us_open", "us_open_monitor", "calendar", "macro", "macro_report", "macro_weights", "vi", "vi_buffett", "vi_turnaround", "scalp", "scalping"],
         help="What to scan",
     )
 
@@ -1574,7 +1889,7 @@ Examples:
         "action",
         nargs="?",
         default="status",
-        choices=["status", "symbols", "bootstrap", "backtest", "brain", "train", "autopilot", "orchestrator", "walkforward", "manage", "affordable", "exec_reasons", "pm_learning", "policy"],
+        choices=["status", "symbols", "bootstrap", "backtest", "brain", "train", "mission", "autopilot", "orchestrator", "walkforward", "manage", "affordable", "exec_reasons", "scalping_report", "pm_learning", "policy"],
         help="MT5 diagnostic action",
     )
     mt5_parser.add_argument(
@@ -1595,6 +1910,52 @@ Examples:
         type=int,
         default=120,
         help="History window days for MT5 outcome sync",
+    )
+    mt5_parser.add_argument(
+        "--symbols",
+        default="XAUUSD,ETHUSD,BTCUSD,GBPUSD",
+        help="Comma-separated symbols for 'mt5 mission'",
+    )
+    mt5_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=3,
+        help="Max optimization iterations for 'mt5 mission'",
+    )
+    mt5_parser.add_argument(
+        "--target-win-rate",
+        type=float,
+        default=58.0,
+        help="Target win rate percent for 'mt5 mission'",
+    )
+    mt5_parser.add_argument(
+        "--target-profit-factor",
+        type=float,
+        default=1.2,
+        help="Target profit factor for 'mt5 mission'",
+    )
+    mt5_parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=12,
+        help="Minimum completed trades per symbol for mission pass criteria",
+    )
+    mt5_parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="For 'mt5 mission': keep running cycles until goal is met (or max-cycles reached)",
+    )
+    mt5_parser.add_argument(
+        "--interval-min",
+        type=int,
+        default=30,
+        help="Minutes between continuous mission cycles",
+    )
+    mt5_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=0,
+        help="Optional safety cap for continuous mission cycles (0 = unlimited)",
     )
     mt5_parser.add_argument(
         "--key",
@@ -1675,6 +2036,14 @@ Examples:
             getattr(args, "scope", "quick"),
             getattr(args, "days", 30),
             getattr(args, "sync_days", 120),
+            getattr(args, "symbols", "XAUUSD,ETHUSD,BTCUSD,GBPUSD"),
+            getattr(args, "iterations", 3),
+            getattr(args, "target_win_rate", 58.0),
+            getattr(args, "target_profit_factor", 1.2),
+            getattr(args, "min_trades", 12),
+            bool(getattr(args, "continuous", False)),
+            getattr(args, "interval_min", 30),
+            getattr(args, "max_cycles", 0),
             getattr(args, "key", ""),
             getattr(args, "value", ""),
             getattr(args, "symbol", ""),

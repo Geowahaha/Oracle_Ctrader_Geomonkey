@@ -811,6 +811,12 @@ class MT5PositionManager:
     def _eligible_position(self, pos: dict, rules: Optional[dict] = None) -> bool:
         if not bool((rules or {}).get("manage_enabled", getattr(config, "MT5_PM_MANAGE_ENABLED", True))):
             return False
+        if bool(getattr(config, "PERSISTENT_CANARY_MT5_SKIP_POSITION_MANAGER", True)):
+            base_magic = _safe_int(getattr(config, "MT5_MAGIC", 0), 0)
+            canary_magic = base_magic + _safe_int(getattr(config, "PERSISTENT_CANARY_MT5_MAGIC_OFFSET", 700), 700)
+            magic = _safe_int(pos.get("magic", 0), 0)
+            if canary_magic > 0 and magic == canary_magic:
+                return False
         manage_manual = bool((rules or {}).get("manage_manual_positions", getattr(config, "MT5_PM_MANAGE_MANUAL_POSITIONS", True)))
         magic = _safe_int(pos.get("magic", 0), 0)
         if manage_manual:
@@ -826,6 +832,92 @@ class MT5PositionManager:
         if ts <= 0:
             return 0.0
         return max(0.0, (_utc_now().timestamp() - float(ts)) / 60.0)
+
+    def _dynamic_trail_gap_r(
+        self,
+        *,
+        base_gap_r: float,
+        trail_start_r: float,
+        r_now: float,
+        spread_pct: float,
+        spread_spike_pct: float,
+        age_min: float,
+    ) -> tuple[float, dict]:
+        info = {
+            "enabled": bool(getattr(config, "MT5_PM_TRAIL_DYNAMIC_ENABLED", True)),
+            "applied": False,
+            "base_gap_r": round(float(base_gap_r), 6),
+            "effective_gap_r": round(float(base_gap_r), 6),
+            "tighten_pct": 0.0,
+            "widen_pct": 0.0,
+            "young_widen_pct": 0.0,
+            "reason": "disabled",
+        }
+        gap = max(0.01, float(base_gap_r))
+        if not bool(info["enabled"]):
+            return gap, info
+
+        step_r = max(0.2, _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_STEP_R", 0.8), 0.8))
+        tighten_per_step = _clamp(
+            _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_TIGHTEN_PCT_PER_STEP", 0.12), 0.12),
+            0.0,
+            0.60,
+        )
+        max_tighten = _clamp(
+            _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_MAX_TIGHTEN_PCT", 0.35), 0.35),
+            0.0,
+            0.80,
+        )
+        spread_widen_pct = _clamp(
+            _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_SPREAD_WIDEN_PCT", 0.18), 0.18),
+            0.0,
+            0.80,
+        )
+        max_widen = _clamp(
+            _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_MAX_WIDEN_PCT", 0.24), 0.24),
+            0.0,
+            0.80,
+        )
+        young_age_min = max(0.0, _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_YOUNG_AGE_MIN", 6.0), 6.0))
+        young_widen = _clamp(
+            _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_YOUNG_WIDEN_PCT", 0.10), 0.10),
+            0.0,
+            0.50,
+        )
+        min_gap = max(0.05, _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_MIN_GAP_R", 0.28), 0.28))
+        max_gap = max(min_gap + 0.01, _safe_float(getattr(config, "MT5_PM_TRAIL_DYNAMIC_MAX_GAP_R", 1.10), 1.10))
+
+        progressed_r = max(0.0, float(r_now) - float(trail_start_r))
+        steps = int(progressed_r / step_r) if step_r > 1e-9 else 0
+        tighten_pct = min(max_tighten, max(0.0, float(steps) * float(tighten_per_step)))
+        if tighten_pct > 0:
+            gap *= (1.0 - tighten_pct)
+
+        widen_pct = 0.0
+        if spread_pct > 0 and spread_spike_pct > 1e-9:
+            ratio = max(0.0, (float(spread_pct) / float(spread_spike_pct)) - 1.0)
+            widen_pct = min(max_widen, ratio * spread_widen_pct)
+            if widen_pct > 0:
+                gap *= (1.0 + widen_pct)
+
+        young_widen_pct = 0.0
+        if float(age_min) <= young_age_min and young_widen > 0:
+            young_widen_pct = young_widen
+            gap *= (1.0 + young_widen)
+
+        gap = _clamp(gap, min_gap, max_gap)
+        info.update(
+            {
+                "applied": True,
+                "effective_gap_r": round(float(gap), 6),
+                "tighten_pct": round(float(tighten_pct), 6),
+                "widen_pct": round(float(widen_pct), 6),
+                "young_widen_pct": round(float(young_widen_pct), 6),
+                "steps": int(steps),
+                "reason": "dynamic_gap_applied",
+            }
+        )
+        return float(gap), info
 
     def _rule_params(self, account_key: str = "") -> dict:
         rules = {
@@ -1376,6 +1468,9 @@ class MT5PositionManager:
                         close_volume=_safe_float(pos.get("volume", 0.0), 0.0),
                         source=f"{source}:time_stop",
                     )
+                    # Suppress market_closed from actions to avoid Telegram spam
+                    if getattr(res, "status", "") == "market_closed":
+                        continue
                     out["actions"].append({
                         "ticket": ticket, "symbol": symbol, "action": "time_stop_close", "ok": res.ok, "status": res.status, "message": res.message, "retcode": (None if getattr(res, "retcode", None) is None else int(res.retcode)),
                         "position_type": str(pos.get("type", "")),
@@ -1393,7 +1488,20 @@ class MT5PositionManager:
                         self._record_action_learning(account_key, out["actions"][-1], pos_rules=pos_rules)
                         action_count += 1
                         out["managed"] += 1
+                        # Instantly label neural brain with the real close outcome
+                        try:
+                            from learning.neural_brain import neural_brain
+                            neural_brain.label_from_mt5_close(
+                                ticket=int(ticket or 0),
+                                close_reason="time_stop",
+                                pnl_r=float(r_now),
+                                symbol=str(symbol or ""),
+                                direction="long" if bool(pos.get("is_buy", True)) else "short",
+                            )
+                        except Exception:
+                            pass
                         continue
+
 
             if not metrics.get("valid"):
                 continue
@@ -1512,6 +1620,9 @@ class MT5PositionManager:
                         close_volume=close_vol,
                         source=f"{source}:partial",
                     )
+                    # Suppress market_closed from actions to avoid Telegram spam
+                    if getattr(res, "status", "") == "market_closed":
+                        continue
                     out["actions"].append({
                         "ticket": ticket, "symbol": symbol, "action": "partial_close", "ok": res.ok, "status": res.status, "message": res.message, "retcode": (None if getattr(res, "retcode", None) is None else int(res.retcode)),
                         "position_type": str(pos.get("type", "")),
@@ -1528,13 +1639,64 @@ class MT5PositionManager:
                     if res.ok:
                         self._set_state(account_key, ticket, symbol, {"partial_done": True, "last_action": "partial_close", "last_action_at": _iso(_utc_now()), "partial_volume": float(close_vol)})
                         self._record_action_learning(account_key, out["actions"][-1], pos_rules=pos_rules)
+                        if bool(getattr(config, "MT5_PM_FORCE_BE_AFTER_PARTIAL", True)):
+                            buffer_r = max(
+                                0.0,
+                                _safe_float(getattr(config, "MT5_PM_FORCE_BE_AFTER_PARTIAL_BUFFER_R", 0.05), 0.05),
+                            )
+                            be_after_partial = open_px + (buffer_r * r_dist if is_buy else -buffer_r * r_dist)
+                            should_lock = (be_after_partial > sl_px) if is_buy else (be_after_partial < sl_px)
+                            if should_lock:
+                                be_res = mt5_executor.modify_position_sltp(
+                                    broker_symbol=symbol,
+                                    position_ticket=ticket,
+                                    sl=be_after_partial,
+                                    tp=_safe_float(current_tp, 0.0) or None,
+                                    source=f"{source}:partial_be",
+                                )
+                                out["actions"].append({
+                                    "ticket": ticket, "symbol": symbol, "action": "breakeven_after_partial", "ok": be_res.ok, "status": be_res.status, "message": be_res.message, "retcode": (None if getattr(be_res, "retcode", None) is None else int(be_res.retcode)),
+                                    "position_type": str(pos.get("type", "")),
+                                    "old_sl": float(sl_px),
+                                    "new_sl": float(be_after_partial),
+                                    "tp": (_safe_float(current_tp, 0.0) or None),
+                                    "r_now": float(r_now),
+                                    "age_min": float(age_min),
+                                    "trigger": f"force_be_after_partial buffer_r={buffer_r:.3f}",
+                                    "price_open": float(open_px),
+                                    "price_current": float(now_px),
+                                    "adaptive_pm": adaptive_pm,
+                                })
+                                if be_res.ok:
+                                    self._set_state(
+                                        account_key,
+                                        ticket,
+                                        symbol,
+                                        {
+                                            "breakeven_done": True,
+                                            "partial_done": True,
+                                            "last_action": "breakeven_after_partial",
+                                            "last_action_at": _iso(_utc_now()),
+                                            "last_sl": float(be_after_partial),
+                                            "partial_volume": float(close_vol),
+                                        },
+                                    )
+                                    self._record_action_learning(account_key, out["actions"][-1], pos_rules=pos_rules)
                         action_count += 1
                         out["managed"] += 1
                         continue
 
             # R-based trailing stop.
             if action_count < max_actions and r_now >= trail_start_r_pos:
-                trail_sl = now_px - (trail_gap_r_pos * r_dist) if is_buy else now_px + (trail_gap_r_pos * r_dist)
+                trail_gap_eff, trail_dyn = self._dynamic_trail_gap_r(
+                    base_gap_r=trail_gap_r_pos,
+                    trail_start_r=trail_start_r_pos,
+                    r_now=r_now,
+                    spread_pct=spread_pct,
+                    spread_spike_pct=spread_spike_pct,
+                    age_min=age_min,
+                )
+                trail_sl = now_px - (trail_gap_eff * r_dist) if is_buy else now_px + (trail_gap_eff * r_dist)
                 should_move = (trail_sl > sl_px) if is_buy else (trail_sl < sl_px)
                 last_sl = _safe_float(pstate.get("last_sl", sl_px), sl_px)
                 if should_move:
@@ -1554,9 +1716,13 @@ class MT5PositionManager:
                             "old_sl": float(sl_px),
                             "prev_tracked_sl": float(last_sl),
                             "new_sl": float(trail_sl),
+                            "trail_gap_r_base": float(trail_gap_r_pos),
+                            "trail_gap_r_eff": float(trail_gap_eff),
+                            "trail_dynamic": trail_dyn,
                             "tp": (_safe_float(current_tp, 0.0) or None),
                             "r_now": float(r_now),
                             "age_min": float(age_min),
+                            "spread_pct": float(spread_pct),
                             "price_open": float(open_px),
                             "price_current": float(now_px),
                             "adaptive_pm": adaptive_pm,

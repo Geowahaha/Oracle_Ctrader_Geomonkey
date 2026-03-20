@@ -10,6 +10,34 @@ import notifier.admin_bot as admin_bot_module
 class AdminBotLanguageMt5Tests(unittest.TestCase):
     def setUp(self):
         self.bot = admin_bot_module.TelegramAdminBot()
+        self.bot._intent_phrase_memory = {}
+
+    def test_parse_run_trace_args_accepts_short_tag(self):
+        parsed = self.bot._parse_run_trace_args("R123")
+        self.assertTrue(parsed.get("valid"))
+        self.assertEqual(parsed.get("run_no"), 123)
+        self.assertEqual(parsed.get("run_tag"), "R000123")
+
+    def test_run_command_uses_trace_lookup_and_formatter(self):
+        decision = SimpleNamespace(allowed=True, reason="ok")
+        fake_report = {"ok": True, "query": {"run_tag": "R000123", "valid": True}, "signal_rows": [], "journal_rows": []}
+        with patch.object(admin_bot_module.access_manager, "check_and_consume", return_value=decision), \
+             patch.object(self.bot, "_lookup_run_trace", return_value=fake_report) as lookup, \
+             patch.object(self.bot, "_format_run_trace_report", return_value="Run Trace\nquery=R000123") as fmt, \
+             patch.object(self.bot, "_send_text") as send_text:
+            self.bot._handle_admin_command(
+                chat_id=1001,
+                user_id=2002,
+                command="run",
+                args="R000123",
+                is_admin=True,
+                lang="en",
+            )
+
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(fmt.call_count, 1)
+        self.assertEqual(send_text.call_count, 2)  # progress + final
+        self.assertIn("R000123", send_text.call_args.args[1])
 
     def test_detect_language_thai_and_german(self):
         self.assertEqual(self.bot._detect_language("ช่วยเช็คสถานะ mt5 ให้หน่อย"), "th")
@@ -53,6 +81,78 @@ class AdminBotLanguageMt5Tests(unittest.TestCase):
         self.assertEqual(handle_cmd.call_count, 1)
         pos_args = handle_cmd.call_args.args
         self.assertEqual(pos_args[2], "mt5_status")
+
+    def test_natural_language_maps_thai_stock_scan_phrase_to_scan_thai(self):
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_record_intent_event"), \
+             patch.object(self.bot, "_remember_intent_phrase"):
+            self.bot._handle_natural_language(
+                chat_id=1201,
+                user_id=2202,
+                text="หาหุ้นไทย อันดับแรก scan th stock",
+                is_admin=True,
+                lang="th",
+            )
+        self.assertEqual(handle_cmd.call_count, 1)
+        self.assertEqual(handle_cmd.call_args.args[2], "scan_thai")
+
+    def test_natural_language_maps_show_only_gold_to_signal_filter(self):
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_record_intent_event"), \
+             patch.object(self.bot, "_remember_intent_phrase"):
+            self.bot._handle_natural_language(
+                chat_id=1202,
+                user_id=2203,
+                text="แสดงแค่ทองคำ",
+                is_admin=True,
+                lang="th",
+            )
+        self.assertEqual(handle_cmd.call_count, 1)
+        pos = handle_cmd.call_args.args
+        self.assertEqual(pos[2], "show_only")
+        self.assertEqual(pos[3], "XAUUSD")
+
+    def test_natural_language_ambiguous_stock_scan_requests_confirmation(self):
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_send_text") as send_text, \
+             patch.object(self.bot, "_record_intent_event"):
+            self.bot._handle_natural_language(
+                chat_id=1203,
+                user_id=2204,
+                text="scan stock now",
+                is_admin=True,
+                lang="en",
+            )
+        self.assertEqual(handle_cmd.call_count, 0)
+        rec = self.bot._pending_intent_confirm(1203)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.get("command"), "scan_stocks")
+        self.assertEqual(send_text.call_count, 1)
+        self.assertIn("confirmation", send_text.call_args.args[1].lower())
+
+    def test_pending_intent_confirmation_yes_executes_and_learns_phrase(self):
+        self.bot._set_pending_intent_confirm(
+            chat_id=1204,
+            command="scan_stocks",
+            args="",
+            source_text="scan stock now",
+        )
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_record_intent_event"), \
+             patch.object(self.bot, "_save_intent_phrase_memory"):
+            ok = self.bot._try_handle_pending_intent_confirm(
+                chat_id=1204,
+                user_id=2205,
+                text="yes",
+                is_admin=True,
+                lang="en",
+            )
+        self.assertTrue(ok)
+        self.assertEqual(handle_cmd.call_count, 1)
+        self.assertEqual(handle_cmd.call_args.args[2], "scan_stocks")
+        learned = self.bot._lookup_learned_intent("scan stock now")
+        self.assertIsNotNone(learned)
+        self.assertEqual(learned[0], "scan_stocks")
 
     def test_mt5_status_includes_open_positions_snapshot(self):
         decision = SimpleNamespace(allowed=True, reason="ok")
@@ -226,6 +326,24 @@ class AdminBotLanguageMt5Tests(unittest.TestCase):
         self.assertEqual(send_loc.call_count, 1)
         self.assertEqual(send_loc.call_args.args[1], "ai_api_locked_trial")
 
+    def test_paid_open_ended_message_does_not_trigger_ai_fallback(self):
+        with patch.object(self.bot, "_ai_api_allowed", return_value=True), \
+             patch.object(self.bot, "_infer_command_ai") as infer_ai, \
+             patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_send_text") as send_text, \
+             patch.object(self.bot, "_record_intent_event"):
+            self.bot._handle_natural_language(
+                chat_id=7102,
+                user_id=8102,
+                text="Can you think deeply and decide everything for me?",
+                is_admin=True,
+                lang="en",
+            )
+        infer_ai.assert_not_called()
+        handle_cmd.assert_not_called()
+        self.assertEqual(send_text.call_count, 1)
+        self.assertIn("rephrase", send_text.call_args.args[1].lower())
+
     def test_macro_command_accepts_star_filter(self):
         decision = SimpleNamespace(allowed=True, reason="ok")
         fake_head = SimpleNamespace(
@@ -330,6 +448,40 @@ class AdminBotLanguageMt5Tests(unittest.TestCase):
         self.assertEqual(self.bot._normalize_utc_offset_input("gmt+7"), "+07:00")
         self.assertEqual(self.bot._normalize_utc_offset_input("UTC+07"), "+07:00")
         self.assertEqual(self.bot._normalize_utc_offset_input("+7"), "+07:00")
+
+    def test_show_only_command_sets_signal_filter_symbols(self):
+        decision = SimpleNamespace(allowed=True, reason="ok")
+        with patch.object(admin_bot_module.access_manager, "check_and_consume", return_value=decision), \
+             patch.object(admin_bot_module.access_manager, "get_user_signal_symbol_filter", return_value=[]), \
+             patch.object(admin_bot_module.access_manager, "set_user_signal_symbol_filter", return_value=["XAUUSD", "BTC"]) as set_filter, \
+             patch.object(self.bot, "_send_text") as send_text:
+            self.bot._handle_admin_command(
+                chat_id=9901,
+                user_id=8801,
+                command="show_only",
+                args="gold btc",
+                is_admin=False,
+                lang="en",
+            )
+        set_filter.assert_called_once_with(8801, ["XAUUSD", "BTC"])
+        self.assertEqual(send_text.call_count, 1)
+        self.assertIn("XAUUSD", send_text.call_args.args[1])
+
+    def test_signal_filter_status_reports_current_symbols(self):
+        decision = SimpleNamespace(allowed=True, reason="ok")
+        with patch.object(admin_bot_module.access_manager, "check_and_consume", return_value=decision), \
+             patch.object(admin_bot_module.access_manager, "get_user_signal_symbol_filter", return_value=["BTC", "ETH"]), \
+             patch.object(self.bot, "_send_text") as send_text:
+            self.bot._handle_admin_command(
+                chat_id=9902,
+                user_id=8802,
+                command="signal_filter",
+                args="status",
+                is_admin=False,
+                lang="en",
+            )
+        self.assertEqual(send_text.call_count, 1)
+        self.assertIn("BTC, ETH", send_text.call_args.args[1])
 
     def test_scan_ethusd_starts_targeted_symbol_scan_not_us_open(self):
         fake_thread = SimpleNamespace(start=lambda: None)
@@ -853,6 +1005,76 @@ class AdminBotLanguageMt5Tests(unittest.TestCase):
             )
         handle_cmd.assert_called_once()
         self.assertEqual(handle_cmd.call_args.args[2], "scan_vi")
+
+    def test_natural_language_scalping_on_routes_to_scalping_on(self):
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_record_intent_event"), \
+             patch.object(self.bot, "_remember_intent_phrase"):
+            self.bot._handle_natural_language(
+                chat_id=9905,
+                user_id=9905,
+                text="เปิดโหมด scalping สำหรับ btc กับ eth",
+                is_admin=True,
+                lang="th",
+            )
+        handle_cmd.assert_called_once()
+        pos = handle_cmd.call_args.args
+        self.assertEqual(pos[2], "scalping_on")
+        self.assertIn("BTCUSD", pos[3])
+        self.assertIn("ETHUSD", pos[3])
+
+    def test_natural_language_logic_trade_btc_routes_to_scalping_logic(self):
+        with patch.object(self.bot, "_handle_admin_command") as handle_cmd, \
+             patch.object(self.bot, "_record_intent_event"), \
+             patch.object(self.bot, "_remember_intent_phrase"):
+            self.bot._handle_natural_language(
+                chat_id=9906,
+                user_id=9906,
+                text="find out the logic trade for BTC",
+                is_admin=True,
+                lang="en",
+            )
+        handle_cmd.assert_called_once()
+        pos = handle_cmd.call_args.args
+        self.assertEqual(pos[2], "scalping_logic")
+        self.assertEqual(pos[3], "BTCUSD")
+
+    def test_scalping_logic_command_formats_btc_signal(self):
+        decision = SimpleNamespace(allowed=True, reason="ok")
+        fake_signal = SimpleNamespace(
+            direction="long",
+            confidence=77.5,
+            entry=60123.0,
+            stop_loss=59888.0,
+            take_profit_1=60456.0,
+            take_profit_2=60720.0,
+            reasons=["trend aligned", "m1 confirmed"],
+        )
+        fake_row = SimpleNamespace(
+            source="scalp_btcusd",
+            symbol="BTCUSD",
+            status="ready",
+            reason="ok",
+            trigger={"ok": True, "reason": "m1_long_confirmed", "rsi14": 55.2, "ema9": 60110.0, "ema21": 60090.0},
+            signal=fake_signal,
+        )
+        with patch.object(admin_bot_module.access_manager, "check_and_consume", return_value=decision), \
+             patch("scanners.scalping_scanner.scalping_scanner.scan_btc", return_value=fake_row), \
+             patch.object(self.bot, "_send_text") as send_text:
+            self.bot._handle_admin_command(
+                chat_id=1007,
+                user_id=2007,
+                command="scalping_logic",
+                args="btc",
+                is_admin=True,
+                lang="en",
+            )
+        send_text.assert_called_once()
+        msg = send_text.call_args.args[1]
+        self.assertIn("Scalping Logic (BTCUSD)", msg)
+        self.assertIn("status=ready", msg)
+        self.assertIn("signal=LONG", msg)
+        self.assertIn("m1_trigger=", msg)
 
 
 if __name__ == "__main__":

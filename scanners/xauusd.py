@@ -7,6 +7,7 @@ import logging
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -94,6 +95,23 @@ class XAUUSDScanner:
             levels["asian_mid"] = asian["mid"]
 
         return levels
+
+    @staticmethod
+    def _tf_label(tf: str) -> str:
+        token = str(tf or "").strip().lower()
+        table = {
+            "1m": "M1",
+            "3m": "M3",
+            "5m": "M5",
+            "15m": "M15",
+            "30m": "M30",
+            "1h": "H1",
+            "2h": "H2",
+            "4h": "H4",
+            "1d": "D1",
+            "1w": "W1",
+        }
+        return table.get(token, str(tf or "").upper() or "?")
 
 
     @staticmethod
@@ -442,6 +460,12 @@ class XAUUSDScanner:
             "wick_ratio": None,
             "vol_ratio": None,
             "reason": "none",
+            "trigger_level": None,
+            "sweep_high": None,
+            "sweep_low": None,
+            "sweep_open": None,
+            "sweep_close": None,
+            "sweep_time": None,
         }
         if df_m5 is None or getattr(df_m5, "empty", True) or len(df_m5) < 40:
             return out
@@ -474,6 +498,12 @@ class XAUUSDScanner:
                         "wick_ratio": round(upper_wick / rng, 3),
                         "vol_ratio": round(vol_ratio, 2),
                         "reason": "m5_sweep_above_high_then_reject",
+                        "trigger_level": round(prev_hi, 4),
+                        "sweep_high": round(hi, 4),
+                        "sweep_low": round(lo, 4),
+                        "sweep_open": round(op, 4),
+                        "sweep_close": round(cl, 4),
+                        "sweep_time": str(d.index[i]),
                     })
                     return out
                 if lo < prev_lo and cl > prev_lo and cl > op and (lower_wick / rng) >= wick_min:
@@ -484,6 +514,12 @@ class XAUUSDScanner:
                         "wick_ratio": round(lower_wick / rng, 3),
                         "vol_ratio": round(vol_ratio, 2),
                         "reason": "m5_sweep_below_low_then_reject",
+                        "trigger_level": round(prev_lo, 4),
+                        "sweep_high": round(hi, 4),
+                        "sweep_low": round(lo, 4),
+                        "sweep_open": round(op, 4),
+                        "sweep_close": round(cl, 4),
+                        "sweep_time": str(d.index[i]),
                     })
                     return out
         except Exception as e:
@@ -552,6 +588,7 @@ class XAUUSDScanner:
                     )
 
             if h1_last is not None:
+                entry_tf_lbl = self._tf_label(str(getattr(config, "XAUUSD_ENTRY_TF", "1h")))
                 ema21 = float(h1_last.get("ema_21", current_price) or current_price)
                 bb_pct = float(h1_last.get("bb_pct", 0.5) or 0.5)
                 if signal.direction == "long":
@@ -560,7 +597,7 @@ class XAUUSDScanner:
                         guard["no_chase"] = True
                         guard["penalty"] += float(getattr(config, "XAUUSD_TRAP_PENALTY_NO_CHASE", 10))
                         guard["warnings"].append(
-                            f"⚠️ No-chase: price stretched {ext_atr:.2f} ATR above H1 EMA21 (BB% {bb_pct:.2f})"
+                            f"⚠️ No-chase: price stretched {ext_atr:.2f} ATR above {entry_tf_lbl} EMA21 (BB% {bb_pct:.2f})"
                         )
                 else:
                     ext_atr = (ema21 - float(current_price)) / max(1e-9, atr_h1)
@@ -568,7 +605,7 @@ class XAUUSDScanner:
                         guard["no_chase"] = True
                         guard["penalty"] += float(getattr(config, "XAUUSD_TRAP_PENALTY_NO_CHASE", 10))
                         guard["warnings"].append(
-                            f"⚠️ No-chase: price stretched {ext_atr:.2f} ATR below H1 EMA21 (BB% {bb_pct:.2f})"
+                            f"⚠️ No-chase: price stretched {ext_atr:.2f} ATR below {entry_tf_lbl} EMA21 (BB% {bb_pct:.2f})"
                         )
                 guard["ext_atr"] = round(ext_atr, 3)
                 guard["bb_pct"] = round(bb_pct, 3)
@@ -659,6 +696,632 @@ class XAUUSDScanner:
             logger.warning("[XAUUSD] Trap guard error: %s", e)
         return signal, guard
 
+    @staticmethod
+    def _as_float(value, default: float = 0.0) -> float:
+        try:
+            v = float(value)
+            return v if np.isfinite(v) else float(default)
+        except Exception:
+            return float(default)
+
+    def _collect_behavior_targets(
+        self,
+        *,
+        direction: str,
+        entry: float,
+        key_levels: dict,
+        liq_map: dict,
+        atr_m5: float,
+    ) -> list[float]:
+        levels: list[float] = []
+
+        def _add(px):
+            try:
+                p = float(px)
+            except Exception:
+                return
+            if not np.isfinite(p) or p <= 0:
+                return
+            levels.append(p)
+
+        km = key_levels or {}
+        lm = liq_map or {}
+        lvl = lm.get("levels") or {}
+        round_levels = lm.get("round_levels") or {}
+        vp = lm.get("volume_profile") or {}
+
+        if direction == "long":
+            _add(km.get("nearest_resistance"))
+            _add(km.get("asian_high"))
+            _add(lvl.get("pdh"))
+            _add(lvl.get("pwh"))
+            for px in (vp.get("hvn") or []):
+                _add(px)
+            for px in round_levels.values():
+                _add(px)
+        else:
+            _add(km.get("nearest_support"))
+            _add(km.get("asian_low"))
+            _add(lvl.get("pdl"))
+            _add(lvl.get("pwl"))
+            for px in (vp.get("hvn") or []):
+                _add(px)
+            for px in round_levels.values():
+                _add(px)
+
+        min_sep = max(0.15 * max(1e-9, float(atr_m5)), abs(float(entry)) * 0.0002)
+        if direction == "long":
+            candidates = sorted([p for p in levels if p > (entry + 0.25 * atr_m5)])
+        else:
+            candidates = sorted([p for p in levels if p < (entry - 0.25 * atr_m5)], reverse=True)
+
+        deduped: list[float] = []
+        for px in candidates:
+            if not deduped or abs(px - deduped[-1]) >= min_sep:
+                deduped.append(px)
+        return deduped
+
+    def _behavioral_fallback_signal(
+        self,
+        *,
+        current_price: float,
+        df_h1,
+        df_m5,
+        df_h4=None,
+        df_d1=None,
+        key_levels: Optional[dict] = None,
+        session_info: Optional[dict] = None,
+        trend_tf_label: str = "1d",
+        structure_tf_label: str = "4h",
+        entry_tf_label: str = "1h",
+    ) -> tuple[Optional[TradeSignal], dict]:
+        diag = {
+            "engine": "behavioral_fallback_v2",
+            "enabled": bool(getattr(config, "XAUUSD_BEHAVIORAL_FALLBACK_ENABLED", True)),
+            "status": "no_signal",
+            "reason": "unmet",
+            "selected_direction": None,
+            "long": {},
+            "short": {},
+            "timeframes": {
+                "trend": self._tf_label(trend_tf_label),
+                "structure": self._tf_label(structure_tf_label),
+                "entry": self._tf_label(entry_tf_label),
+            },
+        }
+        if not diag["enabled"]:
+            diag["reason"] = "fallback_disabled"
+            return None, diag
+        if df_h1 is None or getattr(df_h1, "empty", True) or df_m5 is None or getattr(df_m5, "empty", True):
+            diag["reason"] = "missing_h1_or_m5_data"
+            return None, diag
+
+        try:
+            h1_ta = ta.add_all(df_h1.copy())
+            m5_ta = ta.add_all(df_m5.copy())
+            if m5_ta is None or m5_ta.empty or len(m5_ta) < 40:
+                diag["reason"] = "insufficient_m5_data"
+                return None, diag
+
+            h1_last = h1_ta.iloc[-1]
+            m5_last = m5_ta.iloc[-1]
+            atr_h1 = self._as_float(h1_last.get("atr_14"), max(5.0, abs(float(current_price)) * 0.002))
+            atr_m5 = self._as_float(m5_last.get("atr_14"), max(1.0, abs(float(current_price)) * 0.0008))
+            if atr_h1 <= 0 or atr_m5 <= 0:
+                diag["reason"] = "invalid_atr"
+                return None, diag
+
+            km = dict(key_levels or {})
+            if not km:
+                km = self.analyze_key_levels(float(current_price))
+            sessions = dict(session_info or {})
+
+            liq_map = self._build_liquidity_map(float(current_price), df_h1, df_m5, h1_ta=h1_ta)
+            macro_ctx = self._macro_shock_context(df_m5)
+            news_ctx = self._news_freeze_context()
+            sweep = self._recent_liquidity_sweep(df_m5, float(current_price))
+            kill_zone = str((liq_map.get("kill_zone") or {}).get("label", "off_kill_zone"))
+            kill_zone_active = bool((liq_map.get("kill_zone") or {}).get("active"))
+
+            bb_width_series = pd.to_numeric(m5_ta.get("bb_width"), errors="coerce").dropna()
+            bb_width_rank = 1.0
+            if len(bb_width_series) >= 80:
+                bb_width_rank = float(bb_width_series.tail(192).rank(pct=True).iloc[-1])
+            tr_last = max(
+                self._as_float(m5_last.get("high")) - self._as_float(m5_last.get("low")),
+                abs(self._as_float(m5_last.get("high")) - self._as_float(m5_ta["close"].iloc[-2], float(current_price))),
+                abs(self._as_float(m5_last.get("low")) - self._as_float(m5_ta["close"].iloc[-2], float(current_price))),
+            ) if len(m5_ta) > 1 else self._as_float(m5_last.get("high")) - self._as_float(m5_last.get("low"))
+            tr_atr = tr_last / max(1e-9, atr_m5)
+            compress = bool(
+                bb_width_rank <= float(getattr(config, "XAUUSD_BEHAVIORAL_TRIGGER_BB_PCTL_MAX", 0.25))
+                and tr_atr <= float(getattr(config, "XAUUSD_BEHAVIORAL_TRIGGER_TR_ATR_MAX", 0.85))
+            )
+
+            rr = self._nearest_round_levels(float(current_price))
+            dist_round_atr = min(
+                abs(float(current_price) - float(rr["nearest_50"])) / max(1e-9, atr_h1),
+                abs(float(current_price) - float(rr["nearest_100"])) / max(1e-9, atr_h1),
+            )
+            near_round = dist_round_atr <= float(getattr(config, "XAUUSD_TRAP_NEAR_ROUND_ATR", 0.35))
+
+            trend_entry = ta.determine_trend(h1_ta)
+            trend_structure = ta.determine_trend(ta.add_all(df_h4.copy())) if df_h4 is not None and not getattr(df_h4, "empty", True) else "ranging"
+            trend_regime = ta.determine_trend(ta.add_all(df_d1.copy())) if df_d1 is not None and not getattr(df_d1, "empty", True) else "ranging"
+            bb_h1 = self._as_float(h1_last.get("bb_pct"), 0.5)
+            ema21_h1 = self._as_float(h1_last.get("ema_21"), float(current_price))
+            ext_long = (float(current_price) - ema21_h1) / max(1e-9, atr_h1)
+            ext_short = (ema21_h1 - float(current_price)) / max(1e-9, atr_h1)
+            close_m5 = self._as_float(m5_last.get("close"), float(current_price))
+            ema9_m5 = self._as_float(m5_last.get("ema_9"), close_m5)
+            rsi_m5 = self._as_float(m5_last.get("rsi_14"), 50.0)
+
+            trend_lbl = self._tf_label(trend_tf_label)
+            structure_lbl = self._tf_label(structure_tf_label)
+            entry_lbl = self._tf_label(entry_tf_label)
+
+            imbalance = (liq_map.get("imbalance") or {})
+            bull_fvg = imbalance.get("nearest_bull_fvg")
+            bear_fvg = imbalance.get("nearest_bear_fvg")
+
+            def _zone_dist(zone):
+                if not zone or not isinstance(zone, (list, tuple)) or len(zone) < 2:
+                    return None
+                z0 = self._as_float(zone[0], np.nan)
+                z1 = self._as_float(zone[1], np.nan)
+                if not np.isfinite(z0) or not np.isfinite(z1):
+                    return None
+                lo = min(z0, z1)
+                hi = max(z0, z1)
+                if lo <= float(current_price) <= hi:
+                    return 0.0
+                return min(abs(float(current_price) - lo), abs(float(current_price) - hi))
+
+            bull_fvg_dist = _zone_dist(bull_fvg)
+            bear_fvg_dist = _zone_dist(bear_fvg)
+            no_chase_ema21_atr = float(getattr(config, "XAUUSD_TRAP_NO_CHASE_EMA21_ATR", 1.0))
+            no_chase_bb_pct = float(getattr(config, "XAUUSD_TRAP_NO_CHASE_BB_PCT", 0.92))
+
+            candidates = {
+                "long": {"score": 0.0, "reasons": [], "warnings": [], "trigger": False, "entry_hint": None},
+                "short": {"score": 0.0, "reasons": [], "warnings": [], "trigger": False, "entry_hint": None},
+            }
+            trend_votes = {"long": 0, "short": 0}
+
+            def _add(direction: str, score: float, reason: str):
+                candidates[direction]["score"] = float(candidates[direction]["score"]) + float(score)
+                if reason:
+                    candidates[direction]["reasons"].append(str(reason))
+
+            if compress:
+                _add("long", 6, f"✅ Compression: BB width pct {bb_width_rank:.2f}, TR/ATR {tr_atr:.2f}")
+                _add("short", 6, f"✅ Compression: BB width pct {bb_width_rank:.2f}, TR/ATR {tr_atr:.2f}")
+            if near_round and compress:
+                _add("long", 4, "✅ Compression near round-number liquidity magnet")
+                _add("short", 4, "✅ Compression near round-number liquidity magnet")
+            if kill_zone_active:
+                _add("long", 6, f"✅ Kill-zone active: {kill_zone.replace('_', ' ')}")
+                _add("short", 6, f"✅ Kill-zone active: {kill_zone.replace('_', ' ')}")
+
+            if trend_regime == "bullish":
+                _add("long", 6, f"✅ {trend_lbl} regime supports longs")
+                trend_votes["long"] += 1
+            elif trend_regime == "bearish":
+                _add("short", 6, f"✅ {trend_lbl} regime supports shorts")
+                trend_votes["short"] += 1
+            if trend_structure == "bullish":
+                _add("long", 5, f"✅ {structure_lbl} structure tilts bullish")
+                trend_votes["long"] += 1
+            elif trend_structure == "bearish":
+                _add("short", 5, f"✅ {structure_lbl} structure tilts bearish")
+                trend_votes["short"] += 1
+            if trend_entry == "bullish":
+                _add("long", 3, f"✅ {entry_lbl} momentum supportive")
+                trend_votes["long"] += 1
+            elif trend_entry == "bearish":
+                _add("short", 3, f"✅ {entry_lbl} momentum supportive")
+                trend_votes["short"] += 1
+
+            if sweep.get("detected"):
+                if sweep.get("side") == "bullish_rejection":
+                    _add("long", 30, f"✅ M5 sweep/reject up trigger ({sweep.get('reason')})")
+                    candidates["long"]["trigger"] = True
+                elif sweep.get("side") == "bearish_rejection":
+                    _add("short", 30, f"✅ M5 sweep/reject down trigger ({sweep.get('reason')})")
+                    candidates["short"]["trigger"] = True
+
+            if bull_fvg_dist is not None and bull_fvg_dist <= (1.2 * atr_m5):
+                _add("long", 10, f"✅ Bullish FVG retest proximity ({bull_fvg_dist / max(1e-9, atr_m5):.2f} ATR)")
+                try:
+                    lo = min(float(bull_fvg[0]), float(bull_fvg[1]))
+                    hi = max(float(bull_fvg[0]), float(bull_fvg[1]))
+                    candidates["long"]["entry_hint"] = min(float(current_price), hi - 0.20 * (hi - lo))
+                except Exception:
+                    pass
+            if bear_fvg_dist is not None and bear_fvg_dist <= (1.2 * atr_m5):
+                _add("short", 10, f"✅ Bearish FVG retest proximity ({bear_fvg_dist / max(1e-9, atr_m5):.2f} ATR)")
+                try:
+                    lo = min(float(bear_fvg[0]), float(bear_fvg[1]))
+                    hi = max(float(bear_fvg[0]), float(bear_fvg[1]))
+                    candidates["short"]["entry_hint"] = max(float(current_price), lo + 0.20 * (hi - lo))
+                except Exception:
+                    pass
+
+            if macro_ctx.get("available"):
+                if bool(macro_ctx.get("adverse_for_long")):
+                    candidates["long"]["score"] -= 14.0
+                    candidates["long"]["warnings"].append(f"⚠️ Macro shock adverse to long ({macro_ctx.get('summary')})")
+                if bool(macro_ctx.get("adverse_for_short")):
+                    candidates["short"]["score"] -= 14.0
+                    candidates["short"]["warnings"].append(f"⚠️ Macro shock adverse to short ({macro_ctx.get('summary')})")
+
+            if ext_long >= no_chase_ema21_atr and bb_h1 >= no_chase_bb_pct:
+                candidates["long"]["score"] -= 10.0
+                candidates["long"]["warnings"].append(f"⚠️ No-chase long: +{ext_long:.2f} ATR above {entry_lbl} EMA21 (BB% {bb_h1:.2f})")
+            if ext_short >= no_chase_ema21_atr and bb_h1 <= (1.0 - no_chase_bb_pct):
+                candidates["short"]["score"] -= 10.0
+                candidates["short"]["warnings"].append(f"⚠️ No-chase short: +{ext_short:.2f} ATR below {entry_lbl} EMA21 (BB% {bb_h1:.2f})")
+
+            dist_res_atr = self._as_float((km or {}).get("distance_to_res"), 9999.0) / max(1e-9, atr_h1)
+            dist_sup_atr = self._as_float((km or {}).get("distance_to_sup"), 9999.0) / max(1e-9, atr_h1)
+            near_round_atr = float(getattr(config, "XAUUSD_TRAP_NEAR_ROUND_ATR", 0.35))
+            if dist_res_atr <= near_round_atr:
+                candidates["long"]["score"] -= 8.0
+                candidates["long"]["warnings"].append("⚠️ Overhead liquidity too close for long")
+            if dist_sup_atr <= near_round_atr:
+                candidates["short"]["score"] -= 8.0
+                candidates["short"]["warnings"].append("⚠️ Downside liquidity too close for short")
+
+            require_sweep = bool(getattr(config, "XAUUSD_BEHAVIORAL_REQUIRE_SWEEP_TRIGGER", True))
+            secondary_long = bool(compress and kill_zone_active and bull_fvg_dist is not None and bull_fvg_dist <= 0.8 * atr_m5)
+            secondary_short = bool(compress and kill_zone_active and bear_fvg_dist is not None and bear_fvg_dist <= 0.8 * atr_m5)
+            if not require_sweep:
+                candidates["long"]["trigger"] = bool(candidates["long"]["trigger"] or secondary_long)
+                candidates["short"]["trigger"] = bool(candidates["short"]["trigger"] or secondary_short)
+
+            # Reversal trigger to capture strong pullback opportunities in dominant trend
+            # without blindly catching a falling knife.
+            reversal_enabled = bool(getattr(config, "XAUUSD_BEHAVIORAL_REVERSAL_TRIGGER_ENABLED", True))
+            rev_ext_min = float(getattr(config, "XAUUSD_BEHAVIORAL_REVERSAL_MIN_EXTENSION_ATR", 0.45))
+            rev_rsi_long_min = float(getattr(config, "XAUUSD_BEHAVIORAL_REVERSAL_RSI_LONG_MIN", 49.5))
+            rev_rsi_short_max = float(getattr(config, "XAUUSD_BEHAVIORAL_REVERSAL_RSI_SHORT_MAX", 50.5))
+            if reversal_enabled:
+                pullback_long = bool(ext_short >= rev_ext_min and bull_fvg_dist is not None and bull_fvg_dist <= 1.0 * atr_m5)
+                pullback_short = bool(ext_long >= rev_ext_min and bear_fvg_dist is not None and bear_fvg_dist <= 1.0 * atr_m5)
+                confirm_long = bool(
+                    sweep.get("side") == "bullish_rejection"
+                    and close_m5 >= (ema9_m5 - 0.10 * atr_m5)
+                    and rsi_m5 >= rev_rsi_long_min
+                )
+                confirm_short = bool(
+                    sweep.get("side") == "bearish_rejection"
+                    and close_m5 <= (ema9_m5 + 0.10 * atr_m5)
+                    and rsi_m5 <= rev_rsi_short_max
+                )
+                if pullback_long and confirm_long:
+                    _add("long", 12, f"✅ Pullback reversal confirmed ({entry_lbl} reclaim + sweep) aligned with {trend_lbl}/{structure_lbl}")
+                    candidates["long"]["trigger"] = True
+                elif pullback_long:
+                    candidates["long"]["warnings"].append(
+                        f"⚠️ Pullback long watch: wait for bullish sweep + {entry_lbl} reclaim to avoid knife catch"
+                    )
+                if pullback_short and confirm_short:
+                    _add("short", 12, f"✅ Pullback reversal confirmed ({entry_lbl} reject + sweep) aligned with {trend_lbl}/{structure_lbl}")
+                    candidates["short"]["trigger"] = True
+                elif pullback_short:
+                    candidates["short"]["warnings"].append(
+                        f"⚠️ Pullback short watch: wait for bearish sweep + {entry_lbl} reject to avoid knife catch"
+                    )
+
+            regime_guard_enabled = bool(getattr(config, "XAUUSD_REGIME_GUARD_ENABLED", True))
+            require_struct_align = bool(getattr(config, "XAUUSD_REGIME_GUARD_REQUIRE_STRUCTURE_ALIGN", True))
+            regime_votes = {"long": 0, "short": 0}
+            if trend_regime == "bullish":
+                regime_votes["long"] += 1
+            elif trend_regime == "bearish":
+                regime_votes["short"] += 1
+            if require_struct_align:
+                if trend_structure == "bullish":
+                    regime_votes["long"] += 1
+                elif trend_structure == "bearish":
+                    regime_votes["short"] += 1
+            dominant_side = None
+            if regime_votes["long"] >= 2 and regime_votes["short"] == 0:
+                dominant_side = "long"
+            elif regime_votes["short"] >= 2 and regime_votes["long"] == 0:
+                dominant_side = "short"
+            for side in ("long", "short"):
+                candidates[side]["regime_blocked"] = False
+                candidates[side]["countertrend_confirmed"] = False
+            if regime_guard_enabled and dominant_side in {"long", "short"}:
+                counter = "short" if dominant_side == "long" else "long"
+                counter_confirmed = False
+                if counter == "long":
+                    counter_confirmed = bool(
+                        reversal_enabled
+                        and sweep.get("side") == "bullish_rejection"
+                        and ext_short >= rev_ext_min
+                        and close_m5 >= (ema9_m5 - 0.10 * atr_m5)
+                        and rsi_m5 >= rev_rsi_long_min
+                    )
+                else:
+                    counter_confirmed = bool(
+                        reversal_enabled
+                        and sweep.get("side") == "bearish_rejection"
+                        and ext_long >= rev_ext_min
+                        and close_m5 <= (ema9_m5 + 0.10 * atr_m5)
+                        and rsi_m5 <= rev_rsi_short_max
+                    )
+                if counter_confirmed:
+                    candidates[counter]["countertrend_confirmed"] = True
+                    _add(counter, 3, f"✅ Counter-trend reversal confirmed vs dominant {dominant_side.upper()} regime")
+                else:
+                    candidates[counter]["regime_blocked"] = True
+                    candidates[counter]["trigger"] = False
+                    candidates[counter]["warnings"].append(
+                        f"⚠️ Regime guard blocked {counter.upper()} against dominant {trend_lbl}/{structure_lbl} trend"
+                    )
+
+            for side in ("long", "short"):
+                score = float(candidates[side]["score"])
+                conf = max(0.0, min(95.0, 46.0 + score))
+                candidates[side]["confidence"] = round(conf, 1)
+                candidates[side]["trigger"] = bool(candidates[side]["trigger"])
+
+            edge_triggered = False
+            if bool(getattr(config, "XAUUSD_BEHAVIORAL_EDGE_TRIGGER_ENABLED", True)):
+                long_conf = float(candidates["long"]["confidence"])
+                short_conf = float(candidates["short"]["confidence"])
+                dom_side = "long" if long_conf >= short_conf else "short"
+                dom_conf = max(long_conf, short_conf)
+                conf_edge = abs(long_conf - short_conf)
+                min_dom_conf = float(getattr(config, "XAUUSD_BEHAVIORAL_EDGE_TRIGGER_CONFIDENCE", 68.0))
+                min_edge = float(getattr(config, "XAUUSD_BEHAVIORAL_EDGE_TRIGGER_MIN_EDGE", 5.0))
+                min_votes = max(1, int(getattr(config, "XAUUSD_BEHAVIORAL_EDGE_TRIGGER_MIN_TREND_VOTES", 2)))
+                supporting_context = bool(
+                    compress
+                    or kill_zone_active
+                    or int(trend_votes.get(dom_side, 0)) >= min_votes
+                )
+                if (not bool(candidates[dom_side]["trigger"])) and dom_conf >= min_dom_conf and conf_edge >= min_edge and supporting_context:
+                    candidates[dom_side]["trigger"] = True
+                    edge_triggered = True
+                    candidates[dom_side]["reasons"].append(
+                        f"✅ Dominant-direction edge trigger ({dom_conf:.1f}% confidence, edge {conf_edge:.1f})"
+                    )
+
+            min_conf = float(getattr(config, "XAUUSD_BEHAVIORAL_MIN_CONFIDENCE", 62.0))
+            min_conf_long = float(getattr(config, "XAUUSD_BEHAVIORAL_MIN_CONFIDENCE_LONG", min_conf))
+            min_conf_short = float(getattr(config, "XAUUSD_BEHAVIORAL_MIN_CONFIDENCE_SHORT", min_conf))
+            if bool(getattr(config, "XAUUSD_BEHAVIORAL_BALANCE_SIDE_THRESHOLDS", True)):
+                balanced = max(float(min_conf_long), float(min_conf_short))
+                min_conf_long = balanced
+                min_conf_short = balanced
+            side_min_conf = {
+                "long": max(0.0, min(100.0, float(min_conf_long))),
+                "short": max(0.0, min(100.0, float(min_conf_short))),
+            }
+            valid = [
+                side for side in ("long", "short")
+                if candidates[side]["trigger"] and float(candidates[side]["confidence"]) >= float(side_min_conf.get(side, min_conf))
+            ]
+
+            diag.update({
+                "long": {
+                    "score": round(float(candidates["long"]["score"]), 2),
+                    "confidence": float(candidates["long"]["confidence"]),
+                    "trigger": bool(candidates["long"]["trigger"]),
+                    "regime_blocked": bool(candidates["long"].get("regime_blocked", False)),
+                    "countertrend_confirmed": bool(candidates["long"].get("countertrend_confirmed", False)),
+                    "min_confidence": float(side_min_conf["long"]),
+                    "passed": bool(
+                        bool(candidates["long"]["trigger"])
+                        and (not bool(candidates["long"].get("regime_blocked", False)))
+                        and float(candidates["long"]["confidence"]) >= float(side_min_conf["long"])
+                    ),
+                    "reasons": list(candidates["long"]["reasons"][:6]),
+                    "warnings": list(candidates["long"]["warnings"][:4]),
+                },
+                "short": {
+                    "score": round(float(candidates["short"]["score"]), 2),
+                    "confidence": float(candidates["short"]["confidence"]),
+                    "trigger": bool(candidates["short"]["trigger"]),
+                    "regime_blocked": bool(candidates["short"].get("regime_blocked", False)),
+                    "countertrend_confirmed": bool(candidates["short"].get("countertrend_confirmed", False)),
+                    "min_confidence": float(side_min_conf["short"]),
+                    "passed": bool(
+                        bool(candidates["short"]["trigger"])
+                        and (not bool(candidates["short"].get("regime_blocked", False)))
+                        and float(candidates["short"]["confidence"]) >= float(side_min_conf["short"])
+                    ),
+                    "reasons": list(candidates["short"]["reasons"][:6]),
+                    "warnings": list(candidates["short"]["warnings"][:4]),
+                },
+                "compress": bool(compress),
+                "near_round": bool(near_round),
+                "sweep": dict(sweep or {}),
+                "kill_zone": kill_zone,
+                "trend_votes": dict(trend_votes),
+                "regime_votes": dict(regime_votes),
+                "dominant_side": dominant_side,
+                "edge_triggered": bool(edge_triggered),
+                "macro_summary": str(macro_ctx.get("summary", "unknown")),
+            })
+
+            if news_ctx.get("active") and bool(getattr(config, "XAUUSD_TRAP_BLOCK_ON_NEWS_FREEZE", True)):
+                diag["reason"] = "news_freeze_active"
+                return None, diag
+            if not valid:
+                diag["gating"] = {
+                    "long": {
+                        "trigger": bool(candidates["long"]["trigger"]),
+                        "regime_blocked": bool(candidates["long"].get("regime_blocked", False)),
+                        "confidence": float(candidates["long"]["confidence"]),
+                        "min_confidence": float(side_min_conf["long"]),
+                        "passed": bool(
+                            bool(candidates["long"]["trigger"])
+                            and (not bool(candidates["long"].get("regime_blocked", False)))
+                            and float(candidates["long"]["confidence"]) >= float(side_min_conf["long"])
+                        ),
+                    },
+                    "short": {
+                        "trigger": bool(candidates["short"]["trigger"]),
+                        "regime_blocked": bool(candidates["short"].get("regime_blocked", False)),
+                        "confidence": float(candidates["short"]["confidence"]),
+                        "min_confidence": float(side_min_conf["short"]),
+                        "passed": bool(
+                            bool(candidates["short"]["trigger"])
+                            and (not bool(candidates["short"].get("regime_blocked", False)))
+                            and float(candidates["short"]["confidence"]) >= float(side_min_conf["short"])
+                        ),
+                    },
+                }
+                diag["reason"] = "no_direction_passed_threshold"
+                return None, diag
+
+            if len(valid) > 1:
+                edge_min = float(getattr(config, "XAUUSD_BEHAVIORAL_MIN_EDGE", 4.0))
+                edge = abs(float(candidates["long"]["confidence"]) - float(candidates["short"]["confidence"]))
+                if edge < edge_min:
+                    diag["reason"] = "ambiguous_bidirectional_setup"
+                    return None, diag
+
+            direction = max(valid, key=lambda s: (float(candidates[s]["confidence"]), float(candidates[s]["score"])))
+            chosen = candidates[direction]
+            diag["selected_direction"] = direction
+
+            entry = float(chosen.get("entry_hint") or float(current_price))
+            entry_band = max(0.35 * atr_m5, 0.05 * atr_h1)
+            entry_buffer = float(getattr(config, "XAUUSD_BEHAVIORAL_ENTRY_BUFFER_ATR_M5", 0.10)) * atr_m5
+            rr_min = float(getattr(config, "XAUUSD_BEHAVIORAL_MIN_RR", 2.0))
+
+            if direction == "long":
+                if sweep.get("side") == "bullish_rejection" and np.isfinite(self._as_float(sweep.get("trigger_level"), np.nan)):
+                    entry = min(entry, self._as_float(sweep.get("trigger_level"), entry) + 0.20 * atr_m5)
+                entry = max(entry, float(current_price) - entry_band)
+                entry = min(entry, float(current_price) + 0.20 * atr_m5)
+                sweep_low = self._as_float(sweep.get("sweep_low"), entry - 0.9 * atr_m5)
+                stop_loss = min(entry - 0.75 * atr_m5, sweep_low - entry_buffer)
+                if (entry - stop_loss) < (0.45 * atr_m5):
+                    stop_loss = entry - 0.45 * atr_m5
+            else:
+                if sweep.get("side") == "bearish_rejection" and np.isfinite(self._as_float(sweep.get("trigger_level"), np.nan)):
+                    entry = max(entry, self._as_float(sweep.get("trigger_level"), entry) - 0.20 * atr_m5)
+                entry = min(entry, float(current_price) + entry_band)
+                entry = max(entry, float(current_price) - 0.20 * atr_m5)
+                sweep_high = self._as_float(sweep.get("sweep_high"), entry + 0.9 * atr_m5)
+                stop_loss = max(entry + 0.75 * atr_m5, sweep_high + entry_buffer)
+                if (stop_loss - entry) < (0.45 * atr_m5):
+                    stop_loss = entry + 0.45 * atr_m5
+
+            risk = abs(entry - stop_loss)
+            if not np.isfinite(risk) or risk <= 0:
+                diag["reason"] = "invalid_risk_after_levels"
+                return None, diag
+
+            targets = self._collect_behavior_targets(
+                direction=direction,
+                entry=float(entry),
+                key_levels=km,
+                liq_map=liq_map,
+                atr_m5=float(atr_m5),
+            )
+
+            if direction == "long":
+                def _pick(min_px: float):
+                    for px in targets:
+                        if px >= min_px:
+                            return px
+                    return None
+                tp1 = _pick(entry + 1.0 * risk) or (entry + 1.0 * risk)
+                tp2 = _pick(entry + rr_min * risk) or (entry + rr_min * risk)
+                tp3 = _pick(entry + max(2.8, rr_min + 0.8) * risk) or (entry + max(2.8, rr_min + 0.8) * risk)
+                tp2 = max(tp2, tp1 + 0.3 * risk)
+                tp3 = max(tp3, tp2 + 0.3 * risk)
+            else:
+                def _pick(max_px: float):
+                    for px in targets:
+                        if px <= max_px:
+                            return px
+                    return None
+                tp1 = _pick(entry - 1.0 * risk) or (entry - 1.0 * risk)
+                tp2 = _pick(entry - rr_min * risk) or (entry - rr_min * risk)
+                tp3 = _pick(entry - max(2.8, rr_min + 0.8) * risk) or (entry - max(2.8, rr_min + 0.8) * risk)
+                tp2 = min(tp2, tp1 - 0.3 * risk)
+                tp3 = min(tp3, tp2 - 0.3 * risk)
+
+            rr = abs(tp2 - entry) / max(1e-9, risk)
+            if rr < rr_min:
+                diag["reason"] = f"rr_below_min_{rr_min:.2f}"
+                return None, diag
+
+            session_list = list((sessions or {}).get("active_sessions", []) or [])
+            reasons = list(chosen.get("reasons") or [])
+            if sweep.get("detected"):
+                reasons.append(f"🎯 Trigger candle: {sweep.get('sweep_time', 'recent')} | wick={sweep.get('wick_ratio')} | vol={sweep.get('vol_ratio')}x")
+            if targets:
+                reasons.append(f"🎯 Liquidity TP ladder derived from {min(3, len(targets))} nearby pools/levels")
+            reasons.append(f"📍 Entry style: retest (no breakout chase), kill-zone={kill_zone}")
+
+            warnings = list(chosen.get("warnings") or [])
+            if news_ctx.get("active"):
+                warnings.append(f"⚠️ News proximity: {news_ctx.get('nearest_min')}m")
+
+            signal = TradeSignal(
+                symbol="XAUUSD",
+                direction=direction,
+                confidence=round(float(chosen.get("confidence") or 0.0), 1),
+                entry=round(float(entry), 4),
+                stop_loss=round(float(stop_loss), 4),
+                take_profit_1=round(float(tp1), 4),
+                take_profit_2=round(float(tp2), 4),
+                take_profit_3=round(float(tp3), 4),
+                risk_reward=round(float(rr), 2),
+                timeframe=f"{str(getattr(config, 'XAUUSD_ENTRY_TF', '1h'))}+5m",
+                session=", ".join(session_list) if session_list else "off_hours",
+                trend=str(trend_regime if trend_regime != "ranging" else trend_entry),
+                rsi=round(self._as_float(h1_last.get("rsi_14"), 50.0), 2),
+                atr=round(float(atr_h1), 4),
+                pattern="Behavioral Sweep-Retest + Liquidity Continuation",
+                reasons=reasons[:12],
+                warnings=warnings[:8],
+                smc_context=None,
+                raw_scores={
+                    "engine": "behavioral_fallback_v2",
+                    "long_score": round(float(candidates["long"]["score"]), 2),
+                    "short_score": round(float(candidates["short"]["score"]), 2),
+                    "long_confidence": round(float(candidates["long"]["confidence"]), 2),
+                    "short_confidence": round(float(candidates["short"]["confidence"]), 2),
+                    "selected_score": round(float(chosen.get("score") or 0.0), 2),
+                    "compression": bool(compress),
+                    "near_round": bool(near_round),
+                    "kill_zone": kill_zone,
+                    "trend_tf": trend_lbl,
+                    "structure_tf": structure_lbl,
+                    "entry_tf": entry_lbl,
+                    "regime_votes": dict(regime_votes),
+                    "dominant_side": dominant_side,
+                    "countertrend_confirmed": bool(chosen.get("countertrend_confirmed", False)),
+                    "macro_summary": str(macro_ctx.get("summary", "")),
+                },
+                entry_type="limit" if abs(float(entry) - float(current_price)) > (0.05 * atr_m5) else "market",
+                sl_type="anti_sweep" if bool(sweep.get("detected")) else "atr",
+                sl_reason="SL beyond sweep candle invalidation + ATR buffer",
+                tp_type="liquidity",
+                tp_reason="TP ladder mapped to next liquidity pools/round/session levels",
+                sl_liquidity_mapped=bool(sweep.get("detected")),
+                liquidity_pools_count=len((liq_map.get("volume_profile") or {}).get("hvn", []) or []),
+            )
+
+            diag["status"] = "signal_generated"
+            diag["reason"] = "behavioral_trigger_passed"
+            diag["selected_direction"] = direction
+            return signal, diag
+        except Exception as e:
+            logger.warning("[XAUUSD] behavioral fallback error: %s", e)
+            diag["reason"] = f"fallback_error:{e}"
+            return None, diag
+
     def scan(self) -> Optional[TradeSignal]:
         """
         Full XAUUSD scan. Returns a TradeSignal if opportunity found.
@@ -674,6 +1337,16 @@ class XAUUSDScanner:
         )
         logger.info(f"[XAUUSD] Scan #{self.scan_count} | {session_info['utc_time']} | "
                     f"Sessions: {session_info['active_sessions']}")
+        if not bool(session_info.get("xauusd_market_open", True)):
+            self._set_last_scan_diagnostics(
+                status="market_closed",
+                utc_time=str(session_info.get("utc_time", "-")),
+                active_sessions=list(session_info.get("active_sessions", []) or []),
+                unmet=["market_closed"],
+                notes=["xauusd_market_closed_weekend_window"],
+            )
+            logger.info("[XAUUSD] Market closed; skip signal evaluation")
+            return None
 
         # Fetch all timeframes
         df_d1 = xauusd_provider.fetch(config.XAUUSD_TREND_TF, bars=100)
@@ -714,20 +1387,50 @@ class XAUUSDScanner:
             session_info=session_info,
         )
 
+        signal_source = "base_signal_generator"
+        fallback_diag = {}
         if signal is None:
-            self._set_last_scan_diagnostics(
-                status="no_setup",
-                utc_time=str(session_info.get("utc_time", "-")),
-                active_sessions=list(session_info.get("active_sessions", []) or []),
-                current_price=round(float(current_price), 4),
-                unmet=["base_setup"],
-                notes=["signal_generator_returned_none"],
+            signal, fallback_diag = self._behavioral_fallback_signal(
+                current_price=float(current_price),
+                df_h1=df_h1,
+                df_m5=df_m5,
+                df_h4=df_h4,
+                df_d1=df_d1,
+                key_levels=self.analyze_key_levels(float(current_price)),
+                session_info=session_info,
+                trend_tf_label=str(config.XAUUSD_TREND_TF),
+                structure_tf_label=str(config.XAUUSD_STRUCTURE_TF),
+                entry_tf_label=str(config.XAUUSD_ENTRY_TF),
             )
-            return None
+            if signal is not None:
+                signal_source = "behavioral_fallback_v2"
+                logger.info(
+                    "[XAUUSD] Behavioral fallback produced %s @ %.2f conf=%.1f",
+                    str(signal.direction).upper(),
+                    float(getattr(signal, "entry", current_price)),
+                    float(getattr(signal, "confidence", 0.0)),
+                )
+            else:
+                notes = ["signal_generator_returned_none"]
+                fb_reason = str((fallback_diag or {}).get("reason", "")).strip()
+                if fb_reason:
+                    notes.append(f"fallback:{fb_reason}")
+                self._set_last_scan_diagnostics(
+                    status="no_setup",
+                    utc_time=str(session_info.get("utc_time", "-")),
+                    active_sessions=list(session_info.get("active_sessions", []) or []),
+                    current_price=round(float(current_price), 4),
+                    unmet=["base_setup", "behavioral_fallback"],
+                    notes=notes[:4],
+                    fallback=fallback_diag,
+                )
+                return None
 
         # Enrich signal with XAUUSD-specific context
         if signal is not None:
             key_levels = self.analyze_key_levels(current_price)
+            signal.raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+            signal.raw_scores["xau_signal_source"] = signal_source
             if live_price is not None:
                 signal.reasons.append(f"💰 Live XAUUSD: ${current_price:.2f}")
             else:
@@ -789,6 +1492,8 @@ class XAUUSDScanner:
                 notes=[],
                 confidence=round(float(getattr(signal, "confidence", 0.0) or 0.0), 1),
                 direction=str(getattr(signal, "direction", "")),
+                source=signal_source,
+                fallback=fallback_diag if signal_source != "base_signal_generator" else {},
             )
 
             self.last_signal = signal
