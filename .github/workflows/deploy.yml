@@ -12,16 +12,19 @@ jobs:
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         with:
           host: 129.150.36.17
           username: ubuntu
           key: ${{ secrets.ORACLE_SSH_KEY }}
           port: 22
           command_timeout: 5m
+          envs: GH_PAT
           script: |
             set -euo pipefail
             APP_DIR="/opt/dexter_pro"
-            REPO_URL="https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git"
+            REPO_URL="https://${GH_PAT}@github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git"
 
             # First-time setup: create dir, clone repo, create venv
             if [ ! -d "$APP_DIR" ]; then
@@ -30,6 +33,7 @@ jobs:
               sudo chown ubuntu:ubuntu "$APP_DIR"
               git clone --branch main "$REPO_URL" "$APP_DIR"
               cd "$APP_DIR"
+              git remote set-url origin "$REPO_URL"
               python3 -m venv .venv
               . .venv/bin/activate
               pip install --upgrade pip wheel
@@ -42,6 +46,7 @@ jobs:
 
             echo "=== Pulling latest code ==="
             cd "$APP_DIR"
+            git remote set-url origin "$REPO_URL"
             git fetch --all --prune
             git checkout main
             git pull --ff-only
