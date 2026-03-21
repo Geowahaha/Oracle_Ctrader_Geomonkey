@@ -19,12 +19,15 @@ jobs:
           username: ubuntu
           key: ${{ secrets.ORACLE_SSH_KEY }}
           port: 22
-          command_timeout: 5m
+          command_timeout: 10m
           envs: GH_PAT
           script: |
             set -euo pipefail
             APP_DIR="/opt/dexter_pro"
             REPO_URL="https://${GH_PAT}@github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git"
+
+            # Set git credentials so pip can clone from GitHub
+            git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
 
             # First-time setup: create dir, clone repo, create venv
             if [ ! -d "$APP_DIR/.git" ]; then
