@@ -1396,6 +1396,10 @@ class DexterScheduler:
             "xau_scalp_range_repair": "rr",
             "btc_weekday_lob_momentum": "bwl",
             "eth_weekday_overlap_probe": "ewp",
+            "crypto_flow_short": "cfs",
+            "crypto_flow_buy": "cfb",
+            "crypto_winner_confirmed": "cwc",
+            "crypto_behavioral_retest": "cbr",
         }
         return aliases.get(token, token.replace("xau_scalp_", "")[:6])
 
@@ -1942,6 +1946,14 @@ class DexterScheduler:
                         "experimental": True,
                     }
                 )
+            for _cf in ("crypto_flow_short", "crypto_flow_buy", "crypto_winner_confirmed", "crypto_behavioral_retest"):
+                if _cf in experimental_families and _strategy_lab_family_allowed(_cf):
+                    _cf_enabled_key = _cf.upper().replace("CRYPTO_", "CRYPTO_") + "_ENABLED"
+                    _cf_enabled_key = {"crypto_flow_short": "CRYPTO_FLOW_SHORT_ENABLED", "crypto_flow_buy": "CRYPTO_FLOW_BUY_ENABLED", "crypto_winner_confirmed": "CRYPTO_WINNER_CONFIRMED_ENABLED", "crypto_behavioral_retest": "CRYPTO_BEHAVIORAL_RETEST_ENABLED"}.get(_cf, "")
+                    if bool(getattr(config, _cf_enabled_key, False)):
+                        _allowed_sym = set(getattr(config, f"get_{_cf}_allowed_symbols", lambda: set())() or set())
+                        if not _allowed_sym or "BTCUSD" in _allowed_sym:
+                            fallback_experimental.append({"symbol": "BTCUSD", "family": _cf, "strategy_id": f"btcusd_{_cf}_v1", "priority": 199, "execution_ready": True, "experimental": True})
             return (
                 fallback_standard[: max(0, int(getattr(config, "PERSISTENT_CANARY_FAMILY_MAX_VARIANTS", 2) or 2))]
                 + fallback_experimental[: max(0, int(getattr(config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 1) or 1))]
@@ -1970,6 +1982,13 @@ class DexterScheduler:
                         "experimental": True,
                     }
                 )
+            for _cf in ("crypto_flow_short", "crypto_flow_buy", "crypto_behavioral_retest"):
+                if _cf in experimental_families and _strategy_lab_family_allowed(_cf):
+                    _cf_enabled_key = {"crypto_flow_short": "CRYPTO_FLOW_SHORT_ENABLED", "crypto_flow_buy": "CRYPTO_FLOW_BUY_ENABLED", "crypto_behavioral_retest": "CRYPTO_BEHAVIORAL_RETEST_ENABLED"}.get(_cf, "")
+                    if bool(getattr(config, _cf_enabled_key, False)):
+                        _allowed_sym = set(getattr(config, f"get_{_cf}_allowed_symbols", lambda: set())() or set())
+                        if not _allowed_sym or "ETHUSD" in _allowed_sym:
+                            fallback_experimental.append({"symbol": "ETHUSD", "family": _cf, "strategy_id": f"ethusd_{_cf}_v1", "priority": 199, "execution_ready": True, "experimental": True})
             return (
                 fallback_standard[: max(0, int(getattr(config, "PERSISTENT_CANARY_FAMILY_MAX_VARIANTS", 2) or 2))]
                 + fallback_experimental[: max(0, int(getattr(config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 1) or 1))]
@@ -2991,6 +3010,14 @@ class DexterScheduler:
             return lane_signal, lane_source
         if family in {"btc_weekday_lob_momentum", "eth_weekday_overlap_probe"}:
             return self._build_crypto_weekday_experimental_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "crypto_flow_short":
+            return self._build_crypto_flow_short_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "crypto_flow_buy":
+            return self._build_crypto_flow_buy_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "crypto_winner_confirmed":
+            return self._build_crypto_winner_confirmed_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "crypto_behavioral_retest":
+            return self._build_crypto_behavioral_retest_signal(signal, base_source=base_source, candidate=candidate)
         if family not in {"xau_scalp_pullback_limit", "xau_scalp_breakout_stop"}:
             return None, ""
         lane_signal = copy.deepcopy(signal)
@@ -3931,6 +3958,283 @@ class DexterScheduler:
         except Exception:
             pass
         return shaped, lane_source
+
+    # ── Crypto Smart Family builders (CFS / CFB / CWC / CBR) ─────────────
+
+    def _crypto_family_common_preamble(self, signal, *, base_source: str, candidate: dict, family: str) -> tuple[dict | None, str]:
+        """Shared preamble for all crypto smart families. Returns (ctx_dict, "") or (None, "") on gate failure."""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        if signal is None:
+            return None, ""
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return None, ""
+        timeframe_token = self._signal_timeframe_token(signal)
+        if timeframe_token != "5m+1m":
+            return None, ""
+        session_sig = self._signal_session_signature(signal)
+        try:
+            confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        entry = float(getattr(signal, "entry", 0.0) or 0.0)
+        stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+        if entry <= 0 or stop_loss <= 0 or abs(entry - stop_loss) <= 0:
+            return None, ""
+        entry_type = str(getattr(signal, "entry_type", "") or "market").strip().lower() or "market"
+        pattern = str(getattr(signal, "pattern", "") or "").strip().lower()
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        winner_regime = str(raw.get("crypto_winner_logic_regime") or raw.get("winner_logic_regime") or "").strip().lower()
+        winner_wr = float(raw.get("crypto_winner_logic_win_rate", 0.0) or 0.0)
+        neural_prob = float(raw.get("neural_probability", 0.0) or 0.0)
+        long_score = float(raw.get("long", 0.0) or 0.0)
+        short_score = float(raw.get("short", 0.0) or 0.0)
+        edge = float(raw.get("edge", 0.0) or 0.0)
+        trigger = raw.get("scalping_trigger") or {}
+        rsi = float(trigger.get("rsi14", 0.0) or 0.0) if isinstance(trigger, dict) else 0.0
+        is_weekend = datetime.now(timezone.utc).weekday() >= 5
+        return {
+            "symbol": symbol, "base_token": base_token, "direction": direction,
+            "session_sig": session_sig, "confidence": confidence, "entry": entry,
+            "stop_loss": stop_loss, "entry_type": entry_type, "pattern": pattern,
+            "raw": raw, "winner_regime": winner_regime, "winner_wr": winner_wr,
+            "neural_prob": neural_prob, "long_score": long_score, "short_score": short_score,
+            "edge": edge, "rsi": rsi, "is_weekend": is_weekend, "family": family,
+        }, ""
+
+    def _crypto_family_tag_and_return(self, signal, shaped, *, lane_source: str, candidate: dict, family: str, risk_usd: float, ctx: dict, extra_tags: dict | None = None) -> tuple[object | None, str]:
+        """Shared post-processing for all crypto smart families."""
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = str(ctx.get("base_token") or "")
+            raw["experimental_family"] = True
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = f"scheduler_canary_{family}"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["crypto_weekend_mode"] = ctx.get("is_weekend", False)
+            raw["mt5_ignore_open_positions"] = True
+            raw["ctrader_risk_usd_override"] = risk_usd
+            raw["mt5_limit_allow_market_fallback"] = False
+            raw["persistent_canary_symbol"] = ctx.get("symbol", "")
+            if extra_tags:
+                raw.update(extra_tags)
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    def _build_crypto_flow_short_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """CFS: Crypto Flow Short — sell_stop shorts gated by neural short-score + RSI."""
+        ctx_result, _ = self._crypto_family_common_preamble(signal, base_source=base_source, candidate=candidate, family="crypto_flow_short")
+        if ctx_result is None:
+            return None, ""
+        ctx = ctx_result
+        if not bool(getattr(config, "CRYPTO_FLOW_SHORT_ENABLED", False)):
+            return None, ""
+        if ctx["direction"] != "short":
+            return None, ""
+        allowed_symbols = set(config.get_crypto_flow_short_allowed_symbols() or set())
+        if allowed_symbols and ctx["symbol"] not in allowed_symbols:
+            return None, ""
+        if not getattr(config, "CRYPTO_SMART_FAMILIES_24H_MODE", False):
+            allowed_sessions = set(config.get_crypto_flow_short_allowed_sessions() or set())
+            if allowed_sessions and not self._session_signature_matches(ctx["session_sig"], allowed_sessions):
+                return None, ""
+        min_conf = float(getattr(config, "CRYPTO_FLOW_SHORT_MIN_CONFIDENCE", 68.0) or 68.0)
+        max_conf = float(getattr(config, "CRYPTO_FLOW_SHORT_MAX_CONFIDENCE", 85.0) or 85.0)
+        if ctx["confidence"] < min_conf or ctx["confidence"] > max_conf:
+            return None, ""
+        min_short = float(getattr(config, "CRYPTO_FLOW_SHORT_MIN_SHORT_SCORE", 70.0) or 70.0)
+        if ctx["short_score"] < min_short:
+            return None, ""
+        min_edge = float(getattr(config, "CRYPTO_FLOW_SHORT_MIN_EDGE", 30.0) or 30.0)
+        if ctx["edge"] < min_edge:
+            return None, ""
+        rsi_max = float(getattr(config, "CRYPTO_FLOW_SHORT_RSI_MAX", 45.0) or 45.0)
+        if ctx["rsi"] > rsi_max or ctx["rsi"] <= 0:
+            return None, ""
+        if bool(getattr(config, "CRYPTO_FLOW_SHORT_BLOCK_SEVERE_WINNER", True)) and ctx["winner_regime"] == "severe":
+            return None, ""
+        entry = ctx["entry"]
+        stop_loss = ctx["stop_loss"]
+        risk = abs(entry - stop_loss)
+        trigger_ratio = float(getattr(config, "CRYPTO_FLOW_SHORT_BREAK_STOP_TRIGGER_RISK_RATIO", 0.10) or 0.10)
+        stop_lift_ratio = float(getattr(config, "CRYPTO_FLOW_SHORT_BREAK_STOP_STOP_LIFT_RATIO", 0.30) or 0.30)
+        trigger = max(risk * trigger_ratio, entry * 0.00015)
+        stop_lift = trigger * stop_lift_ratio
+        new_entry = entry - trigger
+        new_stop = stop_loss - stop_lift
+        if new_entry <= 0 or new_stop <= 0 or new_stop <= new_entry:
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family="crypto_flow_short", entry=new_entry, stop_loss=new_stop, entry_type="sell_stop")
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, "crypto_flow_short")
+        risk_usd = float(getattr(config, f"CRYPTO_FLOW_SHORT_{ctx['symbol'][:3]}_CTRADER_RISK_USD", 0.45) or 0.45) if ctx["symbol"] == "BTCUSD" else float(getattr(config, "CRYPTO_FLOW_SHORT_ETH_CTRADER_RISK_USD", 0.20) or 0.20)
+        if ctx["is_weekend"]:
+            risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
+        return self._crypto_family_tag_and_return(signal, shaped, lane_source=lane_source, candidate=candidate, family="crypto_flow_short", risk_usd=risk_usd, ctx=ctx, extra_tags={"crypto_flow_short_neural_gate": {"short_score": ctx["short_score"], "edge": ctx["edge"], "rsi": ctx["rsi"]}, "crypto_flow_short_entry_mode": "sell_stop"})
+
+    def _build_crypto_flow_buy_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """CFB: Crypto Flow Buy — buy_stop longs gated by neural long-score + RSI band."""
+        ctx_result, _ = self._crypto_family_common_preamble(signal, base_source=base_source, candidate=candidate, family="crypto_flow_buy")
+        if ctx_result is None:
+            return None, ""
+        ctx = ctx_result
+        if not bool(getattr(config, "CRYPTO_FLOW_BUY_ENABLED", False)):
+            return None, ""
+        if ctx["direction"] != "long":
+            return None, ""
+        allowed_symbols = set(config.get_crypto_flow_buy_allowed_symbols() or set())
+        if allowed_symbols and ctx["symbol"] not in allowed_symbols:
+            return None, ""
+        if not getattr(config, "CRYPTO_SMART_FAMILIES_24H_MODE", False):
+            allowed_sessions = set(config.get_crypto_flow_buy_allowed_sessions() or set())
+            if allowed_sessions and not self._session_signature_matches(ctx["session_sig"], allowed_sessions):
+                return None, ""
+        min_conf = float(getattr(config, "CRYPTO_FLOW_BUY_MIN_CONFIDENCE", 68.0) or 68.0)
+        max_conf = float(getattr(config, "CRYPTO_FLOW_BUY_MAX_CONFIDENCE", 80.0) or 80.0)
+        if ctx["confidence"] < min_conf or ctx["confidence"] > max_conf:
+            return None, ""
+        min_long = float(getattr(config, "CRYPTO_FLOW_BUY_MIN_LONG_SCORE", 85.0) or 85.0)
+        if ctx["long_score"] < min_long:
+            return None, ""
+        min_edge = float(getattr(config, "CRYPTO_FLOW_BUY_MIN_EDGE", 40.0) or 40.0)
+        if ctx["edge"] < min_edge:
+            return None, ""
+        rsi_min = float(getattr(config, "CRYPTO_FLOW_BUY_RSI_MIN", 55.0) or 55.0)
+        rsi_max = float(getattr(config, "CRYPTO_FLOW_BUY_RSI_MAX", 70.0) or 70.0)
+        if ctx["rsi"] < rsi_min or ctx["rsi"] > rsi_max:
+            return None, ""
+        if bool(getattr(config, "CRYPTO_FLOW_BUY_REQUIRE_STRONG_WINNER", True)):
+            if ctx["winner_regime"] == "strong":
+                pass
+            elif ctx["winner_regime"] == "neutral" and bool(getattr(config, "CRYPTO_FLOW_BUY_ALLOW_NEUTRAL_WINNER", True)):
+                pass
+            else:
+                return None, ""
+        entry = ctx["entry"]
+        stop_loss = ctx["stop_loss"]
+        risk = abs(entry - stop_loss)
+        trigger_ratio = float(getattr(config, "CRYPTO_FLOW_BUY_BREAK_STOP_TRIGGER_RISK_RATIO", 0.10) or 0.10)
+        stop_lift_ratio = float(getattr(config, "CRYPTO_FLOW_BUY_BREAK_STOP_STOP_LIFT_RATIO", 0.30) or 0.30)
+        trigger = max(risk * trigger_ratio, entry * 0.00015)
+        stop_lift = trigger * stop_lift_ratio
+        new_entry = entry + trigger
+        new_stop = stop_loss + stop_lift
+        if new_entry <= 0 or new_stop <= 0 or new_stop >= new_entry:
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family="crypto_flow_buy", entry=new_entry, stop_loss=new_stop, entry_type="buy_stop")
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, "crypto_flow_buy")
+        risk_usd = float(getattr(config, "CRYPTO_FLOW_BUY_BTC_CTRADER_RISK_USD", 0.65) or 0.65) if ctx["symbol"] == "BTCUSD" else float(getattr(config, "CRYPTO_FLOW_BUY_ETH_CTRADER_RISK_USD", 0.25) or 0.25)
+        if ctx["is_weekend"]:
+            risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
+        return self._crypto_family_tag_and_return(signal, shaped, lane_source=lane_source, candidate=candidate, family="crypto_flow_buy", risk_usd=risk_usd, ctx=ctx, extra_tags={"crypto_flow_buy_neural_gate": {"long_score": ctx["long_score"], "edge": ctx["edge"], "rsi": ctx["rsi"]}, "crypto_flow_buy_entry_mode": "buy_stop"})
+
+    def _build_crypto_winner_confirmed_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """CWC: Crypto Winner Confirmed — fires only on strong winner regime + high edge + neural confirmation."""
+        ctx_result, _ = self._crypto_family_common_preamble(signal, base_source=base_source, candidate=candidate, family="crypto_winner_confirmed")
+        if ctx_result is None:
+            return None, ""
+        ctx = ctx_result
+        if not bool(getattr(config, "CRYPTO_WINNER_CONFIRMED_ENABLED", False)):
+            return None, ""
+        allowed_symbols = set(config.get_crypto_winner_confirmed_allowed_symbols() or set())
+        if allowed_symbols and ctx["symbol"] not in allowed_symbols:
+            return None, ""
+        if not getattr(config, "CRYPTO_SMART_FAMILIES_24H_MODE", False):
+            allowed_sessions = set(config.get_crypto_winner_confirmed_allowed_sessions() or set())
+            if allowed_sessions and not self._session_signature_matches(ctx["session_sig"], allowed_sessions):
+                return None, ""
+        min_conf = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_MIN_CONFIDENCE", 70.0) or 70.0)
+        max_conf = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_MAX_CONFIDENCE", 80.0) or 80.0)
+        if ctx["confidence"] < min_conf or ctx["confidence"] > max_conf:
+            return None, ""
+        if ctx["winner_regime"] != "strong":
+            return None, ""
+        min_wr = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_MIN_WIN_RATE", 0.62) or 0.62)
+        if ctx["winner_wr"] < min_wr:
+            return None, ""
+        min_edge = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_MIN_EDGE", 60.0) or 60.0)
+        if ctx["edge"] < min_edge:
+            return None, ""
+        min_np = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_MIN_NEURAL_PROB", 0.62) or 0.62)
+        if ctx["neural_prob"] < min_np:
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family="crypto_winner_confirmed", entry=ctx["entry"], stop_loss=ctx["stop_loss"], entry_type=ctx["entry_type"])
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, "crypto_winner_confirmed")
+        risk_usd = float(getattr(config, "CRYPTO_WINNER_CONFIRMED_CTRADER_RISK_USD", 0.90) or 0.90)
+        if ctx["is_weekend"]:
+            risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
+        return self._crypto_family_tag_and_return(signal, shaped, lane_source=lane_source, candidate=candidate, family="crypto_winner_confirmed", risk_usd=risk_usd, ctx=ctx, extra_tags={"crypto_winner_confirmed_gate": {"winner_regime": ctx["winner_regime"], "winner_wr": ctx["winner_wr"], "edge": ctx["edge"], "neural_prob": ctx["neural_prob"]}})
+
+    def _build_crypto_behavioral_retest_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """CBR: Crypto Behavioral Retest — CHOCH_ENTRY + market-to-limit conversion for higher RR."""
+        ctx_result, _ = self._crypto_family_common_preamble(signal, base_source=base_source, candidate=candidate, family="crypto_behavioral_retest")
+        if ctx_result is None:
+            return None, ""
+        ctx = ctx_result
+        if not bool(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_ENABLED", False)):
+            return None, ""
+        allowed_symbols = set(config.get_crypto_behavioral_retest_allowed_symbols() or set())
+        if allowed_symbols and ctx["symbol"] not in allowed_symbols:
+            return None, ""
+        if not getattr(config, "CRYPTO_SMART_FAMILIES_24H_MODE", False):
+            allowed_sessions = set(config.get_crypto_behavioral_retest_allowed_sessions() or set())
+            if allowed_sessions and not self._session_signature_matches(ctx["session_sig"], allowed_sessions):
+                return None, ""
+        allowed_patterns = set(config.get_crypto_behavioral_retest_allowed_patterns() or set())
+        if allowed_patterns and ((not ctx["pattern"]) or ctx["pattern"].lower() not in allowed_patterns):
+            return None, ""
+        min_conf = float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_MIN_CONFIDENCE", 72.0) or 72.0)
+        max_conf = float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_MAX_CONFIDENCE", 82.0) or 82.0)
+        if ctx["confidence"] < min_conf or ctx["confidence"] > max_conf:
+            return None, ""
+        min_np = float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_MIN_NEURAL_PROB", 0.65) or 0.65)
+        if ctx["neural_prob"] < min_np:
+            return None, ""
+        if bool(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_BLOCK_SEVERE_WINNER", True)) and ctx["winner_regime"] == "severe":
+            return None, ""
+        entry = ctx["entry"]
+        stop_loss = ctx["stop_loss"]
+        entry_type = ctx["entry_type"]
+        converted_market = False
+        if entry_type == "market":
+            risk = abs(entry - stop_loss)
+            pullback_ratio = float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_PULLBACK_RISK_RATIO", 0.15) or 0.15)
+            pullback = max(risk * pullback_ratio, entry * 0.00010)
+            if ctx["direction"] == "long":
+                entry = entry - pullback
+            else:
+                entry = entry + pullback
+            entry_type = "limit"
+            converted_market = True
+        if entry <= 0 or stop_loss <= 0:
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family="crypto_behavioral_retest", entry=entry, stop_loss=stop_loss, entry_type=entry_type)
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, "crypto_behavioral_retest")
+        risk_usd = float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_BTC_CTRADER_RISK_USD", 0.45) or 0.45) if ctx["symbol"] == "BTCUSD" else float(getattr(config, "CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD", 0.20) or 0.20)
+        if ctx["is_weekend"]:
+            risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
+        return self._crypto_family_tag_and_return(signal, shaped, lane_source=lane_source, candidate=candidate, family="crypto_behavioral_retest", risk_usd=risk_usd, ctx=ctx, extra_tags={"crypto_behavioral_retest_gate": {"pattern": ctx["pattern"], "neural_prob": ctx["neural_prob"], "winner_regime": ctx["winner_regime"]}, "crypto_behavioral_retest_market_to_limit": converted_market})
 
     def _persistent_canary_profile(self, signal, source: str) -> dict:
         profile = {

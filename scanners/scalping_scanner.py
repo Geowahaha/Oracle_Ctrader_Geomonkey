@@ -1387,11 +1387,13 @@ class ScalpingScanner:
         d_side = str(direction or "").strip().lower()
         if d_side == "long":
             rsi_min = float(getattr(config, "SCALPING_M1_TRIGGER_RSI_LONG_MIN", 52.0) or 52.0)
+            rsi_max = float(getattr(config, "SCALPING_M1_TRIGGER_RSI_LONG_MAX", 70.0) or 70.0)
             ref_high_mult = float(getattr(config, "SCALPING_M1_TRIGGER_REFHIGH_BUFFER_MULT_LONG", 1.0) or 1.0)
             checks = {
                 "close_vs_ema9": close >= (ema9 - buffer_px * 0.20),
                 "ema9_vs_ema21": ema9 >= (ema21 - buffer_px * 0.20),
                 "rsi_gate": rsi14 >= rsi_min,
+                "rsi_ceiling": rsi14 <= rsi_max,
                 "ref_high_break": close >= (ref_high - buffer_px * ref_high_mult),
                 "prev_close_hold": close >= (prev_close - buffer_px * 0.50),
             }

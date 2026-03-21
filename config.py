@@ -140,6 +140,65 @@ class Config:
     CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER: bool = os.getenv("CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
     CRYPTO_WEEKEND_ETH_ALLOW_SHORT: bool = os.getenv("CRYPTO_WEEKEND_ETH_ALLOW_SHORT", "1").strip().lower() in ("1", "true", "yes", "on")
 
+    # ── Crypto Smart Families — global 24/7 mode (bypasses session gate for testing) ──
+    CRYPTO_SMART_FAMILIES_24H_MODE: bool = os.getenv("CRYPTO_SMART_FAMILIES_24H_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── Crypto Flow Short Sidecar (CFS) — sell_stop shorts, neural short-score gated ──
+    CRYPTO_FLOW_SHORT_ENABLED: bool = os.getenv("CRYPTO_FLOW_SHORT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_FLOW_SHORT_ALLOWED_SYMBOLS: str = os.getenv("CRYPTO_FLOW_SHORT_ALLOWED_SYMBOLS", "BTCUSD,ETHUSD")
+    CRYPTO_FLOW_SHORT_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_FLOW_SHORT_ALLOWED_SESSIONS", "london|new_york|london,new_york,overlap")
+    CRYPTO_FLOW_SHORT_MIN_SHORT_SCORE: float = float(os.getenv("CRYPTO_FLOW_SHORT_MIN_SHORT_SCORE", "70"))
+    CRYPTO_FLOW_SHORT_RSI_MAX: float = float(os.getenv("CRYPTO_FLOW_SHORT_RSI_MAX", "45"))
+    CRYPTO_FLOW_SHORT_MIN_EDGE: float = float(os.getenv("CRYPTO_FLOW_SHORT_MIN_EDGE", "30"))
+    CRYPTO_FLOW_SHORT_MIN_CONFIDENCE: float = float(os.getenv("CRYPTO_FLOW_SHORT_MIN_CONFIDENCE", "68"))
+    CRYPTO_FLOW_SHORT_MAX_CONFIDENCE: float = float(os.getenv("CRYPTO_FLOW_SHORT_MAX_CONFIDENCE", "85"))
+    CRYPTO_FLOW_SHORT_BLOCK_SEVERE_WINNER: bool = os.getenv("CRYPTO_FLOW_SHORT_BLOCK_SEVERE_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_FLOW_SHORT_BREAK_STOP_TRIGGER_RISK_RATIO: float = float(os.getenv("CRYPTO_FLOW_SHORT_BREAK_STOP_TRIGGER_RISK_RATIO", "0.10"))
+    CRYPTO_FLOW_SHORT_BREAK_STOP_STOP_LIFT_RATIO: float = float(os.getenv("CRYPTO_FLOW_SHORT_BREAK_STOP_STOP_LIFT_RATIO", "0.30"))
+    CRYPTO_FLOW_SHORT_BTC_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_FLOW_SHORT_BTC_CTRADER_RISK_USD", "0.45"))
+    CRYPTO_FLOW_SHORT_ETH_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_FLOW_SHORT_ETH_CTRADER_RISK_USD", "0.20"))
+
+    # ── Crypto Flow Buy Stop (CFB) — buy_stop longs, neural long-score gated ──
+    CRYPTO_FLOW_BUY_ENABLED: bool = os.getenv("CRYPTO_FLOW_BUY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_FLOW_BUY_ALLOWED_SYMBOLS: str = os.getenv("CRYPTO_FLOW_BUY_ALLOWED_SYMBOLS", "BTCUSD,ETHUSD")
+    CRYPTO_FLOW_BUY_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_FLOW_BUY_ALLOWED_SESSIONS", "london,new_york,overlap|new_york")
+    CRYPTO_FLOW_BUY_MIN_LONG_SCORE: float = float(os.getenv("CRYPTO_FLOW_BUY_MIN_LONG_SCORE", "85"))
+    CRYPTO_FLOW_BUY_RSI_MIN: float = float(os.getenv("CRYPTO_FLOW_BUY_RSI_MIN", "55"))
+    CRYPTO_FLOW_BUY_RSI_MAX: float = float(os.getenv("CRYPTO_FLOW_BUY_RSI_MAX", "70"))
+    CRYPTO_FLOW_BUY_MIN_EDGE: float = float(os.getenv("CRYPTO_FLOW_BUY_MIN_EDGE", "40"))
+    CRYPTO_FLOW_BUY_MIN_CONFIDENCE: float = float(os.getenv("CRYPTO_FLOW_BUY_MIN_CONFIDENCE", "68"))
+    CRYPTO_FLOW_BUY_MAX_CONFIDENCE: float = float(os.getenv("CRYPTO_FLOW_BUY_MAX_CONFIDENCE", "80"))
+    CRYPTO_FLOW_BUY_REQUIRE_STRONG_WINNER: bool = os.getenv("CRYPTO_FLOW_BUY_REQUIRE_STRONG_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_FLOW_BUY_ALLOW_NEUTRAL_WINNER: bool = os.getenv("CRYPTO_FLOW_BUY_ALLOW_NEUTRAL_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_FLOW_BUY_BREAK_STOP_TRIGGER_RISK_RATIO: float = float(os.getenv("CRYPTO_FLOW_BUY_BREAK_STOP_TRIGGER_RISK_RATIO", "0.10"))
+    CRYPTO_FLOW_BUY_BREAK_STOP_STOP_LIFT_RATIO: float = float(os.getenv("CRYPTO_FLOW_BUY_BREAK_STOP_STOP_LIFT_RATIO", "0.30"))
+    CRYPTO_FLOW_BUY_BTC_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_FLOW_BUY_BTC_CTRADER_RISK_USD", "0.65"))
+    CRYPTO_FLOW_BUY_ETH_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_FLOW_BUY_ETH_CTRADER_RISK_USD", "0.25"))
+
+    # ── Crypto Winner Confirmed (CWC) — strong winner + high edge only ──
+    CRYPTO_WINNER_CONFIRMED_ENABLED: bool = os.getenv("CRYPTO_WINNER_CONFIRMED_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_WINNER_CONFIRMED_ALLOWED_SYMBOLS: str = os.getenv("CRYPTO_WINNER_CONFIRMED_ALLOWED_SYMBOLS", "BTCUSD")
+    CRYPTO_WINNER_CONFIRMED_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_WINNER_CONFIRMED_ALLOWED_SESSIONS", "london,new_york,overlap")
+    CRYPTO_WINNER_CONFIRMED_MIN_WIN_RATE: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_MIN_WIN_RATE", "0.62"))
+    CRYPTO_WINNER_CONFIRMED_MIN_EDGE: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_MIN_EDGE", "60"))
+    CRYPTO_WINNER_CONFIRMED_MIN_CONFIDENCE: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_MIN_CONFIDENCE", "70"))
+    CRYPTO_WINNER_CONFIRMED_MAX_CONFIDENCE: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_MAX_CONFIDENCE", "80"))
+    CRYPTO_WINNER_CONFIRMED_MIN_NEURAL_PROB: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_MIN_NEURAL_PROB", "0.62"))
+    CRYPTO_WINNER_CONFIRMED_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_WINNER_CONFIRMED_CTRADER_RISK_USD", "0.90"))
+
+    # ── Crypto Behavioral Retest (CBR) — CHOCH_ENTRY + market-to-limit conversion ──
+    CRYPTO_BEHAVIORAL_RETEST_ENABLED: bool = os.getenv("CRYPTO_BEHAVIORAL_RETEST_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SYMBOLS: str = os.getenv("CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SYMBOLS", "BTCUSD,ETHUSD")
+    CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SESSIONS", "london,new_york,overlap|new_york")
+    CRYPTO_BEHAVIORAL_RETEST_ALLOWED_PATTERNS: str = os.getenv("CRYPTO_BEHAVIORAL_RETEST_ALLOWED_PATTERNS", "CHOCH_ENTRY")
+    CRYPTO_BEHAVIORAL_RETEST_MIN_CONFIDENCE: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_MIN_CONFIDENCE", "72"))
+    CRYPTO_BEHAVIORAL_RETEST_MAX_CONFIDENCE: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_MAX_CONFIDENCE", "82"))
+    CRYPTO_BEHAVIORAL_RETEST_MIN_NEURAL_PROB: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_MIN_NEURAL_PROB", "0.65"))
+    CRYPTO_BEHAVIORAL_RETEST_BLOCK_SEVERE_WINNER: bool = os.getenv("CRYPTO_BEHAVIORAL_RETEST_BLOCK_SEVERE_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_BEHAVIORAL_RETEST_PULLBACK_RISK_RATIO: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_PULLBACK_RISK_RATIO", "0.15"))
+    CRYPTO_BEHAVIORAL_RETEST_BTC_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_BTC_CTRADER_RISK_USD", "0.45"))
+    CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD", "0.20"))
+
     CTRADER_XAU_ACTIVE_FAMILIES: str = os.getenv("CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit,xau_scalp_breakout_stop")
     CTRADER_XAU_PRIMARY_FAMILY: str = os.getenv("CTRADER_XAU_PRIMARY_FAMILY", "")
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1389,7 +1448,7 @@ class Config:
     SCALPING_CRYPTO_WINNER_CONF_PENALTY_SEVERE: float = float(os.getenv("SCALPING_CRYPTO_WINNER_CONF_PENALTY_SEVERE", "4.5"))
     SCALPING_CRYPTO_WINNER_CONF_MIN: float = float(os.getenv("SCALPING_CRYPTO_WINNER_CONF_MIN", "55.0"))
     SCALPING_CRYPTO_WINNER_CONF_MAX: float = float(os.getenv("SCALPING_CRYPTO_WINNER_CONF_MAX", "90.0"))
-    SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE: bool = os.getenv("SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE", "0").strip().lower() in ("1", "true", "yes", "on")
+    SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE: bool = os.getenv("SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_CRYPTO_WINNER_HARD_BLOCK_MIN_CONF: float = float(os.getenv("SCALPING_CRYPTO_WINNER_HARD_BLOCK_MIN_CONF", "76.0"))
 
     # ── Crypto Winner Exit Retuning (ported from XAU) ─────────────────────────
@@ -1434,6 +1493,7 @@ class Config:
     SCALPING_M1_TRIGGER_LOOKBACK_BARS: int = int(os.getenv("SCALPING_M1_TRIGGER_LOOKBACK_BARS", "120"))
     SCALPING_M1_TRIGGER_BREAKOUT_BARS: int = int(os.getenv("SCALPING_M1_TRIGGER_BREAKOUT_BARS", "3"))
     SCALPING_M1_TRIGGER_RSI_LONG_MIN: float = float(os.getenv("SCALPING_M1_TRIGGER_RSI_LONG_MIN", "52"))
+    SCALPING_M1_TRIGGER_RSI_LONG_MAX: float = float(os.getenv("SCALPING_M1_TRIGGER_RSI_LONG_MAX", "70"))
     SCALPING_M1_TRIGGER_RSI_SHORT_MAX: float = float(os.getenv("SCALPING_M1_TRIGGER_RSI_SHORT_MAX", "48"))
     SCALPING_M1_TRIGGER_REFHIGH_BUFFER_MULT_LONG: float = float(os.getenv("SCALPING_M1_TRIGGER_REFHIGH_BUFFER_MULT_LONG", "1.00"))
     SCALPING_M1_TRIGGER_REFLOW_BUFFER_MULT_SHORT: float = float(os.getenv("SCALPING_M1_TRIGGER_REFLOW_BUFFER_MULT_SHORT", "1.25"))
@@ -1962,6 +2022,42 @@ class Config:
         if raw == "*":
             return {"*"}
         return cls._parse_signature_set(raw)
+
+    @classmethod
+    def get_crypto_flow_short_allowed_symbols(cls) -> set[str]:
+        return cls._parse_symbol_set(cls.CRYPTO_FLOW_SHORT_ALLOWED_SYMBOLS)
+
+    @classmethod
+    def get_crypto_flow_short_allowed_sessions(cls) -> set[str]:
+        return cls._parse_signature_set(cls.CRYPTO_FLOW_SHORT_ALLOWED_SESSIONS)
+
+    @classmethod
+    def get_crypto_flow_buy_allowed_symbols(cls) -> set[str]:
+        return cls._parse_symbol_set(cls.CRYPTO_FLOW_BUY_ALLOWED_SYMBOLS)
+
+    @classmethod
+    def get_crypto_flow_buy_allowed_sessions(cls) -> set[str]:
+        return cls._parse_signature_set(cls.CRYPTO_FLOW_BUY_ALLOWED_SESSIONS)
+
+    @classmethod
+    def get_crypto_winner_confirmed_allowed_symbols(cls) -> set[str]:
+        return cls._parse_symbol_set(cls.CRYPTO_WINNER_CONFIRMED_ALLOWED_SYMBOLS)
+
+    @classmethod
+    def get_crypto_winner_confirmed_allowed_sessions(cls) -> set[str]:
+        return cls._parse_signature_set(cls.CRYPTO_WINNER_CONFIRMED_ALLOWED_SESSIONS)
+
+    @classmethod
+    def get_crypto_behavioral_retest_allowed_symbols(cls) -> set[str]:
+        return cls._parse_symbol_set(cls.CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SYMBOLS)
+
+    @classmethod
+    def get_crypto_behavioral_retest_allowed_sessions(cls) -> set[str]:
+        return cls._parse_signature_set(cls.CRYPTO_BEHAVIORAL_RETEST_ALLOWED_SESSIONS)
+
+    @classmethod
+    def get_crypto_behavioral_retest_allowed_patterns(cls) -> set[str]:
+        return cls._parse_lower_set(cls.CRYPTO_BEHAVIORAL_RETEST_ALLOWED_PATTERNS)
 
     @classmethod
     def get_ctrader_xau_active_families(cls) -> set[str]:

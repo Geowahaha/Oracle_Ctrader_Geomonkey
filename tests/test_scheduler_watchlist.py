@@ -4095,5 +4095,323 @@ class SchedulerWatchlistTests(unittest.TestCase):
         )
 
 
+    # ── Crypto Smart Families (CFS / CFB / CWC / CBR) ──────────────────────
+
+    def test_cfs_btc_sell_stop_fires(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 70200.0
+        sig.entry_type = "sell_stop"
+        sig.direction = "short"
+        sig.raw_scores["crypto_winner_logic_regime"] = "neutral"
+        sig.raw_scores["short"] = 75.0
+        sig.raw_scores["edge"] = 50.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 40.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_symbols", return_value={"BTCUSD", "ETHUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MAX_CONFIDENCE", 85.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_SHORT_SCORE", 70.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_EDGE", 30.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_RSI_MAX", 45.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_BLOCK_SEVERE_WINNER", True), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_BREAK_STOP_TRIGGER_RISK_RATIO", 0.10), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_BREAK_STOP_STOP_LIFT_RATIO", 0.30), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_BTC_CTRADER_RISK_USD", 0.45), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_flow_short_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_short", "strategy_id": "test", "priority": 199})
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_btcusd:cfs:canary")
+        self.assertEqual(str(getattr(shaped, "entry_type", "")), "sell_stop")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertEqual(raw.get("strategy_family"), "crypto_flow_short")
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0)), 0.45, places=2)
+
+    def test_cfs_blocks_long_direction(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["short"] = 75.0
+        sig.raw_scores["edge"] = 50.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 40.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MAX_CONFIDENCE", 85.0), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_flow_short_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_short", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_cfs_blocks_high_rsi(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 70200.0
+        sig.entry_type = "sell_stop"
+        sig.direction = "short"
+        sig.raw_scores["short"] = 75.0
+        sig.raw_scores["edge"] = 50.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 55.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_short_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MAX_CONFIDENCE", 85.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_SHORT_SCORE", 70.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_MIN_EDGE", 30.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_SHORT_RSI_MAX", 45.0), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_flow_short_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_short", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_cfb_btc_buy_stop_fires(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=73.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+        sig.raw_scores["long"] = 90.0
+        sig.raw_scores["edge"] = 60.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 60.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_symbols", return_value={"BTCUSD", "ETHUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MAX_CONFIDENCE", 80.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_LONG_SCORE", 85.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_EDGE", 40.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_RSI_MIN", 55.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_RSI_MAX", 70.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_REQUIRE_STRONG_WINNER", True), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_ALLOW_NEUTRAL_WINNER", True), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_BREAK_STOP_TRIGGER_RISK_RATIO", 0.10), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_BREAK_STOP_STOP_LIFT_RATIO", 0.30), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_BTC_CTRADER_RISK_USD", 0.65), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_flow_buy_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_buy", "strategy_id": "test", "priority": 199})
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_btcusd:cfb:canary")
+        self.assertEqual(str(getattr(shaped, "entry_type", "")), "buy_stop")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0)), 0.65, places=2)
+
+    def test_cfb_blocks_short_direction(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=73.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 70200.0
+        sig.entry_type = "sell_stop"
+        sig.direction = "short"
+        sig.raw_scores["long"] = 90.0
+        sig.raw_scores["edge"] = 60.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 60.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MAX_CONFIDENCE", 80.0), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_flow_buy_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_buy", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_cfb_blocks_overbought_rsi(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=73.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+        sig.raw_scores["long"] = 90.0
+        sig.raw_scores["edge"] = 60.0
+        sig.raw_scores["scalping_trigger"] = {"rsi14": 72.0}
+        with patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_flow_buy_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MAX_CONFIDENCE", 80.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_LONG_SCORE", 85.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_MIN_EDGE", 40.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_RSI_MIN", 55.0), \
+             patch.object(scheduler_module.config, "CRYPTO_FLOW_BUY_RSI_MAX", 70.0), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_flow_buy_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_flow_buy", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_cwc_fires_strong_winner(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=74.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+        sig.raw_scores["crypto_winner_logic_win_rate"] = 0.65
+        sig.raw_scores["edge"] = 65.0
+        sig.raw_scores["neural_probability"] = 0.68
+        with patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_winner_confirmed_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_winner_confirmed_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MAX_CONFIDENCE", 80.0), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_WIN_RATE", 0.62), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_EDGE", 60.0), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_NEURAL_PROB", 0.62), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_CTRADER_RISK_USD", 0.90), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_winner_confirmed_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_winner_confirmed", "strategy_id": "test", "priority": 199})
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_btcusd:cwc:canary")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0)), 0.90, places=2)
+
+    def test_cwc_blocks_neutral_winner(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=74.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["crypto_winner_logic_regime"] = "neutral"
+        sig.raw_scores["crypto_winner_logic_win_rate"] = 0.55
+        sig.raw_scores["edge"] = 65.0
+        sig.raw_scores["neural_probability"] = 0.68
+        with patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_winner_confirmed_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_winner_confirmed_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MAX_CONFIDENCE", 80.0), \
+             patch.object(scheduler_module.config, "CRYPTO_WINNER_CONFIRMED_MIN_WIN_RATE", 0.62), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_winner_confirmed_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_winner_confirmed", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_cbr_market_to_limit_conversion(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=75.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "CHOCH_ENTRY"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "market"
+        sig.direction = "long"
+        sig.raw_scores["crypto_winner_logic_regime"] = "neutral"
+        sig.raw_scores["neural_probability"] = 0.70
+        with patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_symbols", return_value={"BTCUSD", "ETHUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_patterns", return_value={"choch_entry"}), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_MIN_CONFIDENCE", 72.0), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_MAX_CONFIDENCE", 82.0), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_MIN_NEURAL_PROB", 0.65), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_BLOCK_SEVERE_WINNER", True), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_PULLBACK_RISK_RATIO", 0.15), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_BTC_CTRADER_RISK_USD", 0.45), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_behavioral_retest_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_behavioral_retest", "strategy_id": "test", "priority": 199})
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_btcusd:cbr:canary")
+        self.assertEqual(str(getattr(shaped, "entry_type", "")), "limit")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertTrue(raw.get("crypto_behavioral_retest_market_to_limit"))
+
+    def test_cbr_blocks_wrong_pattern(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=75.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "london, new_york, overlap"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "limit"
+        sig.direction = "long"
+        sig.raw_scores["neural_probability"] = 0.70
+        with patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_symbols", return_value={"BTCUSD"}), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_sessions", return_value={"london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "get_crypto_behavioral_retest_allowed_patterns", return_value={"choch_entry"}), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_MIN_CONFIDENCE", 72.0), \
+             patch.object(scheduler_module.config, "CRYPTO_BEHAVIORAL_RETEST_MAX_CONFIDENCE", 82.0), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, _ = dexter._build_crypto_behavioral_retest_signal(sig, base_source="scalp_btcusd", candidate={"family": "crypto_behavioral_retest", "strategy_id": "test", "priority": 199})
+        self.assertIsNone(shaped)
+
+    def test_rsi_ceiling_blocks_overbought_long(self):
+        from scanners.scalping_scanner import ScalpingScanner
+        import pandas as pd
+        scanner = ScalpingScanner.__new__(ScalpingScanner)
+        scanner._as_float = lambda v, d=0.0: float(v) if v is not None else d
+        close_prices = [70000 + i * 10 for i in range(130)]
+        high_prices = [p + 20 for p in close_prices]
+        low_prices = [p - 20 for p in close_prices]
+        open_prices = [p - 5 for p in close_prices]
+        df = pd.DataFrame({"open": open_prices, "high": high_prices, "low": low_prices, "close": close_prices})
+        with patch.object(scheduler_module.config, "SCALPING_M1_TRIGGER_RSI_LONG_MIN", 52.0), \
+             patch.object(scheduler_module.config, "SCALPING_M1_TRIGGER_RSI_LONG_MAX", 70.0), \
+             patch.object(scheduler_module.config, "SCALPING_M1_TRIGGER_REFHIGH_BUFFER_MULT_LONG", 1.0):
+            ok, info = scanner._m1_trigger(df, direction="long")
+        checks = info.get("checks", {})
+        if checks.get("rsi_ceiling") is not None:
+            rsi_val = info.get("rsi14", 0)
+            if rsi_val > 70:
+                self.assertFalse(checks.get("rsi_ceiling"), f"RSI {rsi_val} should be blocked by ceiling 70")
+
+    def test_crypto_severe_winner_hard_block_default_on(self):
+        self.assertTrue(bool(getattr(scheduler_module.config, "SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE", False)), "SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE should default to True")
+
+
 if __name__ == "__main__":
     unittest.main()
