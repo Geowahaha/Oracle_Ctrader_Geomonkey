@@ -77,9 +77,14 @@ jobs:
             echo "=== Restarting service ==="
             if sudo systemctl is-enabled dexter-monitor 2>/dev/null; then
               sudo systemctl restart dexter-monitor
-              sleep 3
-              sudo systemctl is-active dexter-monitor
-              echo "Deploy complete — service restarted!"
+              sleep 5
+              STATUS=$(sudo systemctl is-active dexter-monitor || true)
+              echo "Service status: $STATUS"
+              if [ "$STATUS" = "active" ] || [ "$STATUS" = "activating" ]; then
+                echo "Deploy complete — service running!"
+              else
+                echo "WARNING: service status is $STATUS — check logs with: sudo journalctl -u dexter-monitor -n 50"
+              fi
             else
               echo "Deploy complete — service not yet configured (run oracle_always_free_setup.sh)"
             fi
