@@ -3792,7 +3792,8 @@ class DexterScheduler:
         base_token = str(base_source or "").strip().lower().split(":", 1)[0]
         if signal is None or family not in {"btc_weekday_lob_momentum", "eth_weekday_overlap_probe"}:
             return None, ""
-        if datetime.now(timezone.utc).weekday() >= 5:
+        is_weekend = datetime.now(timezone.utc).weekday() >= 5
+        if is_weekend and not bool(getattr(config, "CRYPTO_WEEKEND_TRADING_ENABLED", False)):
             return None, ""
         direction = str(getattr(signal, "direction", "") or "").strip().lower()
         if direction not in {"long", "short"}:
@@ -3820,7 +3821,8 @@ class DexterScheduler:
                 return None, ""
             if direction != "long":
                 return None, ""
-            if not self._session_signature_matches(session_sig, set(config.get_btc_weekday_lob_allowed_sessions() or set())):
+            btc_sessions = set(config.get_crypto_weekend_btc_allowed_sessions() or set()) if is_weekend else set(config.get_btc_weekday_lob_allowed_sessions() or set())
+            if "*" not in btc_sessions and not self._session_signature_matches(session_sig, btc_sessions):
                 return None, ""
             if confidence < float(getattr(config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0) or 70.0):
                 return None, ""
@@ -3838,7 +3840,10 @@ class DexterScheduler:
             )
             if neutral_ob_allowed:
                 relaxed_gate_reasons.append("neutral_ob_bounce")
-            if bool(getattr(config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not neutral_ob_allowed:
+            weekend_neutral_ok = is_weekend and bool(getattr(config, "CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", True)) and winner_regime == "neutral"
+            if weekend_neutral_ok:
+                relaxed_gate_reasons.append("weekend_neutral_winner")
+            if bool(getattr(config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not neutral_ob_allowed and not weekend_neutral_ok:
                 return None, ""
             if entry_type == "market" and not bool(getattr(config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True)):
                 return None, ""
@@ -3861,10 +3866,13 @@ class DexterScheduler:
             risk_usd = float(getattr(config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9) or 0.9)
             if relaxed_gate_reasons:
                 risk_usd *= float(getattr(config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.70) or 0.70)
+            if is_weekend:
+                risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         else:
             if symbol != "ETHUSD" or base_token != "scalp_ethusd":
                 return None, ""
-            if not self._session_signature_matches(session_sig, set(config.get_eth_weekday_probe_allowed_sessions() or set())):
+            eth_sessions = set(config.get_crypto_weekend_eth_allowed_sessions() or set()) if is_weekend else set(config.get_eth_weekday_probe_allowed_sessions() or set())
+            if "*" not in eth_sessions and not self._session_signature_matches(session_sig, eth_sessions):
                 return None, ""
             if confidence < float(getattr(config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0) or 74.0):
                 return None, ""
@@ -3873,11 +3881,16 @@ class DexterScheduler:
             allowed_patterns = set(config.get_eth_weekday_probe_allowed_patterns() or set())
             if allowed_patterns and ((not pattern) or pattern.lower() not in allowed_patterns):
                 return None, ""
-            if bool(getattr(config, "ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong":
+            eth_weekend_neutral_ok = is_weekend and bool(getattr(config, "CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", True)) and winner_regime == "neutral"
+            if eth_weekend_neutral_ok:
+                relaxed_gate_reasons.append("weekend_neutral_winner")
+            if bool(getattr(config, "ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not eth_weekend_neutral_ok:
                 return None, ""
             if entry_type == "market" and not bool(getattr(config, "ETH_WEEKDAY_PROBE_ALLOW_MARKET", True)):
                 return None, ""
             risk_usd = float(getattr(config, "ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", 0.35) or 0.35)
+            if is_weekend:
+                risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         lane_signal = copy.deepcopy(signal)
         shaped = self._apply_family_price_plan(
             lane_signal,
@@ -3904,6 +3917,8 @@ class DexterScheduler:
             raw["strategy_family_executor"] = "scheduler_canary_crypto_weekday"
             raw["strategy_family_alias"] = self._strategy_family_alias(family)
             raw["crypto_weekday_experimental"] = True
+            raw["crypto_weekend_mode"] = is_weekend
+            raw["crypto_weekend_risk_multiplier"] = float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65) if is_weekend else 1.0
             raw["crypto_weekday_regime"] = winner_regime
             raw["crypto_weekday_session"] = session_sig
             raw["crypto_weekday_pattern"] = pattern

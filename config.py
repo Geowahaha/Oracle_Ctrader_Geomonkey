@@ -131,6 +131,15 @@ class Config:
     ETH_WEEKDAY_PROBE_ALLOW_MARKET: bool = os.getenv("ETH_WEEKDAY_PROBE_ALLOW_MARKET", "1").strip().lower() in ("1", "true", "yes", "on")
     ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER: bool = os.getenv("ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
     ETH_WEEKDAY_PROBE_CTRADER_RISK_USD: float = float(os.getenv("ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", "0.35"))
+
+    # ── Crypto Weekend Trading ────────────────────────────────────────────────
+    CRYPTO_WEEKEND_TRADING_ENABLED: bool = os.getenv("CRYPTO_WEEKEND_TRADING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_WEEKEND_RISK_MULTIPLIER: float = float(os.getenv("CRYPTO_WEEKEND_RISK_MULTIPLIER", "0.65"))
+    CRYPTO_WEEKEND_BTC_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_WEEKEND_BTC_ALLOWED_SESSIONS", "*")
+    CRYPTO_WEEKEND_ETH_ALLOWED_SESSIONS: str = os.getenv("CRYPTO_WEEKEND_ETH_ALLOWED_SESSIONS", "*")
+    CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER: bool = os.getenv("CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_WEEKEND_ETH_ALLOW_SHORT: bool = os.getenv("CRYPTO_WEEKEND_ETH_ALLOW_SHORT", "1").strip().lower() in ("1", "true", "yes", "on")
+
     CTRADER_XAU_ACTIVE_FAMILIES: str = os.getenv("CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit,xau_scalp_breakout_stop")
     CTRADER_XAU_PRIMARY_FAMILY: str = os.getenv("CTRADER_XAU_PRIMARY_FAMILY", "")
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1382,6 +1391,19 @@ class Config:
     SCALPING_CRYPTO_WINNER_CONF_MAX: float = float(os.getenv("SCALPING_CRYPTO_WINNER_CONF_MAX", "90.0"))
     SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE: bool = os.getenv("SCALPING_CRYPTO_WINNER_HARD_BLOCK_SEVERE", "0").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_CRYPTO_WINNER_HARD_BLOCK_MIN_CONF: float = float(os.getenv("SCALPING_CRYPTO_WINNER_HARD_BLOCK_MIN_CONF", "76.0"))
+
+    # ── Crypto Winner Exit Retuning (ported from XAU) ─────────────────────────
+    SCALPING_CRYPTO_WINNER_RISK_MULT_STRONG: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RISK_MULT_STRONG", "1.00"))
+    SCALPING_CRYPTO_WINNER_RISK_MULT_WEAK: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RISK_MULT_WEAK", "0.85"))
+    SCALPING_CRYPTO_WINNER_RISK_MULT_SEVERE: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RISK_MULT_SEVERE", "0.75"))
+    SCALPING_CRYPTO_WINNER_RR_MULT_STRONG: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RR_MULT_STRONG", "1.05"))
+    SCALPING_CRYPTO_WINNER_RR_MULT_WEAK: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RR_MULT_WEAK", "0.88"))
+    SCALPING_CRYPTO_WINNER_RR_MULT_SEVERE: float = float(os.getenv("SCALPING_CRYPTO_WINNER_RR_MULT_SEVERE", "0.78"))
+
+    # ── Crypto Performance Tracker ────────────────────────────────────────────
+    CRYPTO_PERFORMANCE_TRACKER_ENABLED: bool = os.getenv("CRYPTO_PERFORMANCE_TRACKER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CRYPTO_PERFORMANCE_TRACKER_LOOKBACK_DAYS: int = int(os.getenv("CRYPTO_PERFORMANCE_TRACKER_LOOKBACK_DAYS", "21"))
+    CRYPTO_PERFORMANCE_TRACKER_REPORT_PATH: str = os.getenv("CRYPTO_PERFORMANCE_TRACKER_REPORT_PATH", "data/reports/crypto_performance_tracker.json")
     SCALPING_XAU_WINNER_LOGIC_ENABLED: bool = os.getenv("SCALPING_XAU_WINNER_LOGIC_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_XAU_WINNER_CACHE_SEC: int = int(os.getenv("SCALPING_XAU_WINNER_CACHE_SEC", "180"))
     SCALPING_XAU_WINNER_LOOKBACK_DAYS: int = int(os.getenv("SCALPING_XAU_WINNER_LOOKBACK_DAYS", "14"))
@@ -1926,6 +1948,20 @@ class Config:
     @classmethod
     def get_eth_weekday_probe_allowed_patterns(cls) -> set[str]:
         return cls._parse_lower_set(cls.ETH_WEEKDAY_PROBE_ALLOWED_PATTERNS)
+
+    @classmethod
+    def get_crypto_weekend_btc_allowed_sessions(cls) -> set[str]:
+        raw = cls.CRYPTO_WEEKEND_BTC_ALLOWED_SESSIONS.strip()
+        if raw == "*":
+            return {"*"}
+        return cls._parse_signature_set(raw)
+
+    @classmethod
+    def get_crypto_weekend_eth_allowed_sessions(cls) -> set[str]:
+        raw = cls.CRYPTO_WEEKEND_ETH_ALLOWED_SESSIONS.strip()
+        if raw == "*":
+            return {"*"}
+        return cls._parse_signature_set(raw)
 
     @classmethod
     def get_ctrader_xau_active_families(cls) -> set[str]:

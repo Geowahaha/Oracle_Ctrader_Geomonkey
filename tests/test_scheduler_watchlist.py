@@ -3298,6 +3298,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         sig.raw_scores["crypto_winner_logic_regime"] = "strong"
         sig.raw_scores["neural_probability"] = 0.6382
 
+        weekday_dt = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)  # Monday
         with patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True), \
@@ -3309,7 +3310,10 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
-             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}):
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekday_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
                 sig,
                 base_source="scalp_btcusd",
@@ -3335,6 +3339,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         sig.raw_scores["crypto_winner_logic_regime"] = "neutral"
         sig.raw_scores["neural_probability"] = 0.6605
 
+        weekday_dt = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)  # Monday
         with patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True), \
@@ -3345,7 +3350,10 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
-             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}):
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekday_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
                 sig,
                 base_source="scalp_btcusd",
@@ -3357,6 +3365,181 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertTrue(bool(getattr(shaped, "raw_scores", {}).get("strategy_family_relaxed_gate")))
         self.assertIn("neutral_ob_bounce", str(getattr(shaped, "raw_scores", {}).get("strategy_family_relaxed_reason", "")))
         self.assertAlmostEqual(float(getattr(shaped, "raw_scores", {}).get("ctrader_risk_usd_override", 0.0) or 0.0), 0.63, places=2)
+
+    def test_crypto_weekend_toggle_off_blocks_btc(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "new_york"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "market"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+
+        weekend_dt = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        with patch.object(scheduler_module.config, "CRYPTO_WEEKEND_TRADING_ENABLED", False), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekend_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
+                sig, base_source="scalp_btcusd",
+                candidate={"family": "btc_weekday_lob_momentum", "strategy_id": "test", "priority": 3},
+            )
+
+        self.assertIsNone(shaped)
+        self.assertEqual(lane_source, "")
+
+    def test_crypto_weekend_btc_strong_winner_fires_with_reduced_risk(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "new_york"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "market"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+
+        weekend_dt = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        with patch.object(scheduler_module.config, "CRYPTO_WEEKEND_TRADING_ENABLED", True), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_BTC_ALLOWED_SESSIONS", "*"), \
+             patch.object(scheduler_module.config, "get_crypto_weekend_btc_allowed_sessions", return_value={"*"}), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekend_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
+                sig, base_source="scalp_btcusd",
+                candidate={"family": "btc_weekday_lob_momentum", "strategy_id": "test", "priority": 3},
+            )
+
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_btcusd:bwl:canary")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertTrue(raw.get("crypto_weekend_mode"))
+        risk = float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0)
+        self.assertAlmostEqual(risk, 0.9 * 0.65, places=2)
+
+    def test_crypto_weekend_btc_neutral_winner_fires_with_relaxed_reason(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "new_york"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "market"
+        sig.raw_scores["crypto_winner_logic_regime"] = "neutral"
+        sig.raw_scores["neural_probability"] = 0.70
+
+        weekend_dt = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        with patch.object(scheduler_module.config, "CRYPTO_WEEKEND_TRADING_ENABLED", True), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", True), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_BTC_ALLOWED_SESSIONS", "*"), \
+             patch.object(scheduler_module.config, "get_crypto_weekend_btc_allowed_sessions", return_value={"*"}), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_NEUTRAL_OB_BOUNCE", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_CONFIDENCE", 72.8), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_NEURAL_PROB", 0.65), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekend_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
+                sig, base_source="scalp_btcusd",
+                candidate={"family": "btc_weekday_lob_momentum", "strategy_id": "test", "priority": 3},
+            )
+
+        self.assertIsNotNone(shaped)
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertIn("weekend_neutral_winner", str(raw.get("strategy_family_relaxed_reason", "")))
+        self.assertTrue(raw.get("crypto_weekend_mode"))
+
+    def test_crypto_weekend_eth_fires_with_weekend_sessions(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("ETHUSD", confidence=76.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "asian"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 3500.0
+        sig.stop_loss = 3490.0
+        sig.entry_type = "market"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+
+        weekend_dt = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        with patch.object(scheduler_module.config, "CRYPTO_WEEKEND_TRADING_ENABLED", True), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65), \
+             patch.object(scheduler_module.config, "CRYPTO_WEEKEND_ETH_ALLOWED_SESSIONS", "*"), \
+             patch.object(scheduler_module.config, "get_crypto_weekend_eth_allowed_sessions", return_value={"*"}), \
+             patch.object(scheduler_module.config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0), \
+             patch.object(scheduler_module.config, "ETH_WEEKDAY_PROBE_MAX_CONFIDENCE", 79.9), \
+             patch.object(scheduler_module.config, "ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", True), \
+             patch.object(scheduler_module.config, "ETH_WEEKDAY_PROBE_ALLOW_MARKET", True), \
+             patch.object(scheduler_module.config, "ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", 0.35), \
+             patch.object(scheduler_module.config, "get_eth_weekday_probe_allowed_patterns", return_value={"ob_bounce"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekend_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
+                sig, base_source="scalp_ethusd",
+                candidate={"family": "eth_weekday_overlap_probe", "strategy_id": "test", "priority": 3},
+            )
+
+        self.assertIsNotNone(shaped)
+        self.assertEqual(lane_source, "scalp_ethusd:ewp:canary")
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertTrue(raw.get("crypto_weekend_mode"))
+        risk = float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0)
+        self.assertAlmostEqual(risk, 0.35 * 0.65, places=2)
+
+    def test_crypto_weekday_toggle_on_unchanged_behavior(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("BTCUSD", confidence=72.0)
+        sig.timeframe = "5m+1m"
+        sig.session = "new_york"
+        sig.pattern = "OB_BOUNCE"
+        sig.entry = 70000.0
+        sig.stop_loss = 69800.0
+        sig.entry_type = "market"
+        sig.raw_scores["crypto_winner_logic_regime"] = "strong"
+
+        weekday_dt = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)  # Monday
+        with patch.object(scheduler_module.config, "CRYPTO_WEEKEND_TRADING_ENABLED", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
+             patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = weekday_dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            shaped, lane_source = dexter._build_crypto_weekday_experimental_signal(
+                sig, base_source="scalp_btcusd",
+                candidate={"family": "btc_weekday_lob_momentum", "strategy_id": "test", "priority": 3},
+            )
+
+        self.assertIsNotNone(shaped)
+        raw = getattr(shaped, "raw_scores", {})
+        self.assertFalse(raw.get("crypto_weekend_mode", False))
+        risk = float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0)
+        self.assertAlmostEqual(risk, 0.9, places=2)
 
     def test_mt5_lane_scorecard_builds_and_saves_report(self):
         dexter = scheduler_module.DexterScheduler()
