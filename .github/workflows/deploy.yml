@@ -17,9 +17,28 @@ jobs:
           username: ubuntu
           key: ${{ secrets.ORACLE_SSH_KEY }}
           port: 22
+          command_timeout: 5m
           script: |
             set -euo pipefail
             APP_DIR="/opt/dexter_pro"
+            REPO_URL="https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git"
+
+            # First-time setup: create dir, clone repo, create venv
+            if [ ! -d "$APP_DIR" ]; then
+              echo "=== First-time setup ==="
+              sudo mkdir -p "$APP_DIR"
+              sudo chown ubuntu:ubuntu "$APP_DIR"
+              git clone --branch main "$REPO_URL" "$APP_DIR"
+              cd "$APP_DIR"
+              python3 -m venv .venv
+              . .venv/bin/activate
+              pip install --upgrade pip wheel
+              pip install -r requirements.txt
+              echo "=== First-time setup complete ==="
+              echo "NOTE: Edit /opt/dexter_pro/.env.local with API keys, then run:"
+              echo "  sudo systemctl start dexter-monitor"
+              exit 0
+            fi
 
             echo "=== Pulling latest code ==="
             cd "$APP_DIR"
@@ -33,9 +52,11 @@ jobs:
             pip install -q -r requirements.txt
 
             echo "=== Restarting service ==="
-            sudo systemctl restart dexter-monitor
-
-            echo "=== Verifying ==="
-            sleep 3
-            sudo systemctl is-active dexter-monitor
-            echo "Deploy complete!"
+            if sudo systemctl is-enabled dexter-monitor 2>/dev/null; then
+              sudo systemctl restart dexter-monitor
+              sleep 3
+              sudo systemctl is-active dexter-monitor
+              echo "Deploy complete — service restarted!"
+            else
+              echo "Deploy complete — service not yet configured (run oracle_always_free_setup.sh)"
+            fi
