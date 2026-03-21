@@ -3673,7 +3673,8 @@ class TelegramAdminBot:
         lines.append("")
         lines.append("mood-stop logic:")
         lines.append(f"- enabled={mood.get('enabled')} weak_cycles={mood.get('weak_cycles',0)}/{mood.get('weak_cycles_to_stop',0)}")
-        lines.append(f"- status={("ACTIVE" if mood.get('active') else "clear")} reason={mood.get('reason','-')}")
+        mood_st = "ACTIVE" if mood.get('active') else "clear"
+        lines.append(f"- status={mood_st} reason={mood.get('reason','-')}")
         if mood.get("release_at_ny"):
             lines.append(f"- release_at={mood.get('release_at_ny')}")
         lines.append("")
