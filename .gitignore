@@ -45,3 +45,12 @@ logs/
 *.pkl
 cache/
 data/
+
+# ── Temp / scratch ────────────────────────────────────────────────────────────
+_temp_openclaw/
+_tmp_openclaw/
+_test_fss/
+_upstream/
+temp-grok/
+env_examplebackup.txt
+*.pub
