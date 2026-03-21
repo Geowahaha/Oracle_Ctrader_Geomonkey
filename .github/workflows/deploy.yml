@@ -54,6 +54,14 @@ jobs:
             git checkout main
             git pull --ff-only
 
+            # Create venv if missing
+            if [ ! -d "$APP_DIR/.venv" ]; then
+              echo "=== Creating missing venv ==="
+              sudo apt-get update -y
+              sudo apt-get install -y python3-venv python3-pip build-essential
+              python3 -m venv .venv
+            fi
+
             echo "=== Installing dependencies ==="
             . .venv/bin/activate
             pip install -q --upgrade pip
