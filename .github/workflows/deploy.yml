@@ -1,0 +1,42 @@
+name: Deploy to Oracle VM
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 129.150.36.17
+          username: ubuntu
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="/opt/dexter_pro"
+
+            echo "=== Pulling latest code ==="
+            cd "$APP_DIR"
+            git fetch --all --prune
+            git checkout main
+            git pull --ff-only
+
+            echo "=== Installing dependencies ==="
+            . .venv/bin/activate
+            pip install -q --upgrade pip
+            pip install -q -r requirements.txt
+
+            echo "=== Restarting service ==="
+            sudo systemctl restart dexter-monitor
+
+            echo "=== Verifying ==="
+            sleep 3
+            sudo systemctl is-active dexter-monitor
+            echo "Deploy complete!"
