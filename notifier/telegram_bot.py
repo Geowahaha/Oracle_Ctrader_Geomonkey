@@ -461,7 +461,8 @@ class TelegramNotifier:
         if entry_type == "limit":
             tiger_badges.append("🎯 Limit Entry")
         if tiger_badges:
-            lines.append(f"🐯 *TIGER QUALITY:* {' \\| '.join(tiger_badges)}")
+            sep = " \\| "
+            lines.append(f"🐯 *TIGER QUALITY:* {sep.join(tiger_badges)}")
 
         lines += [
             f"🕐 `{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}`",
