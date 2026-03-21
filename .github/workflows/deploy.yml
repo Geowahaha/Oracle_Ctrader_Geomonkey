@@ -17,7 +17,6 @@ jobs:
           username: ubuntu
           key: ${{ secrets.ORACLE_SSH_KEY }}
           port: 22
-          script_stop: true
           script: |
             set -euo pipefail
             APP_DIR="/opt/dexter_pro"
