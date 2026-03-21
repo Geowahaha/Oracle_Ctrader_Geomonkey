@@ -2,7 +2,7 @@ anthropic>=0.40.0
 ccxt>=4.3.0
 yfinance>=0.2.40
 pandas>=2.0.0
-pandas-ta>=0.3.14b,<0.4.67b0
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@main
 numpy>=1.24.0
 python-telegram-bot>=20.7
 aiohttp>=3.9.0
