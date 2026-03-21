@@ -2647,7 +2647,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
             "direction": "short",
             "session": "asian",
             "timeframe": "5m+1m",
-            "confidence_band": "70-74.9",
+            "confidence_band": "75-79.9",
             "h1_trend": "bearish",
             "day_type": "trend",
             "state_label": "continuation_drive",
@@ -2689,9 +2689,73 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertEqual(lane_source, "scalp_xauusd:fss:canary")
         self.assertEqual(str(getattr(lane_signal, "entry_type", "")), "sell_stop")
         raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
-        self.assertTrue(bool((raw.get("chart_state_flow_short_sidecar") or {}).get("first_sample_mode")))
-        self.assertTrue(bool((raw.get("chart_state_flow_short_sidecar") or {}).get("high_confidence_bridge")))
+        self.assertTrue(bool((raw.get("chart_state_flow_short_sidecar") or {}).get("relaxed_confidence_band")))
+        self.assertFalse(bool((raw.get("chart_state_flow_short_sidecar") or {}).get("first_sample_mode")))
+        self.assertFalse(bool((raw.get("chart_state_flow_short_sidecar") or {}).get("high_confidence_bridge")))
         self.assertEqual(str((raw.get("chart_state_flow_short_snapshot") or {}).get("entry_mode")), "break_stop")
+
+    def test_build_family_canary_signal_for_flow_short_sidecar_rejects_70_band_bridge_for_80plus(self):
+        """Fix 1 regression: 80+ must NOT bridge to 70-74.9 (two-band jump)."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=82.0)
+        sig.pattern = "Behavioral Sweep-Retest + Liquidity Continuation"
+        sig.direction = "short"
+        sig.session = "asian"
+        sig.timeframe = "5m+1m"
+        sig.entry_type = "limit"
+        sig.entry = 4690.85
+        sig.stop_loss = 4704.16
+        sig.take_profit_1 = 4678.51
+        candidate = {
+            "family": "xau_scalp_flow_short_sidecar",
+            "strategy_id": "xau_scalp_flow_short_sidecar_v1",
+            "priority": 7,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        ctx = {
+            "direction": "short",
+            "session": "asian",
+            "timeframe": "5m+1m",
+            "confidence_band": "70-74.9",
+            "h1_trend": "bearish",
+            "day_type": "trend",
+            "state_label": "continuation_drive",
+            "follow_up_plan": "follow_with_shallow_retest_or_break_stop",
+            "state_score": 43.2,
+            "resolved": 3,
+            "best_family": "xau_scalp_flow_short_sidecar",
+            "continuation_bias": 0.0,
+        }
+        snapshot = {
+            "ok": True,
+            "run_id": "ctcap_fss_70band",
+            "last_event_utc": "2026-03-20T02:14:54Z",
+            "features": {
+                "delta_proxy": 0.1391,
+                "bar_volume_proxy": 1.0,
+                "depth_imbalance": 0.3451,
+            },
+        }
+        with patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_FORCE_STOP_ONLY", True), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_SAMPLE_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_SAMPLE_MIN_CONFIDENCE", 72.0), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_SAMPLE_MIN_STATE_SCORE", 32.0), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_MODE_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 68.0), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_MIN_STATE_SCORE", 34.0), \
+             patch.object(scheduler_module.config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_ALLOW_HIGH_CONFIDENCE_BRIDGE", True), \
+             patch.object(dexter, "_load_xau_flow_short_sidecar_contexts", return_value=[ctx]), \
+             patch.object(scheduler_module.live_profile_autopilot, "latest_capture_feature_snapshot", return_value=snapshot), \
+             patch.object(scheduler_module, "live_profile_classify_chart_state", return_value={
+                 "state_label": "range_probe",
+                 "day_type": "trend",
+                 "continuation_bias": 0.0,
+             }):
+            lane_signal, lane_source = dexter._build_family_canary_signal(sig, base_source="scalp_xauusd", candidate=candidate)
+
+        self.assertIsNone(lane_signal, "80+ must NOT bridge to 70-74.9 (two-band jump)")
 
     def test_build_family_canary_signal_blocks_pb_outside_narrow_context(self):
         dexter = scheduler_module.DexterScheduler()

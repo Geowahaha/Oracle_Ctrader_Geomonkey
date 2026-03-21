@@ -2533,7 +2533,7 @@ class DexterScheduler:
             return True
         normalized = {str(item or "").strip().lower() for item in pattern_families if str(item or "").strip()}
         if not normalized:
-            return True
+            return False
         for token in allowed_patterns:
             token_l = str(token or "").strip().lower()
             if token_l in normalized:
@@ -3256,7 +3256,7 @@ class DexterScheduler:
                     high_confidence_bridge = bool(
                         bool(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_ALLOW_HIGH_CONFIDENCE_BRIDGE", True))
                         and conf_band == "80+"
-                        and ctx_conf in {"70-74.9", "75-79.9"}
+                        and ctx_conf == "75-79.9"
                         and signal_confidence >= max(min_confidence, 80.0)
                     )
                     if not high_confidence_bridge:
