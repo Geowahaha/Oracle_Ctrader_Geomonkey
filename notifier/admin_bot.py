@@ -3605,24 +3605,28 @@ class TelegramAdminBot:
         mood = dict(s.get("mood_stop") or {})
         symcd = dict(s.get("symbol_cooldown") or {})
         lines = ["US Open Guard (compact)"]
+        window_label = "IN" if s.get('in_us_open_window') else "OUT"
         lines.append(
-            f"window={("IN" if s.get('in_us_open_window') else "OUT")} "
+            f"window={window_label} "
             f"premarket={bool(s.get('premarket'))} t+={s.get('elapsed_after_open_min')}m"
         )
+        macro_label = "ACTIVE" if macro.get('active') else "clear"
         lines.append(
-            f"macro={("ACTIVE" if macro.get('active') else "clear")}"
+            f"macro={macro_label}"
             + (f" (~{macro.get('release_eta_min')}m)" if macro.get("release_eta_min") is not None else "")
         )
         if macro.get("active") and macro.get("reason"):
             lines.append(f"macro_reason: {str(macro.get('reason'))[:140]}")
+        cb_label = "ACTIVE" if cb.get('active') else "clear"
         lines.append(
-            f"cb={("ACTIVE" if cb.get('active') else "clear")}"
+            f"cb={cb_label}"
             + (f" (~{cb.get('release_eta_min')}m)" if cb.get("release_eta_min") is not None else "")
         )
         if cb.get("active") and cb.get("reason"):
             lines.append(f"cb_reason: {str(cb.get('reason'))[:140]}")
+        mood_label = "ACTIVE" if mood.get('active') else "clear"
         lines.append(
-            f"mood={("ACTIVE" if mood.get('active') else "clear")} "
+            f"mood={mood_label} "
             f"weak={mood.get('weak_cycles',0)}/{mood.get('weak_cycles_to_stop',0)}"
         )
         lines.append(
@@ -3651,7 +3655,8 @@ class TelegramAdminBot:
             f"- enabled={macro.get('enabled')} min_score>={macro.get('min_score')} "
             f"max_age<={macro.get('max_age_min')}m priority_only={macro.get('priority_only')}"
         )
-        lines.append(f"- status={("ACTIVE" if macro.get('active') else "clear")} reason={macro.get('reason','-')}")
+        macro_st = "ACTIVE" if macro.get('active') else "clear"
+        lines.append(f"- status={macro_st} reason={macro.get('reason','-')}")
         if macro.get("headline"):
             lines.append(f"- headline={macro.get('headline')}")
         if macro.get("release_eta_min") is not None:
@@ -3659,7 +3664,8 @@ class TelegramAdminBot:
         lines.append("")
         lines.append("circuit-breaker logic:")
         lines.append(f"- enabled={cb.get('enabled')} check_start_after_open={cb.get('check_start_min')}m")
-        lines.append(f"- status={("ACTIVE" if cb.get('active') else "clear")} reason={cb.get('reason','-')}")
+        cb_st = "ACTIVE" if cb.get('active') else "clear"
+        lines.append(f"- status={cb_st} reason={cb.get('reason','-')}")
         if cb.get("release_eta_min") is not None:
             lines.append(f"- release_eta≈{cb.get('release_eta_min')}m")
         if cb.get("release_at_ny"):
