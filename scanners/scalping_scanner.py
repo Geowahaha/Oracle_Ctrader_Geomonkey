@@ -166,6 +166,67 @@ class ScalpingScanner:
     def _is_weekend_utc() -> bool:
         return bool(datetime.now(timezone.utc).weekday() >= 5)
 
+    # ── Crypto multi-TF context (ported from XAU _apply_xau_multi_tf_context) ──
+
+    def _apply_crypto_multi_tf_context(self, signal, symbol: str) -> None:
+        """Fetch 4h + 1h trends from cTrader and adjust signal confidence."""
+        if signal is None:
+            return
+        try:
+            df_h4 = self._fetch_ctrader_ohlcv(symbol, "4h", bars=50)
+            df_h1 = self._fetch_ctrader_ohlcv(symbol, "1h", bars=100)
+            h4_trend = "unknown"
+            h1_trend = "unknown"
+            if df_h4 is not None and len(df_h4) >= 20:
+                df_h4 = self.ta.add_all(df_h4)
+                h4_trend = self.ta.determine_trend(df_h4)
+            if df_h1 is not None and len(df_h1) >= 20:
+                df_h1 = self.ta.add_all(df_h1)
+                h1_trend = self.ta.determine_trend(df_h1)
+            direction = str(getattr(signal, "direction", "") or "").lower()
+            aligned_trend = "bullish" if direction == "long" else "bearish"
+            bonus = 0.0
+            h4_match = (h4_trend == aligned_trend)
+            h1_match = (h1_trend == aligned_trend)
+            if h4_match and h1_match:
+                bonus = 5.0
+            elif h4_match or h1_match:
+                bonus = 2.0
+            h4_oppose = (h4_trend == ("bearish" if direction == "long" else "bullish"))
+            h1_oppose = (h1_trend == ("bearish" if direction == "long" else "bullish"))
+            if h4_oppose and h1_oppose:
+                bonus = -3.0
+            elif h4_oppose or h1_oppose:
+                bonus = min(bonus, 0.0)
+            if bonus != 0.0:
+                old_conf = float(getattr(signal, "confidence", 0) or 0)
+                signal.confidence = round(max(55.0, min(95.0, old_conf + bonus)), 1)
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["crypto_mtf_h4_trend"] = h4_trend
+            raw["crypto_mtf_h1_trend"] = h1_trend
+            raw["crypto_mtf_bonus"] = round(bonus, 1)
+            signal.raw_scores = raw
+            if bonus != 0.0:
+                logger.info("[ScalpCrypto] %s multi_tf: h4=%s h1=%s bonus=%+.1f conf=%.1f",
+                             symbol, h4_trend, h1_trend, bonus, signal.confidence)
+        except Exception as e:
+            logger.debug("[ScalpCrypto] %s multi_tf error: %s", symbol, e)
+
+    def _m1_trigger_crypto(self, df_m1, direction: str) -> tuple:
+        """M1 trigger with crypto-specific RSI/breakout overrides."""
+        import contextlib
+        from unittest.mock import patch as _mock_patch
+        overrides = {
+            "SCALPING_M1_TRIGGER_RSI_LONG_MIN": float(getattr(config, "SCALPING_CRYPTO_M1_RSI_LONG_MIN", 48)),
+            "SCALPING_M1_TRIGGER_RSI_LONG_MAX": float(getattr(config, "SCALPING_CRYPTO_M1_RSI_LONG_MAX", 75)),
+            "SCALPING_M1_TRIGGER_RSI_SHORT_MAX": float(getattr(config, "SCALPING_CRYPTO_M1_RSI_SHORT_MAX", 52)),
+            "SCALPING_M1_TRIGGER_BREAKOUT_BARS": int(getattr(config, "SCALPING_CRYPTO_M1_BREAKOUT_BARS", 5)),
+        }
+        with contextlib.ExitStack() as stack:
+            for key, val in overrides.items():
+                stack.enter_context(_mock_patch.object(config, key, val))
+            return self._m1_trigger(df_m1, direction)
+
     def _crypto_scalping_profile(self, symbol: str) -> dict:
         sym = str(symbol or "").strip().upper()
         base_min = float(getattr(config, "SCALPING_MIN_CONFIDENCE", getattr(config, "MIN_SIGNAL_CONFIDENCE", 70)) or 70)
@@ -1887,6 +1948,7 @@ class ScalpingScanner:
         trend_tf = str(getattr(config, "SCALPING_CRYPTO_TREND_TF", "15m"))
         df_entry = self._fetch_ctrader_ohlcv(symbol_up, entry_tf, bars=200)
         if df_entry is None or len(df_entry) < 50:
+            logger.debug("[ScalpCrypto] %s ctrader_data_unavailable tf=%s", symbol_up, entry_tf)
             return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="ctrader_data_unavailable")
         df_trend = self._fetch_ctrader_ohlcv(symbol_up, trend_tf, bars=100)
         session_info = session_manager.get_session_info()
@@ -1895,10 +1957,16 @@ class ScalpingScanner:
         _sig = SignalGenerator(min_confidence=config.MIN_SIGNAL_CONFIDENCE)
         signal = _sig.score_signal(df_entry=df_entry, df_trend=df_trend, symbol=symbol_up, timeframe=entry_tf, session_info=session_info)
         if signal is None:
+            logger.info("[ScalpCrypto] %s base_scanner_no_signal (MIN_SIGNAL_CONFIDENCE=%s)", symbol_up, config.MIN_SIGNAL_CONFIDENCE)
             return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="base_scanner_no_signal")
 
-        # Keep external-facing symbol identity stable (ETHUSD/BTCUSD),
-        # while preserving the exchange pair used for data fetches.
+        logger.info("[ScalpCrypto] %s score_signal: conf=%.1f dir=%s pattern=%s rr=%.2f",
+                     symbol_up, signal.confidence, signal.direction, getattr(signal, "pattern", "?"), getattr(signal, "risk_reward", 0))
+
+        # ── Multi-TF context — fetch 4h + 1h for trend alignment bonus ──
+        self._apply_crypto_multi_tf_context(signal, symbol_up)
+
+        # Keep external-facing symbol identity stable (ETHUSD/BTCUSD)
         signal.symbol = symbol_up
         if not str(getattr(signal, "session", "") or "").strip():
             signal.session = ", ".join(session_manager.current_sessions()) or "off_hours"
@@ -1916,6 +1984,7 @@ class ScalpingScanner:
             raw["scalp_profile_allowed_sessions"] = sorted(list(profile.get("allowed_sessions") or set()))
         signal.raw_scores = raw
         if profile.get("allowed_sessions") and (not self._session_signature_matches(session_sig, set(profile.get("allowed_sessions") or set()))):
+            logger.info("[ScalpCrypto] %s session_filtered: %s not in %s", symbol_up, session_sig, profile.get("allowed_sessions"))
             return ScalpingScanResult(
                 source=src,
                 symbol=symbol_up,
@@ -1924,7 +1993,12 @@ class ScalpingScanner:
                 signal=signal,
             )
 
+        conf_before_winner = float(getattr(signal, "confidence", 0) or 0)
         winner_info = self._apply_crypto_winner_logic(signal, apply_confidence=True)
+        conf_after_winner = float(getattr(signal, "confidence", 0) or 0)
+        if winner_info:
+            logger.info("[ScalpCrypto] %s winner_logic: regime=%s conf %.1f→%.1f",
+                         symbol_up, (winner_info or {}).get("regime", "?"), conf_before_winner, conf_after_winner)
         if bool((winner_info or {}).get("hard_block")):
             return ScalpingScanResult(
                 source=src,
@@ -1937,6 +2011,7 @@ class ScalpingScanner:
 
         min_conf = float(profile.get("min_confidence", getattr(config, "SCALPING_MIN_CONFIDENCE", getattr(config, "MIN_SIGNAL_CONFIDENCE", 70))) or 70)
         if float(getattr(signal, "confidence", 0.0) or 0.0) < min_conf:
+            logger.info("[ScalpCrypto] %s below_confidence: %.1f < %.1f", symbol_up, signal.confidence, min_conf)
             return ScalpingScanResult(
                 source=src,
                 symbol=symbol_up,
@@ -1946,12 +2021,15 @@ class ScalpingScanner:
                 trigger={"winner_logic": winner_info} if winner_info else {},
             )
 
+        # ── M1 trigger with crypto-specific RSI/breakout overrides ──
         m1_df = self._fetch_ctrader_ohlcv(
             symbol_up,
             str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m")),
             bars=max(60, int(getattr(config, "SCALPING_M1_TRIGGER_LOOKBACK_BARS", 120) or 120)),
         )
-        ok, trigger = self._m1_trigger(m1_df, str(getattr(signal, "direction", "") or ""))
+        ok, trigger = self._m1_trigger_crypto(m1_df, str(getattr(signal, "direction", "") or ""))
+        logger.info("[ScalpCrypto] %s m1_trigger: ok=%s reason=%s rsi=%.1f",
+                     symbol_up, ok, trigger.get("reason", "?"), float(trigger.get("rsi14") or 0))
         if winner_info:
             trigger["winner_logic"] = dict(winner_info)
         if not ok:
@@ -1965,6 +2043,8 @@ class ScalpingScanner:
             )
 
         self._tag_signal(signal, source=src, trigger=trigger)
+        logger.info("[ScalpCrypto] %s READY: conf=%.1f dir=%s entry=%.2f sl=%.2f tp1=%.2f",
+                     symbol_up, signal.confidence, signal.direction, signal.entry, signal.stop_loss, signal.take_profit_1)
         return ScalpingScanResult(source=src, symbol=symbol_up, status="ready", reason="ok", signal=signal, trigger=trigger)
 
 
