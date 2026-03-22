@@ -20,9 +20,11 @@ import schedule
 
 from config import config
 from scanners.xauusd import xauusd_scanner
-from scanners.crypto_sniper import crypto_sniper
-from scanners.fx_major_scanner import fx_major_scanner
-from scanners.stock_scanner import stock_scanner
+# DISABLED: non-cTrader scanners removed to reduce VM memory
+# All trading uses cTrader OpenAPI only (XAUUSD, BTCUSD, ETHUSD)
+# from scanners.crypto_sniper import crypto_sniper
+# from scanners.fx_major_scanner import fx_major_scanner
+# from scanners.stock_scanner import stock_scanner
 from scanners.scalping_scanner import scalping_scanner
 from notifier.telegram_bot import notifier
 from market.data_fetcher import session_manager
@@ -9794,9 +9796,10 @@ class DexterScheduler:
 
         # ── Continuous scanners ──────────────────────────────────────────────
         schedule.every(xauusd_mins).minutes.do(self._run_xauusd_scan)
-        schedule.every(crypto_mins).minutes.do(self._run_crypto_scan)
-        schedule.every(max(1, fx_mins)).minutes.do(self._run_fx_scan)
-        schedule.every(stock_mins).minutes.do(self._run_stock_scan)
+        # DISABLED: non-cTrader scans — BTC/ETH handled by scalping scanner via cTrader OpenAPI
+        # schedule.every(crypto_mins).minutes.do(self._run_crypto_scan)
+        # schedule.every(max(1, fx_mins)).minutes.do(self._run_fx_scan)
+        # schedule.every(stock_mins).minutes.do(self._run_stock_scan)
         if scalping_enabled:
             if scalping_scan_sec < 60:
                 schedule.every(scalping_scan_sec).seconds.do(self._run_scalping_scan)
@@ -9940,30 +9943,28 @@ class DexterScheduler:
             xau_guard_sec = max(15, int(getattr(config, "XAU_GUARD_TRANSITION_WATCH_INTERVAL_SEC", 30) or 30))
             schedule.every(xau_guard_sec).seconds.do(self._run_xau_guard_transition_watch)
             xau_guard_transition_line = f"  XAU guard transition watch: every {xau_guard_sec}s\n"
-        schedule.every(max(3, config.US_OPEN_SMART_INTERVAL_MIN)).minutes.do(self._run_us_open_smart_monitor)
+        # DISABLED: US open monitor uses stock_scanner (not cTrader)
+        # schedule.every(max(3, config.US_OPEN_SMART_INTERVAL_MIN)).minutes.do(self._run_us_open_smart_monitor)
         schedule.every(max(2, int(config.ECON_CALENDAR_CHECK_INTERVAL_MIN))).minutes.do(self._run_economic_calendar_alerts)
         schedule.every(max(5, int(config.MACRO_NEWS_CHECK_INTERVAL_MIN))).minutes.do(self._run_macro_news_watch)
         if bool(getattr(config, "MACRO_IMPACT_TRACKER_ENABLED", True)):
             schedule.every(max(5, int(getattr(config, "MACRO_IMPACT_TRACKER_SYNC_INTERVAL_MIN", 15)))).minutes.do(self._run_macro_impact_tracker_sync)
 
         # ── Market-open triggered scans (UTC times) ──────────────────────────
-        # Thailand SET50 opens 03:30 UTC
-        schedule.every().day.at("03:35").do(self._run_thai_scan)
-        # Japan/HK/SG/IN open ~00:00-01:30 UTC
-        schedule.every().day.at("01:35").do(self._run_stock_scan)
-        # London/EU open 08:00 UTC
-        schedule.every().day.at("08:05").do(self._run_stock_scan)
+        # DISABLED: stock/thai scans — cTrader OpenAPI only
+        # schedule.every().day.at("03:35").do(self._run_thai_scan)
+        # schedule.every().day.at("01:35").do(self._run_stock_scan)
+        # schedule.every().day.at("08:05").do(self._run_stock_scan)
         # Gold overview at London open
         schedule.every().day.at("07:00").do(self._run_gold_overview)
-        # US NYSE open 13:30 UTC
-        schedule.every().day.at("13:35").do(self._run_us_open_daytrade)  # DST period
-        schedule.every().day.at("14:35").do(self._run_us_open_daytrade)  # Standard time period
+        # DISABLED: US stock scans
+        # schedule.every().day.at("13:35").do(self._run_us_open_daytrade)
+        # schedule.every().day.at("14:35").do(self._run_us_open_daytrade)
         # Gold overview at NY open
         schedule.every().day.at("13:00").do(self._run_gold_overview)
-        # US mid-session scan 16:00 UTC
-        schedule.every().day.at("16:00").do(self._run_stock_scan)
-        # US close scan 20:00 UTC
-        schedule.every().day.at("19:55").do(self._run_us_scan)
+        # DISABLED: US stock scans
+        # schedule.every().day.at("16:00").do(self._run_stock_scan)
+        # schedule.every().day.at("19:55").do(self._run_us_scan)
 
         # ── Maintenance ──────────────────────────────────────────────────────
         schedule.every(3).hours.do(self._clear_signal_cache)
@@ -10053,9 +10054,6 @@ class DexterScheduler:
         logger.info(
             f"[Scheduler] Jobs configured:\n"
             f"  XAUUSD:  every {xauusd_mins}m\n"
-            f"  Crypto:  every {crypto_mins}m\n"
-            f"  FX Majors: every {max(1, fx_mins)}m\n"
-            f"  Stocks:  every {stock_mins}m + market-open triggers\n"
             f"  US Open Smart Monitor: every {max(3, config.US_OPEN_SMART_INTERVAL_MIN)}m "
             f"(pre-open {max(0, int(getattr(config, 'US_OPEN_SMART_PREMARKET_LEAD_MIN', 60)))}m "
             f"+ post-open {max(30, int(getattr(config, 'US_OPEN_SMART_POST_OPEN_MAX_MIN', 120)))}m"
@@ -10107,11 +10105,10 @@ class DexterScheduler:
         time.sleep(10)
         self._run_xauusd_scan()
         time.sleep(5)
-        self._run_crypto_scan()
-        time.sleep(5)
-        self._run_fx_scan()
-        time.sleep(5)
-        self._run_stock_scan()      # Initial stock scan on startup
+        # DISABLED: non-cTrader startup scans
+        # self._run_crypto_scan()
+        # self._run_fx_scan()
+        # self._run_stock_scan()
         self._run_economic_calendar_alerts()
         self._run_macro_impact_tracker_sync()
         self._run_xau_guard_transition_watch(force=True)
@@ -10192,22 +10189,14 @@ class DexterScheduler:
         results: dict = {}
         if task in ("xauusd", "gold", "all"):
             results["xauusd"] = self._run_xauusd_scan(force_alert=True, source="manual")
-        if task in ("crypto", "all"):
-            self._run_crypto_scan(force=True)
+        # crypto scan disabled — BTC/ETH via cTrader scalping scanner
+        if task in ("crypto",):
+            logger.info("[Scheduler] Crypto sniper disabled — use 'scalp' for BTC/ETH via cTrader")
         if task in ("scalp", "scalping", "scalp_signals", "all"):
             results["scalping"] = self._run_scalping_scan(force=True)
-        if task in ("fx", "forex"):
-            self._run_fx_scan(force=True)
-        if task in ("stocks", "all"):
-            self._run_stock_scan()
-        if task in ("thai", "thailand"):
-            self._run_thai_scan()
-        if task in ("thai_vi", "th_vi", "thailand_vi"):
-            self._run_thai_vi_stock_scan(force=True)
-        if task in ("us",):
-            self._run_us_scan()
-        if task in ("us_open", "us_open_plan"):
-            self._run_us_open_daytrade(force=True)
+        # DISABLED: fx/stocks/thai/us scans — cTrader OpenAPI only
+        if task in ("fx", "forex", "stocks", "thai", "thailand", "thai_vi", "th_vi", "us", "us_open", "us_open_plan"):
+            logger.info(f"[Scheduler] '{task}' scan disabled — system uses cTrader OpenAPI only")
         if task in ("us_open_monitor", "monitor_us"):
             self._run_us_open_smart_monitor(force=True)
         if task in ("overview", "all"):

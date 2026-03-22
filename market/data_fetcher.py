@@ -517,6 +517,8 @@ class SessionManager:
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 xauusd_provider  = XAUUSDProvider()
-crypto_provider  = CryptoProvider(config.CRYPTO_EXCHANGE)
-fx_provider      = FXProvider()
+# DISABLED: Binance/yfinance providers — all trading uses cTrader OpenAPI only
+# crypto_provider and fx_provider are lazy to avoid loading ccxt/yfinance on import
+crypto_provider  = None  # was CryptoProvider — use cTrader for BTC/ETH
+fx_provider      = None  # was FXProvider — not used
 session_manager  = SessionManager()

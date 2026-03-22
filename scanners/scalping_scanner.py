@@ -1897,7 +1897,6 @@ class ScalpingScanner:
         if signal is None:
             return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="base_scanner_no_signal")
 
-        signal = opp.signal
         # Keep external-facing symbol identity stable (ETHUSD/BTCUSD),
         # while preserving the exchange pair used for data fetches.
         signal.symbol = symbol_up

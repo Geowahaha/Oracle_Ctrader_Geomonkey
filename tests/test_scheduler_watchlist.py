@@ -87,39 +87,13 @@ class SchedulerWatchlistTests(unittest.TestCase):
             impact_hint="Macro-sensitive headline",
         )
 
+    @unittest.skip("stock_scanner disabled — system uses cTrader OpenAPI only")
     def test_scheduler_uses_filtered_watchlist_when_no_quality(self):
-        dexter = scheduler_module.DexterScheduler()
-        opps_all = [make_opp("A", 0.3), make_opp("B", 0.7)]
-        watchlist = [make_opp("B", 0.7)]
+        pass
 
-        with patch.object(scheduler_module.stock_scanner, "scan_all_open_markets", return_value=opps_all), \
-             patch.object(scheduler_module.stock_scanner, "filter_quality", return_value=[]), \
-             patch.object(scheduler_module.stock_scanner, "filter_watchlist", return_value=watchlist), \
-             patch.object(scheduler_module.notifier, "send_stock_scan_summary") as send_summary, \
-             patch.object(scheduler_module.notifier, "send_stock_signal") as send_signal:
-            dexter._run_stock_scan()
-
-        self.assertTrue(send_summary.called)
-        args, kwargs = send_summary.call_args
-        self.assertEqual(args[0], watchlist)
-        self.assertIn("WATCHLIST", kwargs.get("market_label", ""))
-        self.assertFalse(send_signal.called)
-
+    @unittest.skip("stock_scanner disabled — system uses cTrader OpenAPI only")
     def test_scheduler_logs_quality_and_watchlist_counts(self):
-        dexter = scheduler_module.DexterScheduler()
-        opps_all = [make_opp("A", 0.3), make_opp("B", 0.7)]
-        watchlist = [make_opp("B", 0.7)]
-
-        with patch.object(scheduler_module.stock_scanner, "scan_all_open_markets", return_value=opps_all), \
-             patch.object(scheduler_module.stock_scanner, "filter_quality", return_value=[]), \
-             patch.object(scheduler_module.stock_scanner, "filter_watchlist", return_value=watchlist), \
-             patch.object(scheduler_module.notifier, "send_stock_scan_summary"), \
-             patch.object(scheduler_module.logger, "info") as info_log:
-            dexter._run_stock_scan()
-
-        messages = [str(call.args[0]) for call in info_log.call_args_list if call.args]
-        self.assertTrue(any("Stocks quality filter:" in m for m in messages))
-        self.assertTrue(any("Stocks watchlist filter:" in m for m in messages))
+        pass
 
     def test_xauusd_scheduled_scan_respects_cooldown(self):
         dexter = scheduler_module.DexterScheduler()
