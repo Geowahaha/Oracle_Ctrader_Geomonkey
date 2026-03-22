@@ -359,3 +359,36 @@ Next session todo:
 * Merge fss-fixes-only → main
 * Build FLS test lane in fls-development
 
+● Now let me check the scanner's datetime usage to know exactly what to patch.
+
+  Searched for 3 patterns (ctrl+o to expand)
+
+● Let me read the key sections in the scanner that use datetime.now().
+
+  Read 1 file (ctrl+o to expand)
+
+● Let me look at how session_info is used in the scanner's direction logic.
+
+  Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Now I see the full issue. The _backtest_session_info() calls _original_get_info() which uses real datetime.now() for session detection. All 829 bars
+  see the same Saturday session instead of their actual historical session. Let me also check what now is used for at line 323.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I see all the issues. datetime.now() at lines 323, 339, 363 uses real Saturday time for PDH/PDL and session window calculations. This corrupts the
+   liquidity map analysis. The fix needs three things:
+
+  1. Patch datetime in scanner module to use cursor time
+  2. Fix get_session_info() to use cursor time for session detection
+  3. Suppress EcoCalendar to prevent 429 spam
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  You're out of extra usage · resets 5am (Asia/Bangkok)
+
+✻ Worked for 19m 58s
+
+● Background command "Run 3-day XAUUSD backtest with session_info patch" completed (exit code 0)
+  ⎿  You're out of extra usage · resets 5am (Asia/Bangkok)
+
+❯ /rate-limit-options

@@ -1088,6 +1088,118 @@ def _workflow(mode: str, payload: dict):
             })
             return
 
+        if mode == "get_trendbars":
+            # ── Historical OHLCV bars via ProtoOAGetTrendbarsReq ──────────
+            _TF_TO_PERIOD = {
+                "1m": 1, "2m": 2, "3m": 3, "4m": 4, "5m": 5,
+                "10m": 6, "15m": 7, "30m": 8,
+                "1h": 9, "4h": 10, "12h": 11,
+                "1d": 12, "1w": 13, "1mn": 14,
+            }
+            tb_symbol = str(payload.get("symbol", "XAUUSD") or "XAUUSD")
+            tb_tf = str(payload.get("timeframe", "5m") or "5m").lower()
+            tb_period = _TF_TO_PERIOD.get(tb_tf)
+            if tb_period is None:
+                defer.returnValue({
+                    "ok": False,
+                    "status": "invalid_timeframe",
+                    "message": f"unsupported timeframe: {tb_tf}, valid: {list(_TF_TO_PERIOD.keys())}",
+                })
+                return
+            from_ms = _safe_int(payload.get("from_ms"), 0)
+            to_ms = _safe_int(payload.get("to_ms"), int(time.time() * 1000))
+            tb_count = max(1, min(_safe_int(payload.get("count"), 5000), 14000))
+            tb_symbol_obj, tb_match = _resolve_symbol(light_symbols, {"symbol": tb_symbol, "market_symbol": tb_symbol})
+            if tb_symbol_obj is None:
+                defer.returnValue({
+                    "ok": False,
+                    "status": "symbol_not_found",
+                    "message": f"symbol not found: {tb_symbol}",
+                })
+                return
+            tb_symbol_id = _safe_int(getattr(tb_symbol_obj, "symbolId", 0), 0)
+            tb_symbol_name = str(getattr(tb_symbol_obj, "symbolName", "") or "").strip()
+            # Get symbol digits for price scale
+            try:
+                tb_meta_msg = yield client.send(
+                    pb.ProtoOASymbolByIdReq(ctidTraderAccountId=int(account_id), symbolId=[int(tb_symbol_id)]),
+                    responseTimeoutInSeconds=8,
+                )
+                tb_meta_payload = Protobuf.extract(tb_meta_msg)
+                tb_meta_list = list(getattr(tb_meta_payload, "symbol", []) or [])
+                tb_meta = tb_meta_list[0] if tb_meta_list else None
+                tb_digits = _safe_int(getattr(tb_meta, "digits", 5), 5) if tb_meta else 5
+            except Exception:
+                tb_digits = 5
+            # cTrader trendbar raw prices use 1e-5 rate units (same as spot events),
+            # NOT the symbol's display digits.  Using symbol digits under-scales by ~1000x.
+            tb_scale = float(_MARKET_DATA_PRICE_SCALE)
+            _debug("get_trendbars", tb_symbol_name, "id", tb_symbol_id, "tf", tb_tf, "period", tb_period, "digits", tb_digits, "scale", tb_scale)
+            try:
+                tb_msg = yield client.send(
+                    pb.ProtoOAGetTrendbarsReq(
+                        ctidTraderAccountId=int(account_id),
+                        symbolId=int(tb_symbol_id),
+                        period=int(tb_period),
+                        fromTimestamp=int(from_ms),
+                        toTimestamp=int(to_ms),
+                        count=int(tb_count),
+                    ),
+                    responseTimeoutInSeconds=15,
+                )
+            except Exception as tb_err:
+                defer.returnValue({
+                    "ok": False,
+                    "status": "trendbar_request_failed",
+                    "message": str(tb_err),
+                    "symbol": tb_symbol_name,
+                    "timeframe": tb_tf,
+                })
+                return
+            tb_payload = Protobuf.extract(tb_msg)
+            if _is_error(tb_payload):
+                defer.returnValue({
+                    "ok": False,
+                    "status": "trendbar_error",
+                    "message": str(getattr(tb_payload, "description", "") or ""),
+                    "error_code": str(getattr(tb_payload, "errorCode", "") or ""),
+                    "symbol": tb_symbol_name,
+                    "timeframe": tb_tf,
+                })
+                return
+            raw_bars = list(getattr(tb_payload, "trendbar", []) or [])
+            bars = []
+            for bar in raw_bars:
+                low_raw = _safe_int(getattr(bar, "low", 0), 0)
+                delta_open = _safe_int(getattr(bar, "deltaOpen", 0), 0)
+                delta_close = _safe_int(getattr(bar, "deltaClose", 0), 0)
+                delta_high = _safe_int(getattr(bar, "deltaHigh", 0), 0)
+                vol = _safe_int(getattr(bar, "volume", 0), 0)
+                ts_min = _safe_int(getattr(bar, "utcTimestampInMinutes", 0), 0)
+                low = low_raw / tb_scale
+                bars.append({
+                    "ts_ms": ts_min * 60 * 1000,
+                    "ts_utc": _ms_to_iso(ts_min * 60 * 1000),
+                    "open": (low_raw + delta_open) / tb_scale,
+                    "high": (low_raw + delta_high) / tb_scale,
+                    "low": low,
+                    "close": (low_raw + delta_close) / tb_scale,
+                    "volume": vol,
+                })
+            defer.returnValue({
+                "ok": True,
+                "status": "trendbars_loaded",
+                "symbol": tb_symbol_name,
+                "symbol_id": int(tb_symbol_id),
+                "timeframe": tb_tf,
+                "digits": int(tb_digits),
+                "bar_count": len(bars),
+                "bars": bars,
+                "has_more": bool(getattr(tb_payload, "hasMore", False)),
+                "token_refresh": dict(refreshed_meta or {}),
+            })
+            return
+
         if mode == "reconcile":
             reconcile_msg = yield client.send(pb.ProtoOAReconcileReq(ctidTraderAccountId=int(account_id)), responseTimeoutInSeconds=10)
             reconcile_payload = Protobuf.extract(reconcile_msg)
@@ -1287,7 +1399,7 @@ def _workflow(mode: str, payload: dict):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["health", "execute", "accounts", "reconcile", "close", "cancel_order", "amend_order", "amend_position_sltp", "capture_market"], required=True)
+    parser.add_argument("--mode", choices=["health", "execute", "accounts", "reconcile", "close", "cancel_order", "amend_order", "amend_position_sltp", "capture_market", "get_trendbars"], required=True)
     parser.add_argument("--payload-file", default="")
     args = parser.parse_args()
     payload = _load_payload(str(args.payload_file or ""))

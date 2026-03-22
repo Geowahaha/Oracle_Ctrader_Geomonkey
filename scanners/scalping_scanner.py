@@ -1824,7 +1824,7 @@ class ScalpingScanner:
     def scan_eth(self, require_enabled: bool = True) -> ScalpingScanResult:
         return self._scan_crypto_symbol(
             canonical_symbol="ETHUSD",
-            market_symbol=str(getattr(config, "SCALPING_ETH_SYMBOL", "ETH/USDT") or "ETH/USDT").strip().upper(),
+            market_symbol="ETHUSD",
             source="scalp_ethusd",
             require_enabled=require_enabled,
         )
@@ -1832,10 +1832,39 @@ class ScalpingScanner:
     def scan_btc(self, require_enabled: bool = True) -> ScalpingScanResult:
         return self._scan_crypto_symbol(
             canonical_symbol="BTCUSD",
-            market_symbol=str(getattr(config, "SCALPING_BTC_SYMBOL", "BTC/USDT") or "BTC/USDT").strip().upper(),
+            market_symbol="BTCUSD",
             source="scalp_btcusd",
             require_enabled=require_enabled,
         )
+
+    @staticmethod
+    def _fetch_ctrader_ohlcv(symbol: str, tf: str, bars: int = 200) -> "Optional[pd.DataFrame]":
+        """Fetch OHLCV from cTrader OpenAPI for BTCUSD/ETHUSD."""
+        import pandas as pd
+        try:
+            from execution.ctrader_executor import ctrader_executor
+        except ImportError:
+            logger.debug("[ScalpCrypto] ctrader_executor not available")
+            return None
+        if not ctrader_executor.enabled:
+            return None
+        import time as _t
+        _tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+        mins = _tf_minutes.get(tf, 5)
+        to_ms = int(_t.time() * 1000)
+        from_ms = to_ms - (bars * mins * 60 * 1000)
+        result = ctrader_executor.fetch_trendbars(symbol=symbol, timeframe=tf, from_ms=from_ms, to_ms=to_ms, count=bars)
+        if not result.get("ok") or not result.get("bars"):
+            return None
+        rows = []
+        for bar in result["bars"]:
+            rows.append({"timestamp": pd.Timestamp(bar["ts_ms"], unit="ms", tz="UTC"), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar.get("volume", 0))})
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df.set_index("timestamp", inplace=True)
+        df = df.astype(float)
+        return df.tail(bars)
 
     def _scan_crypto_symbol(
         self,
@@ -1853,12 +1882,19 @@ class ScalpingScanner:
         if require_enabled and (not config.scalping_symbol_enabled(symbol_up)):
             return ScalpingScanResult(source=src, symbol=symbol_up, status="disabled", reason="symbol_not_enabled")
 
-        with self._temporary_config(
-            CRYPTO_ENTRY_TF=str(getattr(config, "SCALPING_ENTRY_TF", "5m")),
-            CRYPTO_TREND_TF=str(getattr(config, "SCALPING_CRYPTO_TREND_TF", "15m")),
-        ):
-            opp = crypto_sniper.analyze_single(market_up)
-        if opp is None or getattr(opp, "signal", None) is None:
+        # Fetch data from cTrader OpenAPI (BTCUSD/ETHUSD) — no Binance
+        entry_tf = str(getattr(config, "SCALPING_ENTRY_TF", "5m"))
+        trend_tf = str(getattr(config, "SCALPING_CRYPTO_TREND_TF", "15m"))
+        df_entry = self._fetch_ctrader_ohlcv(symbol_up, entry_tf, bars=200)
+        if df_entry is None or len(df_entry) < 50:
+            return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="ctrader_data_unavailable")
+        df_trend = self._fetch_ctrader_ohlcv(symbol_up, trend_tf, bars=100)
+        session_info = session_manager.get_session_info()
+
+        from analysis.signals import SignalGenerator
+        _sig = SignalGenerator(min_confidence=config.MIN_SIGNAL_CONFIDENCE)
+        signal = _sig.score_signal(df_entry=df_entry, df_trend=df_trend, symbol=symbol_up, timeframe=entry_tf, session_info=session_info)
+        if signal is None:
             return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="base_scanner_no_signal")
 
         signal = opp.signal
@@ -1911,8 +1947,8 @@ class ScalpingScanner:
                 trigger={"winner_logic": winner_info} if winner_info else {},
             )
 
-        m1_df = crypto_provider.fetch_ohlcv(
-            market_up,
+        m1_df = self._fetch_ctrader_ohlcv(
+            symbol_up,
             str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m")),
             bars=max(60, int(getattr(config, "SCALPING_M1_TRIGGER_LOOKBACK_BARS", 120) or 120)),
         )

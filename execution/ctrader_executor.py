@@ -2983,6 +2983,36 @@ class CTraderExecutor:
                 raw["storage"] = {"ok": False, "status": "store_error", "message": str(e)}
         return raw
 
+    def fetch_trendbars(
+        self,
+        *,
+        symbol: str = "XAUUSD",
+        timeframe: str = "5m",
+        from_ms: int = 0,
+        to_ms: int = 0,
+        count: int = 5000,
+    ) -> dict:
+        """Fetch historical OHLCV bars from cTrader OpenAPI.
+
+        Returns dict with 'ok', 'bars' (list of {ts_ms, ts_utc, open, high, low, close, volume}),
+        'bar_count', 'has_more', etc.
+        """
+        if not self.enabled:
+            return {"ok": False, "status": "disabled", "message": "ctrader disabled"}
+        if not self.sdk_available:
+            return {"ok": False, "status": "unavailable", "message": "ctrader-open-api not installed"}
+        if to_ms <= 0:
+            to_ms = int(time.time() * 1000)
+        payload = {
+            "symbol": str(symbol or "XAUUSD").strip().upper(),
+            "timeframe": str(timeframe or "5m").strip().lower(),
+            "from_ms": int(from_ms),
+            "to_ms": int(to_ms),
+            "count": max(1, min(int(count), 14000)),
+        }
+        raw = self._run_worker(mode="get_trendbars", payload=payload, timeout_sec=20)
+        return raw
+
     def _journal(self, signal, result: CTraderExecutionResult, *, source: str, request_payload: Optional[dict] = None, response_payload: Optional[dict] = None) -> int:
         trace = self._signal_trace_meta(signal)
         created_ts = time.time()

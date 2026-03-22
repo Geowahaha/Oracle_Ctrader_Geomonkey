@@ -52,6 +52,28 @@ def make_opp(symbol: str, vol: float = 0.8, quality_score: int = 1, confidence: 
 
 
 class SchedulerWatchlistTests(unittest.TestCase):
+    def setUp(self):
+        # Prevent test fixture signals (pattern=TEST, entry=100) from leaking into
+        # the production execution_journal (data/ctrader_openapi.db).
+        # Two write paths: journal_pre_dispatch_skip (pre-dispatch audit) and
+        # _journal (called by execute_signal when it filters/dry-runs).
+        self._journal_patcher = patch.object(
+            scheduler_module.ctrader_executor,
+            "journal_pre_dispatch_skip",
+            return_value=0,
+        )
+        self._db_journal_patcher = patch.object(
+            scheduler_module.ctrader_executor,
+            "_journal",
+            return_value=0,
+        )
+        self._journal_mock = self._journal_patcher.start()
+        self._db_journal_mock = self._db_journal_patcher.start()
+
+    def tearDown(self):
+        self._db_journal_patcher.stop()
+        self._journal_patcher.stop()
+
     @staticmethod
     def _macro_headline(headline_id: str, score: int, themes: list[str], age_min: int = 15) -> MacroHeadline:
         return MacroHeadline(

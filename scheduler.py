@@ -6824,12 +6824,10 @@ class DexterScheduler:
 
                     if config.MT5_EXECUTE_CRYPTO:
                         self._maybe_execute_mt5_batch([opp.signal for opp in new_opps], source="crypto")
-                    # Route through symbol-specific sources to connect to family system
-                    _crypto_source_map = {"BTCUSD": "scalp_btcusd", "ETHUSD": "scalp_ethusd", "BTC/USDT": "scalp_btcusd", "ETH/USDT": "scalp_ethusd"}
-                    for opp in new_opps:
-                        _sym = str(getattr(opp.signal, "symbol", "") or "").upper()
-                        _src = _crypto_source_map.get(_sym, "crypto")
-                        self._maybe_execute_ctrader_batch([opp.signal], source=_src)
+                    # cTrader execution for BTCUSD/ETHUSD is handled by
+                    # scalping scanner scan_btc()/scan_eth() — not here.
+                    # crypto_sniper signals use exchange symbols (BTC/USDT)
+                    # which are not valid on cTrader.
 
                     for opp in new_opps:
                         self._last_signal_symbols.add(opp.signal.symbol)
@@ -6870,12 +6868,8 @@ class DexterScheduler:
 
                 if config.MT5_EXECUTE_CRYPTO:
                     self._maybe_execute_mt5_batch([opp.signal for opp in new_focus], source="crypto")
-                # Route through symbol-specific sources to connect to family system
-                _crypto_source_map = {"BTCUSD": "scalp_btcusd", "ETHUSD": "scalp_ethusd", "BTC/USDT": "scalp_btcusd", "ETH/USDT": "scalp_ethusd"}
-                for opp in new_focus:
-                    _sym = str(getattr(opp.signal, "symbol", "") or "").upper()
-                    _src = _crypto_source_map.get(_sym, "crypto")
-                    self._maybe_execute_ctrader_batch([opp.signal], source=_src)
+                # cTrader execution for BTCUSD/ETHUSD is handled by
+                # scalping scanner scan_btc()/scan_eth() — not here.
 
                 for opp in new_focus:
                     self._last_signal_symbols.add(opp.signal.symbol)
