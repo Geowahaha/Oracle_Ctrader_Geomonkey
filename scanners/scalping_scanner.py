@@ -1954,10 +1954,14 @@ class ScalpingScanner:
         session_info = session_manager.get_session_info()
 
         from analysis.signals import SignalGenerator
-        _sig = SignalGenerator(min_confidence=config.MIN_SIGNAL_CONFIDENCE)
+        # Use a lower floor for crypto so borderline signals survive for
+        # multi-TF enrichment.  The profile gate (65/67) is the real filter.
+        profile = self._crypto_scalping_profile(symbol_up)
+        crypto_floor = max(55, int(profile.get("min_confidence", 65)) - 5)
+        _sig = SignalGenerator(min_confidence=crypto_floor)
         signal = _sig.score_signal(df_entry=df_entry, df_trend=df_trend, symbol=symbol_up, timeframe=entry_tf, session_info=session_info)
         if signal is None:
-            logger.info("[ScalpCrypto] %s base_scanner_no_signal (MIN_SIGNAL_CONFIDENCE=%s)", symbol_up, config.MIN_SIGNAL_CONFIDENCE)
+            logger.info("[ScalpCrypto] %s base_scanner_no_signal (floor=%d)", symbol_up, crypto_floor)
             return ScalpingScanResult(source=src, symbol=symbol_up, status="no_signal", reason="base_scanner_no_signal")
 
         logger.info("[ScalpCrypto] %s score_signal: conf=%.1f dir=%s pattern=%s rr=%.2f",
@@ -1974,7 +1978,6 @@ class ScalpingScanner:
         raw["market_symbol"] = market_up
         raw["canonical_symbol"] = symbol_up
         raw["strategy_box"] = f"crypto_{symbol_up.lower()}"
-        profile = self._crypto_scalping_profile(symbol_up)
         session_sig = self._normalized_signature(str(getattr(signal, "session", "") or ""))
         raw["scalp_profile_symbol"] = symbol_up
         raw["scalp_profile_weekend"] = bool(profile.get("weekend", False))
