@@ -644,6 +644,7 @@ class CTraderStreamService:
 
     def _on_message(self, _client, message) -> None:
         """Callback for all push messages from cTrader."""
+        self._last_msg_at = time.time()
         try:
             payload = Protobuf.extract(message)
         except Exception:
@@ -853,6 +854,17 @@ class CTraderStreamService:
         """Send heartbeat to keep connection alive."""
         if not self.client:
             return
+            
+        now = time.time()
+        # Check if we are receiving any ticks, margin updates, or cTrader heartbeats.
+        # cTrader sends frequent heartbeats and spot events. If 45s pass completely silently,
+        # the TCP stream is dead/half-open and must be severed.
+        last_msg = getattr(self, "_last_msg_at", now)
+        if now - last_msg > 45.0:
+            logger.error("CRITICAL: Stream has been completely silent for 45s. Socket is dead. Force reconnect!")
+            self._schedule_reconnect()
+            return
+            
         try:
             protocol = self.client.getProtocol()
             if protocol:
