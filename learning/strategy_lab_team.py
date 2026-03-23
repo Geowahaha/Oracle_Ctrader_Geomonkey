@@ -179,9 +179,22 @@ class StrategyLabTeamAgent:
         if not bool(getattr(config, "STRATEGY_LAB_TEAM_RECOVERY_ENABLED", True)):
             return []
         topk = max(1, int(getattr(config, "STRATEGY_LAB_TEAM_RECOVERY_TOPK", 3) or 3))
+        # Force-inject families from config (bypasses score/blocker gates)
+        force_families = {
+            str(f or "").strip().lower()
+            for f in str(getattr(config, "STRATEGY_LAB_FORCE_RECOVERY_FAMILIES", "") or "").split(",")
+            if str(f or "").strip()
+        }
         recovery: list[dict] = []
         for row in list(ranked or []):
+            family = str(row.get("family") or "").strip().lower()
             mode = str(row.get("mode") or "").strip().lower()
+            # Force-recovery: bypass score/blocker checks
+            if family in force_families and mode in {"shadow", "blocked"} and bool(row.get("execution_ready", False)):
+                enriched = dict(row)
+                enriched["recovery_reason"] = "config_force_recovery"
+                recovery.append(enriched)
+                continue
             score = float(row.get("score", -9999.0) or -9999.0)
             blockers = [str(item or "").strip() for item in list(row.get("blockers") or []) if str(item or "").strip()]
             if mode not in {"shadow", "blocked"}:
