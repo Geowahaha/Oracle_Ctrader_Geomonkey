@@ -5001,6 +5001,33 @@ class CTraderExecutor:
                                         "mode": str(order_care_state.get("mode") or ""),
                                     })
                                 continue
+                    if ":canary" in source and risk > 0 and self._target_valid_for_position(direction, entry, target_tp):
+                        canary_be_trigger_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_TRIGGER_R", 0.80) or 0.80)
+                        canary_be_lock_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_LOCK_R", 0.05) or 0.05)
+                        stop_tol_c = max(abs(entry) * 0.000001, 0.01)
+                        if (r_now is not None) and float(r_now) >= canary_be_trigger_r:
+                            be_sl = entry + (risk * canary_be_lock_r) if direction == "long" else entry - (risk * canary_be_lock_r)
+                            improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
+                            if improves and abs(be_sl - stop_loss) > stop_tol_c:
+                                res = self.amend_position_sltp(
+                                    position_id=position_id,
+                                    stop_loss=be_sl,
+                                    take_profit=target_tp,
+                                    trailing_stop_loss=False,
+                                )
+                                if bool(res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append({
+                                        "position_id": position_id,
+                                        "source": source,
+                                        "symbol": symbol,
+                                        "action": "canary_family_breakeven",
+                                        "reference_price": round(ref, 4),
+                                        "new_stop_loss": round(be_sl, 4),
+                                        "take_profit": round(target_tp, 4),
+                                        "r_now": round(float(r_now), 4),
+                                    })
+                                continue
                     continue
             if self._is_scheduled_canary_source(source) and self._target_valid_for_position(direction, entry, target_tp):
                 no_follow_age = max(1, int(getattr(config, "CTRADER_PM_SCHEDULED_CANARY_NO_FOLLOW_MAX_AGE_MIN", 18) or 18))

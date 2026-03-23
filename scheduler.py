@@ -1005,6 +1005,11 @@ class DexterScheduler:
                 return False, f"xau_scheduled_timeframe_not_allowed:{timeframe_token or '-'}"
             if allowed_entry_types and entry_type not in allowed_entry_types:
                 return False, f"xau_scheduled_entry_type_not_allowed:{entry_type or '-'}"
+            if bool(getattr(config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True)):
+                mtf_guard = self._scalp_xau_direct_mtf_guard(signal)
+                mtf_reason = str(mtf_guard.get("reason") or "")
+                if not bool(mtf_guard.get("allowed", True)) and "d1_h4_h1_block" in mtf_reason:
+                    return False, f"xau_scheduled_mtf_block:{mtf_reason}"
             return True, "xau_scheduled_profile_pass"
 
         if base_source == "scalp_btcusd":
