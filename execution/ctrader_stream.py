@@ -34,6 +34,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from config import config  # noqa: E402
+from market.tick_bar_engine import TickBarEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -323,6 +324,9 @@ class CTraderStreamService:
         self._status_loop: Optional[task.LoopingCall] = None
         self._margin_loop: Optional[task.LoopingCall] = None
         self._running: bool = False
+        
+        # Gate 1: Tick engines initialized internally
+        self._tick_engines: dict[str, list[TickBarEngine]] = {}
 
     # ── Connection lifecycle ─────────────────────────────────────────────
 
@@ -461,6 +465,28 @@ class CTraderStreamService:
         # Subscribe to live trendbars
         yield self._subscribe_trendbars()
 
+        # Gate 0: Depth Subscription Smoke Test
+        try:
+            yield self.client.send(
+                pb.ProtoOASubscribeDepthQuotesReq(
+                    ctidTraderAccountId=int(self._account_id),
+                    symbolId=[int(s) for s in self._symbol_ids],
+                ),
+                responseTimeoutInSeconds=5,
+            )
+            logger.info("Subscribed to Depth Quotes for multi-level updates.")
+        except Exception as e:
+            logger.warning("Failed to subscribe depth quotes: %s", e)
+
+        # Initialize TickBarEngines for all subscribed symbols
+        for sid in self._symbol_ids:
+            sym_name = self._symbol_map.get(sid, "")
+            if sym_name:
+                self._tick_engines[sym_name] = [
+                    TickBarEngine(sym_name, 60, "time"),     # M1
+                    TickBarEngine(sym_name, 100, "tick")     # 100-Tick
+                ]
+                
         # Start periodic loops
         self._start_loops()
 
@@ -633,6 +659,25 @@ class CTraderStreamService:
             self._handle_margin_changed(payload)
         elif isinstance(payload, pb.ProtoOAMarginCallUpdateEvent):
             self._handle_margin_call_update(payload)
+        elif isinstance(payload, pb.ProtoOADepthEvent):
+            self._handle_depth_event(payload)
+
+    def _handle_depth_event(self, evt) -> None:
+        """Smoke test handler to log L2 multi-level updates."""
+        sid = _safe_int(getattr(evt, "symbolId", 0), 0)
+        symbol = self._symbol_map.get(sid, "")
+        
+        bids = getattr(evt, "newBids", [])
+        asks = getattr(evt, "newAsks", [])
+        
+        # Minimal footprint log every N depth updates to prove L2 is incoming
+        if hasattr(self, "_depth_count"):
+            self._depth_count += 1
+        else:
+            self._depth_count = 1
+            
+        if self._depth_count % 500 == 1:
+            logger.info("DepthEvent Smoke Test: %s — %d bid levels, %d ask levels", symbol, len(bids), len(asks))
 
     def _handle_spot_event(self, evt) -> None:
         """Process SpotEvent — extract live trendbar data if present."""
@@ -673,6 +718,17 @@ class CTraderStreamService:
             if self._total_bars % 50 == 1:
                 logger.info("Trendbar: %s %s O=%.2f H=%.2f L=%.2f C=%.2f V=%d (total=%d)",
                             symbol, tf_name, o, h, l, c, volume, self._total_bars)
+
+        # Feed to TickBarEngine silently (no callback logging or DB write as requested)
+        bid = _safe_float(getattr(evt, "bid", 0)) / scale
+        ask = _safe_float(getattr(evt, "ask", 0)) / scale
+        ts_ms = _safe_int(getattr(evt, "timestamp", 0))
+
+        if bid > 0 and ask > 0 and ts_ms > 0 and symbol in self._tick_engines:
+            for engine in self._tick_engines[symbol]:
+                # on_quote returns a completed bar dict if the period closes, else None
+                completed = engine.on_quote(bid, ask, ts_ms)
+                # The engine stores it in internally, we prove it runs without crashing.
 
     def _handle_execution_event(self, evt) -> None:
         """Process execution event — log to stream_executions."""

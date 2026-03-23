@@ -24,6 +24,9 @@ from config import config
 from market.data_fetcher import xauusd_provider, crypto_provider, session_manager
 from scanners.xauusd import xauusd_scanner
 from scanners.crypto_sniper import crypto_sniper
+from market.tick_bar_engine import TickBarEngine
+from scanners.mrd_scanner import MRDScanner
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -1880,7 +1883,102 @@ class ScalpingScanner:
             return forced or blocked
         self._apply_xau_multi_tf_context(signal, trigger=trigger)
         self._tag_signal(signal, source=source, trigger=trigger)
+        
+        # --- Gate 3: MRD Live Guard ---
+        mrd_guard = self._mrd_guard_check(signal)
+        if mrd_guard and mrd_guard.get("suppressed"):
+            trigger["mrd"] = mrd_guard
+            blocked = ScalpingScanResult(
+                source=source,
+                symbol="XAUUSD",
+                status="mrd_recovery_blocked",
+                reason=mrd_guard.get("reason", "mrd_macro_recovery_regime"),
+                signal=signal,
+                trigger=trigger,
+            )
+            forced = self._maybe_force_xau_result(
+                source=source, blocked_status=blocked.status, blocked_reason=blocked.reason, signal=signal, trigger=trigger
+            )
+            return forced or blocked
+            
         return ScalpingScanResult(source=source, symbol="XAUUSD", status="ready", reason="ok", signal=signal, trigger=trigger)
+
+    def _mrd_guard_check(self, signal: TradeSignal) -> dict:
+        """Run MRD dynamically to suppress fake shorts during macro recoveries."""
+        direction = str(getattr(signal, "direction", "") or "").lower()
+        symbol = str(getattr(signal, "symbol", "") or "").upper()
+        
+        info = {"suppressed": False, "score": 0.0, "reason": ""}
+        
+        if symbol != "XAUUSD" or direction != "short":
+            return info
+            
+        try:
+            mrd = MRDScanner()
+            engine = TickBarEngine("XAUUSD", 100, "tick")
+            
+            now_utc = datetime.now(timezone.utc)
+            from_utc = (now_utc - pd.Timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            to_utc = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            db_path = "data/ctrader_openapi.db"
+            with sqlite3.connect(db_path) as conn:
+                df_ticks = pd.read_sql_query(
+                    "SELECT event_ts, bid, ask FROM ctrader_spot_ticks WHERE symbol = 'XAUUSD' AND event_utc >= ? AND event_utc <= ? ORDER BY event_ts ASC", 
+                    conn, params=(from_utc, to_utc))
+                
+                df_depth = pd.read_sql_query(
+                    "SELECT event_ts, side, price, size FROM ctrader_depth_quotes WHERE symbol = 'XAUUSD' AND event_utc >= ? AND event_utc <= ? ORDER BY event_ts ASC", 
+                    conn, params=(from_utc, to_utc))
+            
+            if df_ticks.empty:
+                return info
+                
+            depth_groups = {}
+            for _, row in df_depth.iterrows():
+                ts = int(float(row['event_ts']) * 1000)
+                if ts not in depth_groups:
+                    depth_groups[ts] = {'bids': [], 'asks': []}
+                if row['side'] == 'bid':
+                    depth_groups[ts]['bids'].append({'price': row['price'], 'size': row['size']})
+                else:
+                    depth_groups[ts]['asks'].append({'price': row['price'], 'size': row['size']})
+            
+            last_b, last_a = 0.0, 0.0
+            for _, row in df_ticks.iterrows():
+                b, a = float(row['bid']), float(row['ask'])
+                ts_ms = int(float(row['event_ts']) * 1000)
+                
+                if b > 0: last_b = b
+                if a > 0: last_a = a
+                if last_b == 0 or last_a == 0: continue
+                
+                if ts_ms in depth_groups:
+                    mrd.on_depth_event(depth_groups[ts_ms]['bids'], depth_groups[ts_ms]['asks'], ts_ms)
+                    
+                bar = engine.on_quote(last_b, last_a, ts_ms)
+                if bar: mrd.on_tick_bar_completed(bar)
+                
+            suppress, metrics = mrd.should_suppress_short("XAUUSD")
+            
+            raw = getattr(signal, "raw_scores", {})
+            raw["mrd_recovery_score"] = float(metrics["score"])
+            raw["mrd_suppressed"] = suppress
+            signal.raw_scores = raw
+            
+            info["score"] = float(metrics["score"])
+            
+            if suppress:
+                info["suppressed"] = True
+                info["reason"] = f"mrd_score_{metrics['score']:.3f}_vwap_{metrics['vwap_slope']:.2f}"
+                logger.warning(f"[MRD LIVE GUARD] BLOCKED SHORT XAUUSD | Recovery Score={metrics['score']:.3f} | VWAP_slope={metrics['vwap_slope']:.2f}")
+            else:
+                logger.info(f"[MRD LIVE GUARD] Allowed short | Recovery Score={metrics['score']:.3f}")
+                
+        except Exception as e:
+            logger.error(f"[MRD ERROR] Failed live check: {e}")
+            
+        return info
 
     def scan_eth(self, require_enabled: bool = True) -> ScalpingScanResult:
         return self._scan_crypto_symbol(

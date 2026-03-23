@@ -206,97 +206,43 @@ D:\\dexter\_pro\_v3\_fixed\\
 |`.env.local`|Raw thresholds 1200+ lines — never hardcode from here|
 |`main.py`|Entry point, process start|
 |`execution/`|Order placement + position manager|
-|`api/`|All broker connectors|
-|`learning/`|Winner logic, autopilot, neural scoring|
-|`data/ctrader\_openapi.db`|Execution journal — audit all trades here|
-|`data/runtime/trading\_manager\_state.json`|Live XAU directive + swarm state|
-|`data/reports/chart\_state\_memory\_report.json`|Accumulated band/session memory|
-|`runtime/`|Live position state, canary state|
+|`api/`|All brok## Recent Changes
 
-## Non-Negotiable Rules
+### 2026-03-24 — Deep Data Architecture phase preparation (Pre-Phase Backup)
 
-1. NO hardcoded values — all thresholds from `.env.local` via config object
-2. ALL orders pass `check\_risk()` before execution — no bypass ever
-3. Every broker API call has try/except with explicit error logging
-4. Position state confirmed from broker, never assumed from local state
-5. Never commit `.env.local`, `\*.key`, `\*.pem`, `\*.pub`, any API keys
-6. MAX\_POSITION\_SIZE and per-family/direction limits are hard ceilings
-7. Telegram alerts are async — never block the main trading loop
-8. `CTRADER\_BLOCK\_OPPOSITE\_DIRECTION=1` — do not touch this
-9. Canary positions are fully isolated from standard positions
-10. XAU active defense runs independently from normal position manager
-11. New config key = must add to BOTH `config.py` AND `.env.local`
-12. Any change to scheduler.py routing logic needs a regression test
+Status: **BACKUP COMPLETE** (Safe Restore Point Created)
+Branch: `backtester-xauusd`
+Tag: `v3-fixed-profitable-20260324`
 
-## Code Style
+**Backup Locations:**
+- **Git:** Pushed to `origin` and `dexter` remotes (Tag: `v3-fixed-profitable-20260324`)
+- **Local DB/Config Backup:** `C:\dexter_backups\`
+  - `ctrader_openapi__backup__20260324_before-deep-data.db` (2.3GB)
+  - `candle_data__backup__20260324.db`
+  - `.env.local__backup__20260324`
+  - `config__backup__20260324.py`
+- **Restore Docs:** `RESTORE_POINT_2026-03-24.txt` at project root.
 
-* Python 3.10+, async/await throughout
-* Type hints on all public functions
-* Dataclasses or TypedDict for positions/orders (no bare dicts)
-* `logging` module, structured format
-* Tests: `pytest tests/` — 107 passing as of 2026-03-20
+**Next Phase (Deep Data):**
+- Implementing `TickBarEngine` (Quote-level exact Timestamp bars).
+- Microstructure Regime Detector (MRD) testing.
+- Order-Flow Asymmetry Scanner (OFAS).
 
-## Environment Config Pattern
+## Session Startup
 
-```python
-# CORRECT
-from config import get\_config
-cfg = get\_config()
-threshold = cfg.SCALPING\_XAU\_TP1\_RR   # from .env.local
-
-# WRONG
-threshold = 0.90   # hardcoded!
+```
+/add scheduler.py
+/add config.py
+/add data/runtime/trading_manager_state.json
 ```
 
-## Key Subsystem Risk Map
+Say: "Continue from 2026-03-24 pre-deep-data backup. What is current system state?"
 
-|Subsystem|Files|Risk|
-|-|-|-|
-|Order execution + risk guards|execution/, api/|CRITICAL|
-|Position state + PM|runtime/, execution/|CRITICAL|
-|Direction guard + family limits|config, execution/|CRITICAL|
-|Signal routing (scheduler)|scheduler.py|HIGH|
-|Neural brain + AI providers|agent/, learning/|HIGH|
-|Winner logic + autopilot|learning/|HIGH|
-|Trading manager state|data/runtime/|HIGH|
-|Scanner signal generation|scanners/|MEDIUM|
-|Telegram notifier|notifier/|MEDIUM|
-|Market data feeds|data/, market/|MEDIUM|
+## Never Ask Me About
 
-## When Reviewing Code
-
-Prioritize in this order:
-
-1. Race conditions in async order placement (same symbol, two families)
-2. Position state drift — local vs broker reality
-3. Missing `await` on broker calls
-4. `except: pass` or bare exception swallowing
-5. Direction guard bypass paths
-6. Risk check bypass paths
-7. Pattern gate too narrow — signal silently skipped (FSS bug class)
-8. Winner logic bonus/penalty stacking beyond intended caps
-9. Missing cleanup on WebSocket disconnect
-
-## Do NOT Touch Without Tests
-
-* Any routing logic in `scheduler.py`
-* FSS pattern bridge (2026-03-20)
-* `high\_confidence\_bridge` logic (2026-03-20)
-* Winner logic bonus/penalty calculation
-* Direction guard evaluation order
-* Active defense close/tighten thresholds
-
-## Files to NEVER /add
-
-* `logs/` — huge, read-only
-* `\*.key`, `\*.pem`, `\*.pub` — SSH keys
-* `.env.local.backup-\*` — stale keys
-* `dexter\_pro\_v3\_fixed+1.zip` — 554MB
-* `\_\_pycache\_\_/`, `.pytest\_cache/`, `\_temp\_openclaw/`, `temp-grok/`
-
-## Security
-
-* All API keys rotated: 2026-03-20 (after accidental exposure)
+* Basic Python, installing packages, general coding concepts
+* Anything not related to this trading system's live behavior
+Focus: multi-family trading logic, AI reasoning, self-learning adaptation, position management, live-market safety, signal routing bugs.idental exposure)
 * SSH keys moved to: `C:\\Users\\mrgeo\\.ssh\\`
 * `.gitignore` must cover: `.env.local`, `\*.key`, `\*.pem`, `\*.pub`, `\*.zip`
 
