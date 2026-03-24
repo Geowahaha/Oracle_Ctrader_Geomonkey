@@ -1254,7 +1254,7 @@ class Config:
 
 
     # ── Signal Thresholds ──────────────────────────────────────────────────────
-    MIN_SIGNAL_CONFIDENCE:  int = int(os.getenv("MIN_SIGNAL_CONFIDENCE", "70"))
+    MIN_SIGNAL_CONFIDENCE:  int = int(os.getenv("MIN_SIGNAL_CONFIDENCE", "65"))
     STOCK_MIN_CONFIDENCE:   int = int(os.getenv("STOCK_MIN_CONFIDENCE",  "70"))
     STOCK_MAX_RESULTS:      int = int(os.getenv("STOCK_MAX_RESULTS",     "5"))
     TOP_COINS_COUNT:        int = int(os.getenv("TOP_COINS_COUNT",       "50"))
