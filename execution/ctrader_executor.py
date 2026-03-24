@@ -4661,6 +4661,7 @@ class CTraderExecutor:
             planned_rr = self._planned_rr(journal_row)
             planned_risk = self._planned_risk(journal_row, entry_price=entry, stop_loss=planned_sl or stop_loss)
             r_now = self._r_multiple(direction, entry, stop_loss, ref)
+            risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
             action_reason = ""
             live_sl_valid = self._stop_valid_for_position(direction, entry, stop_loss)
             if repair_missing_sl and not live_sl_valid:
