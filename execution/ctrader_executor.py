@@ -4663,7 +4663,7 @@ class CTraderExecutor:
             r_now = self._r_multiple(direction, entry, stop_loss, ref)
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
             
-            # --- NEURAL TRAILING GHOST HOOK ---
+            # --- NEURAL TRAILING BRAIN HOOK (Bridge Mode) ---
             if (r_now is not None) and risk > 0 and direction in {"long", "short"}:
                 try:
                     from learning.position_trailing_brain import trailing_brain
@@ -4690,7 +4690,35 @@ class CTraderExecutor:
                         "active_sl": stop_loss,
                     }
                     decision = trailing_brain.get_trailing_decision(state)
-                    # Safety Net: should_move rigorously constrained to False by ghost mode.
+                    
+                    if decision and decision.should_move and decision.trail_lock_r > 0:
+                        brain_sl = entry + (risk * decision.trail_lock_r) if direction == "long" else entry - (risk * decision.trail_lock_r)
+                        brain_improves = (brain_sl > stop_loss) if direction == "long" else (brain_sl < stop_loss)
+                        brain_tol = max(abs(entry) * 0.000001, 0.01)
+                        if brain_improves and abs(brain_sl - stop_loss) > brain_tol and self._stop_valid_for_position(direction, entry, brain_sl):
+                            res = self.amend_position_sltp(
+                                position_id=position_id,
+                                stop_loss=brain_sl,
+                                take_profit=target_tp,
+                                trailing_stop_loss=False,
+                            )
+                            if bool(res.ok):
+                                report["amended_positions"] += 1
+                                report["pm_actions"].append({
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": f"trailing_brain_{decision.mode}",
+                                    "r_now": round(float(r_now), 4),
+                                    "trail_lock_r": round(decision.trail_lock_r, 4),
+                                    "new_stop_loss": round(brain_sl, 4),
+                                    "decision_id": decision.decision_id,
+                                })
+                                logger.info(
+                                    f"[TRAIL DECISION] SL_MOVED | symbol={symbol} | "
+                                    f"r_now={float(r_now):.2f} | lock_r={decision.trail_lock_r:.2f} | "
+                                    f"old_sl={stop_loss:.4f} | new_sl={brain_sl:.4f}"
+                                )
                 except Exception as e:
                     logger.error(f"[CTraderExecutor] Trailing brain evaluation crashed: {e}", exc_info=True)
             # ----------------------------------
