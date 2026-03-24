@@ -4703,6 +4703,9 @@ class CTraderExecutor:
                                 trailing_stop_loss=False,
                             )
                             if bool(res.ok):
+                                logger.info(
+                                    f"[TRAIL LIVE] symbol={symbol} pos={position_id} | r_now={r_now:.2f} -> proposed_lock={decision.trail_lock_r:.2f} | actual_sl_moved=SUCCESS"
+                                )
                                 report["amended_positions"] += 1
                                 report["pm_actions"].append({
                                     "position_id": position_id,

@@ -5,8 +5,8 @@ Neural action-value trailing stop engine.
 MISSION: Use real-time microstructure (100-tick bars, order flow) to predict 
 the optimal profit-lock R. 
 
-PHASE 1: Stronger Stepped Heuristic (Active) + Neural Shadow.
-PHASE 2: Neural Inference (Supervised Learning from X, Y pairs).
+PHASE 1: Aggressive Stepped Heuristic (Forced Live Improvement) + Neural Shadow.
+PHASE 2: Online Supervised Learning (Transitioning to Neural Active).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class TrailingDecision:
     decision_id: str
     should_move: bool
     trail_lock_r: float
-    mode: str  # "heuristic_active" or "shadow_neural"
+    mode: str  # "heuristic_active" or "neural_shadow"
     diagnostics: dict
 
 
@@ -51,17 +51,16 @@ class PositionTrailingBrain:
         self._lock = threading.Lock()
         self._init_db()
         
-        # Phase 2: MLP Weights (7 features)
-        # Sequence: [r_now, age, slope, velocity, imbalance, vol_regime, session]
-        self.weights_path = self.model_dir / "trailing_mlp_v1.npy"
+        # Neural Model: Linear Regressor (8 features)
+        self.weights_path = self.model_dir / "trailing_weights_v1.npy"
         self.weights = self._load_weights()
         
-        # Active Heuristic: Stronger Stepped Rules for immediate profit protection.
+        # ACTIVE LOGIC: Aggressive Stepped Heuristic (FORCED LIVE IMPROVEMENT)
         self._active_steps = [
-            (1.80, 1.20, "runner_max"),
-            (1.20, 0.80, "runner_major"),
-            (0.80, 0.50, "profit_mid"),
-            (0.22, 0.18, "be_plus"),
+            (1.80, 1.30, "runner_aggressive"),
+            (1.20, 0.85, "major_aggressive"),
+            (0.80, 0.55, "mid_aggressive"),
+            (0.22, 0.20, "be_plus_aggressive"),
         ]
 
     def _init_db(self):
@@ -100,43 +99,39 @@ class PositionTrailingBrain:
 
     def _load_weights(self) -> np.ndarray:
         if self.weights_path.exists():
-            try:
-                return np.load(str(self.weights_path))
-            except Exception:
-                pass
-        # Initialize with neutral/biased weights towards r_now
-        w = np.zeros(7)
-        w[0] = 0.5  # Start with simple 50% r_now as prediction
+            try: return np.load(str(self.weights_path))
+            except Exception: pass
+        w = np.zeros(8)
+        w[0] = 0.5 # Default bias: 50% R trailing
+        w[7] = 0.01 
         return w
 
     def _save_weights(self):
-        try:
-            np.save(str(self.weights_path), self.weights)
-        except Exception as e:
-            logger.error(f"[PositionTrailingBrain] Weights Save Error: {e}")
+        try: np.save(str(self.weights_path), self.weights)
+        except Exception as e: logger.error(f"[PositionTrailingBrain] weights save error: {e}")
 
-    @staticmethod
-    def _utc_now_iso() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def _get_feature_vector(self, features: dict) -> np.ndarray:
+        return np.array([
+            features["r_now"],
+            min(features["time_in_trade_minutes"] / 120.0, 1.0),
+            features["vwap_slope"] * 100.0,
+            features["tick_velocity"],
+            features["depth_imbalance"],
+            features["vol_regime_ratio"],
+            features["session_overlap_flag"],
+            1.0 # Bias
+        ])
 
     def _predict_heuristic_lock_r(self, r_now: float) -> tuple[float, str]:
-        """Stronger stepped rules for immediate profit protection."""
+        """AGGRESSIVE STEPPED RULES: Forced Profit Protection."""
         for thresh, lock, lbl in self._active_steps:
             if r_now >= thresh:
                 return lock, lbl
         return 0.0, "hold"
 
     def _predict_neural_lock_r(self, features: dict) -> float:
-        """Linear layer inference (Shadow)."""
-        X = np.array([
-            features["r_now"],
-            features["time_in_trade_minutes"],
-            features["vwap_slope"],
-            features["tick_velocity"],
-            features["depth_imbalance"],
-            features["vol_regime_ratio"],
-            features["session_overlap_flag"]
-        ])
+        """Linear inference (Shadow)."""
+        X = self._get_feature_vector(features)
         return float(np.dot(X, self.weights))
 
     def get_trailing_decision(self, state: dict) -> TrailingDecision:
@@ -145,7 +140,6 @@ class PositionTrailingBrain:
         symbol = str(state.get("symbol", "UNKNOWN"))
         family = str(state.get("family", "other"))
 
-        # Features (X)
         r_now = float(state.get("r_now", 0.0))
         features = {
             "r_now": r_now,
@@ -158,7 +152,7 @@ class PositionTrailingBrain:
             "is_canary": 1.0 if "canary" in str(state.get("source_lane", "")) else 0.0
         }
 
-        # 1. Active: Stronger Stepped Heuristic
+        # 1. Active: Heuristic (Aggressive)
         heuristic_r, h_label = self._predict_heuristic_lock_r(r_now)
         
         # 2. Shadow: Neural Prediction
@@ -166,10 +160,9 @@ class PositionTrailingBrain:
         
         mode = "heuristic_active"
         final_lock_r = heuristic_r
-        
         should_move = bool(final_lock_r > 0)
 
-        # 3. Persist
+        # 3. Log Features + Decision
         try:
             with self._lock:
                 with sqlite3.connect(str(self.db_path)) as conn:
@@ -189,12 +182,12 @@ class PositionTrailingBrain:
                         final_lock_r, heuristic_r, neural_r, mode
                     ))
         except Exception as e:
-            logger.error(f"[PositionTrailingBrain] DB Log Error: {e}")
+            logger.error(f"[PositionTrailingBrain] DB log error: {e}")
 
-        # Heavy Transparency Logging (Audit trail)
+        # Heavy Audit Log
         logger.info(
             f"[TRAIL DECISION] {mode.upper()} | r_now={r_now:.2f} -> lock_r={final_lock_r:.2f} | "
-            f"neural_shadow={neural_r:.2f} | label={h_label}"
+            f"neural_pred={neural_r:.2f} | h_label={h_label}"
         )
 
         return TrailingDecision(
@@ -206,7 +199,7 @@ class PositionTrailingBrain:
         )
 
     def update_from_closed_trade(self, position_id: int, final_trade_r: float, optimal_lock_r: float, choked: bool):
-        """FEEDBACK LOOP: Label historical decisions."""
+        """FEEDBACK LOOP: Updates historical decisions with TRUE labels."""
         choked_int = 1 if choked else 0
         try:
             with self._lock:
@@ -218,54 +211,36 @@ class PositionTrailingBrain:
                     """, (float(optimal_lock_r), float(final_trade_r), int(choked_int), position_id))
             logger.info(f"[TRAIL FEEDBACK] Position {position_id} resolved: Final={final_trade_r:.2f}R | Optimal={optimal_lock_r:.2f}R | Choked={choked}")
         except Exception as e:
-            logger.error(f"[PositionTrailingBrain] FB Update Error: {e}")
+            logger.error(f"[PositionTrailingBrain] FB update error: {e}")
 
-    def train_trailing_mlp(self):
-        """Supervised Learning: Update weights using (Features X) -> (Optimal Y)."""
+    def train_trailing_mlp(self, learning_rate: float = 0.01):
+        """Supervised Online Learning Cycle (SGD)."""
         try:
             with self._lock:
                 with sqlite3.connect(str(self.db_path)) as conn:
                     conn.row_factory = sqlite3.Row
-                    data = conn.execute("""
+                    rows = conn.execute("""
                         SELECT r_now, time_in_trade_minutes, vwap_slope, tick_velocity, 
                                depth_imbalance, vol_regime_ratio, session_overlap_flag,
                                optimal_lock_r, choked_runner
-                        FROM trailing_decisions 
-                        WHERE optimal_lock_r IS NOT NULL
+                        FROM trailing_decisions WHERE optimal_lock_r IS NOT NULL
                     """).fetchall()
             
-            if len(data) < 20:
-                logger.debug(f"[PositionTrailingBrain] Insufficient samples for training ({len(data)}/20)")
-                return
-                
-            X = []
-            Y = []
-            weights = []
-            for row in data:
-                X.append([
-                    row["r_now"], row["time_in_trade_minutes"], row["vwap_slope"],
-                    row["tick_velocity"], row["depth_imbalance"], row["vol_regime_ratio"],
-                    row["session_overlap_flag"]
-                ])
-                Y.append(row["optimal_lock_r"])
-                # 3x penalty for choked runners (optimal_lock_r was much higher than trailed)
-                weights.append(3.0 if row["choked_runner"] else 1.0)
-            
-            X = np.array(X)
-            Y = np.array(Y)
-            W = np.diag(weights)
-            
-            # Weighted Least Squares solution: w = (X^T W X)^-1 X^T W Y
-            try:
-                new_w = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ Y
-                self.weights = new_w
-                self._save_weights()
-                logger.info(f"[PositionTrailingBrain] Training complete: n={len(data)} | bias_weight[0]={new_w[0]:.4f}")
-            except np.linalg.LinAlgError:
-                logger.error("[PositionTrailingBrain] Matrix inversion failed (singular matrix)")
-                
-        except Exception as e:
-            logger.error(f"[PositionTrailingBrain] Training Cycle Error: {e}")
+            if len(rows) < 10: return
+            for row in rows:
+                features = {
+                    "r_now": row["r_now"], "time_in_trade_minutes": row["time_in_trade_minutes"],
+                    "vwap_slope": row["vwap_slope"], "tick_velocity": row["tick_velocity"],
+                    "depth_imbalance": row["depth_imbalance"], "vol_regime_ratio": row["vol_regime_ratio"],
+                    "session_overlap_flag": row["session_overlap_flag"]
+                }
+                X = self._get_feature_vector(features)
+                y_pred = np.dot(X, self.weights)
+                penalty = 3.0 if row["choked_runner"] else 1.0 # Force aggressive capture
+                self.weights += learning_rate * penalty * (row["optimal_lock_r"] - y_pred) * X
+            self._save_weights()
+            logger.info(f"[PositionTrailingBrain] Training complete: n={len(rows)}")
+        except Exception as e: logger.error(f"[PositionTrailingBrain] train error: {e}")
 
 # Singleton
 trailing_brain = PositionTrailingBrain()
