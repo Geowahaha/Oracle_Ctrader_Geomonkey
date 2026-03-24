@@ -4662,6 +4662,39 @@ class CTraderExecutor:
             planned_risk = self._planned_risk(journal_row, entry_price=entry, stop_loss=planned_sl or stop_loss)
             r_now = self._r_multiple(direction, entry, stop_loss, ref)
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
+            
+            # --- NEURAL TRAILING GHOST HOOK ---
+            if (r_now is not None) and risk > 0 and direction in {"long", "short"}:
+                try:
+                    from learning.position_trailing_brain import trailing_brain
+                    _sf = getattr(self, "_session_flags", None)
+                    _cls_func = getattr(self, "_classify_symbol", lambda x: "other")
+                    now_ts = datetime.now(timezone.utc)
+                    curr_session_overlap = float(_sf(now_ts.hour).get("session_overlap", 0.0)) if _sf else 0.0
+                    
+                    snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=0.0)
+                    feat = snapshot.get("features", {}) if snapshot else {}
+                    
+                    state = {
+                        "position_id": position_id,
+                        "symbol": symbol,
+                        "family": _cls_func(symbol),
+                        "source_lane": source,
+                        "r_now": float(r_now),
+                        "time_in_trade_minutes": float(age_min),
+                        "vwap_slope_100t": float(feat.get("mid_drift_pct", 0.0)),
+                        "tick_velocity": float(feat.get("bar_volume_proxy", 0.0)),
+                        "depth_imbalance": float(feat.get("depth_imbalance", 0.0)),
+                        "vol_regime_ratio": 1.0,
+                        "session_overlap_flag": curr_session_overlap,
+                        "active_sl": stop_loss,
+                    }
+                    decision = trailing_brain.get_trailing_decision(state)
+                    # Safety Net: should_move rigorously constrained to False by ghost mode.
+                except Exception as e:
+                    logger.error(f"[CTraderExecutor] Trailing brain evaluation crashed: {e}", exc_info=True)
+            # ----------------------------------
+            
             action_reason = ""
             live_sl_valid = self._stop_valid_for_position(direction, entry, stop_loss)
             if repair_missing_sl and not live_sl_valid:
