@@ -4975,16 +4975,14 @@ class CTraderExecutor:
                             continue
                         if (r_now is not None) and float(r_now) >= be_trigger_r:
                             r_current = float(r_now)
-                            trail_lock_r = 0.10
-                            if r_current >= 0.8:
-                                trail_lock_r = 0.50
-                            if r_current >= 1.2:
-                                trail_lock_r = 0.80
-                            if r_current >= 1.8:
-                                trail_lock_r = 1.20
-                            
+                            trail_lock_r = float(be_lock_r)
+                            if r_current >= 1.0:
+                                trail_lock_r = max(trail_lock_r, 0.50)
+                            if r_current >= 2.0:
+                                trail_lock_r = max(trail_lock_r, 1.00)
+                            if r_current >= 3.0:
+                                trail_lock_r = max(trail_lock_r, 2.00)
                             be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
-                            logger.info(f"[TRAIL DEBUG] {symbol} {direction} lane=winner | r_now={r_current:.2f} | current_sl={stop_loss:.4f} | proposed_be_sl={be_sl:.4f}")
                             improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                             trimmed_tp = target_tp
                             if trim_tp_r > 0:
@@ -5018,16 +5016,14 @@ class CTraderExecutor:
                         stop_tol_c = max(abs(entry) * 0.000001, 0.01)
                         if (r_now is not None) and float(r_now) >= canary_be_trigger_r:
                             r_current = float(r_now)
-                            trail_lock_r = 0.10
-                            if r_current >= 0.8:
-                                trail_lock_r = 0.50
-                            if r_current >= 1.2:
-                                trail_lock_r = 0.80
-                            if r_current >= 1.8:
-                                trail_lock_r = 1.20
-                                
+                            trail_lock_r = float(canary_be_lock_r)
+                            if r_current >= 1.0:
+                                trail_lock_r = max(trail_lock_r, 0.50)
+                            if r_current >= 2.0:
+                                trail_lock_r = max(trail_lock_r, 1.00)
+                            if r_current >= 3.0:
+                                trail_lock_r = max(trail_lock_r, 2.00)
                             be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
-                            logger.info(f"[TRAIL DEBUG] {symbol} {direction} lane=canary | r_now={r_current:.2f} | current_sl={stop_loss:.4f} | proposed_be_sl={be_sl:.4f}")
                             improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                             if improves and abs(be_sl - stop_loss) > stop_tol_c:
                                 res = self.amend_position_sltp(
@@ -5072,16 +5068,14 @@ class CTraderExecutor:
                     continue
                 if (r_now is not None) and float(r_now) >= float(be_trigger_r):
                     r_current = float(r_now)
-                    trail_lock_r = 0.10
-                    if r_current >= 0.8:
-                        trail_lock_r = 0.50
-                    if r_current >= 1.2:
-                        trail_lock_r = 0.80
-                    if r_current >= 1.8:
-                        trail_lock_r = 1.20
-                        
+                    trail_lock_r = float(be_lock_r)
+                    if r_current >= 1.0:
+                        trail_lock_r = max(trail_lock_r, 0.50)
+                    if r_current >= 1.5:
+                        trail_lock_r = max(trail_lock_r, 1.00)
+                    if r_current >= 2.0:
+                        trail_lock_r = max(trail_lock_r, 1.50)
                     be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
-                    logger.info(f"[TRAIL DEBUG] {symbol} {direction} lane=scheduled | r_now={r_current:.2f} | current_sl={stop_loss:.4f} | proposed_be_sl={be_sl:.4f}")
                     move_sl = abs(be_sl - stop_loss)
                     improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                     if improves and move_sl > stop_tol:
