@@ -63,6 +63,10 @@ class PositionTrailingBrain:
             (0.22, 0.20, "be_plus_aggressive"),
         ]
 
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _init_db(self):
         with self._lock:
             with sqlite3.connect(str(self.db_path)) as conn:
