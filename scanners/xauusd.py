@@ -16,6 +16,8 @@ from analysis.technical import TechnicalAnalysis
 from analysis.smc import SMCAnalyzer
 from analysis.signals import SignalGenerator, TradeSignal
 from config import config
+from learning.live_profile_autopilot import LiveProfileAutopilot
+autopilot = LiveProfileAutopilot()
 
 logger = logging.getLogger(__name__)
 ta = TechnicalAnalysis()
@@ -32,6 +34,44 @@ class XAUUSDScanner:
       - H1 for precise entry timing
     Also tracks Asian range, London breakout, NY continuation.
     """
+
+    def _check_microstructure_alignment(self, signal: TradeSignal, current_price: float) -> tuple[bool, str]:
+        """
+        Final check against the TickBarEngine data via the autopilot.
+        Validates that order-flow delta and depth imbalance support the direction.
+        """
+        try:
+            snapshot = autopilot.latest_capture_feature_snapshot(
+                symbol="XAUUSD", 
+                direction=signal.direction, 
+                confidence=signal.confidence
+            )
+            features = snapshot.get("features", {}) if snapshot else {}
+            delta = float(features.get("delta_proxy", 0.0))
+            imbalance = float(features.get("depth_imbalance", 0.0))
+            tick_velocity = float(features.get("bar_volume_proxy", 0.0))
+            
+            # Constraints:
+            if signal.direction == "long":
+                # We want positive or neutral delta (don't buy in strong sell-off)
+                if delta < -0.15:
+                    return False, f"negative_delta_bias:{delta:.3f}"
+                if imbalance < -0.25:
+                    return False, f"negative_depth_imbalance:{imbalance:.3f}"
+            else:
+                # We want negative or neutral delta (don't sell in strong blow-off)
+                if delta > 0.15:
+                    return False, f"positive_delta_bias:{delta:.3f}"
+                if imbalance > 0.25:
+                    return False, f"positive_depth_imbalance:{imbalance:.3f}"
+            
+            if tick_velocity < 0.18:
+                return False, f"low_tick_velocity:{tick_velocity:.3f}"
+                
+            return True, "micro_aligned"
+        except Exception as e:
+            logger.debug("[XAUUSD] microstructure alignment error: %s", e)
+            return True, "micro_error_default_on"
 
     def __init__(self):
         self.last_signal: Optional[TradeSignal] = None
@@ -1404,8 +1444,22 @@ class XAUUSDScanner:
             )
             if signal is not None:
                 signal_source = "behavioral_fallback_v2"
+                # Microstructure Check
+                ok, micro_reason = self._check_microstructure_alignment(signal, float(current_price))
+                if not ok:
+                    logger.warning("[SIGNAL REJECTED] Microstructure misalignment: %s | dir=%s conf=%.1f", 
+                                   micro_reason, signal.direction, signal.confidence)
+                    self._set_last_scan_diagnostics(
+                        status="signal_rejected",
+                        micro_reason=micro_reason,
+                        utc_time=str(session_info.get("utc_time", "-")),
+                        active_sessions=list(session_info.get("active_sessions", []) or []),
+                        notes=[f"micro_rejected:{micro_reason}"]
+                    )
+                    return None
+                    
                 logger.info(
-                    "[XAUUSD] Behavioral fallback produced %s @ %.2f conf=%.1f",
+                    "[XAUUSD] Behavioral fallback produced %s @ %.2f conf=%.1f [MICRO_ALIGNED]",
                     str(signal.direction).upper(),
                     float(getattr(signal, "entry", current_price)),
                     float(getattr(signal, "confidence", 0.0)),
