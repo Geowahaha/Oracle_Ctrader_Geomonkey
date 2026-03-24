@@ -4974,7 +4974,15 @@ class CTraderExecutor:
                                 })
                             continue
                         if (r_now is not None) and float(r_now) >= be_trigger_r:
-                            be_sl = entry + (risk * be_lock_r) if direction == "long" else entry - (risk * be_lock_r)
+                            r_current = float(r_now)
+                            trail_lock_r = float(be_lock_r)
+                            if r_current >= 1.0:
+                                trail_lock_r = max(trail_lock_r, 0.50)
+                            if r_current >= 2.0:
+                                trail_lock_r = max(trail_lock_r, 1.00)
+                            if r_current >= 3.0:
+                                trail_lock_r = max(trail_lock_r, 2.00)
+                            be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
                             improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                             trimmed_tp = target_tp
                             if trim_tp_r > 0:
@@ -5007,7 +5015,15 @@ class CTraderExecutor:
                         canary_be_lock_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_LOCK_R", 0.05) or 0.05)
                         stop_tol_c = max(abs(entry) * 0.000001, 0.01)
                         if (r_now is not None) and float(r_now) >= canary_be_trigger_r:
-                            be_sl = entry + (risk * canary_be_lock_r) if direction == "long" else entry - (risk * canary_be_lock_r)
+                            r_current = float(r_now)
+                            trail_lock_r = float(canary_be_lock_r)
+                            if r_current >= 1.0:
+                                trail_lock_r = max(trail_lock_r, 0.50)
+                            if r_current >= 2.0:
+                                trail_lock_r = max(trail_lock_r, 1.00)
+                            if r_current >= 3.0:
+                                trail_lock_r = max(trail_lock_r, 2.00)
+                            be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
                             improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                             if improves and abs(be_sl - stop_loss) > stop_tol_c:
                                 res = self.amend_position_sltp(
@@ -5051,7 +5067,15 @@ class CTraderExecutor:
                         })
                     continue
                 if (r_now is not None) and float(r_now) >= float(be_trigger_r):
-                    be_sl = entry + (risk * be_lock_r) if direction == "long" else entry - (risk * be_lock_r)
+                    r_current = float(r_now)
+                    trail_lock_r = float(be_lock_r)
+                    if r_current >= 1.0:
+                        trail_lock_r = max(trail_lock_r, 0.50)
+                    if r_current >= 1.5:
+                        trail_lock_r = max(trail_lock_r, 1.00)
+                    if r_current >= 2.0:
+                        trail_lock_r = max(trail_lock_r, 1.50)
+                    be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
                     move_sl = abs(be_sl - stop_loss)
                     improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                     if improves and move_sl > stop_tol:
