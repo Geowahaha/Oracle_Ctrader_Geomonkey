@@ -1001,6 +1001,29 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertEqual(exec_call.call_args.kwargs.get("source"), "scalp_ethusd:winner")
         self.assertEqual(getattr(sig, "raw_scores", {}).get("ctrader_dispatch_source"), "scalp_ethusd:winner")
 
+    def test_ctrader_eth_blocks_base_lane_when_winner_not_strong(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("ETHUSD", confidence=79.0)
+        sig.pattern = "SCALP_FLOW_FORCE"
+        sig.raw_scores.update({
+            "crypto_winner_logic_enabled": True,
+            "crypto_winner_logic_regime": "weak",
+        })
+
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="ETHUSD", broker_symbol="ETHUSD", message="ok")
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_ETH_WINNER_DIRECT_ENABLED", True), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_ethusd", "scalp_ethusd:winner"}), \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_result) as exec_call:
+            dispatch_source, dispatch_meta = dexter._ctrader_pick_dispatch_source(sig, source="scalp_ethusd")
+            self.assertEqual(dispatch_source, "")
+            self.assertIn("eth_winner_memory_block", str(dispatch_meta.get("winner_reason", "")))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_ethusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_call.call_count, 0)
+
     def test_ctrader_xau_scheduled_routes_winner_lane_when_profile_matches(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("XAUUSD", confidence=84.0)

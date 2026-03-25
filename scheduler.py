@@ -1328,6 +1328,18 @@ class DexterScheduler:
                         meta["winner_reason"] = "winner_logic_strong"
                     else:
                         meta["winner_reason"] = f"winner_logic_regime:{regime or 'none'}"
+                        # ETH-only mission-control gate:
+                        # If winner-memory says ETH is not in "strong" regime, block the fallback to the base
+                        # (non-:winner, non-:canary) lane to prevent repeating weak/losing ETH routes.
+                        eth_symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+                        if (
+                            eth_symbol == "ETHUSD"
+                            and src.startswith("scalp_ethusd")
+                            and (":canary" not in src)
+                            and (":bypass" not in src)
+                        ):
+                            meta["winner_reason"] = f"eth_winner_memory_block:{regime or 'none'}"
+                            return "", meta
             else:
                 meta["winner_reason"] = "winner_source_not_allowed"
             meta["winner_candidate"] = candidate
