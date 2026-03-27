@@ -4360,6 +4360,7 @@ class CTraderExecutor:
                 runtime_families
                 and family not in runtime_families
                 and family != "xau_scalp_microtrend"
+                and ":canary" not in source
             ):
                 return f"disabled_family:{family}"
         created_ts = _safe_float(order_row.get("created_ts"), 0.0)
