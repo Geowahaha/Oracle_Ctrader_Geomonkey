@@ -1424,6 +1424,7 @@ class DexterScheduler:
             "btc_weekday_lob_momentum": "bwl",
             "btc_scalp_flow_short_sidecar": "bfss",
             "btc_scalp_flow_long_sidecar": "bfls",
+            "btc_scalp_range_repair": "brr",
             "eth_weekday_overlap_probe": "ewp",
             "crypto_flow_short": "cfs",
             "crypto_flow_buy": "cfb",
@@ -2017,6 +2018,18 @@ class DexterScheduler:
                             "family": "btc_scalp_flow_long_sidecar",
                             "strategy_id": "btcusd_flow_long_sidecar_v1",
                             "priority": 187,
+                            "execution_ready": True,
+                            "experimental": True,
+                        }
+                    )
+            if "btc_scalp_range_repair" in experimental_families and _strategy_lab_family_allowed("btc_scalp_range_repair"):
+                if bool(getattr(config, "BTC_RANGE_REPAIR_ENABLED", True)):
+                    fallback_experimental.append(
+                        {
+                            "symbol": "BTCUSD",
+                            "family": "btc_scalp_range_repair",
+                            "strategy_id": "btcusd_range_repair_v1",
+                            "priority": 186,
                             "execution_ready": True,
                             "experimental": True,
                         }
@@ -3109,6 +3122,8 @@ class DexterScheduler:
             return self._build_btc_flow_short_sidecar_signal(signal, base_source=base_source, candidate=candidate)
         if family == "btc_scalp_flow_long_sidecar":
             return self._build_btc_flow_long_sidecar_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "btc_scalp_range_repair":
+            return self._build_btc_range_repair_signal(signal, base_source=base_source, candidate=candidate)
         if family == "crypto_flow_short":
             return self._build_crypto_flow_short_signal(signal, base_source=base_source, candidate=candidate)
         if family == "crypto_flow_buy":
@@ -4413,7 +4428,16 @@ class DexterScheduler:
                 return None, ""
             btc_sessions = set(config.get_crypto_weekend_btc_allowed_sessions() or set()) if is_weekend else set(config.get_btc_weekday_lob_allowed_sessions() or set())
             if "*" not in btc_sessions and not self._session_signature_matches(session_sig, btc_sessions):
-                return None, ""
+                # Phase 3: high-confidence session bypass (mirror of XAU Priority #1)
+                _btc_np_bypass = float(getattr(signal, "raw_scores", {}) or {} if isinstance(getattr(signal, "raw_scores", None), dict) else {})
+                try:
+                    _btc_np_bypass = float((dict(getattr(signal, "raw_scores", {}) or {})).get("neural_probability", 0.0) or 0.0)
+                except Exception:
+                    _btc_np_bypass = 0.0
+                _btc_bypass_thresh = float(getattr(config, "BTC_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.87) or 0.87)
+                if _btc_np_bypass < _btc_bypass_thresh:
+                    return None, ""
+                relaxed_gate_reasons.append(f"btc_scheduled_high_conf_session_bypass:np={_btc_np_bypass:.2f}")
             if confidence < float(getattr(config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0) or 70.0):
                 return None, ""
             if confidence > float(getattr(config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9) or 74.9):
@@ -4434,6 +4458,10 @@ class DexterScheduler:
             if weekend_neutral_ok:
                 relaxed_gate_reasons.append("weekend_neutral_winner")
             if bool(getattr(config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not neutral_ob_allowed and not weekend_neutral_ok:
+                return None, ""
+            # Phase 4 MRD: block LOB longs when BTC macro micro-regime is bearish
+            _lob_mrd_regime, _ = self._btc_mrd_check("long")
+            if _lob_mrd_regime == "bearish_micro":
                 return None, ""
             if entry_type == "market" and not bool(getattr(config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True)):
                 return None, ""
@@ -4650,6 +4678,42 @@ class DexterScheduler:
             pass
         return False, ""
 
+    # ── Crypto MRD — BTC Microstructure Regime Detector (Phase 4) ───────────
+
+    def _btc_mrd_check(self, direction: str) -> tuple[str, float]:
+        """Returns (regime, delta_proxy) where regime is 'neutral'|'bearish_micro'|'bullish_micro'.
+        Uses a longer 600s lookback to detect macro micro-regime for BTC.
+        bearish_micro → suppress longs (BFLS, LOB). bullish_micro → suppress shorts (BFSS)."""
+        if not bool(getattr(config, "BTC_MRD_ENABLED", True)):
+            return "neutral", 0.0
+        try:
+            snapshot = dict(
+                live_profile_autopilot.latest_capture_feature_snapshot(
+                    symbol="BTCUSD",
+                    lookback_sec=int(getattr(config, "BTC_MRD_LOOKBACK_SEC", 600) or 600),
+                    direction=direction,
+                    confidence=70.0,
+                )
+                or {}
+            )
+        except Exception:
+            return "neutral", 0.0
+        if not bool(snapshot.get("ok")):
+            return "neutral", 0.0
+        features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
+        delta_proxy = float(features.get("delta_proxy", 0.0) or 0.0)
+        bar_volume_proxy = float(features.get("bar_volume_proxy", 0.0) or 0.0)
+        min_bv = float(getattr(config, "BTC_MRD_MIN_BAR_VOLUME_PROXY", 0.20) or 0.20)
+        if bar_volume_proxy < min_bv:
+            return "neutral", delta_proxy  # low volume = no regime signal
+        bearish_thresh = float(getattr(config, "BTC_MRD_BEARISH_DELTA_THRESHOLD", -0.05) or -0.05)
+        bullish_thresh = float(getattr(config, "BTC_MRD_BULLISH_DELTA_THRESHOLD", 0.05) or 0.05)
+        if delta_proxy < bearish_thresh:
+            return "bearish_micro", delta_proxy  # selling flow dominant → suppress longs
+        if delta_proxy > bullish_thresh:
+            return "bullish_micro", delta_proxy  # buying flow dominant → suppress shorts
+        return "neutral", delta_proxy
+
     # ── BTC Flow Short Sidecar (BFSS) — crypto clone of XAU FSS ─────────────
 
     def _build_btc_flow_short_sidecar_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
@@ -4704,6 +4768,10 @@ class DexterScheduler:
         min_bv = float(getattr(config, "BTC_FSS_MIN_BAR_VOLUME_PROXY", 0.28) or 0.28)
         # Guard B+C (mirror of XAU): selling flow must be NEGATIVE delta_proxy
         if delta_proxy >= 0:
+            return None, ""
+        # Phase 4 MRD: suppress shorts if BTC macro micro-regime is bullish
+        _mrd_regime, _mrd_dp = self._btc_mrd_check("short")
+        if _mrd_regime == "bullish_micro":
             return None, ""
         # For behavioral trigger: require full thresholds (Guard A equivalent)
         if abs(delta_proxy) < min_dp:
@@ -4812,6 +4880,10 @@ class DexterScheduler:
         # Guard B+C: buying flow must be POSITIVE delta_proxy
         if delta_proxy <= 0:
             return None, ""
+        # Phase 4 MRD: suppress longs if BTC macro micro-regime is bearish
+        _mrd_regime, _mrd_dp = self._btc_mrd_check("long")
+        if _mrd_regime == "bearish_micro":
+            return None, ""
         if delta_proxy < min_dp:
             return None, ""
         if bar_volume_proxy < min_bv:
@@ -4858,6 +4930,133 @@ class DexterScheduler:
                 "stop_lift": round(stop_lift, 4),
             }
             raw["ctrader_risk_usd_override"] = round(float(getattr(config, "BTC_FLS_CTRADER_RISK_USD", 0.65) or 0.65), 4)
+            raw["mt5_ignore_open_positions"] = True
+            raw["mt5_limit_allow_market_fallback"] = False
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    # ── BTC Range Repair (BRR) — crypto clone of XAU RR ─────────────────────
+
+    def _build_btc_range_repair_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """BTC mirror of XAU Range Repair: probe limit entries after BTC exhaustion/range-probe setups.
+        Completely isolated from XAU — separate config BTC_RANGE_REPAIR_*, no XAU infra shared."""
+        family = str((candidate or {}).get("family") or "").strip().lower()
+        if signal is None or family != "btc_scalp_range_repair":
+            return None, ""
+        if not bool(getattr(config, "BTC_RANGE_REPAIR_ENABLED", True)):
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        if symbol != "BTCUSD":
+            return None, ""
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return None, ""
+        # Phase 1 guards
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        if _clg_blocked:
+            return None, ""
+        _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
+        if _cap_blocked:
+            return None, ""
+        # Phase 4 MRD: suppress direction against macro regime
+        _brr_mrd_regime, _ = self._btc_mrd_check(direction)
+        if direction == "long" and _brr_mrd_regime == "bearish_micro":
+            return None, ""
+        if direction == "short" and _brr_mrd_regime == "bullish_micro":
+            return None, ""
+        try:
+            snapshot = dict(
+                live_profile_autopilot.latest_capture_feature_snapshot(
+                    symbol=symbol,
+                    lookback_sec=int(getattr(config, "BTC_RANGE_REPAIR_LOOKBACK_SEC", 300) or 300),
+                    direction=direction,
+                    confidence=float(getattr(signal, "confidence", 0.0) or 0.0),
+                )
+                or {}
+            )
+        except Exception:
+            snapshot = {}
+        if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            return None, ""
+        capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
+        chart_state = dict(
+            live_profile_classify_chart_state(direction, self._signal_request_context(signal), capture_features=capture_features)
+            or {}
+        )
+        state_label = str(chart_state.get("state_label") or "").strip().lower()
+        allowed_states = {
+            s.strip().lower()
+            for s in str(getattr(config, "BTC_RANGE_REPAIR_ALLOWED_STATES", "reversal_exhaustion,range_probe") or "").split(",")
+            if s.strip()
+        }
+        if allowed_states and state_label not in allowed_states:
+            return None, ""
+        continuation_bias = abs(float(chart_state.get("continuation_bias", 0.0) or 0.0))
+        rejection_ratio = float(capture_features.get("rejection_ratio", 0.0) or 0.0)
+        bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
+        delta_proxy = abs(float(capture_features.get("delta_proxy", 0.0) or 0.0))
+        if continuation_bias > float(getattr(config, "BTC_RANGE_REPAIR_MAX_CONTINUATION_BIAS", 0.12) or 0.12):
+            return None, ""
+        if rejection_ratio < float(getattr(config, "BTC_RANGE_REPAIR_MIN_REJECTION_RATIO", 0.14) or 0.14):
+            return None, ""
+        if bar_volume_proxy < float(getattr(config, "BTC_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY", 0.20) or 0.20):
+            return None, ""
+        if delta_proxy > float(getattr(config, "BTC_RANGE_REPAIR_MAX_ABS_DELTA_PROXY", 0.14) or 0.14):
+            return None, ""
+        entry = float(getattr(signal, "entry", 0.0) or 0.0)
+        stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+        atr = abs(float(getattr(signal, "atr", 0.0) or 0.0))
+        base_risk = abs(entry - stop_loss)
+        if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            return None, ""
+        sign = 1.0 if direction == "long" else -1.0
+        atr_eff = max(base_risk, atr, entry * 0.0005)
+        retest = max(
+            base_risk * float(getattr(config, "BTC_RANGE_REPAIR_ENTRY_RISK_RATIO", 0.10) or 0.10),
+            atr_eff * float(getattr(config, "BTC_RANGE_REPAIR_ENTRY_ATR_RATIO", 0.04) or 0.04),
+        )
+        new_entry = entry - (retest * sign)
+        new_risk = max(entry * 0.00008, base_risk * float(getattr(config, "BTC_RANGE_REPAIR_STOP_KEEP_RISK_RATIO", 0.75) or 0.75))
+        new_stop = new_entry - (new_risk * sign)
+        lane_signal = copy.deepcopy(signal)
+        lane_signal.take_profit_1 = round(float(entry + (base_risk * sign * float(getattr(config, "BTC_RANGE_REPAIR_TP1_RR", 0.50) or 0.50))), 2)
+        lane_signal.take_profit_2 = round(float(entry + (base_risk * sign * float(getattr(config, "BTC_RANGE_REPAIR_TP2_RR", 0.85) or 0.85))), 2)
+        lane_signal.take_profit_3 = round(float(entry + (base_risk * sign * float(getattr(config, "BTC_RANGE_REPAIR_TP3_RR", 1.15) or 1.15))), 2)
+        lane_signal.risk_reward = round(float(getattr(config, "BTC_RANGE_REPAIR_TP2_RR", 0.85) or 0.85), 2)
+        shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type="limit")
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        follow_plan = str(chart_state.get("follow_up_plan") or "").strip().lower() or (
+            "probe_repair_limit_after_exhaustion" if state_label == "reversal_exhaustion" else "fade_range_edge_with_limit_only"
+        )
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = str(base_source or "").strip().lower()
+            raw["experimental_family"] = True
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_btc_range_repair"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["btc_range_repair_snapshot"] = {
+                "state_label": state_label,
+                "follow_up_plan": follow_plan,
+                "continuation_bias": round(continuation_bias, 4),
+                "rejection_ratio": round(rejection_ratio, 4),
+                "delta_proxy_abs": round(delta_proxy, 4),
+                "bar_volume_proxy": round(bar_volume_proxy, 4),
+                "run_id": str(snapshot.get("run_id") or ""),
+                "entry_mode": "range_limit_repair",
+            }
+            raw["ctrader_risk_usd_override"] = round(float(getattr(config, "BTC_RANGE_REPAIR_CTRADER_RISK_USD", 0.55) or 0.55), 4)
             raw["mt5_ignore_open_positions"] = True
             raw["mt5_limit_allow_market_fallback"] = False
             shaped.raw_scores = raw

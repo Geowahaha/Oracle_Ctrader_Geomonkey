@@ -162,6 +162,32 @@ class Config:
     BTC_FLS_CTRADER_RISK_USD: float = float(os.getenv("BTC_FLS_CTRADER_RISK_USD", "0.65"))
     BTC_FLS_LOOKBACK_SEC: int = int(os.getenv("BTC_FLS_LOOKBACK_SEC", "240"))
 
+    # ── BTC Scheduled High-Confidence Session Bypass (Phase 3) ──
+    BTC_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD: float = float(os.getenv("BTC_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", "0.87"))
+
+    # ── BTC Range Repair (BRR) — crypto clone of XAU RR, isolated ──
+    BTC_RANGE_REPAIR_ENABLED: bool = os.getenv("BTC_RANGE_REPAIR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("BTC_RANGE_REPAIR_LOOKBACK_SEC", "300"))
+    BTC_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("BTC_RANGE_REPAIR_ALLOWED_STATES", "reversal_exhaustion,range_probe")
+    BTC_RANGE_REPAIR_MAX_CONTINUATION_BIAS: float = float(os.getenv("BTC_RANGE_REPAIR_MAX_CONTINUATION_BIAS", "0.12"))
+    BTC_RANGE_REPAIR_MIN_REJECTION_RATIO: float = float(os.getenv("BTC_RANGE_REPAIR_MIN_REJECTION_RATIO", "0.14"))
+    BTC_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("BTC_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY", "0.20"))
+    BTC_RANGE_REPAIR_MAX_ABS_DELTA_PROXY: float = float(os.getenv("BTC_RANGE_REPAIR_MAX_ABS_DELTA_PROXY", "0.14"))
+    BTC_RANGE_REPAIR_ENTRY_RISK_RATIO: float = float(os.getenv("BTC_RANGE_REPAIR_ENTRY_RISK_RATIO", "0.10"))
+    BTC_RANGE_REPAIR_ENTRY_ATR_RATIO: float = float(os.getenv("BTC_RANGE_REPAIR_ENTRY_ATR_RATIO", "0.04"))
+    BTC_RANGE_REPAIR_STOP_KEEP_RISK_RATIO: float = float(os.getenv("BTC_RANGE_REPAIR_STOP_KEEP_RISK_RATIO", "0.75"))
+    BTC_RANGE_REPAIR_TP1_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP1_RR", "0.50"))
+    BTC_RANGE_REPAIR_TP2_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP2_RR", "0.85"))
+    BTC_RANGE_REPAIR_TP3_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP3_RR", "1.15"))
+    BTC_RANGE_REPAIR_CTRADER_RISK_USD: float = float(os.getenv("BTC_RANGE_REPAIR_CTRADER_RISK_USD", "0.55"))
+
+    # ── Crypto MRD — BTC Microstructure Regime Detector (Phase 4) ──
+    BTC_MRD_ENABLED: bool = os.getenv("BTC_MRD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_MRD_LOOKBACK_SEC: int = int(os.getenv("BTC_MRD_LOOKBACK_SEC", "600"))
+    BTC_MRD_BEARISH_DELTA_THRESHOLD: float = float(os.getenv("BTC_MRD_BEARISH_DELTA_THRESHOLD", "-0.05"))
+    BTC_MRD_BULLISH_DELTA_THRESHOLD: float = float(os.getenv("BTC_MRD_BULLISH_DELTA_THRESHOLD", "0.05"))
+    BTC_MRD_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("BTC_MRD_MIN_BAR_VOLUME_PROXY", "0.20"))
+
     # ── Crypto Weekend Trading ────────────────────────────────────────────────
     CRYPTO_WEEKEND_TRADING_ENABLED: bool = os.getenv("CRYPTO_WEEKEND_TRADING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     CRYPTO_WEEKEND_RISK_MULTIPLIER: float = float(os.getenv("CRYPTO_WEEKEND_RISK_MULTIPLIER", "0.65"))
