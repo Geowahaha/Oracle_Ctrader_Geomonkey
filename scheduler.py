@@ -1422,6 +1422,8 @@ class DexterScheduler:
             "xau_scalp_flow_long_sidecar": "fls",
             "xau_scalp_range_repair": "rr",
             "btc_weekday_lob_momentum": "bwl",
+            "btc_scalp_flow_short_sidecar": "bfss",
+            "btc_scalp_flow_long_sidecar": "bfls",
             "eth_weekday_overlap_probe": "ewp",
             "crypto_flow_short": "cfs",
             "crypto_flow_buy": "cfb",
@@ -1995,6 +1997,30 @@ class DexterScheduler:
                         "experimental": True,
                     }
                 )
+            if "btc_scalp_flow_short_sidecar" in experimental_families and _strategy_lab_family_allowed("btc_scalp_flow_short_sidecar"):
+                if bool(getattr(config, "BTC_FSS_ENABLED", True)):
+                    fallback_experimental.append(
+                        {
+                            "symbol": "BTCUSD",
+                            "family": "btc_scalp_flow_short_sidecar",
+                            "strategy_id": "btcusd_flow_short_sidecar_v1",
+                            "priority": 188,
+                            "execution_ready": True,
+                            "experimental": True,
+                        }
+                    )
+            if "btc_scalp_flow_long_sidecar" in experimental_families and _strategy_lab_family_allowed("btc_scalp_flow_long_sidecar"):
+                if bool(getattr(config, "BTC_FLS_ENABLED", True)):
+                    fallback_experimental.append(
+                        {
+                            "symbol": "BTCUSD",
+                            "family": "btc_scalp_flow_long_sidecar",
+                            "strategy_id": "btcusd_flow_long_sidecar_v1",
+                            "priority": 187,
+                            "execution_ready": True,
+                            "experimental": True,
+                        }
+                    )
             for _cf in ("crypto_flow_short", "crypto_flow_buy", "crypto_winner_confirmed", "crypto_behavioral_retest"):
                 if _cf in experimental_families and _strategy_lab_family_allowed(_cf):
                     _cf_enabled_key = _cf.upper().replace("CRYPTO_", "CRYPTO_") + "_ENABLED"
@@ -3079,6 +3105,10 @@ class DexterScheduler:
             return lane_signal, lane_source
         if family in {"btc_weekday_lob_momentum", "eth_weekday_overlap_probe"}:
             return self._build_crypto_weekday_experimental_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "btc_scalp_flow_short_sidecar":
+            return self._build_btc_flow_short_sidecar_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "btc_scalp_flow_long_sidecar":
+            return self._build_btc_flow_long_sidecar_signal(signal, base_source=base_source, candidate=candidate)
         if family == "crypto_flow_short":
             return self._build_crypto_flow_short_signal(signal, base_source=base_source, candidate=candidate)
         if family == "crypto_flow_buy":
@@ -4348,6 +4378,13 @@ class DexterScheduler:
         is_weekend = datetime.now(timezone.utc).weekday() >= 5
         if is_weekend and not bool(getattr(config, "CRYPTO_WEEKEND_TRADING_ENABLED", False)):
             return None, ""
+        # Phase 1: Cluster loss guard + daily cap (isolated per symbol, no XAU impact)
+        _clg_blocked, _clg_reason = self._crypto_cluster_loss_check(symbol)
+        if _clg_blocked:
+            return None, ""
+        _cap_blocked, _cap_reason = self._crypto_daily_cap_check(symbol)
+        if _cap_blocked:
+            return None, ""
         direction = str(getattr(signal, "direction", "") or "").strip().lower()
         if direction not in {"long", "short"}:
             return None, ""
@@ -4552,6 +4589,277 @@ class DexterScheduler:
             raw["persistent_canary_symbol"] = ctx.get("symbol", "")
             if extra_tags:
                 raw.update(extra_tags)
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    # ── Crypto Guards: Cluster Loss + Daily Cap (Phase 1) ────────────────────
+
+    def _crypto_cluster_loss_check(self, symbol: str) -> tuple[bool, str]:
+        """Block if too many recent losses for this crypto symbol (mirror of XAU cluster loss guard)."""
+        if not bool(getattr(config, "CRYPTO_CLUSTER_LOSS_GUARD_ENABLED", True)):
+            return False, ""
+        sym = str(symbol or "").strip().upper()
+        if sym not in {"BTCUSD", "ETHUSD"}:
+            return False, ""
+        if sym == "BTCUSD":
+            window_h = float(getattr(config, "BTC_CLUSTER_LOSS_WINDOW_HOURS", 3.0) or 3.0)
+            min_losses = int(getattr(config, "BTC_CLUSTER_LOSS_MIN_LOSSES", 2) or 2)
+        else:
+            window_h = float(getattr(config, "ETH_CLUSTER_LOSS_WINDOW_HOURS", 2.0) or 2.0)
+            min_losses = int(getattr(config, "ETH_CLUSTER_LOSS_MIN_LOSSES", 2) or 2)
+        try:
+            db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+            db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+            with sqlite3.connect(str(db_path), timeout=3) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending') AND execution_utc >= datetime('now', ? || ' hours')",
+                    (sym, f"-{window_h:.1f}"),
+                ).fetchone()
+            loss_count = int((row or [0])[0] or 0)
+            if loss_count >= min_losses:
+                return True, f"crypto_cluster_loss_guard:{sym} {loss_count}>={min_losses} losses in {window_h:.1f}h"
+        except Exception:
+            pass
+        return False, ""
+
+    def _crypto_daily_cap_check(self, symbol: str) -> tuple[bool, str]:
+        """Block if daily trade count for this crypto symbol exceeds cap."""
+        sym = str(symbol or "").strip().upper()
+        if sym == "BTCUSD":
+            cap = int(getattr(config, "BTC_DAILY_TRADE_CAP", 3) or 3)
+        elif sym == "ETHUSD":
+            cap = int(getattr(config, "ETH_DAILY_TRADE_CAP", 2) or 2)
+        else:
+            return False, ""
+        if cap <= 0:
+            return False, ""
+        try:
+            db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+            db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+            with sqlite3.connect(str(db_path), timeout=3) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND outcome NOT IN ('open','pending') AND date(execution_utc)=date('now')",
+                    (sym,),
+                ).fetchone()
+            count = int((row or [0])[0] or 0)
+            if count >= cap:
+                return True, f"crypto_daily_cap:{sym} {count}>={cap} trades today"
+        except Exception:
+            pass
+        return False, ""
+
+    # ── BTC Flow Short Sidecar (BFSS) — crypto clone of XAU FSS ─────────────
+
+    def _build_btc_flow_short_sidecar_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """BTC mirror of XAU FSS: fires sell_stop below entry when real selling flow confirmed.
+        Completely isolated from XAU — separate config, separate family, no shared infra."""
+        family = str((candidate or {}).get("family") or "").strip().lower()
+        if signal is None or family != "btc_scalp_flow_short_sidecar":
+            return None, ""
+        if not bool(getattr(config, "BTC_FSS_ENABLED", True)):
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        if symbol != "BTCUSD":
+            return None, ""
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction != "short":
+            return None, ""
+        confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        if confidence < float(getattr(config, "BTC_FSS_MIN_CONFIDENCE", 67.0) or 67.0):
+            return None, ""
+        # Phase 1 guards re-applied (BFSS skips weekday builder, call directly)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        if _clg_blocked:
+            return None, ""
+        _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
+        if _cap_blocked:
+            return None, ""
+        # Read behavioral trigger flag
+        try:
+            _raw_check = dict(getattr(signal, "raw_scores", {}) or {})
+            _btc_behavioral = bool(_raw_check.get("btc_behavioral_trigger") or _raw_check.get("behavioral_trigger"))
+        except Exception:
+            _btc_behavioral = False
+        # Get microstructure flow data for BTC
+        try:
+            snapshot = dict(
+                live_profile_autopilot.latest_capture_feature_snapshot(
+                    symbol=symbol,
+                    lookback_sec=int(getattr(config, "BTC_FSS_LOOKBACK_SEC", 240) or 240),
+                    direction=direction,
+                    confidence=confidence,
+                )
+                or {}
+            )
+        except Exception:
+            snapshot = {}
+        if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            return None, ""
+        capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
+        delta_proxy = float(capture_features.get("delta_proxy", 0.0) or 0.0)
+        bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
+        min_dp = float(getattr(config, "BTC_FSS_MIN_DELTA_PROXY", 0.04) or 0.04)
+        min_bv = float(getattr(config, "BTC_FSS_MIN_BAR_VOLUME_PROXY", 0.28) or 0.28)
+        # Guard B+C (mirror of XAU): selling flow must be NEGATIVE delta_proxy
+        if delta_proxy >= 0:
+            return None, ""
+        # For behavioral trigger: require full thresholds (Guard A equivalent)
+        if abs(delta_proxy) < min_dp:
+            return None, ""
+        if bar_volume_proxy < min_bv:
+            return None, ""
+        entry = float(getattr(signal, "entry", 0.0) or 0.0)
+        stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+        atr = abs(float(getattr(signal, "atr", 0.0) or 0.0))
+        base_risk = abs(entry - stop_loss)
+        if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            return None, ""
+        atr_eff = max(base_risk, atr, entry * 0.0005)
+        trigger_ratio = float(getattr(config, "BTC_FSS_TRIGGER_RISK_RATIO", 0.10) or 0.10)
+        stop_lift_ratio = float(getattr(config, "BTC_FSS_STOP_LIFT_RATIO", 0.28) or 0.28)
+        trigger = max(base_risk * trigger_ratio, atr_eff * 0.04)
+        stop_lift = trigger * stop_lift_ratio
+        new_entry = entry - trigger      # sell_stop BELOW current entry
+        new_stop = stop_loss - stop_lift  # widen stop slightly for the shift
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type="sell_stop")
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = str(base_source or "").strip().lower()
+            raw["experimental_family"] = True
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_btc_flow_short_sidecar"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["btc_fss_snapshot"] = {
+                "delta_proxy": round(delta_proxy, 4),
+                "bar_volume_proxy": round(bar_volume_proxy, 4),
+                "btc_behavioral_trigger": _btc_behavioral,
+                "run_id": str(snapshot.get("run_id") or ""),
+                "entry_mode": "sell_stop",
+                "trigger": round(trigger, 4),
+                "stop_lift": round(stop_lift, 4),
+            }
+            raw["ctrader_risk_usd_override"] = round(float(getattr(config, "BTC_FSS_CTRADER_RISK_USD", 0.65) or 0.65), 4)
+            raw["mt5_ignore_open_positions"] = True
+            raw["mt5_limit_allow_market_fallback"] = False
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    # ── BTC Flow Long Sidecar (BFLS) — crypto clone of XAU FLS ─────────────
+
+    def _build_btc_flow_long_sidecar_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        """BTC mirror of XAU FLS: fires buy_stop above entry when real buying flow confirmed.
+        Completely isolated from XAU — separate config, separate family, no shared infra."""
+        family = str((candidate or {}).get("family") or "").strip().lower()
+        if signal is None or family != "btc_scalp_flow_long_sidecar":
+            return None, ""
+        if not bool(getattr(config, "BTC_FLS_ENABLED", True)):
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        if symbol != "BTCUSD":
+            return None, ""
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction != "long":
+            return None, ""
+        confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        if confidence < float(getattr(config, "BTC_FLS_MIN_CONFIDENCE", 67.0) or 67.0):
+            return None, ""
+        # Phase 1 guards
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        if _clg_blocked:
+            return None, ""
+        _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
+        if _cap_blocked:
+            return None, ""
+        try:
+            _raw_check = dict(getattr(signal, "raw_scores", {}) or {})
+            _btc_behavioral = bool(_raw_check.get("btc_behavioral_trigger") or _raw_check.get("behavioral_trigger"))
+        except Exception:
+            _btc_behavioral = False
+        try:
+            snapshot = dict(
+                live_profile_autopilot.latest_capture_feature_snapshot(
+                    symbol=symbol,
+                    lookback_sec=int(getattr(config, "BTC_FLS_LOOKBACK_SEC", 240) or 240),
+                    direction=direction,
+                    confidence=confidence,
+                )
+                or {}
+            )
+        except Exception:
+            snapshot = {}
+        if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            return None, ""
+        capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
+        delta_proxy = float(capture_features.get("delta_proxy", 0.0) or 0.0)
+        bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
+        min_dp = float(getattr(config, "BTC_FLS_MIN_DELTA_PROXY", 0.04) or 0.04)
+        min_bv = float(getattr(config, "BTC_FLS_MIN_BAR_VOLUME_PROXY", 0.28) or 0.28)
+        # Guard B+C: buying flow must be POSITIVE delta_proxy
+        if delta_proxy <= 0:
+            return None, ""
+        if delta_proxy < min_dp:
+            return None, ""
+        if bar_volume_proxy < min_bv:
+            return None, ""
+        entry = float(getattr(signal, "entry", 0.0) or 0.0)
+        stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+        atr = abs(float(getattr(signal, "atr", 0.0) or 0.0))
+        base_risk = abs(entry - stop_loss)
+        if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            return None, ""
+        atr_eff = max(base_risk, atr, entry * 0.0005)
+        trigger_ratio = float(getattr(config, "BTC_FLS_TRIGGER_RISK_RATIO", 0.10) or 0.10)
+        stop_lift_ratio = float(getattr(config, "BTC_FLS_STOP_LIFT_RATIO", 0.28) or 0.28)
+        trigger = max(base_risk * trigger_ratio, atr_eff * 0.04)
+        stop_lift = trigger * stop_lift_ratio
+        new_entry = entry + trigger      # buy_stop ABOVE current entry
+        new_stop = stop_loss + stop_lift  # raise stop slightly for the shift
+        lane_signal = copy.deepcopy(signal)
+        shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type="buy_stop")
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = str(base_source or "").strip().lower()
+            raw["experimental_family"] = True
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_btc_flow_long_sidecar"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["btc_fls_snapshot"] = {
+                "delta_proxy": round(delta_proxy, 4),
+                "bar_volume_proxy": round(bar_volume_proxy, 4),
+                "btc_behavioral_trigger": _btc_behavioral,
+                "run_id": str(snapshot.get("run_id") or ""),
+                "entry_mode": "buy_stop",
+                "trigger": round(trigger, 4),
+                "stop_lift": round(stop_lift, 4),
+            }
+            raw["ctrader_risk_usd_override"] = round(float(getattr(config, "BTC_FLS_CTRADER_RISK_USD", 0.65) or 0.65), 4)
+            raw["mt5_ignore_open_positions"] = True
+            raw["mt5_limit_allow_market_fallback"] = False
             shaped.raw_scores = raw
         except Exception:
             pass

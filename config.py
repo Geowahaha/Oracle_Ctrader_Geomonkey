@@ -133,6 +133,35 @@ class Config:
     ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER: bool = os.getenv("ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
     ETH_WEEKDAY_PROBE_CTRADER_RISK_USD: float = float(os.getenv("ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", "0.35"))
 
+    # ── Crypto Cluster Loss Guard + Daily Cap (Phase 1 — isolated from XAU) ──
+    CRYPTO_CLUSTER_LOSS_GUARD_ENABLED: bool = os.getenv("CRYPTO_CLUSTER_LOSS_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("BTC_CLUSTER_LOSS_WINDOW_HOURS", "3.0"))
+    BTC_CLUSTER_LOSS_MIN_LOSSES: int = int(os.getenv("BTC_CLUSTER_LOSS_MIN_LOSSES", "2"))
+    BTC_DAILY_TRADE_CAP: int = int(os.getenv("BTC_DAILY_TRADE_CAP", "3"))
+    ETH_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("ETH_CLUSTER_LOSS_WINDOW_HOURS", "2.0"))
+    ETH_CLUSTER_LOSS_MIN_LOSSES: int = int(os.getenv("ETH_CLUSTER_LOSS_MIN_LOSSES", "2"))
+    ETH_DAILY_TRADE_CAP: int = int(os.getenv("ETH_DAILY_TRADE_CAP", "2"))
+
+    # ── BTC Flow Short Sidecar (BFSS) — crypto clone of XAU FSS, isolated ──
+    BTC_FSS_ENABLED: bool = os.getenv("BTC_FSS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_FSS_MIN_CONFIDENCE: float = float(os.getenv("BTC_FSS_MIN_CONFIDENCE", "67.0"))
+    BTC_FSS_MIN_DELTA_PROXY: float = float(os.getenv("BTC_FSS_MIN_DELTA_PROXY", "0.04"))
+    BTC_FSS_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("BTC_FSS_MIN_BAR_VOLUME_PROXY", "0.28"))
+    BTC_FSS_TRIGGER_RISK_RATIO: float = float(os.getenv("BTC_FSS_TRIGGER_RISK_RATIO", "0.10"))
+    BTC_FSS_STOP_LIFT_RATIO: float = float(os.getenv("BTC_FSS_STOP_LIFT_RATIO", "0.28"))
+    BTC_FSS_CTRADER_RISK_USD: float = float(os.getenv("BTC_FSS_CTRADER_RISK_USD", "0.65"))
+    BTC_FSS_LOOKBACK_SEC: int = int(os.getenv("BTC_FSS_LOOKBACK_SEC", "240"))
+
+    # ── BTC Flow Long Sidecar (BFLS) — crypto clone of XAU FLS, isolated ──
+    BTC_FLS_ENABLED: bool = os.getenv("BTC_FLS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_FLS_MIN_CONFIDENCE: float = float(os.getenv("BTC_FLS_MIN_CONFIDENCE", "67.0"))
+    BTC_FLS_MIN_DELTA_PROXY: float = float(os.getenv("BTC_FLS_MIN_DELTA_PROXY", "0.04"))
+    BTC_FLS_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("BTC_FLS_MIN_BAR_VOLUME_PROXY", "0.28"))
+    BTC_FLS_TRIGGER_RISK_RATIO: float = float(os.getenv("BTC_FLS_TRIGGER_RISK_RATIO", "0.10"))
+    BTC_FLS_STOP_LIFT_RATIO: float = float(os.getenv("BTC_FLS_STOP_LIFT_RATIO", "0.28"))
+    BTC_FLS_CTRADER_RISK_USD: float = float(os.getenv("BTC_FLS_CTRADER_RISK_USD", "0.65"))
+    BTC_FLS_LOOKBACK_SEC: int = int(os.getenv("BTC_FLS_LOOKBACK_SEC", "240"))
+
     # ── Crypto Weekend Trading ────────────────────────────────────────────────
     CRYPTO_WEEKEND_TRADING_ENABLED: bool = os.getenv("CRYPTO_WEEKEND_TRADING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     CRYPTO_WEEKEND_RISK_MULTIPLIER: float = float(os.getenv("CRYPTO_WEEKEND_RISK_MULTIPLIER", "0.65"))
