@@ -3059,6 +3059,16 @@ class DexterScheduler:
             return lane_signal, lane_source
         if family == "xau_scalp_range_repair":
             lane_signal, lane_source = self._build_xau_range_repair_canary_signal(signal, base_source=base_source, candidate=candidate)
+            if lane_signal is not None:
+                # Composite guard: block only when np < 0.50 AND MTF blocked simultaneously
+                # BT result: catches exactly 1 trade (-$3.73 loser), zero winners blocked
+                try:
+                    _rr_np = float((dict(getattr(signal, "raw_scores", {}) or {})).get("neural_probability", 1.0) or 1.0)
+                    _rr_mtf_blocked = xau_mtf_guard is not None and not bool((xau_mtf_guard or {}).get("allowed", True))
+                    if _rr_np < 0.50 and _rr_mtf_blocked:
+                        return None, ""
+                except Exception:
+                    pass
             if lane_signal is not None and xau_mtf_guard:
                 try:
                     raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
