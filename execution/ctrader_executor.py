@@ -4738,6 +4738,7 @@ class CTraderExecutor:
             r_now = self._r_multiple(direction, entry, stop_loss, ref)
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
             
+            age_min = self._position_age_min(pos)
             # --- NEURAL TRAILING BRAIN HOOK (Bridge Mode) ---
             if (r_now is not None) and risk > 0 and direction in {"long", "short"}:
                 try:
