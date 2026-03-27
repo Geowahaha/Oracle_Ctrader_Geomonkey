@@ -3422,6 +3422,10 @@ class DexterScheduler:
             # When chart-state memory lacks a stored continuation bias, use the live short-horizon
             # flow as a conservative proxy so FSS can sample real continuation setups.
             continuation_bias = max(abs(delta_proxy), abs(float(capture_features.get("depth_imbalance", 0.0) or 0.0)) * 0.5)
+        # Guard B+C: behavioral_trigger bypass — require NEGATIVE delta_proxy (real selling flow)
+        # positive delta_proxy = buyers dominating = macro recovery = end-of-short-trend → block FSS
+        if _behavioral_trigger and delta_proxy >= 0:
+            return None, ""
         follow_plan = str(matched_context.get("follow_up_plan") or "").strip().lower()
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
         stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
@@ -3459,16 +3463,20 @@ class DexterScheduler:
             )
             sample_mode = bool(use_break_stop)
         if not use_break_stop and first_sample_mode and ("break_stop" in follow_plan or "follow" in follow_plan):
+            # Guard A: behavioral_trigger bypass must pass FULL thresholds, never relaxed multipliers
+            _fsm_cb = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_CONTINUATION_BIAS_MULT", 0.68) or 0.68)
+            _fsm_dp = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_DELTA_PROXY_MULT", 0.68) or 0.68)
+            _fsm_bv = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.82) or 0.82)
             use_break_stop = bool(
                 abs(continuation_bias)
                 >= float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_BREAK_STOP_MIN_CONTINUATION_BIAS", 0.10) or 0.10)
-                * float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_CONTINUATION_BIAS_MULT", 0.68) or 0.68)
+                * _fsm_cb
                 and abs(delta_proxy)
                 >= float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_BREAK_STOP_MIN_DELTA_PROXY", 0.08) or 0.08)
-                * float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_DELTA_PROXY_MULT", 0.68) or 0.68)
+                * _fsm_dp
                 and bar_volume_proxy
                 >= float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_BREAK_STOP_MIN_BAR_VOLUME_PROXY", 0.38) or 0.38)
-                * float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.82) or 0.82)
+                * _fsm_bv
             )
             sample_mode = bool(use_break_stop)
         if use_break_stop:
@@ -3834,6 +3842,10 @@ class DexterScheduler:
         bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
         if abs(continuation_bias) < 1e-9:
             continuation_bias = max(abs(delta_proxy), abs(float(capture_features.get("depth_imbalance", 0.0) or 0.0)) * 0.5)
+        # Guard B+C: behavioral_trigger bypass — require POSITIVE delta_proxy (real buying flow)
+        # negative/zero delta_proxy = sellers dominating = long exhaustion = end-of-long-trend → block FLS
+        if _behavioral_trigger and delta_proxy <= 0:
+            return None, ""
         follow_plan = str(matched_context.get("follow_up_plan") or "").strip().lower()
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
         stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
@@ -3871,16 +3883,20 @@ class DexterScheduler:
             )
             sample_mode = bool(use_break_stop)
         if not use_break_stop and first_sample_mode and ("break_stop" in follow_plan or "follow" in follow_plan):
+            # Guard A: behavioral_trigger bypass must pass FULL thresholds, never relaxed multipliers
+            _fsm_cb = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_CONTINUATION_BIAS_MULT", 0.68) or 0.68)
+            _fsm_dp = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_DELTA_PROXY_MULT", 0.68) or 0.68)
+            _fsm_bv = 1.0 if _behavioral_trigger else float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.82) or 0.82)
             use_break_stop = bool(
                 abs(continuation_bias)
                 >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_CONTINUATION_BIAS", 0.10) or 0.10)
-                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_CONTINUATION_BIAS_MULT", 0.68) or 0.68)
+                * _fsm_cb
                 and abs(delta_proxy)
                 >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_DELTA_PROXY", 0.08) or 0.08)
-                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_DELTA_PROXY_MULT", 0.68) or 0.68)
+                * _fsm_dp
                 and bar_volume_proxy
                 >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_BAR_VOLUME_PROXY", 0.38) or 0.38)
-                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.82) or 0.82)
+                * _fsm_bv
             )
             sample_mode = bool(use_break_stop)
         if use_break_stop:
