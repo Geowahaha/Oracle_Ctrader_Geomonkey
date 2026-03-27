@@ -1485,6 +1485,9 @@ class XAUUSDScanner:
             key_levels = self.analyze_key_levels(current_price)
             signal.raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
             signal.raw_scores["xau_signal_source"] = signal_source
+            if signal_source == "behavioral_fallback_v2":
+                signal.raw_scores["behavioral_trigger"] = True
+                signal.raw_scores["behavioral_trigger_source"] = "behavioral_fallback_v2"
             if live_price is not None:
                 signal.reasons.append(f"💰 Live XAUUSD: ${current_price:.2f}")
             else:

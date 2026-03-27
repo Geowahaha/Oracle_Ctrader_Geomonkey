@@ -999,6 +999,13 @@ class DexterScheduler:
             allowed_entry_types = set(config.get_ctrader_xau_scheduled_allowed_entry_types() or set())
             if conf < min_conf:
                 return False, f"xau_scheduled_conf_below:{conf:.1f}<{min_conf:.1f}"
+            try:
+                _np_bypass = float((dict(getattr(signal, "raw_scores", {}) or {})).get("neural_probability", 0.0) or 0.0)
+                _np_threshold = float(getattr(config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85) or 0.85)
+                if _np_bypass >= _np_threshold:
+                    return True, f"xau_scheduled_high_conf_session_bypass:np={_np_bypass:.2f}"
+            except Exception:
+                pass
             if allowed_sessions and (not self._session_signature_matches(session_sig, allowed_sessions)):
                 return False, f"xau_scheduled_session_not_allowed:{session_sig or '-'}"
             if allowed_tfs and (not self._timeframe_matches(timeframe_token, allowed_tfs)):
@@ -1412,6 +1419,7 @@ class DexterScheduler:
             "xau_scalp_failed_fade_follow_stop": "ff",
             "xau_scalp_microtrend_follow_up": "mfu",
             "xau_scalp_flow_short_sidecar": "fss",
+            "xau_scalp_flow_long_sidecar": "fls",
             "xau_scalp_range_repair": "rr",
             "btc_weekday_lob_momentum": "bwl",
             "eth_weekday_overlap_probe": "ewp",
@@ -1768,6 +1776,17 @@ class DexterScheduler:
                         "experimental": True,
                     }
                 )
+            if "xau_scalp_flow_long_sidecar" in experimental_families and _strategy_lab_family_allowed("xau_scalp_flow_long_sidecar"):
+                fallback_experimental.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": "xau_scalp_flow_long_sidecar",
+                        "strategy_id": "xau_scalp_flow_long_sidecar_v1",
+                        "priority": 178,
+                        "execution_ready": True,
+                        "experimental": True,
+                    }
+                )
             if "xau_scalp_failed_fade_follow_stop" in experimental_families and _strategy_lab_family_allowed("xau_scalp_failed_fade_follow_stop"):
                 fallback_experimental.append(
                     {
@@ -1905,6 +1924,17 @@ class DexterScheduler:
                         "family": "xau_scalp_flow_short_sidecar",
                         "strategy_id": "xau_scalp_flow_short_sidecar_v1",
                         "priority": 179,
+                        "execution_ready": True,
+                        "experimental": True,
+                    }
+                )
+            if "xau_scalp_flow_long_sidecar" in experimental_families and _strategy_lab_family_allowed("xau_scalp_flow_long_sidecar"):
+                fallback_experimental.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": "xau_scalp_flow_long_sidecar",
+                        "strategy_id": "xau_scalp_flow_long_sidecar_v1",
+                        "priority": 178,
                         "execution_ready": True,
                         "experimental": True,
                     }
@@ -3017,6 +3047,16 @@ class DexterScheduler:
                 except Exception:
                     pass
             return lane_signal, lane_source
+        if family == "xau_scalp_flow_long_sidecar":
+            lane_signal, lane_source = self._build_xau_flow_long_sidecar_canary_signal(signal, base_source=base_source, candidate=candidate)
+            if lane_signal is not None and xau_mtf_guard:
+                try:
+                    raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+                    raw["xau_multi_tf_guard"] = dict(xau_mtf_guard)
+                    lane_signal.raw_scores = raw
+                except Exception:
+                    pass
+            return lane_signal, lane_source
         if family == "xau_scalp_range_repair":
             lane_signal, lane_source = self._build_xau_range_repair_canary_signal(signal, base_source=base_source, candidate=candidate)
             if lane_signal is not None and xau_mtf_guard:
@@ -3223,17 +3263,24 @@ class DexterScheduler:
             return None, ""
         if not bool(getattr(config, "XAU_FLOW_SHORT_SIDECAR_ENABLED", False)):
             return None, ""
-        contexts = self._load_xau_flow_short_sidecar_contexts()
-        if not contexts:
-            return None, ""
         lane_signal = copy.deepcopy(signal)
         direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
         if direction != "short":
             return None, ""
-        if not self._xau_flow_short_signal_pattern_matches(
+        try:
+            _raw_check = dict(getattr(lane_signal, "raw_scores", {}) or {})
+            _behavioral_trigger = bool(_raw_check.get("behavioral_trigger"))
+        except Exception:
+            _behavioral_trigger = False
+        contexts = self._load_xau_flow_short_sidecar_contexts()
+        if not contexts and not _behavioral_trigger:
+            return None, ""
+        allowed_patterns = self._xau_flow_short_allowed_pattern_tokens()
+        pattern_ok = self._xau_flow_short_signal_pattern_matches(
             str(getattr(lane_signal, "pattern", "") or ""),
-            self._xau_flow_short_allowed_pattern_tokens(),
-        ):
+            allowed_patterns,
+        )
+        if not pattern_ok and not _behavioral_trigger:
             return None, ""
         session_sig = self._signal_session_signature(lane_signal)
         timeframe_token = self._signal_timeframe_token(lane_signal)
@@ -3336,6 +3383,24 @@ class DexterScheduler:
                     matched_context["requested_h1_trend"] = h1_trend
                 first_sample_mode = True
                 break
+        # Priority #3: behavioral_trigger bypass — fire FSS even without chart_state context
+        if not matched_context and _behavioral_trigger:
+            signal_confidence = float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            if signal_confidence >= float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 69.0) or 69.0):
+                matched_context = {
+                    "direction": "short",
+                    "state_label": "continuation_drive",
+                    "day_type": chart_day_type,
+                    "follow_up_plan": "break_stop_follow",
+                    "state_score": 50.0,
+                    "session": session_sig,
+                    "timeframe": timeframe_token,
+                    "confidence_band": conf_band,
+                    "best_family": "fss",
+                    "behavioral_trigger_bypass": True,
+                    "first_sample_mode": True,
+                }
+                first_sample_mode = True
         if not matched_context:
             return None, ""
         snapshot = dict(
@@ -3455,6 +3520,8 @@ class DexterScheduler:
                 "confidence_band": str(matched_context.get("confidence_band") or ""),
                 "best_family": str(matched_context.get("best_family") or ""),
             }
+            if bool(matched_context.get("behavioral_trigger_bypass")):
+                raw["chart_state_flow_short_sidecar"]["behavioral_trigger_bypass"] = True
             if bool(matched_context.get("relaxed_confidence_band")):
                 raw["chart_state_flow_short_sidecar"]["relaxed_confidence_band"] = True
             if bool(matched_context.get("relaxed_day_type")):
@@ -3495,6 +3562,420 @@ class DexterScheduler:
         except Exception:
             pass
         return shaped, lane_source
+
+    # ── FLS (Flow Long Sidecar) helpers ──────────────────────────────────────
+
+    def _xau_flow_long_allowed_pattern_tokens(self) -> set[str]:
+        tokens = {
+            str(token or "").strip().upper()
+            for token in str(getattr(config, "XAU_FLOW_LONG_SIDECAR_ALLOWED_PATTERNS", "SCALP_FLOW_FORCE") or "").split(",")
+            if str(token or "").strip()
+        }
+        expanded = set(tokens)
+        for token in list(tokens):
+            if token.startswith("SCALP_FLOW"):
+                expanded.add("SCALP_FLOW")
+        return expanded
+
+    def _xau_flow_long_state_pattern_matches(self, pattern_families: set[str], allowed_patterns: set[str]) -> bool:
+        if not allowed_patterns:
+            return True
+        normalized = {str(item or "").strip().lower() for item in pattern_families if str(item or "").strip()}
+        if not normalized:
+            return False
+        for token in allowed_patterns:
+            token_l = str(token or "").strip().lower()
+            if token_l in normalized:
+                return True
+            if token_l.startswith("scalp_flow") and "scalp_flow" in normalized:
+                return True
+        return False
+
+    def _xau_flow_long_signal_pattern_matches(self, signal_pattern: str, allowed_patterns: set[str]) -> bool:
+        if not allowed_patterns:
+            return True
+        signal_token = str(signal_pattern or "").strip().upper()
+        if not signal_token:
+            return False
+        if signal_token in allowed_patterns:
+            return True
+        if any(token in signal_token for token in allowed_patterns):
+            return True
+        if "SCALP_FLOW_FORCE" in signal_token and "SCALP_FLOW" in allowed_patterns:
+            return True
+        if {"SCALP_FLOW", "SCALP_FLOW_FORCE"} & allowed_patterns:
+            if "LIQUIDITY CONTINUATION" in signal_token and any(
+                token in signal_token
+                for token in ("SWEEP-RETEST", "SWEEP RETEST", "SWEEP_RETEST", "BEHAVIORAL SWEEP")
+            ):
+                return True
+        return False
+
+    def _load_xau_flow_long_sidecar_contexts(self) -> list[dict]:
+        if not bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_ENABLED", False)):
+            return []
+        report_path = Path(__file__).resolve().parent / "data" / "reports" / "chart_state_memory_report.json"
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+        except Exception:
+            payload = {}
+        allowed_sessions = {
+            self._normalized_signature(token)
+            for token in str(getattr(config, "XAU_FLOW_LONG_SIDECAR_ALLOWED_SESSIONS", "new_york|london|overlap") or "").split("|")
+            if self._normalized_signature(token)
+        }
+        allowed_patterns = self._xau_flow_long_allowed_pattern_tokens()
+        min_resolved = max(1, int(getattr(config, "XAU_FLOW_LONG_SIDECAR_MIN_RESOLVED", 3) or 3))
+        min_state_score = float(getattr(config, "XAU_FLOW_LONG_SIDECAR_MIN_STATE_SCORE", 20.0) or 20.0)
+        max_rows = max(1, int(getattr(config, "XAU_FLOW_LONG_SIDECAR_MAX_ROWS", 6) or 6))
+        rows: list[dict] = []
+        for row in list((payload.get("states") if isinstance(payload, dict) else []) or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol") or "").strip().upper() != "XAUUSD":
+                continue
+            if not bool(row.get("follow_up_candidate")):
+                continue
+            if str(row.get("direction") or "").strip().lower() != "long":
+                continue
+            state_label = str(row.get("state_label") or "").strip().lower()
+            if state_label not in {"continuation_drive", "repricing_transition"}:
+                continue
+            stats = dict(row.get("stats") or {})
+            if int(stats.get("resolved", 0) or 0) < min_resolved:
+                continue
+            if float(row.get("state_score", 0.0) or 0.0) < min_state_score:
+                continue
+            session = self._normalized_signature(str(row.get("session") or ""))
+            if allowed_sessions and session not in allowed_sessions:
+                continue
+            pattern_families = {str(k or "").strip() for k in dict(row.get("pattern_families") or {}).keys() if str(k or "").strip()}
+            if not self._xau_flow_long_state_pattern_matches(pattern_families, allowed_patterns):
+                continue
+            rows.append(
+                {
+                    "direction": "long",
+                    "session": session,
+                    "timeframe": self._signal_timeframe_token(type("Obj", (), {"timeframe": str(row.get("timeframe") or "")})()),
+                    "confidence_band": str(row.get("confidence_band") or "").strip(),
+                    "h1_trend": str(row.get("h1_trend") or "").strip().lower() or "unknown",
+                    "day_type": str(row.get("day_type") or "").strip().lower() or "trend",
+                    "state_label": state_label,
+                    "state_score": float(row.get("state_score", 0.0) or 0.0),
+                    "follow_up_plan": str(row.get("follow_up_plan") or "break_stop_follow").strip().lower(),
+                    "follow_up_candidate": True,
+                    "continuation_bias": float(row.get("continuation_bias", 0.0) or 0.0),
+                    "best_family": str(row.get("best_family") or "").strip(),
+                }
+            )
+            if len(rows) >= max_rows:
+                break
+        return rows
+
+    def _build_xau_flow_long_sidecar_canary_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        family = str((candidate or {}).get("family") or "").strip().lower()
+        if signal is None or family != "xau_scalp_flow_long_sidecar":
+            return None, ""
+        if not bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_ENABLED", False)):
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
+        if direction != "long":
+            return None, ""
+        # Check if behavioral_trigger pre-qualifies this signal (Priority #3)
+        try:
+            _raw_check = dict(getattr(lane_signal, "raw_scores", {}) or {})
+            _behavioral_trigger = bool(_raw_check.get("behavioral_trigger"))
+        except Exception:
+            _behavioral_trigger = False
+        allowed_patterns = self._xau_flow_long_allowed_pattern_tokens()
+        pattern_ok = self._xau_flow_long_signal_pattern_matches(
+            str(getattr(lane_signal, "pattern", "") or ""),
+            allowed_patterns,
+        )
+        if not pattern_ok and not _behavioral_trigger:
+            return None, ""
+        contexts = self._load_xau_flow_long_sidecar_contexts()
+        session_sig = self._signal_session_signature(lane_signal)
+        timeframe_token = self._signal_timeframe_token(lane_signal)
+        conf_band = self._signal_confidence_band(lane_signal)
+        h1_trend = self._signal_h1_trend_token(lane_signal)
+        chart_state = live_profile_classify_chart_state(direction, self._signal_request_context(lane_signal), capture_features={})
+        chart_day_type = str(chart_state.get("day_type") or "trend").strip().lower() or "trend"
+        matched_context: dict = {}
+        first_sample_mode = False
+        for ctx in contexts:
+            if str(ctx.get("direction") or "") != direction:
+                continue
+            if str(ctx.get("session") or "") and not self._session_signature_matches(session_sig, {str(ctx.get("session") or "")}):
+                continue
+            if str(ctx.get("timeframe") or "") and not self._timeframe_matches(timeframe_token, {str(ctx.get("timeframe") or "")}):
+                continue
+            if str(ctx.get("h1_trend") or "unknown") not in {"", "unknown"} and h1_trend not in {"", "unknown"} and str(ctx.get("h1_trend") or "") != h1_trend:
+                continue
+            ctx_conf = str(ctx.get("confidence_band") or "")
+            relaxed_confidence_band = False
+            if ctx_conf and ctx_conf != conf_band:
+                if bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_ALLOW_ADJACENT_CONFIDENCE", True)) and self._confidence_band_adjacent(ctx_conf, conf_band):
+                    relaxed_confidence_band = True
+                else:
+                    continue
+            requested_day_type = str(ctx.get("day_type") or "").strip().lower()
+            relaxed_day_type = False
+            if requested_day_type and requested_day_type != chart_day_type:
+                if bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_ALLOW_COMPATIBLE_DAY_TYPE", True)) and self._xau_follow_up_day_type_compatible(requested_day_type, chart_day_type):
+                    relaxed_day_type = True
+                else:
+                    continue
+            matched_context = dict(ctx)
+            if relaxed_confidence_band:
+                matched_context["relaxed_confidence_band"] = True
+                matched_context["requested_confidence_band"] = conf_band
+            if relaxed_day_type:
+                matched_context["relaxed_day_type"] = True
+                matched_context["requested_day_type"] = chart_day_type
+            break
+        if not matched_context and bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_MODE_ENABLED", True)):
+            allowed_states = {
+                str(token or "").strip().lower()
+                for token in str(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_ALLOWED_STATES", "continuation_drive,repricing_transition") or "").split(",")
+                if str(token or "").strip()
+            }
+            min_state_score = float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_MIN_STATE_SCORE", 34.0) or 34.0)
+            min_confidence = float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 69.0) or 69.0)
+            signal_confidence = float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            for ctx in contexts:
+                if str(ctx.get("direction") or "") != direction:
+                    continue
+                if str(ctx.get("session") or "") and not self._session_signature_matches(session_sig, {str(ctx.get("session") or "")}):
+                    continue
+                if str(ctx.get("timeframe") or "") and not self._timeframe_matches(timeframe_token, {str(ctx.get("timeframe") or "")}):
+                    continue
+                if allowed_states and str(ctx.get("state_label") or "").strip().lower() not in allowed_states:
+                    continue
+                if float(ctx.get("state_score", 0.0) or 0.0) < min_state_score:
+                    continue
+                if signal_confidence < min_confidence:
+                    continue
+                ctx_conf = str(ctx.get("confidence_band") or "")
+                high_confidence_bridge = False
+                if ctx_conf and ctx_conf != conf_band and not self._confidence_band_adjacent(ctx_conf, conf_band):
+                    high_confidence_bridge = bool(
+                        bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_ALLOW_HIGH_CONFIDENCE_BRIDGE", True))
+                        and conf_band == "80+"
+                        and ctx_conf == "75-79.9"
+                        and signal_confidence >= max(min_confidence, 80.0)
+                    )
+                    if not high_confidence_bridge:
+                        continue
+                requested_day_type = str(ctx.get("day_type") or "").strip().lower()
+                if requested_day_type and requested_day_type != chart_day_type and not self._xau_follow_up_day_type_compatible(requested_day_type, chart_day_type):
+                    continue
+                if (
+                    str(ctx.get("h1_trend") or "unknown") not in {"", "unknown"}
+                    and h1_trend not in {"", "unknown"}
+                    and str(ctx.get("h1_trend") or "") != h1_trend
+                    and not bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_ALLOW_H1_RELAXED", True))
+                ):
+                    continue
+                matched_context = dict(ctx)
+                matched_context["first_sample_mode"] = True
+                if ctx_conf and ctx_conf != conf_band:
+                    matched_context["relaxed_confidence_band"] = True
+                    matched_context["requested_confidence_band"] = conf_band
+                    if high_confidence_bridge:
+                        matched_context["high_confidence_bridge"] = True
+                if requested_day_type and requested_day_type != chart_day_type:
+                    matched_context["relaxed_day_type"] = True
+                    matched_context["requested_day_type"] = chart_day_type
+                if (
+                    str(ctx.get("h1_trend") or "unknown") not in {"", "unknown"}
+                    and h1_trend not in {"", "unknown"}
+                    and str(ctx.get("h1_trend") or "") != h1_trend
+                ):
+                    matched_context["relaxed_h1_trend"] = True
+                    matched_context["requested_h1_trend"] = h1_trend
+                first_sample_mode = True
+                break
+        # Priority #3: behavioral_trigger bypass — fire FLS even without chart_state context
+        if not matched_context and _behavioral_trigger:
+            signal_confidence = float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            if signal_confidence >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 69.0) or 69.0):
+                matched_context = {
+                    "direction": "long",
+                    "state_label": "continuation_drive",
+                    "day_type": chart_day_type,
+                    "follow_up_plan": "break_stop_follow",
+                    "state_score": 50.0,
+                    "session": session_sig,
+                    "timeframe": timeframe_token,
+                    "confidence_band": conf_band,
+                    "best_family": "fls",
+                    "behavioral_trigger_bypass": True,
+                    "first_sample_mode": True,
+                }
+                first_sample_mode = True
+        if not matched_context:
+            return None, ""
+        snapshot = dict(
+            live_profile_autopilot.latest_capture_feature_snapshot(
+                symbol=str(getattr(lane_signal, "symbol", "") or ""),
+                lookback_sec=int(getattr(config, "XAU_TICK_DEPTH_FILTER_LOOKBACK_SEC", 240) or 240),
+                direction=direction,
+                confidence=float(getattr(lane_signal, "confidence", 0.0) or 0.0),
+            )
+            or {}
+        )
+        if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            return None, ""
+        capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
+        continuation_bias = float(((matched_context.get("continuation_bias") or chart_state.get("continuation_bias") or 0.0) or 0.0))
+        delta_proxy = float(capture_features.get("delta_proxy", 0.0) or 0.0)
+        bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
+        if abs(continuation_bias) < 1e-9:
+            continuation_bias = max(abs(delta_proxy), abs(float(capture_features.get("depth_imbalance", 0.0) or 0.0)) * 0.5)
+        follow_plan = str(matched_context.get("follow_up_plan") or "").strip().lower()
+        entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
+        stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
+        atr = abs(float(getattr(lane_signal, "atr", 0.0) or 0.0))
+        base_risk = abs(entry - stop_loss)
+        if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            return None, ""
+        atr_eff = max(base_risk, atr, entry * 0.0003)
+        use_break_stop = bool(
+            ("break_stop" in follow_plan or "follow" in follow_plan)
+            and abs(continuation_bias) >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_CONTINUATION_BIAS", 0.10) or 0.10)
+            and abs(delta_proxy) >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_DELTA_PROXY", 0.08) or 0.08)
+            and bar_volume_proxy >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_BAR_VOLUME_PROXY", 0.38) or 0.38)
+        )
+        sample_mode = False
+        if (
+            not use_break_stop
+            and bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_ENABLED", True))
+            and float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_MIN_CONFIDENCE", 72.0) or 72.0)
+            and float(matched_context.get("state_score", 0.0) or 0.0)
+            >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_MIN_STATE_SCORE", 32.0) or 32.0)
+            and ("break_stop" in follow_plan or "follow" in follow_plan)
+        ):
+            use_break_stop = bool(
+                abs(continuation_bias)
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_CONTINUATION_BIAS", 0.10) or 0.10)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_CONTINUATION_BIAS_MULT", 0.75) or 0.75)
+                and abs(delta_proxy)
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_DELTA_PROXY", 0.08) or 0.08)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_DELTA_PROXY_MULT", 0.75) or 0.75)
+                and bar_volume_proxy
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_BAR_VOLUME_PROXY", 0.38) or 0.38)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.90) or 0.90)
+            )
+            sample_mode = bool(use_break_stop)
+        if not use_break_stop and first_sample_mode and ("break_stop" in follow_plan or "follow" in follow_plan):
+            use_break_stop = bool(
+                abs(continuation_bias)
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_CONTINUATION_BIAS", 0.10) or 0.10)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_CONTINUATION_BIAS_MULT", 0.68) or 0.68)
+                and abs(delta_proxy)
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_DELTA_PROXY", 0.08) or 0.08)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_DELTA_PROXY_MULT", 0.68) or 0.68)
+                and bar_volume_proxy
+                >= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_MIN_BAR_VOLUME_PROXY", 0.38) or 0.38)
+                * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_BAR_VOLUME_PROXY_MULT", 0.82) or 0.82)
+            )
+            sample_mode = bool(use_break_stop)
+        if use_break_stop:
+            trigger = max(
+                base_risk * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_TRIGGER_RISK_RATIO", 0.12) or 0.12),
+                atr_eff * 0.05,
+            )
+            stop_lift = trigger * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_BREAK_STOP_STOP_LIFT_RATIO", 0.34) or 0.34)
+            new_entry = entry + trigger
+            new_stop = stop_loss + stop_lift
+            next_entry_type = "buy_stop"
+        else:
+            if bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_FORCE_STOP_ONLY", True)):
+                return None, ""
+            retest = max(
+                base_risk * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SHALLOW_RETEST_RISK_RATIO", 0.10) or 0.10),
+                atr_eff * 0.045,
+            )
+            stop_pad = retest * 0.24
+            new_entry = entry - retest
+            new_stop = stop_loss - stop_pad
+            next_entry_type = "limit"
+        shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type=next_entry_type)
+        if shaped is None:
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = str(base_source or "").strip().lower()
+            raw["experimental_family"] = True
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_flow_long_sidecar"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["chart_state_flow_long_sidecar"] = {
+                "state_label": str(matched_context.get("state_label") or ""),
+                "day_type": str(matched_context.get("day_type") or ""),
+                "follow_up_plan": follow_plan,
+                "state_score": float(matched_context.get("state_score", 0.0) or 0.0),
+                "session": str(matched_context.get("session") or ""),
+                "timeframe": str(matched_context.get("timeframe") or ""),
+                "direction": "long",
+                "confidence_band": str(matched_context.get("confidence_band") or ""),
+                "best_family": str(matched_context.get("best_family") or ""),
+            }
+            if bool(matched_context.get("behavioral_trigger_bypass")):
+                raw["chart_state_flow_long_sidecar"]["behavioral_trigger_bypass"] = True
+            if bool(matched_context.get("relaxed_confidence_band")):
+                raw["chart_state_flow_long_sidecar"]["relaxed_confidence_band"] = True
+            if bool(matched_context.get("relaxed_day_type")):
+                raw["chart_state_flow_long_sidecar"]["relaxed_day_type"] = True
+                raw["chart_state_flow_long_sidecar"]["requested_day_type"] = str(matched_context.get("requested_day_type") or "")
+            if bool(matched_context.get("relaxed_h1_trend")):
+                raw["chart_state_flow_long_sidecar"]["relaxed_h1_trend"] = True
+                raw["chart_state_flow_long_sidecar"]["requested_h1_trend"] = str(matched_context.get("requested_h1_trend") or "")
+            if bool(matched_context.get("first_sample_mode")):
+                raw["chart_state_flow_long_sidecar"]["first_sample_mode"] = True
+            if bool(matched_context.get("high_confidence_bridge")):
+                raw["chart_state_flow_long_sidecar"]["high_confidence_bridge"] = True
+            raw["chart_state_flow_long_snapshot"] = {
+                "run_id": str(snapshot.get("run_id") or ""),
+                "last_event_utc": str(snapshot.get("last_event_utc") or ""),
+                "entry_mode": "break_stop_sample" if sample_mode else ("break_stop" if use_break_stop else "shallow_retest_limit"),
+            }
+            raw["mt5_ignore_open_positions"] = True
+            risk_usd = float(getattr(config, "XAU_FLOW_LONG_SIDECAR_CTRADER_RISK_USD", 0.45) or 0.45)
+            if sample_mode:
+                risk_usd *= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SAMPLE_RISK_MULTIPLIER", 0.70) or 0.70)
+                raw["chart_state_flow_long_sidecar"]["sample_mode"] = True
+            if bool(matched_context.get("first_sample_mode")):
+                risk_usd *= float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_RISK_MULTIPLIER", 0.55) or 0.55)
+            raw["ctrader_risk_usd_override"] = round(risk_usd, 4)
+            raw["mt5_limit_allow_market_fallback"] = False
+            raw = self._apply_xau_observability_tags(
+                raw,
+                source=lane_source,
+                family=family,
+                chart_state={
+                    "state_label": str(matched_context.get("state_label") or ""),
+                    "day_type": str(matched_context.get("day_type") or ""),
+                },
+                follow_up_plan=follow_plan,
+            )
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    # ── end FLS ──────────────────────────────────────────────────────────────
 
     def _build_xau_microtrend_follow_up_canary_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
         family = str((candidate or {}).get("family") or "").strip().lower()
