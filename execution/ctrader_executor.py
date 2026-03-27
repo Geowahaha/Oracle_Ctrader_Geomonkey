@@ -4654,6 +4654,80 @@ class CTraderExecutor:
                 ref = self._reference_price(symbol)
                 price_cache[symbol] = ref
             if _safe_float(ref, 0.0) <= 0:
+                # When the live reference price is unavailable (e.g. crypto_provider disabled),
+                # we must not run any SL-breach close decisions. But we *can* still repair a
+                # missing/invalid SL using the planned SL stored in `execution_journal`.
+                live_sl_valid = self._stop_valid_for_position(direction, entry, stop_loss)
+                if repair_missing_sl and not live_sl_valid:
+                    planned_tp = _safe_float(journal_row["take_profit"], 0.0) if journal_row is not None else 0.0
+                    planned_sl = _safe_float(journal_row["stop_loss"], 0.0) if journal_row is not None else 0.0
+                    planned_rr = self._planned_rr(journal_row)
+                    planned_risk = self._planned_risk(journal_row, entry_price=entry, stop_loss=planned_sl or stop_loss)
+
+                    target_sl = planned_sl
+                    if not self._stop_valid_for_position(direction, entry, target_sl):
+                        # If the planned SL doesn't match the live filled entry, lock a SL that preserves the planned risk.
+                        if planned_risk > 0:
+                            target_sl = (entry - planned_risk) if direction == "long" else (entry + planned_risk)
+
+                    if self._stop_valid_for_position(direction, entry, target_sl):
+                        # cTrader enforces SL outside the current spread.
+                        # If we don't have a reference price, capture bid/ask from cTrader and clamp SL accordingly.
+                        bid_px: float = 0.0
+                        ask_px: float = 0.0
+                        try:
+                            cap = self.capture_market_data(
+                                symbols=[symbol],
+                                duration_sec=3,
+                                include_depth=False,
+                                max_events=20,
+                            )
+                            spots = list(cap.get("spots") or [])
+                            for sp in reversed(spots):
+                                sp_sym = str(sp.get("symbol", "") or "").strip().upper()
+                                if sp_sym == symbol:
+                                    bid_px = _safe_float(sp.get("bid"), 0.0)
+                                    ask_px = _safe_float(sp.get("ask"), 0.0)
+                                    break
+                        except Exception:
+                            pass
+
+                        if direction == "short" and ask_px > 0:
+                            buffer = max(abs(ask_px) * 0.000001, 0.01)
+                            target_sl = max(target_sl, ask_px + buffer)
+                        elif direction == "long" and bid_px > 0:
+                            buffer = max(abs(bid_px) * 0.000001, 0.01)
+                            target_sl = min(target_sl, bid_px - buffer)
+
+                        new_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else planned_tp
+                        if not self._target_valid_for_position(direction, entry, new_tp):
+                            repair_rr = self._repair_rr_for_source(source, planned_rr)
+                            new_tp = (
+                                entry + (planned_risk * repair_rr)
+                                if direction == "long"
+                                else entry - (planned_risk * repair_rr)
+                            )
+                        take_profit_final = (
+                            new_tp if self._target_valid_for_position(direction, entry, new_tp) else 0.0
+                        )
+
+                        res = self.amend_position_sltp(
+                            position_id=position_id,
+                            stop_loss=target_sl,
+                            take_profit=take_profit_final,
+                            trailing_stop_loss=False,
+                        )
+                        if bool(res.ok):
+                            report["amended_positions"] += 1
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": "repair_missing_sl_no_ref",
+                                "reference_price": 0.0,
+                                "new_stop_loss": round(target_sl, 4),
+                                "new_take_profit": round(take_profit_final, 4),
+                            })
                 continue
             report["managed_positions"] += 1
             planned_tp = _safe_float(journal_row["take_profit"], 0.0) if journal_row is not None else 0.0
