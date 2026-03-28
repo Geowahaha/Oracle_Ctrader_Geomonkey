@@ -6446,13 +6446,32 @@ class LiveProfileAutopilot:
         win_rate = float(summary.get("win_rate", 0.0) or 0.0)
         fill_rate = float(summary.get("fill_rate", 0.0) or 0.0)
         min_resolved = max(1, int(getattr(config, "XAU_DIRECT_LANE_AUTO_TUNE_MIN_RESOLVED", 4) or 4))
+        shadow_min = max(1, int(getattr(config, "XAU_SHADOW_BACKTEST_MIN_SAMPLE", 5) or 5))
+        use_shadow = False
+        shadow_data: dict = {}
         if resolved < min_resolved:
-            out["ok"] = True
-            out["status"] = "insufficient_sample"
-            out["reasons"].append(f"resolved<{min_resolved}")
-            _save_tune_state(out)
-            self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
-            return out
+            # Attempt to supplement with shadow backtest outcomes
+            if bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)):
+                try:
+                    shadow_data = dict(self._get_shadow_outcomes(lookback_hours=72) or {})
+                except Exception:
+                    shadow_data = {}
+            shadow_resolved = int(shadow_data.get("resolved", 0) or 0)
+            if shadow_resolved >= shadow_min:
+                use_shadow = True
+                resolved = shadow_resolved
+                win_rate = float(shadow_data.get("win_rate", 0.0) or 0.0)
+                pnl_usd = 0.0  # no real PnL from shadow; use win_rate only
+                out["reasons"].append(f"shadow_evidence:resolved={shadow_resolved}")
+            else:
+                out["ok"] = True
+                out["status"] = "insufficient_sample"
+                out["reasons"].append(
+                    f"resolved<{min_resolved} shadow_resolved={shadow_resolved}<{shadow_min}"
+                )
+                _save_tune_state(out)
+                self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
+                return out
 
         current_min = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0) or 72.0)
         current_max = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0) or 75.0)
@@ -6467,17 +6486,23 @@ class LiveProfileAutopilot:
 
         new_min = current_min
         new_max = current_max
-        tighten = bool(win_rate <= tighten_wr or pnl_usd <= tighten_pnl)
-        loosen = bool(win_rate >= loosen_wr and pnl_usd >= loosen_pnl and fill_rate < target_fill)
+        if use_shadow:
+            # Shadow mode: no real PnL, use win_rate only for tighten/loosen decision
+            tighten = bool(win_rate <= tighten_wr)
+            loosen = bool(win_rate >= loosen_wr)
+        else:
+            tighten = bool(win_rate <= tighten_wr or pnl_usd <= tighten_pnl)
+            loosen = bool(win_rate >= loosen_wr and pnl_usd >= loosen_pnl and fill_rate < target_fill)
+        status_tag = "shadow_" if use_shadow else ""
         if tighten:
             new_min = min(max_ceil - 1.0, max(min_floor, current_min + step))
             new_max = max(new_min + 1.0, min(max_ceil, current_max - step))
-            out["status"] = "tightened"
+            out["status"] = f"{status_tag}tightened"
             out["reasons"].append(f"wr={win_rate:.2f} pnl={pnl_usd:.2f}")
         elif loosen:
             new_min = max(min_floor, current_min - step)
             new_max = min(max_ceil, max(current_max + step, new_min + 1.0))
-            out["status"] = "loosened"
+            out["status"] = f"{status_tag}loosened"
             out["reasons"].append(f"wr={win_rate:.2f} pnl={pnl_usd:.2f} fill={fill_rate:.2f}")
         else:
             out["ok"] = True
@@ -6512,6 +6537,246 @@ class LiveProfileAutopilot:
         out["applied_changes"] = applied
         _save_tune_state(out)
         self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
+        return out
+
+    # ── Shadow backtest ──────────────────────────────────────────────────────
+
+    def _get_shadow_outcomes(self, *, lookback_hours: int = 72) -> dict:
+        """Return aggregated shadow journal stats for auto-tune consumption."""
+        out: dict = {
+            "ok": False,
+            "total": 0,
+            "resolved": 0,
+            "wins": 0,
+            "losses": 0,
+            "expired": 0,
+            "win_rate": 0.0,
+            "top_block_reasons": [],
+            "by_block_reason": {},
+        }
+        if not self.ctrader_db_path.exists():
+            return out
+        since_iso = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        try:
+            with self._connect_ctrader() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT shadow_outcome, block_reason
+                      FROM xau_shadow_journal
+                     WHERE signal_utc >= ?
+                       AND symbol = 'XAUUSD'
+                    """,
+                    (since_iso,),
+                ).fetchall()
+        except Exception:
+            return out
+        reason_buckets: dict = {}
+        for row in rows:
+            outcome = str(row[0] or "").strip().lower() if row[0] else ""
+            reason = str(row[1] or "unknown").strip()
+            out["total"] += 1
+            bucket = reason_buckets.setdefault(reason, {"resolved": 0, "wins": 0, "losses": 0})
+            if outcome == "tp_hit":
+                out["resolved"] += 1
+                out["wins"] += 1
+                bucket["resolved"] += 1
+                bucket["wins"] += 1
+            elif outcome == "sl_hit":
+                out["resolved"] += 1
+                out["losses"] += 1
+                bucket["resolved"] += 1
+                bucket["losses"] += 1
+            elif outcome == "expired":
+                out["expired"] += 1
+        resolved = out["resolved"]
+        out["win_rate"] = round(out["wins"] / resolved, 4) if resolved > 0 else 0.0
+        out["by_block_reason"] = {
+            r: {
+                "resolved": b["resolved"],
+                "wins": b["wins"],
+                "losses": b["losses"],
+                "win_rate": round(b["wins"] / b["resolved"], 4) if b["resolved"] > 0 else 0.0,
+            }
+            for r, b in reason_buckets.items()
+        }
+        top = sorted(reason_buckets.items(), key=lambda x: -x[1]["resolved"])
+        out["top_block_reasons"] = [r for r, _ in top[:5]]
+        out["ok"] = True
+        return out
+
+    def run_xau_shadow_backtest(self) -> dict:
+        """Resolve pending shadow journal signals against candle_data.db.
+
+        For each unresolved XAUUSD shadow signal, walks 1m candles forward
+        in time and records whether TP1 or SL was hit first within the
+        configured resolve window.
+        """
+        out: dict = {
+            "ok": False,
+            "total": 0,
+            "pending": 0,
+            "newly_resolved": 0,
+            "skipped_no_candles": 0,
+            "error": "",
+        }
+        if not bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)):
+            out["status"] = "disabled"
+            return out
+        candle_db_path = Path(__file__).resolve().parent.parent / "backtest" / "candle_data.db"
+        if not candle_db_path.exists():
+            out["error"] = "candle_db_missing"
+            return out
+        if not self.ctrader_db_path.exists():
+            out["error"] = "ctrader_db_missing"
+            return out
+        resolve_hours = max(1.0, float(getattr(config, "XAU_SHADOW_BACKTEST_RESOLVE_HOURS", 4.0) or 4.0))
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=resolve_hours + 0.5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        try:
+            with self._connect_ctrader() as cconn:
+                cconn.execute("PRAGMA journal_mode=WAL")
+                cconn.execute("""
+                    CREATE TABLE IF NOT EXISTS xau_shadow_journal (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        signal_utc TEXT NOT NULL,
+                        symbol TEXT NOT NULL DEFAULT 'XAUUSD',
+                        direction TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.0,
+                        entry REAL NOT NULL DEFAULT 0.0,
+                        stop_loss REAL NOT NULL DEFAULT 0.0,
+                        take_profit_1 REAL NOT NULL DEFAULT 0.0,
+                        take_profit_2 REAL NOT NULL DEFAULT 0.0,
+                        take_profit_3 REAL NOT NULL DEFAULT 0.0,
+                        block_reason TEXT NOT NULL DEFAULT '',
+                        raw_scores_json TEXT NOT NULL DEFAULT '{}',
+                        shadow_outcome TEXT,
+                        resolved_utc TEXT,
+                        shadow_pnl_rr REAL
+                    )
+                """)
+                pending_rows = cconn.execute(
+                    """
+                    SELECT id, signal_utc, direction, entry, stop_loss, take_profit_1
+                      FROM xau_shadow_journal
+                     WHERE shadow_outcome IS NULL
+                       AND signal_utc <= ?
+                       AND symbol = 'XAUUSD'
+                     ORDER BY signal_utc ASC
+                     LIMIT 200
+                    """,
+                    (cutoff_iso,),
+                ).fetchall()
+                out["total"] = int(
+                    (cconn.execute("SELECT COUNT(*) FROM xau_shadow_journal WHERE symbol='XAUUSD'").fetchone() or (0,))[0]
+                )
+                out["pending"] = len(pending_rows)
+        except Exception as exc:
+            out["error"] = f"db_query_error:{exc}"
+            return out
+
+        if not pending_rows:
+            out["ok"] = True
+            return out
+
+        newly_resolved = 0
+        skipped = 0
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        try:
+            candle_conn = sqlite3.connect(str(candle_db_path), timeout=15)
+            candle_conn.row_factory = sqlite3.Row
+        except Exception as exc:
+            out["error"] = f"candle_db_connect_error:{exc}"
+            return out
+
+        try:
+            with self._connect_ctrader() as cconn:
+                for row in pending_rows:
+                    row_id = int(row[0])
+                    signal_utc = str(row[1] or "")
+                    direction = str(row[2] or "").strip().lower()
+                    entry = float(row[3] or 0.0)
+                    sl = float(row[4] or 0.0)
+                    tp1 = float(row[5] or 0.0)
+                    if entry <= 0 or sl <= 0 or tp1 <= 0:
+                        cconn.execute(
+                            "UPDATE xau_shadow_journal SET shadow_outcome=?, resolved_utc=? WHERE id=?",
+                            ("expired", now_iso, row_id),
+                        )
+                        newly_resolved += 1
+                        continue
+                    risk = abs(entry - sl)
+                    if risk < 1e-6:
+                        cconn.execute(
+                            "UPDATE xau_shadow_journal SET shadow_outcome=?, resolved_utc=? WHERE id=?",
+                            ("expired", now_iso, row_id),
+                        )
+                        newly_resolved += 1
+                        continue
+                    # Load 1m candles from signal_utc forward for resolve_hours
+                    end_utc = (
+                        datetime.strptime(signal_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        + timedelta(hours=resolve_hours)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    try:
+                        candles = candle_conn.execute(
+                            """
+                            SELECT high, low FROM candles
+                             WHERE symbol='XAUUSD' AND tf='1m'
+                               AND ts >= ? AND ts <= ?
+                             ORDER BY ts ASC
+                            """,
+                            (signal_utc, end_utc),
+                        ).fetchall()
+                    except Exception:
+                        skipped += 1
+                        continue
+                    if not candles:
+                        skipped += 1
+                        continue
+                    outcome = "expired"
+                    pnl_rr = None
+                    for bar in candles:
+                        high = float(bar[0] or 0.0)
+                        low = float(bar[1] or 0.0)
+                        if direction == "long":
+                            tp_hit = high >= tp1
+                            sl_hit = low <= sl
+                        else:
+                            tp_hit = low <= tp1
+                            sl_hit = high >= sl
+                        if tp_hit and sl_hit:
+                            # ambiguous bar — give benefit of doubt to TP (conservative)
+                            outcome = "tp_hit"
+                            pnl_rr = round(abs(tp1 - entry) / risk, 4)
+                            break
+                        elif tp_hit:
+                            outcome = "tp_hit"
+                            pnl_rr = round(abs(tp1 - entry) / risk, 4)
+                            break
+                        elif sl_hit:
+                            outcome = "sl_hit"
+                            pnl_rr = round(-1.0, 4)
+                            break
+                    cconn.execute(
+                        "UPDATE xau_shadow_journal SET shadow_outcome=?, resolved_utc=?, shadow_pnl_rr=? WHERE id=?",
+                        (outcome, now_iso, pnl_rr, row_id),
+                    )
+                    newly_resolved += 1
+                cconn.commit()
+        except Exception as exc:
+            out["error"] = f"resolve_loop_error:{exc}"
+        finally:
+            candle_conn.close()
+
+        out["ok"] = True
+        out["newly_resolved"] = newly_resolved
+        out["skipped_no_candles"] = skipped
+        out["pending"] = max(0, out["pending"] - newly_resolved)
+        self._save_report_snapshot("xau_shadow_backtest_report", out)
         return out
 
     def _build_candidate_changes(

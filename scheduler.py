@@ -8166,6 +8166,11 @@ class DexterScheduler:
                         self._maybe_execute_mt5_signal(signal, source=source)
                         self._maybe_execute_mt5_best_lane(signal, source=source)
                         item["executed_mt5"] = True
+                    elif bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)) and str(getattr(signal, "symbol", "") or "").strip().upper() == "XAUUSD":
+                        try:
+                            self._store_shadow_signal(signal, block_reason=str(live_reason or ""))
+                        except Exception:
+                            pass
                 ctrader_res = self._maybe_execute_ctrader_signal(signal, source=source)
                 if ctrader_res is not None:
                     item["executed_ctrader"] = bool(getattr(ctrader_res, "ok", False) or getattr(ctrader_res, "dry_run", False))
@@ -9880,6 +9885,86 @@ class DexterScheduler:
                 logger.debug("[Scheduler] XAU direct lane auto-tune telegram send failed", exc_info=True)
         return report
 
+    # ── XAU shadow backtest ──────────────────────────────────────────────────
+
+    def _store_shadow_signal(self, signal, *, block_reason: str) -> None:
+        """Persist a blocked XAU direct-lane signal for shadow simulation."""
+        import json as _json
+        import sqlite3 as _sqlite3
+        from datetime import datetime, timezone
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return
+        try:
+            entry = float(getattr(signal, "entry", 0.0) or 0.0)
+            sl = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+            if entry <= 0 or sl <= 0:
+                return
+            tp1 = float(getattr(signal, "take_profit_1", 0.0) or 0.0)
+            tp2 = float(getattr(signal, "take_profit_2", 0.0) or 0.0)
+            tp3 = float(getattr(signal, "take_profit_3", 0.0) or 0.0)
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+            symbol = str(getattr(signal, "symbol", "XAUUSD") or "XAUUSD").strip().upper()
+            signal_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw_json = _json.dumps(raw)
+            except Exception:
+                raw_json = "{}"
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS xau_shadow_journal (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        signal_utc TEXT NOT NULL,
+                        symbol TEXT NOT NULL DEFAULT 'XAUUSD',
+                        direction TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.0,
+                        entry REAL NOT NULL DEFAULT 0.0,
+                        stop_loss REAL NOT NULL DEFAULT 0.0,
+                        take_profit_1 REAL NOT NULL DEFAULT 0.0,
+                        take_profit_2 REAL NOT NULL DEFAULT 0.0,
+                        take_profit_3 REAL NOT NULL DEFAULT 0.0,
+                        block_reason TEXT NOT NULL DEFAULT '',
+                        raw_scores_json TEXT NOT NULL DEFAULT '{}',
+                        shadow_outcome TEXT,
+                        resolved_utc TEXT,
+                        shadow_pnl_rr REAL
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO xau_shadow_journal
+                        (signal_utc, symbol, direction, confidence, entry, stop_loss,
+                         take_profit_1, take_profit_2, take_profit_3, block_reason, raw_scores_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (signal_utc, symbol, direction, conf, entry, sl, tp1, tp2, tp3, str(block_reason or ""), raw_json))
+                conn.commit()
+        except Exception as exc:
+            logger.debug("[Shadow] store_shadow_signal failed: %s", exc)
+
+    def _run_xau_shadow_backtest(self, force: bool = False) -> dict:
+        """Resolve pending shadow journal signals against candle history and feed auto-tune."""
+        if not bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        try:
+            report = dict(live_profile_autopilot.run_xau_shadow_backtest() or {})
+        except Exception as exc:
+            logger.error("[Scheduler] XAU shadow backtest error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        if bool(report.get("ok")):
+            resolved = int(report.get("newly_resolved", 0) or 0)
+            pending = int(report.get("pending", 0) or 0)
+            logger.info(
+                "[Scheduler] XAU shadow backtest: newly_resolved=%s pending=%s total_shadow=%s",
+                resolved,
+                pending,
+                int(report.get("total", 0) or 0),
+            )
+        else:
+            logger.warning("[Scheduler] XAU shadow backtest failed: %s", report.get("error"))
+        return report
+
     @staticmethod
     def _format_strategy_lab_report_text(report: dict) -> str:
         if not bool((report or {}).get("ok")):
@@ -10924,6 +11009,11 @@ class DexterScheduler:
                 f"  XAU direct lane auto-tune: every {xau_direct_lane_tune_mins}m "
                 f"(lookback={max(1, int(getattr(config, 'XAU_DIRECT_LANE_AUTO_TUNE_LOOKBACK_HOURS', 24) or 24))}h)\n"
             )
+        xau_shadow_bt_line = ""
+        if bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)):
+            shadow_bt_mins = max(15, int(getattr(config, "XAU_SHADOW_BACKTEST_INTERVAL_MIN", 30) or 30))
+            schedule.every(shadow_bt_mins).minutes.do(self._run_xau_shadow_backtest)
+            xau_shadow_bt_line = f"  XAU shadow backtest resolver: every {shadow_bt_mins}m\n"
         strategy_lab_line = ""
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)):
             strategy_lab_mins = max(5, int(getattr(config, "STRATEGY_LAB_REPORT_INTERVAL_MIN", 15) or 15))
@@ -11103,6 +11193,7 @@ class DexterScheduler:
             f"{ctrader_integrity_line}"
             f"{xau_direct_lane_line}"
             f"{xau_direct_lane_tune_line}"
+            f"{xau_shadow_bt_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
             f"{ctrader_market_capture_line}"
@@ -11171,6 +11262,8 @@ class DexterScheduler:
             self._run_xau_direct_lane_report(force=True)
         if bool(getattr(config, "XAU_DIRECT_LANE_AUTO_TUNE_ENABLED", False)) and bool(getattr(config, "XAU_DIRECT_LANE_AUTO_TUNE_ON_START", True)):
             self._run_xau_direct_lane_auto_tune(force=True)
+        if bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)) and bool(getattr(config, "XAU_SHADOW_BACKTEST_ON_START", True)):
+            self._run_xau_shadow_backtest(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):
