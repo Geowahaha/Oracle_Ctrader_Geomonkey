@@ -9905,6 +9905,31 @@ class DexterScheduler:
             logger.warning("[Scheduler] BTC auto-tune failed: %s", report.get("error"))
         return report
 
+    # ── Conductor / Multi-Agent Cycle ─────────────────────────────────────────
+
+    def _run_conductor_cycle(self, force: bool = False) -> dict:
+        """Run the Conductor multi-agent cycle (Performance + Regime + Optimization + Risk Guard)."""
+        if not bool(getattr(config, "CONDUCTOR_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        try:
+            from openclaw.conductor import run_conductor_cycle
+            result = run_conductor_cycle()
+            ok = bool(result.get("ok"))
+            opt_findings = (result.get("results") or {}).get("optimization") or {}
+            routed = list((opt_findings.get("findings") or {}).get("proposals_routed") or [])
+            rg_findings = (result.get("results") or {}).get("risk_guard") or {}
+            emergencies = list((rg_findings.get("findings") or {}).get("emergency_actions_taken") or [])
+            if emergencies:
+                logger.warning("[Scheduler] Conductor — emergency actions: %s", emergencies)
+            if routed:
+                logger.info("[Scheduler] Conductor — %d trial(s) proposed: %s", len(routed), routed)
+            else:
+                logger.debug("[Scheduler] Conductor cycle done — no proposals")
+            return result
+        except Exception as exc:
+            logger.error("[Scheduler] Conductor cycle error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+
     # ── Parameter Trial Sandbox ──────────────────────────────────────────────
 
     @staticmethod
@@ -11130,6 +11155,11 @@ class DexterScheduler:
             btc_tune_mins = max(60, int(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_INTERVAL_MIN", 120) or 120))
             schedule.every(btc_tune_mins).minutes.do(self._run_btc_direct_lane_auto_tune)
             btc_auto_tune_line = f"  BTC direct lane auto-tune (BFSS/BFLS/BRR): every {btc_tune_mins}m\n"
+        conductor_line = ""
+        if bool(getattr(config, "CONDUCTOR_ENABLED", True)):
+            conductor_mins = max(15, int(getattr(config, "CONDUCTOR_INTERVAL_MIN", 30) or 30))
+            schedule.every(conductor_mins).minutes.do(self._run_conductor_cycle)
+            conductor_line = f"  Conductor (multi-agent AI): every {conductor_mins}m\n"
         strategy_lab_line = ""
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)):
             strategy_lab_mins = max(5, int(getattr(config, "STRATEGY_LAB_REPORT_INTERVAL_MIN", 15) or 15))
@@ -11312,6 +11342,7 @@ class DexterScheduler:
             f"{xau_shadow_bt_line}"
             f"{param_trial_line}"
             f"{btc_auto_tune_line}"
+            f"{conductor_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
             f"{ctrader_market_capture_line}"
@@ -11386,6 +11417,8 @@ class DexterScheduler:
             self._run_parameter_trial_bt(force=True)
         if bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ENABLED", True)) and bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ON_START", True)):
             self._run_btc_direct_lane_auto_tune(force=True)
+        if bool(getattr(config, "CONDUCTOR_ENABLED", True)) and bool(getattr(config, "CONDUCTOR_ON_START", True)):
+            self._run_conductor_cycle(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):

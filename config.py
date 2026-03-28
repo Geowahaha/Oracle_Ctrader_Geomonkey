@@ -880,6 +880,10 @@ class Config:
     BTC_DIRECT_LANE_AUTO_TUNE_LOOSEN_MIN_WIN_RATE: float = float(os.getenv("BTC_DIRECT_LANE_AUTO_TUNE_LOOSEN_MIN_WIN_RATE", "0.62"))
     BTC_DIRECT_LANE_AUTO_TUNE_MIN_CONF_FLOOR: float = float(os.getenv("BTC_DIRECT_LANE_AUTO_TUNE_MIN_CONF_FLOOR", "63.0"))
     BTC_DIRECT_LANE_AUTO_TUNE_MAX_CONF_CEIL: float = float(os.getenv("BTC_DIRECT_LANE_AUTO_TUNE_MAX_CONF_CEIL", "74.0"))
+    # ── Conductor / Multi-Agent ──────────────────────────────────────────────
+    CONDUCTOR_ENABLED: bool = os.getenv("CONDUCTOR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CONDUCTOR_INTERVAL_MIN: int = int(os.getenv("CONDUCTOR_INTERVAL_MIN", "30"))
+    CONDUCTOR_ON_START: bool = os.getenv("CONDUCTOR_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_LAB_REPORT_ENABLED: bool = os.getenv("STRATEGY_LAB_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_LAB_REPORT_INTERVAL_MIN: int = int(os.getenv("STRATEGY_LAB_REPORT_INTERVAL_MIN", "15"))
     STRATEGY_LAB_REPORT_ON_START: bool = os.getenv("STRATEGY_LAB_REPORT_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
