@@ -6625,9 +6625,7 @@ class LiveProfileAutopilot:
             out["status"] = "disabled"
             return out
         candle_db_path = Path(__file__).resolve().parent.parent / "backtest" / "candle_data.db"
-        if not candle_db_path.exists():
-            out["error"] = "candle_db_missing"
-            return out
+        use_tick_fallback = not candle_db_path.exists()
         if not self.ctrader_db_path.exists():
             out["error"] = "ctrader_db_missing"
             return out
@@ -6685,12 +6683,41 @@ class LiveProfileAutopilot:
         skipped = 0
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        try:
-            candle_conn = sqlite3.connect(str(candle_db_path), timeout=15)
-            candle_conn.row_factory = sqlite3.Row
-        except Exception as exc:
-            out["error"] = f"candle_db_connect_error:{exc}"
-            return out
+        def _fetch_bars(signal_utc_str: str, end_utc_str: str) -> list:
+            """Return list of (high, low) tuples covering the resolve window.
+            Primary: candle_data.db 1m bars. Fallback: 1m buckets from spot_ticks."""
+            if not use_tick_fallback:
+                try:
+                    cconn2 = sqlite3.connect(str(candle_db_path), timeout=15)
+                    rows = cconn2.execute(
+                        "SELECT high, low FROM candles WHERE symbol='XAUUSD' AND tf='1m' AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+                        (signal_utc_str, end_utc_str),
+                    ).fetchall()
+                    cconn2.close()
+                    return [(float(r[0] or 0), float(r[1] or 0)) for r in rows]
+                except Exception:
+                    return []
+            # Tick fallback: build 1m buckets from ctrader_spot_ticks mid prices
+            try:
+                tick_rows = self._connect_ctrader().execute(
+                    "SELECT bid, ask FROM ctrader_spot_ticks WHERE symbol='XAUUSD' AND event_utc >= ? AND event_utc <= ? ORDER BY event_utc ASC",
+                    (signal_utc_str, end_utc_str),
+                ).fetchall()
+            except Exception:
+                return []
+            if not tick_rows:
+                return []
+            # Aggregate into pseudo-1m buckets of ~12 ticks each (sparse but sufficient)
+            bucket_size = max(1, len(tick_rows) // max(1, int(resolve_hours * 60)))
+            bars: list = []
+            i = 0
+            while i < len(tick_rows):
+                chunk = tick_rows[i: i + bucket_size]
+                mids = [(float(r[0] or 0) + float(r[1] or 0)) / 2.0 for r in chunk if r[0] and r[1]]
+                if mids:
+                    bars.append((max(mids), min(mids)))
+                i += bucket_size
+            return bars
 
         try:
             with self._connect_ctrader() as cconn:
@@ -6716,32 +6743,17 @@ class LiveProfileAutopilot:
                         )
                         newly_resolved += 1
                         continue
-                    # Load 1m candles from signal_utc forward for resolve_hours
                     end_utc = (
                         datetime.strptime(signal_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                         + timedelta(hours=resolve_hours)
                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    try:
-                        candles = candle_conn.execute(
-                            """
-                            SELECT high, low FROM candles
-                             WHERE symbol='XAUUSD' AND tf='1m'
-                               AND ts >= ? AND ts <= ?
-                             ORDER BY ts ASC
-                            """,
-                            (signal_utc, end_utc),
-                        ).fetchall()
-                    except Exception:
-                        skipped += 1
-                        continue
-                    if not candles:
+                    bars = _fetch_bars(signal_utc, end_utc)
+                    if not bars:
                         skipped += 1
                         continue
                     outcome = "expired"
                     pnl_rr = None
-                    for bar in candles:
-                        high = float(bar[0] or 0.0)
-                        low = float(bar[1] or 0.0)
+                    for high, low in bars:
                         if direction == "long":
                             tp_hit = high >= tp1
                             sl_hit = low <= sl
@@ -6749,7 +6761,6 @@ class LiveProfileAutopilot:
                             tp_hit = low <= tp1
                             sl_hit = high >= sl
                         if tp_hit and sl_hit:
-                            # ambiguous bar — give benefit of doubt to TP (conservative)
                             outcome = "tp_hit"
                             pnl_rr = round(abs(tp1 - entry) / risk, 4)
                             break
@@ -6769,8 +6780,6 @@ class LiveProfileAutopilot:
                 cconn.commit()
         except Exception as exc:
             out["error"] = f"resolve_loop_error:{exc}"
-        finally:
-            candle_conn.close()
 
         out["ok"] = True
         out["newly_resolved"] = newly_resolved
