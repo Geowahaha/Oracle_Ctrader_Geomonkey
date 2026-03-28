@@ -21,14 +21,27 @@ logger = logging.getLogger(__name__)
 
 # Only touch confidence params — risk params need explicit user approval
 _TUNABLE_PARAMS: dict[str, str] = {
+    # XAU families
     "xau_scalp_pullback_limit": "XAU_DIRECT_LANE_MIN_CONFIDENCE",
     "xau_scalp_tick_depth_filter": "XAU_TDF_MIN_CONFIDENCE",
     "xau_scalp_microtrend_follow_up": "XAU_MFU_MIN_CONFIDENCE",
     "xau_scalp_flow_short_sidecar": "XAU_FLOW_SHORT_SIDECAR_MIN_CONFIDENCE",
     "xau_scalp_failed_fade_follow_stop": "XAU_FFFS_MIN_CONFIDENCE",
     "xau_scalp_range_repair": "XAU_RANGE_REPAIR_MIN_CONFIDENCE",
-    "btc_weekday_lob_momentum": "BTC_FSS_MIN_CONFIDENCE",
-    "eth_weekday_overlap_probe": "XAU_DIRECT_LANE_MIN_CONFIDENCE",  # uses XAU gate as proxy
+    # BTC families — all active on weekend
+    "btc_weekday_lob_momentum": "BTC_WEEKDAY_LOB_MIN_CONFIDENCE",
+    "btc_fss": "BTC_FSS_MIN_CONFIDENCE",
+    "btc_fls": "BTC_FLS_MIN_CONFIDENCE",
+    # ETH family
+    "eth_weekday_overlap_probe": "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE",
+}
+
+# Weekend-only: source tokens for BTC/ETH fills used in auto-tune
+_CRYPTO_FAMILIES = {
+    "btc_weekday_lob_momentum",
+    "btc_fss",
+    "btc_fls",
+    "eth_weekday_overlap_probe",
 }
 
 _SYSTEM_PROMPT = """You are Dexter Pro's Parameter Optimization Agent — an expert autonomous
@@ -60,20 +73,36 @@ Output format:
 
 
 def _build_prompt(perf_findings: dict, regime_findings: dict) -> str:
+    from datetime import datetime, timezone
     family_scores = list(perf_findings.get("family_scores") or [])
     regime = str(regime_findings.get("regime", "unknown"))
     recommended = list(regime_findings.get("recommended_families") or [])
     bottom = [f.get("family", "") for f in (perf_findings.get("bottom_performers") or [])]
     top = [f.get("family", "") for f in (perf_findings.get("top_performers") or [])]
+    is_weekend = datetime.now(timezone.utc).weekday() >= 5
 
-    # Only include families we can tune and have data on
-    tunable_scores = [
-        f for f in family_scores
-        if f.get("family") in _TUNABLE_PARAMS and f.get("resolved", 0) >= 5
-    ]
+    # On weekends prioritize crypto families; weekdays include all
+    if is_weekend:
+        tunable_scores = [
+            f for f in family_scores
+            if f.get("family") in _TUNABLE_PARAMS
+            and f.get("resolved", 0) >= 3  # lower bar on weekend — fewer fills
+        ]
+        focus_note = (
+            "WEEKEND MODE: XAU market is closed. Focus ONLY on BTC and ETH families. "
+            "BTC/ETH trade 24/7. Even 3+ resolved trades are sufficient for weekend tuning."
+        )
+    else:
+        tunable_scores = [
+            f for f in family_scores
+            if f.get("family") in _TUNABLE_PARAMS and f.get("resolved", 0) >= 5
+        ]
+        focus_note = "Weekday mode: XAU + BTC/ETH all active."
 
     context = {
         "regime": regime,
+        "is_weekend": is_weekend,
+        "focus_note": focus_note,
         "recommended_families": recommended,
         "top_performers": top,
         "bottom_performers": bottom,

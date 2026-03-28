@@ -143,17 +143,26 @@ class RiskGuardAgent(BaseAgent):
     def _check_cluster_losses(self, db_path: Path) -> list[dict]:
         if not db_path.exists():
             return []
+        from datetime import datetime, timezone
         cutoff = _iso(_utc_now() - timedelta(minutes=_CLUSTER_LOSS_WINDOW_MIN))
+        is_weekend = _utc_now().weekday() >= 5
         try:
             import sqlite3
             with sqlite3.connect(str(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
+                # On weekends: check crypto sources only (XAU is closed)
+                # On weekdays: check all sources
+                if is_weekend:
+                    where_extra = "AND (source LIKE '%btcusd%' OR source LIKE '%ethusd%' OR source LIKE '%btc%' OR source LIKE '%eth%')"
+                else:
+                    where_extra = ""
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT source, COUNT(*) as loss_count, SUM(pnl_usd) as total_pnl
                     FROM execution_journal
                     WHERE closed_at >= ?
                       AND outcome = 0
+                      {where_extra}
                     GROUP BY source
                     HAVING loss_count >= 2
                     ORDER BY loss_count DESC
@@ -178,11 +187,16 @@ class RiskGuardAgent(BaseAgent):
         if not db_path.exists():
             return False, 0.0
         cutoff = _iso(_utc_now() - timedelta(minutes=_CLUSTER_LOSS_WINDOW_MIN))
+        is_weekend = _utc_now().weekday() >= 5
         try:
             import sqlite3
             with sqlite3.connect(str(db_path)) as conn:
+                if is_weekend:
+                    where_extra = "AND (source LIKE '%btcusd%' OR source LIKE '%ethusd%' OR source LIKE '%btc%' OR source LIKE '%eth%')"
+                else:
+                    where_extra = ""
                 row = conn.execute(
-                    "SELECT SUM(pnl_usd) as total FROM execution_journal WHERE closed_at >= ?",
+                    f"SELECT SUM(pnl_usd) as total FROM execution_journal WHERE closed_at >= ? {where_extra}",
                     (cutoff,),
                 ).fetchone()
                 total = float(row[0] or 0) if row else 0.0

@@ -25,6 +25,7 @@ REGIME_RANGING = "ranging"
 REGIME_VOLATILE_EXPANSION = "volatile_expansion"
 REGIME_NEWS_SHOCK = "news_shock"
 REGIME_OFF_HOURS = "off_hours"
+REGIME_CRYPTO_WEEKEND = "crypto_weekend"  # Saturday/Sunday: XAU closed, crypto 24/7
 
 # Per-regime family recommendations (canary & primary)
 _REGIME_FAMILY_MAP: dict[str, list[str]] = {
@@ -52,6 +53,14 @@ _REGIME_FAMILY_MAP: dict[str, list[str]] = {
     REGIME_NEWS_SHOCK: [],  # shock mode — no new entries recommended
     REGIME_OFF_HOURS: [
         "xau_scalp_pullback_limit",  # scheduled only
+    ],
+    REGIME_CRYPTO_WEEKEND: [
+        "btc_weekday_lob_momentum",   # BTC primary canary
+        "eth_weekday_overlap_probe",  # ETH probe
+        # BTC canary sub-families (always active on weekend)
+        "xau_scalp_flow_short_sidecar",   # bfss maps to BTC FSS
+        "xau_scalp_failed_fade_follow_stop",  # bfls maps to BTC FLS
+        "xau_scalp_range_repair",         # brr maps to BTC RR
     ],
 }
 
@@ -119,9 +128,13 @@ class RegimeAgent(BaseAgent):
             "session": session,
         }
 
-        # Priority order: shock > cluster_loss > micro_regime > directive > session
+        # Priority order: shock > weekend_crypto > cluster_loss > micro_regime > directive > session
         if shock_active:
             regime = REGIME_NEWS_SHOCK
+        elif session == "crypto_weekend":
+            # Weekend: XAU market closed, focus exclusively on BTC/ETH
+            # cluster_loss still blocks if crypto families are losing
+            regime = REGIME_RANGING if cluster_loss_active else REGIME_CRYPTO_WEEKEND
         elif cluster_loss_active:
             regime = REGIME_RANGING  # conservative — wait for cluster to clear
         elif "recovery" in micro_label or "expansion" in micro_label:
@@ -163,9 +176,9 @@ class RegimeAgent(BaseAgent):
         hour = now_utc.hour
         weekday = now_utc.weekday()  # 0=Monday
 
-        # Weekend: no institutional flow
+        # Weekend: XAU closed, but BTC/ETH 24/7
         if weekday >= 5:
-            return "off_hours"
+            return "crypto_weekend"
 
         # London: 07:00–17:00 UTC
         if 7 <= hour < 17:
