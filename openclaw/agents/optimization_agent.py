@@ -157,23 +157,25 @@ class OptimizationAgent(BaseAgent):
 
         # ── call AI ─────────────────────────────────────────────────────────
         ai_raw = self._call_ai(prompt)
-        if not ai_raw:
-            logger.warning("[optimization_agent] AI returned empty — Gemini and Ollama both failed")
-            return self._skip("AI returned empty response")
 
-        # ── parse AI JSON ────────────────────────────────────────────────────
-        try:
-            ai_json = self._extract_json(ai_raw)
-        except Exception as exc:
-            return self._error(f"AI JSON parse error: {exc} | raw={ai_raw[:200]}")
-
-        ai_proposals = list(ai_json.get("proposals") or [])
-        skip_reason = str(ai_json.get("skip_reason") or "").strip()
-
-        logger.info("[optimization_agent] AI proposals: %d | skip_reason: %s", len(ai_proposals), skip_reason or "none")
+        if ai_raw:
+            # ── parse AI JSON ────────────────────────────────────────────────
+            try:
+                ai_json = self._extract_json(ai_raw)
+                ai_proposals = list(ai_json.get("proposals") or [])
+                skip_reason = str(ai_json.get("skip_reason") or "").strip()
+                logger.info("[optimization_agent] AI proposals: %d | skip_reason: %s", len(ai_proposals), skip_reason or "none")
+                if not ai_proposals:
+                    return self._skip(skip_reason or "AI proposed no changes")
+            except Exception as exc:
+                logger.warning("[optimization_agent] AI JSON parse error: %s | falling back to rules", exc)
+                ai_proposals = self._rule_based_proposals(perf_findings, regime_findings)
+        else:
+            logger.warning("[optimization_agent] All AI providers failed — using rule-based proposals")
+            ai_proposals = self._rule_based_proposals(perf_findings, regime_findings)
 
         if not ai_proposals:
-            return self._skip(skip_reason or "AI proposed no changes")
+            return self._skip("no proposals from AI or rules")
 
         # ── validate + route through PTS ─────────────────────────────────────
         try:
@@ -252,43 +254,96 @@ class OptimizationAgent(BaseAgent):
     # ── AI call ──────────────────────────────────────────────────────────────
 
     def _call_ai(self, prompt: str) -> str:
-        """Call AI using DexterBrain's native Gemini call (reuses proven auth/endpoint logic)."""
+        """Call AI — tries Groq → OpenRouter → Gemini in order. Returns empty on all failures."""
+        from agent.brain import DexterBrain
+        from config import config
+
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        # ── Try Gemini via Brain (correct Vertex/direct auth) ─────────────
-        try:
-            from agent.brain import DexterBrain
-            from config import config
-            if config.has_gemini_key():
-                brain = DexterBrain()
+        brain = DexterBrain()
+
+        # ── Groq (fastest, reliable) ──────────────────────────────────────
+        if config.GROQ_API_KEY:
+            try:
+                result = brain._chat_openai_compat(messages=messages, provider="groq", max_tokens=800, temperature=0.1)
+                if result:
+                    logger.info("[optimization_agent] Groq OK: %d chars", len(result))
+                    return str(result).strip()
+            except Exception as exc:
+                logger.warning("[optimization_agent] Groq error: %s", exc)
+
+        # ── OpenRouter (free models) ──────────────────────────────────────
+        if config.OPENROUTER_API_KEY:
+            try:
+                result = brain._chat_openai_compat(messages=messages, provider="openrouter", max_tokens=800, temperature=0.1)
+                if result:
+                    logger.info("[optimization_agent] OpenRouter OK: %d chars", len(result))
+                    return str(result).strip()
+            except Exception as exc:
+                logger.warning("[optimization_agent] OpenRouter error: %s", exc)
+
+        # ── Gemini native (billing required) ─────────────────────────────
+        if config.has_gemini_key():
+            try:
                 result = brain._chat_gemini_native(messages=messages, max_tokens=800, temperature=0.1)
                 if result:
-                    logger.debug("[optimization_agent] Gemini OK: %d chars", len(result))
+                    logger.info("[optimization_agent] Gemini OK: %d chars", len(result))
                     return str(result).strip()
-        except Exception as exc:
-            logger.warning("[optimization_agent] Gemini error: %s", exc)
-
-        # ── Try OpenRouter (fallback) ─────────────────────────────────────
-        try:
-            from agent.brain import DexterBrain
-            from config import config
-            if config.OPENROUTER_API_KEY:
-                brain = DexterBrain()
-                result = brain._chat_openai_compat(
-                    messages=messages,
-                    provider="openrouter",
-                    max_tokens=800,
-                    temperature=0.1,
-                )
-                if result:
-                    logger.debug("[optimization_agent] OpenRouter OK: %d chars", len(result))
-                    return str(result).strip()
-        except Exception as exc:
-            logger.warning("[optimization_agent] OpenRouter error: %s", exc)
+            except Exception as exc:
+                logger.warning("[optimization_agent] Gemini error: %s", exc)
 
         return ""
+
+    @staticmethod
+    def _rule_based_proposals(perf_findings: dict, regime_findings: dict) -> list[dict]:
+        """
+        Deterministic confidence tuning when AI is unavailable.
+        Rules mirror auto_tune_xau_direct_lane logic:
+          WR < 0.42 + resolved >= 3 → TIGHTEN (+0.5 conf)
+          WR >= 0.62 + resolved >= 3 → LOOSEN (-0.5 conf)
+        """
+        from datetime import datetime, timezone
+        from config import config
+        is_weekend = datetime.now(timezone.utc).weekday() >= 5
+        min_resolved = 3 if is_weekend else 5
+        tighten_wr = float(getattr(config, "XAU_DIRECT_LANE_AUTO_TUNE_TIGHTEN_MAX_WIN_RATE", 0.42))
+        loosen_wr = float(getattr(config, "XAU_DIRECT_LANE_AUTO_TUNE_LOOSEN_MIN_WIN_RATE", 0.62))
+
+        family_scores = list(perf_findings.get("family_scores") or [])
+        proposals = []
+
+        for fam in family_scores:
+            family_name = str(fam.get("family", ""))
+            resolved = int(fam.get("resolved", 0) or 0)
+            wr = float(fam.get("win_rate", 0.0) or 0.0)
+
+            if resolved < min_resolved:
+                continue
+            if family_name not in _TUNABLE_PARAMS:
+                continue
+
+            param = _TUNABLE_PARAMS[family_name]
+            current = getattr(config, param, None)
+            if current is None:
+                continue
+
+            current_f = float(current)
+            if wr < tighten_wr:
+                proposed = round(current_f + 0.5, 1)
+                reason = f"rule: wr={wr:.2f}<{tighten_wr} resolved={resolved}"
+                proposals.append({"param": param, "family": family_name, "current_value": current_f,
+                                   "proposed_value": proposed, "direction": "tighten", "reason": reason})
+            elif wr >= loosen_wr:
+                proposed = round(current_f - 0.5, 1)
+                reason = f"rule: wr={wr:.2f}>={loosen_wr} resolved={resolved}"
+                proposals.append({"param": param, "family": family_name, "current_value": current_f,
+                                   "proposed_value": proposed, "direction": "loosen", "reason": reason})
+
+        if proposals:
+            logger.info("[optimization_agent] rule-based proposals: %d", len(proposals))
+        return proposals
 
     @staticmethod
     def _extract_json(text: str) -> dict:
