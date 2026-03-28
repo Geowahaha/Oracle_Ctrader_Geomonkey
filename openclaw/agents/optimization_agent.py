@@ -137,6 +137,7 @@ class OptimizationAgent(BaseAgent):
     def run(self, context: dict) -> AgentResult:
         perf_findings = context.get("performance_findings") or {}
         regime_findings = context.get("regime_findings") or {}
+        skip_reason = ""  # may be set by AI path
 
         if not perf_findings:
             return self._skip("no performance findings in context")
@@ -265,7 +266,9 @@ class OptimizationAgent(BaseAgent):
         brain = DexterBrain()
 
         # ── Groq (fastest, reliable) ──────────────────────────────────────
-        if config.GROQ_API_KEY:
+        groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")
+        logger.debug("[optimization_agent] Groq key present: %s", bool(groq_key))
+        if groq_key:
             try:
                 result = brain._chat_openai_compat(messages=messages, provider="groq", max_tokens=800, temperature=0.1)
                 if result:
