@@ -6792,7 +6792,23 @@ class LiveProfileAutopilot:
             param = str(trial.get("param") or "")
             direction = str(trial.get("direction") or "")
             bt_result: dict = {"trial_id": tid, "param": param, "verdict": "insufficient_data"}
-            if param in ("MT5_SCALP_XAU_LIVE_CONF_MIN", "MT5_SCALP_XAU_LIVE_CONF_MAX"):
+            # XAU params: shadow journal incremental band BT
+            _XAU_SHADOW_PARAMS = {
+                "MT5_SCALP_XAU_LIVE_CONF_MIN", "MT5_SCALP_XAU_LIVE_CONF_MAX",
+                "XAU_DIRECT_LANE_MIN_CONFIDENCE", "XAU_TDF_MIN_CONFIDENCE",
+                "XAU_MFU_MIN_CONFIDENCE", "XAU_FLOW_SHORT_SIDECAR_MIN_CONFIDENCE",
+                "XAU_FFFS_MIN_CONFIDENCE", "XAU_RANGE_REPAIR_MIN_CONFIDENCE",
+            }
+            # BTC/ETH params: ctrader_deals overall WR (no confidence band available)
+            _CRYPTO_LIVE_PARAMS: dict[str, str] = {
+                "CTRADER_BTC_WINNER_MIN_CONFIDENCE": "scalp_btcusd:canary",
+                "BTC_WEEKDAY_LOB_MIN_CONFIDENCE": "scalp_btcusd:canary",
+                "BTC_FSS_MIN_CONFIDENCE": "scalp_btcusd:cfs:canary",
+                "BTC_FLS_MIN_CONFIDENCE": "scalp_btcusd:fls:canary",
+                "SCALPING_ETH_MIN_CONFIDENCE_WEEKEND": "scalp_ethusd:canary",
+                "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE": "scalp_ethusd:canary",
+            }
+            if param in _XAU_SHADOW_PARAMS:
                 try:
                     current_val = float(trial.get("current_value") or 0.0)
                     proposed_val = float(trial.get("proposed_value") or 0.0)
@@ -6854,6 +6870,59 @@ class LiveProfileAutopilot:
                 else:
                     bt_result["verdict"] = "fail"
                     bt_result["verdict_reason"] = f"incremental_wr={inc_wr:.2f}<{min_wr:.2f} | n={inc_resolved}"
+                    trial["status"] = "bt_failed"
+                    out["failed"] += 1
+            elif param in _CRYPTO_LIVE_PARAMS:
+                # BTC/ETH: use ctrader_deals overall WR (no confidence band stored)
+                source_token = _CRYPTO_LIVE_PARAMS[param]
+                try:
+                    with self._connect_ctrader() as conn:
+                        crypto_rows = conn.execute(
+                            """
+                            SELECT outcome, pnl_usd FROM ctrader_deals
+                            WHERE source = ? AND outcome IS NOT NULL
+                            ORDER BY rowid DESC LIMIT 30
+                            """,
+                            (source_token,),
+                        ).fetchall()
+                    resolved = len(crypto_rows)
+                    wins = sum(1 for r in crypto_rows if int(r[0] or 0) == 1)
+                    overall_wr = round(wins / resolved, 4) if resolved > 0 else 0.0
+                    sl_rate = round(1.0 - overall_wr, 4)
+                    bt_result.update({
+                        "source": source_token,
+                        "resolved": resolved,
+                        "wins": wins,
+                        "overall_win_rate": overall_wr,
+                        "sl_rate": sl_rate,
+                        "min_resolved_required": min_incremental,
+                    })
+                    if resolved < min_incremental:
+                        bt_result["verdict"] = "insufficient_data"
+                        bt_result["verdict_reason"] = f"resolved={resolved}<{min_incremental}"
+                        trial["status"] = "pending_bt"
+                        out["skipped"] += 1
+                    elif direction in ("loosened", "loosen") and overall_wr >= min_wr:
+                        bt_result["verdict"] = "pass"
+                        bt_result["verdict_reason"] = f"overall_wr={overall_wr:.2f}>={min_wr:.2f} n={resolved}"
+                        trial["status"] = "bt_passed"
+                        out["passed"] += 1
+                    elif direction in ("tightened", "tighten") and sl_rate >= 0.45:
+                        bt_result["verdict"] = "pass"
+                        bt_result["verdict_reason"] = f"sl_rate={sl_rate:.2f}>=0.45 (losers confirmed) n={resolved}"
+                        trial["status"] = "bt_passed"
+                        out["passed"] += 1
+                    else:
+                        bt_result["verdict"] = "fail"
+                        bt_result["verdict_reason"] = (
+                            f"overall_wr={overall_wr:.2f} direction={direction} "
+                            f"(need loosen>={min_wr:.2f} or tighten sl>=0.45) n={resolved}"
+                        )
+                        trial["status"] = "bt_failed"
+                        out["failed"] += 1
+                except Exception as exc:
+                    bt_result["verdict"] = "error"
+                    bt_result["verdict_reason"] = str(exc)
                     trial["status"] = "bt_failed"
                     out["failed"] += 1
             else:
