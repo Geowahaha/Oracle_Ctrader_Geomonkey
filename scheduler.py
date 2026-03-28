@@ -9885,6 +9885,26 @@ class DexterScheduler:
                 logger.debug("[Scheduler] XAU direct lane auto-tune telegram send failed", exc_info=True)
         return report
 
+    def _run_btc_direct_lane_auto_tune(self, force: bool = False) -> dict:
+        """Run BTC BFSS/BFLS/BRR confidence auto-tune from live fills."""
+        if not bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        try:
+            report = dict(live_profile_autopilot.auto_tune_btc_direct_lane() or {})
+        except Exception as exc:
+            logger.error("[Scheduler] BTC direct lane auto-tune error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        if bool(report.get("ok")):
+            families = dict(report.get("families") or {})
+            actioned = {k: v.get("status") for k, v in families.items() if "trial_proposed" in str(v.get("status") or "") or "applied" in str(v.get("status") or "")}
+            if actioned:
+                logger.info("[Scheduler] BTC auto-tune: %s", actioned)
+            else:
+                logger.debug("[Scheduler] BTC auto-tune: hold_all status=%s", report.get("status"))
+        else:
+            logger.warning("[Scheduler] BTC auto-tune failed: %s", report.get("error"))
+        return report
+
     # ── Parameter Trial Sandbox ──────────────────────────────────────────────
 
     @staticmethod
@@ -11105,6 +11125,11 @@ class DexterScheduler:
             trial_bt_mins = max(10, int(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_INTERVAL_MIN", 15) or 15))
             schedule.every(trial_bt_mins).minutes.do(self._run_parameter_trial_bt)
             param_trial_line = f"  Parameter trial sandbox BT: every {trial_bt_mins}m\n"
+        btc_auto_tune_line = ""
+        if bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ENABLED", True)):
+            btc_tune_mins = max(60, int(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_INTERVAL_MIN", 120) or 120))
+            schedule.every(btc_tune_mins).minutes.do(self._run_btc_direct_lane_auto_tune)
+            btc_auto_tune_line = f"  BTC direct lane auto-tune (BFSS/BFLS/BRR): every {btc_tune_mins}m\n"
         strategy_lab_line = ""
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)):
             strategy_lab_mins = max(5, int(getattr(config, "STRATEGY_LAB_REPORT_INTERVAL_MIN", 15) or 15))
@@ -11286,6 +11311,7 @@ class DexterScheduler:
             f"{xau_direct_lane_tune_line}"
             f"{xau_shadow_bt_line}"
             f"{param_trial_line}"
+            f"{btc_auto_tune_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
             f"{ctrader_market_capture_line}"
@@ -11358,6 +11384,8 @@ class DexterScheduler:
             self._run_xau_shadow_backtest(force=True)
         if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)) and bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_ON_START", True)):
             self._run_parameter_trial_bt(force=True)
+        if bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ENABLED", True)) and bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ON_START", True)):
+            self._run_btc_direct_lane_auto_tune(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):

@@ -737,6 +737,7 @@ class TelegramAdminBot:
             "stock_mt5_filter",
             "plan", "upgrade", "research",
             "grant", "setplan", "revoke", "block", "admin_add", "admin_del", "admin_list", "user_list",
+            "trials", "approve", "reject",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -6645,6 +6646,98 @@ class TelegramAdminBot:
                 lines.append(f"- {uid_row}  {handle}  {name or '-'}  plan={plan_txt}  seen={seen}")
             lines.append("Tip: /admin_add @username  or  /admin_add <user_id>")
             self._send_text(chat_id, "\n".join(lines))
+            return
+
+        # ── Parameter Trial Sandbox commands ────────────────────────────────
+        if command in {"trials", "trial_list", "pts"}:
+            if not is_admin:
+                self._send_text(chat_id, "/trials is admin-only.")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                trials = live_profile_autopilot._load_trials()
+            except Exception as e:
+                self._send_text(chat_id, f"Error loading trials: {e}")
+                return
+            if not trials:
+                self._send_text(chat_id, "No parameter trials found.")
+                return
+            lines = ["PARAMETER TRIALS", ""]
+            status_icon = {"pending_bt": "⏳", "bt_running": "🔄", "bt_passed": "✅", "bt_failed": "❌", "applied": "✔️", "rejected": "🚫"}
+            for t in trials[-10:]:
+                tid = str(t.get("id") or "")
+                status = str(t.get("status") or "")
+                icon = status_icon.get(status, "•")
+                param = str(t.get("param") or "")
+                cur = str(t.get("current_value") or "")
+                prop = str(t.get("proposed_value") or "")
+                direction = str(t.get("direction") or "")
+                created = str(t.get("created_at") or "")[:16]
+                lines.append(f"{icon} [{status}] {created}")
+                lines.append(f"   {param}: {cur} → {prop} ({direction})")
+                if status == "bt_passed":
+                    lines.append(f"   ✅ READY → /approve {tid}")
+                elif status == "pending_bt":
+                    lines.append(f"   ⏳ BT pending — waiting for shadow data")
+                lines.append(f"   ID: {tid}")
+                lines.append("")
+            self._send_text(chat_id, "\n".join(lines).strip())
+            return
+
+        if command in {"approve", "approve_trial"}:
+            if not is_admin:
+                self._send_text(chat_id, "/approve is admin-only.")
+                return
+            trial_id = str(args or "").strip()
+            if not trial_id:
+                self._send_text(chat_id, "Usage: /approve <trial_id>\nGet IDs from /trials")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                result = live_profile_autopilot.apply_trial(trial_id)
+            except Exception as e:
+                self._send_text(chat_id, f"Error applying trial: {e}")
+                return
+            if bool(result.get("ok")):
+                param = str(result.get("param") or "")
+                value = str(result.get("value") or "")
+                self._send_text(
+                    chat_id,
+                    f"✅ Trial applied successfully\n\n"
+                    f"  {param} = {value}\n"
+                    f"  Written to .env.local + runtime config\n"
+                    f"  Trial ID: {trial_id}"
+                )
+            else:
+                self._send_text(chat_id, f"❌ Apply failed: {result.get('error', 'unknown')}")
+            return
+
+        if command in {"reject", "reject_trial"}:
+            if not is_admin:
+                self._send_text(chat_id, "/reject is admin-only.")
+                return
+            trial_id = str(args or "").strip()
+            if not trial_id:
+                self._send_text(chat_id, "Usage: /reject <trial_id>")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                trials = live_profile_autopilot._load_trials()
+                trial = next((t for t in trials if str(t.get("id") or "") == trial_id), None)
+                if not trial:
+                    self._send_text(chat_id, f"Trial not found: {trial_id}")
+                    return
+                trial["status"] = "rejected"
+                trial["rejected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                live_profile_autopilot._save_trials(trials)
+                self._send_text(
+                    chat_id,
+                    f"🚫 Trial rejected\n\n"
+                    f"  {trial.get('param')}: {trial.get('current_value')} → {trial.get('proposed_value')}\n"
+                    f"  Current value kept. Trial ID: {trial_id}"
+                )
+            except Exception as e:
+                self._send_text(chat_id, f"Error rejecting trial: {e}")
             return
 
         suggestion = self._suggest_command(command)

@@ -6567,6 +6567,135 @@ class LiveProfileAutopilot:
         self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
         return out
 
+    # ── BTC direct lane auto-tune ────────────────────────────────────────────
+
+    def auto_tune_btc_direct_lane(self) -> dict:
+        """Self-tune BTC_FSS_MIN_CONFIDENCE and BTC_FLS_MIN_CONFIDENCE from live fills.
+
+        Priority: live fills (ctrader_deals) > shadow journal > insufficient_sample.
+        All tuning proposals go through PTS (Parameter Trial Sandbox) — never applied directly.
+        """
+        enabled = bool(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_ENABLED", True))
+        out: dict = {
+            "ok": False,
+            "enabled": enabled,
+            "generated_at": _iso(_utc_now()),
+            "families": {},
+            "status": "disabled" if not enabled else "ready",
+            "error": "",
+        }
+        if not enabled:
+            self._save_report_snapshot("btc_direct_lane_auto_tune_report", out)
+            return out
+        if not self.ctrader_db_path.exists():
+            out["error"] = "ctrader_db_missing"
+            self._save_report_snapshot("btc_direct_lane_auto_tune_report", out)
+            return out
+
+        lookback_hours = max(24, int(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_LOOKBACK_HOURS", 48) or 48))
+        min_resolved = max(1, int(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_MIN_RESOLVED", 3) or 3))
+        step = max(0.1, float(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_CONF_STEP", 0.5) or 0.5))
+        min_floor = float(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_MIN_CONF_FLOOR", 63.0) or 63.0)
+        max_ceil = max(min_floor + 1.0, float(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_MAX_CONF_CEIL", 74.0) or 74.0))
+        tighten_wr = float(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_TIGHTEN_MAX_WIN_RATE", 0.42) or 0.42)
+        loosen_wr = float(getattr(config, "BTC_DIRECT_LANE_AUTO_TUNE_LOOSEN_MIN_WIN_RATE", 0.62) or 0.62)
+        since_iso = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Sources: scalp_btcusd:bfss:canary, scalp_btcusd:bfls:canary, scalp_btcusd:brr:canary
+        family_config: list[tuple[str, str, str]] = [
+            ("bfss", "BTC_FSS_MIN_CONFIDENCE", "scalp_btcusd:bfss:canary"),
+            ("bfls", "BTC_FLS_MIN_CONFIDENCE", "scalp_btcusd:bfls:canary"),
+            ("brr", "BTC_RANGE_REPAIR_MIN_CONFIDENCE", "scalp_btcusd:brr:canary"),
+        ]
+
+        try:
+            with self._connect_ctrader() as conn:
+                deal_cols = _table_columns(conn, "ctrader_deals")
+                direction_col = "direction" if "direction" in deal_cols else "'' AS direction"
+                all_deals = conn.execute(
+                    f"""
+                    SELECT LOWER(COALESCE(source,'')) AS source, pnl_usd, outcome, {direction_col}
+                      FROM ctrader_deals
+                     WHERE execution_utc >= ?
+                       AND UPPER(COALESCE(symbol,'')) = 'BTCUSD'
+                     ORDER BY execution_utc DESC
+                    """,
+                    (since_iso,),
+                ).fetchall()
+        except Exception as exc:
+            out["error"] = f"db_query_error:{exc}"
+            self._save_report_snapshot("btc_direct_lane_auto_tune_report", out)
+            return out
+
+        any_action = False
+        for alias, conf_key, source_token in family_config:
+            family_out: dict = {"alias": alias, "param": conf_key, "source": source_token, "status": "hold"}
+            fills = [r for r in all_deals if str(r[0] or "").startswith(source_token.split(":")[0]) and alias in str(r[0] or "")]
+            resolved = len(fills)
+            wins = sum(1 for r in fills if (int(r[2] or -1) == 1 or float(r[1] or 0.0) > 0))
+            losses = sum(1 for r in fills if (int(r[2] or -1) == 0 or float(r[1] or 0.0) < 0))
+            pnl = round(sum(float(r[1] or 0.0) for r in fills), 2)
+            win_rate = round(wins / resolved, 4) if resolved > 0 else 0.0
+
+            family_out.update({"resolved": resolved, "wins": wins, "losses": losses, "pnl_usd": pnl, "win_rate": win_rate})
+
+            if resolved < min_resolved:
+                family_out["status"] = f"insufficient_sample:{resolved}<{min_resolved}"
+                out["families"][alias] = family_out
+                continue
+
+            current_conf = float(getattr(config, conf_key, 67.0) or 67.0)
+            tighten = bool(win_rate <= tighten_wr or pnl < -3.0)
+            loosen = bool(win_rate >= loosen_wr and pnl >= 2.0)
+
+            if tighten:
+                new_conf = round(min(max_ceil - 1.0, max(min_floor, current_conf + step)), 2)
+                direction = "tightened"
+            elif loosen:
+                new_conf = round(max(min_floor, current_conf - step), 2)
+                direction = "loosened"
+            else:
+                family_out["status"] = "hold"
+                out["families"][alias] = family_out
+                continue
+
+            if abs(round(new_conf, 4) - round(current_conf, 4)) < 0.05:
+                family_out["status"] = "no_effective_change"
+                out["families"][alias] = family_out
+                continue
+
+            family_out["proposed_value"] = f"{new_conf:.2f}"
+            family_out["current_value"] = f"{current_conf:.2f}"
+            family_out["direction"] = direction
+            reason = f"wr={win_rate:.2f} pnl={pnl:.2f} n={resolved}"
+
+            if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)):
+                try:
+                    tid = self._propose_parameter_trial(
+                        param=conf_key,
+                        current_value=f"{current_conf:.2f}",
+                        proposed_value=f"{new_conf:.2f}",
+                        direction=direction,
+                        reason=f"btc_{alias}:{reason}",
+                        source="auto_tune_btc_direct_lane",
+                    )
+                    family_out["status"] = f"trial_proposed:{tid}"
+                    any_action = True
+                except Exception:
+                    family_out["status"] = "trial_propose_failed"
+            else:
+                self._apply_runtime_value(conf_key, f"{new_conf:.2f}")
+                self._upsert_env_key(self.env_local_path, conf_key, f"{new_conf:.2f}")
+                family_out["status"] = f"{direction}:applied_direct"
+                any_action = True
+
+            out["families"][alias] = family_out
+
+        out["ok"] = True
+        out["status"] = "ran" if any_action else "hold_all"
+        self._save_report_snapshot("btc_direct_lane_auto_tune_report", out)
+        return out
+
     # ── Parameter Trial Sandbox ──────────────────────────────────────────────
 
     def _load_trials(self) -> list:
