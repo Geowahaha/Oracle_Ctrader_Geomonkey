@@ -252,64 +252,41 @@ class OptimizationAgent(BaseAgent):
     # ── AI call ──────────────────────────────────────────────────────────────
 
     def _call_ai(self, prompt: str) -> str:
-        """Try Gemini first, then Ollama."""
-        from config import config
-        import requests
-
-        # ── Gemini ───────────────────────────────────────────────────────────
-        if config.has_gemini_key():
-            try:
-                model = config.model_for_provider("gemini")
-                mode = config.gemini_mode()
-                if mode == "vertex":
-                    endpoint = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent"
-                    api_key = config.GEMINI_VERTEX_AI_API_KEY
-                else:
-                    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-                    api_key = config.GEMINI_API_KEY
-
-                payload = {
-                    "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
-                }
-                resp = requests.post(
-                    endpoint,
-                    params={"key": api_key},
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=45,
-                )
-                if resp.status_code < 400:
-                    data = resp.json()
-                    candidates = data.get("candidates") or []
-                    if candidates:
-                        parts = (candidates[0].get("content") or {}).get("parts") or []
-                        text = "".join(p.get("text", "") for p in parts).strip()
-                        if text:
-                            return text
-            except Exception as exc:
-                logger.debug("[optimization_agent] Gemini error: %s", exc)
-
-        # ── Ollama ───────────────────────────────────────────────────────────
-        ollama_host = str(getattr(config, "OLLAMA_HOST", "http://localhost:11434") or "http://localhost:11434")
-        ollama_model = str(getattr(config, "OLLAMA_MODEL", "qwen3:1.5b") or "qwen3:1.5b")
+        """Call AI using DexterBrain's native Gemini call (reuses proven auth/endpoint logic)."""
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        # ── Try Gemini via Brain (correct Vertex/direct auth) ─────────────
         try:
-            resp = requests.post(
-                f"{ollama_host}/api/generate",
-                json={
-                    "model": ollama_model,
-                    "system": _SYSTEM_PROMPT,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 600},
-                },
-                timeout=60,
-            )
-            if resp.status_code < 400:
-                return str(resp.json().get("response") or "").strip()
+            from agent.brain import DexterBrain
+            from config import config
+            if config.has_gemini_key():
+                brain = DexterBrain()
+                result = brain._chat_gemini_native(messages=messages, max_tokens=800, temperature=0.1)
+                if result:
+                    logger.debug("[optimization_agent] Gemini OK: %d chars", len(result))
+                    return str(result).strip()
         except Exception as exc:
-            logger.debug("[optimization_agent] Ollama error: %s", exc)
+            logger.warning("[optimization_agent] Gemini error: %s", exc)
+
+        # ── Try OpenRouter (fallback) ─────────────────────────────────────
+        try:
+            from agent.brain import DexterBrain
+            from config import config
+            if config.OPENROUTER_API_KEY:
+                brain = DexterBrain()
+                result = brain._chat_openai_compat(
+                    messages=messages,
+                    provider="openrouter",
+                    max_tokens=800,
+                    temperature=0.1,
+                )
+                if result:
+                    logger.debug("[optimization_agent] OpenRouter OK: %d chars", len(result))
+                    return str(result).strip()
+        except Exception as exc:
+            logger.warning("[optimization_agent] OpenRouter error: %s", exc)
 
         return ""
 
