@@ -997,6 +997,7 @@ class LiveProfileAutopilot:
         self.canary_audit_state_path = self.runtime_dir / "canary_post_trade_audit_state.json"
         self.ct_only_watch_state_path = self.runtime_dir / "ct_only_watch_state.json"
         self.xau_direct_lane_tune_state_path = self.runtime_dir / "xau_direct_lane_tune_state.json"
+        self.parameter_trial_state_path = self.runtime_dir / "parameter_trials.json"
         self._last_family_collect_summary = {"rows_seen": 0, "excluded_abnormal_rows": 0}
 
     def _connect_neural(self) -> sqlite3.Connection:
@@ -6525,6 +6526,33 @@ class LiveProfileAutopilot:
             self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
             return out
 
+        # ── Parameter Trial Sandbox gate ────────────────────────────────────
+        # Instead of applying directly, propose a trial POC to be validated by BT first.
+        if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)):
+            trial_reason = " | ".join(str(r) for r in list(out.get("reasons") or []))
+            trial_ids = []
+            for param, proposed_value in changes.items():
+                try:
+                    current_val = str(getattr(config, param, "") or "")
+                    tid = self._propose_parameter_trial(
+                        param=param,
+                        current_value=current_val,
+                        proposed_value=str(proposed_value),
+                        direction=str(out.get("status") or "").replace("shadow_", ""),
+                        reason=trial_reason,
+                        source="auto_tune_xau_direct_lane",
+                    )
+                    trial_ids.append(tid)
+                except Exception:
+                    pass
+            out["ok"] = True
+            out["status"] = f"trial_proposed:{','.join(trial_ids)}" if trial_ids else "trial_propose_failed"
+            out["trial_ids"] = trial_ids
+            _save_tune_state(out)
+            self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
+            return out
+
+        # Fallback: apply directly (trial sandbox disabled)
         applied = {}
         for key, value in changes.items():
             self._apply_runtime_value(str(key), str(value))
@@ -6538,6 +6566,213 @@ class LiveProfileAutopilot:
         _save_tune_state(out)
         self._save_report_snapshot("xau_direct_lane_auto_tune_report", out)
         return out
+
+    # ── Parameter Trial Sandbox ──────────────────────────────────────────────
+
+    def _load_trials(self) -> list:
+        state = self._load_named_state(self.parameter_trial_state_path)
+        return list(state.get("trials") or [])
+
+    def _save_trials(self, trials: list) -> None:
+        self._save_named_state(self.parameter_trial_state_path, {"trials": trials})
+
+    def _propose_parameter_trial(
+        self,
+        *,
+        param: str,
+        current_value: str,
+        proposed_value: str,
+        direction: str,
+        reason: str,
+        source: str,
+    ) -> str:
+        """Create a new trial record. Returns trial ID. Skips if duplicate pending."""
+        trials = self._load_trials()
+        # De-duplicate: skip if same param already pending BT
+        for t in trials:
+            if str(t.get("param") or "") == param and str(t.get("status") or "") in ("pending_bt", "bt_running"):
+                return str(t.get("id") or "")
+        # Enforce max pending cap
+        pending = [t for t in trials if str(t.get("status") or "") in ("pending_bt", "bt_running")]
+        max_pending = max(1, int(getattr(config, "XAU_DIRECT_LANE_TRIAL_MAX_PENDING", 3) or 3))
+        if len(pending) >= max_pending:
+            return "cap_reached"
+        trial_id = f"pts_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{param[-8:]}"
+        trial: dict = {
+            "id": trial_id,
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": str(source or ""),
+            "status": "pending_bt",
+            "param": str(param),
+            "current_value": str(current_value),
+            "proposed_value": str(proposed_value),
+            "direction": str(direction or ""),
+            "reason": str(reason or ""),
+            "bt_result": None,
+            "bt_completed_at": None,
+            "notified_at": None,
+            "applied_at": None,
+        }
+        trials.append(trial)
+        # Prune applied/rejected beyond last 20
+        archived = [t for t in trials if str(t.get("status") or "") in ("applied", "rejected")]
+        active = [t for t in trials if str(t.get("status") or "") not in ("applied", "rejected")]
+        self._save_trials(active + archived[-20:])
+        return trial_id
+
+    def run_parameter_trial_bt(self) -> dict:
+        """Run BT for all pending trials. Returns summary of results."""
+        out: dict = {"ok": False, "checked": 0, "passed": 0, "failed": 0, "skipped": 0, "trials": []}
+        if not bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)):
+            out["status"] = "disabled"
+            return out
+        trials = self._load_trials()
+        pending = [t for t in trials if str(t.get("status") or "") == "pending_bt"]
+        if not pending:
+            out["ok"] = True
+            out["status"] = "no_pending"
+            return out
+        lookback_hours = max(24, int(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_LOOKBACK_HOURS", 72) or 72))
+        min_incremental = max(1, int(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_MIN_INCREMENTAL", 3) or 3))
+        min_wr = max(0.3, float(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_MIN_WIN_RATE", 0.55) or 0.55))
+        since_iso = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Load shadow journal once for all trials
+        shadow_rows: list = []
+        try:
+            with self._connect_ctrader() as conn:
+                shadow_rows = conn.execute(
+                    """
+                    SELECT confidence, shadow_outcome, block_reason
+                      FROM xau_shadow_journal
+                     WHERE signal_utc >= ?
+                       AND symbol = 'XAUUSD'
+                       AND shadow_outcome IS NOT NULL
+                       AND shadow_outcome != 'expired'
+                    """,
+                    (since_iso,),
+                ).fetchall()
+        except Exception as exc:
+            out["error"] = f"shadow_query_error:{exc}"
+            return out
+        for trial in pending:
+            trial["status"] = "bt_running"
+            tid = str(trial.get("id") or "")
+            param = str(trial.get("param") or "")
+            direction = str(trial.get("direction") or "")
+            bt_result: dict = {"trial_id": tid, "param": param, "verdict": "insufficient_data"}
+            if param in ("MT5_SCALP_XAU_LIVE_CONF_MIN", "MT5_SCALP_XAU_LIVE_CONF_MAX"):
+                try:
+                    current_val = float(trial.get("current_value") or 0.0)
+                    proposed_val = float(trial.get("proposed_value") or 0.0)
+                except Exception:
+                    bt_result["verdict"] = "invalid_values"
+                    trial["bt_result"] = bt_result
+                    trial["status"] = "bt_failed"
+                    trial["bt_completed_at"] = now_iso
+                    out["failed"] += 1
+                    out["trials"].append(bt_result)
+                    continue
+                lo = min(current_val, proposed_val)
+                hi = max(current_val, proposed_val)
+                # Incremental signals: confidence in the delta band
+                incremental = [r for r in shadow_rows if lo <= float(r[0] or 0.0) < hi]
+                inc_wins = sum(1 for r in incremental if str(r[1] or "") == "tp_hit")
+                inc_resolved = len(incremental)
+                inc_wr = round(inc_wins / inc_resolved, 4) if inc_resolved > 0 else 0.0
+                # Baseline: signals above current threshold (already allowed)
+                baseline = [r for r in shadow_rows if float(r[0] or 0.0) >= hi]
+                base_wins = sum(1 for r in baseline if str(r[1] or "") == "tp_hit")
+                base_resolved = len(baseline)
+                base_wr = round(base_wins / base_resolved, 4) if base_resolved > 0 else 0.0
+                bt_result.update({
+                    "current_value": current_val,
+                    "proposed_value": proposed_val,
+                    "direction": direction,
+                    "incremental_resolved": inc_resolved,
+                    "incremental_wins": inc_wins,
+                    "incremental_win_rate": inc_wr,
+                    "baseline_resolved": base_resolved,
+                    "baseline_win_rate": base_wr,
+                    "min_win_rate_required": min_wr,
+                    "min_incremental_required": min_incremental,
+                })
+                if inc_resolved < min_incremental:
+                    bt_result["verdict"] = "insufficient_data"
+                    bt_result["verdict_reason"] = f"incremental_resolved={inc_resolved}<{min_incremental}"
+                    trial["status"] = "pending_bt"  # keep pending — not enough data yet
+                    out["skipped"] += 1
+                elif direction in ("loosened", "loosen") and inc_wr >= min_wr:
+                    bt_result["verdict"] = "pass"
+                    bt_result["verdict_reason"] = f"incremental_wr={inc_wr:.2f}>={min_wr:.2f} | n={inc_resolved}"
+                    trial["status"] = "bt_passed"
+                    out["passed"] += 1
+                elif direction in ("tightened", "tighten"):
+                    # For tightening: incremental signals have bad WR (we're blocking losers)
+                    inc_sl_rate = round(1.0 - inc_wr, 4)
+                    if inc_sl_rate >= 0.45:
+                        bt_result["verdict"] = "pass"
+                        bt_result["verdict_reason"] = f"incremental_sl_rate={inc_sl_rate:.2f} (losers confirmed) | n={inc_resolved}"
+                        trial["status"] = "bt_passed"
+                        out["passed"] += 1
+                    else:
+                        bt_result["verdict"] = "fail"
+                        bt_result["verdict_reason"] = f"incremental_wr={inc_wr:.2f} — tightening would block winners | n={inc_resolved}"
+                        trial["status"] = "bt_failed"
+                        out["failed"] += 1
+                else:
+                    bt_result["verdict"] = "fail"
+                    bt_result["verdict_reason"] = f"incremental_wr={inc_wr:.2f}<{min_wr:.2f} | n={inc_resolved}"
+                    trial["status"] = "bt_failed"
+                    out["failed"] += 1
+            else:
+                bt_result["verdict"] = "unsupported_param"
+                trial["status"] = "bt_failed"
+                out["failed"] += 1
+            trial["bt_result"] = bt_result
+            if trial["status"] != "pending_bt":
+                trial["bt_completed_at"] = now_iso
+            out["checked"] += 1
+            out["trials"].append(bt_result)
+        self._save_trials(trials)
+        out["ok"] = True
+        self._save_report_snapshot("parameter_trial_bt_report", out)
+        return out
+
+    def get_pending_trial_notifications(self) -> list:
+        """Return trials that passed BT and have not yet been notified."""
+        trials = self._load_trials()
+        return [t for t in trials if str(t.get("status") or "") == "bt_passed" and not t.get("notified_at")]
+
+    def mark_trial_notified(self, trial_id: str) -> None:
+        trials = self._load_trials()
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for t in trials:
+            if str(t.get("id") or "") == trial_id:
+                t["notified_at"] = now_iso
+        self._save_trials(trials)
+
+    def apply_trial(self, trial_id: str, *, persist: bool = True) -> dict:
+        """Apply a passed trial to live config. Returns result dict."""
+        trials = self._load_trials()
+        trial = next((t for t in trials if str(t.get("id") or "") == trial_id), None)
+        if not trial:
+            return {"ok": False, "error": f"trial_not_found:{trial_id}"}
+        if str(trial.get("status") or "") != "bt_passed":
+            return {"ok": False, "error": f"trial_status_not_bt_passed:{trial.get('status')}"}
+        param = str(trial.get("param") or "")
+        proposed_value = str(trial.get("proposed_value") or "")
+        if not param or not proposed_value:
+            return {"ok": False, "error": "missing_param_or_value"}
+        self._apply_runtime_value(param, proposed_value)
+        env_result = self._upsert_env_key(self.env_local_path, param, proposed_value) if persist else {"ok": True, "updated": False, "reason": "persist_disabled"}
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trial["status"] = "applied"
+        trial["applied_at"] = now_iso
+        self._save_trials(trials)
+        return {"ok": True, "trial_id": trial_id, "param": param, "value": proposed_value, "env": env_result}
 
     # ── Shadow backtest ──────────────────────────────────────────────────────
 

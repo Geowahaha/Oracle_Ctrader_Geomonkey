@@ -9885,6 +9885,92 @@ class DexterScheduler:
                 logger.debug("[Scheduler] XAU direct lane auto-tune telegram send failed", exc_info=True)
         return report
 
+    # ── Parameter Trial Sandbox ──────────────────────────────────────────────
+
+    @staticmethod
+    def _format_trial_report_text(trial: dict, bt_result: dict) -> str:
+        """Format 3-part trial report: found / progress / result."""
+        param = str(trial.get("param") or "")
+        current = str(trial.get("current_value") or "")
+        proposed = str(trial.get("proposed_value") or "")
+        direction = str(trial.get("direction") or "")
+        reason = str(trial.get("reason") or "")
+        verdict = str(bt_result.get("verdict") or "")
+        verdict_reason = str(bt_result.get("verdict_reason") or "")
+        inc_resolved = int(bt_result.get("incremental_resolved", 0) or 0)
+        inc_wr = float(bt_result.get("incremental_win_rate", 0.0) or 0.0)
+        base_wr = float(bt_result.get("baseline_win_rate", 0.0) or 0.0)
+        min_wr = float(bt_result.get("min_win_rate_required", 0.55) or 0.55)
+        verdict_icon = "✅" if verdict == "pass" else "❌"
+        dir_icon = "🔓" if "loosen" in direction else "🔒"
+        lines = [
+            "╔══ PARAMETER TRIAL RESULT ══╗",
+            "",
+            "① FOUND",
+            f"  Param: {param}",
+            f"  Current: {current}  →  Proposed: {proposed}",
+            f"  Signal: {direction.upper()} ({reason})",
+            "",
+            "② TESTED (POC Backtest)",
+            f"  Incremental signals unlocked: {inc_resolved}",
+            f"  Win rate at incremental band: {inc_wr:.0%}",
+            f"  Baseline (allowed signals) WR: {base_wr:.0%}",
+            f"  Required min WR to pass: {min_wr:.0%}",
+            "",
+            "③ RESULT",
+            f"  Verdict: {verdict_icon} {verdict.upper()}",
+            f"  Reason: {verdict_reason}",
+        ]
+        if verdict == "pass":
+            lines += [
+                "",
+                f"  {dir_icon} Ready to apply: {param} = {proposed}",
+                "  ⚠️  Not applied yet — awaiting confirmation",
+                f"  Trial ID: {trial.get('id', '')}",
+            ]
+        else:
+            lines += [
+                "",
+                "  ⛔ Change blocked — insufficient evidence",
+                "  Keeping current value until more data.",
+            ]
+        return "\n".join(lines)
+
+    def _run_parameter_trial_bt(self, force: bool = False) -> dict:
+        """Run BT for pending trials, then send Telegram for any that passed."""
+        if not bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        try:
+            report = dict(live_profile_autopilot.run_parameter_trial_bt() or {})
+        except Exception as exc:
+            logger.error("[Scheduler] Parameter trial BT error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        checked = int(report.get("checked", 0) or 0)
+        passed = int(report.get("passed", 0) or 0)
+        failed = int(report.get("failed", 0) or 0)
+        skipped = int(report.get("skipped", 0) or 0)
+        if checked:
+            logger.info(
+                "[Scheduler] Parameter trial BT: checked=%s passed=%s failed=%s skipped=%s",
+                checked, passed, failed, skipped,
+            )
+        # Notify Telegram for passed-but-not-yet-notified trials
+        if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_NOTIFY_TELEGRAM", True)):
+            try:
+                pending_notifications = live_profile_autopilot.get_pending_trial_notifications()
+            except Exception:
+                pending_notifications = []
+            for trial in pending_notifications:
+                bt_result = dict(trial.get("bt_result") or {})
+                text = self._format_trial_report_text(trial, bt_result)
+                try:
+                    notifier._send(text, parse_mode=None, feature="winner_mission")
+                    live_profile_autopilot.mark_trial_notified(str(trial.get("id") or ""))
+                    logger.info("[Scheduler] Trial notification sent: %s", trial.get("id"))
+                except Exception as exc_n:
+                    logger.warning("[Scheduler] Trial notification failed: %s", exc_n)
+        return report
+
     # ── XAU shadow backtest ──────────────────────────────────────────────────
 
     def _store_shadow_signal(self, signal, *, block_reason: str) -> None:
@@ -11014,6 +11100,11 @@ class DexterScheduler:
             shadow_bt_mins = max(15, int(getattr(config, "XAU_SHADOW_BACKTEST_INTERVAL_MIN", 30) or 30))
             schedule.every(shadow_bt_mins).minutes.do(self._run_xau_shadow_backtest)
             xau_shadow_bt_line = f"  XAU shadow backtest resolver: every {shadow_bt_mins}m\n"
+        param_trial_line = ""
+        if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)):
+            trial_bt_mins = max(10, int(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_INTERVAL_MIN", 15) or 15))
+            schedule.every(trial_bt_mins).minutes.do(self._run_parameter_trial_bt)
+            param_trial_line = f"  Parameter trial sandbox BT: every {trial_bt_mins}m\n"
         strategy_lab_line = ""
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)):
             strategy_lab_mins = max(5, int(getattr(config, "STRATEGY_LAB_REPORT_INTERVAL_MIN", 15) or 15))
@@ -11194,6 +11285,7 @@ class DexterScheduler:
             f"{xau_direct_lane_line}"
             f"{xau_direct_lane_tune_line}"
             f"{xau_shadow_bt_line}"
+            f"{param_trial_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
             f"{ctrader_market_capture_line}"
@@ -11264,6 +11356,8 @@ class DexterScheduler:
             self._run_xau_direct_lane_auto_tune(force=True)
         if bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True)) and bool(getattr(config, "XAU_SHADOW_BACKTEST_ON_START", True)):
             self._run_xau_shadow_backtest(force=True)
+        if bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_ENABLED", True)) and bool(getattr(config, "XAU_DIRECT_LANE_TRIAL_BT_ON_START", True)):
+            self._run_parameter_trial_bt(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):

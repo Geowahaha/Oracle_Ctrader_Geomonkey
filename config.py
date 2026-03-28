@@ -854,6 +854,15 @@ class Config:
     XAU_DIRECT_LANE_AUTO_TUNE_MAX_CONF_CEIL: float = float(os.getenv("XAU_DIRECT_LANE_AUTO_TUNE_MAX_CONF_CEIL", "78.0"))
     XAU_DIRECT_LANE_AUTO_TUNE_ON_START: bool = os.getenv("XAU_DIRECT_LANE_AUTO_TUNE_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_DIRECT_LANE_AUTO_TUNE_NOTIFY_TELEGRAM: bool = os.getenv("XAU_DIRECT_LANE_AUTO_TUNE_NOTIFY_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Parameter Trial Sandbox — POC gate before any auto-tune change goes live
+    XAU_DIRECT_LANE_TRIAL_ENABLED: bool = os.getenv("XAU_DIRECT_LANE_TRIAL_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_DIRECT_LANE_TRIAL_BT_LOOKBACK_HOURS: int = int(os.getenv("XAU_DIRECT_LANE_TRIAL_BT_LOOKBACK_HOURS", "72"))
+    XAU_DIRECT_LANE_TRIAL_BT_MIN_INCREMENTAL: int = int(os.getenv("XAU_DIRECT_LANE_TRIAL_BT_MIN_INCREMENTAL", "3"))
+    XAU_DIRECT_LANE_TRIAL_BT_MIN_WIN_RATE: float = float(os.getenv("XAU_DIRECT_LANE_TRIAL_BT_MIN_WIN_RATE", "0.55"))
+    XAU_DIRECT_LANE_TRIAL_BT_INTERVAL_MIN: int = int(os.getenv("XAU_DIRECT_LANE_TRIAL_BT_INTERVAL_MIN", "15"))
+    XAU_DIRECT_LANE_TRIAL_BT_ON_START: bool = os.getenv("XAU_DIRECT_LANE_TRIAL_BT_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_DIRECT_LANE_TRIAL_NOTIFY_TELEGRAM: bool = os.getenv("XAU_DIRECT_LANE_TRIAL_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_DIRECT_LANE_TRIAL_MAX_PENDING: int = int(os.getenv("XAU_DIRECT_LANE_TRIAL_MAX_PENDING", "3"))
     # Shadow backtest — simulate blocked XAU direct lane signals against candle history
     XAU_SHADOW_BACKTEST_ENABLED: bool = os.getenv("XAU_SHADOW_BACKTEST_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_SHADOW_BACKTEST_RESOLVE_HOURS: float = float(os.getenv("XAU_SHADOW_BACKTEST_RESOLVE_HOURS", "4.0"))
