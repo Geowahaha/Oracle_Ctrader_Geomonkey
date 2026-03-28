@@ -110,6 +110,10 @@ class PerformanceAgent(BaseAgent):
         top = [f for f in scored if f["score"] >= 0.65 and f["resolved"] >= _MIN_RESOLVED]
         bottom = [f for f in scored if f["score"] < 0.35 and f["resolved"] >= _MIN_RESOLVED]
 
+        for f in scored:
+            logger.info("[performance_agent] %s r=%d wr=%.2f pnl=%.1f score=%.3f",
+                        f["family"], f["resolved"], f["win_rate"], f["pnl_usd"], f["score"])
+
         # Canary summary
         canary_summary: dict = {}
         try:

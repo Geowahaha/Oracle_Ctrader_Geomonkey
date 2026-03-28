@@ -20,6 +20,7 @@ from openclaw.agents.base import AgentResult, BaseAgent
 logger = logging.getLogger(__name__)
 
 # Only touch confidence params — risk params need explicit user approval
+# Family names come from live_profile_autopilot._collect_family_closed_rows()
 _TUNABLE_PARAMS: dict[str, str] = {
     # XAU families
     "xau_scalp_pullback_limit": "XAU_DIRECT_LANE_MIN_CONFIDENCE",
@@ -28,21 +29,23 @@ _TUNABLE_PARAMS: dict[str, str] = {
     "xau_scalp_flow_short_sidecar": "XAU_FLOW_SHORT_SIDECAR_MIN_CONFIDENCE",
     "xau_scalp_failed_fade_follow_stop": "XAU_FFFS_MIN_CONFIDENCE",
     "xau_scalp_range_repair": "XAU_RANGE_REPAIR_MIN_CONFIDENCE",
-    # BTC families — all active on weekend
-    "btc_weekday_lob_momentum": "BTC_WEEKDAY_LOB_MIN_CONFIDENCE",
-    "btc_fss": "BTC_FSS_MIN_CONFIDENCE",
-    "btc_fls": "BTC_FLS_MIN_CONFIDENCE",
-    # ETH family
-    "eth_weekday_overlap_probe": "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE",
+    # BTC families — real calibration names
+    "btc_weekend_winner": "CTRADER_BTC_WINNER_MIN_CONFIDENCE",       # source: scalp_btcusd:canary
+    "btc_weekday_lob_momentum": "BTC_WEEKDAY_LOB_MIN_CONFIDENCE",    # weekday LOB
+    # ETH families — real calibration names
+    "eth_weekend_winner": "SCALPING_ETH_MIN_CONFIDENCE_WEEKEND",     # source: scalp_ethusd:canary
+    "eth_weekday_overlap_probe": "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", # weekday probe
 }
 
-# Weekend-only: source tokens for BTC/ETH fills used in auto-tune
-_CRYPTO_FAMILIES = {
-    "btc_weekday_lob_momentum",
-    "btc_fss",
-    "btc_fls",
-    "eth_weekday_overlap_probe",
+# Confidence value ceilings per param (from config AUTO_APPLY_*_MAX)
+_PARAM_CEILINGS: dict[str, str] = {
+    "CTRADER_BTC_WINNER_MIN_CONFIDENCE": "AUTO_APPLY_BTC_WEEKEND_CONFIDENCE_MAX",
+    "SCALPING_ETH_MIN_CONFIDENCE_WEEKEND": "AUTO_APPLY_ETH_WEEKEND_CONFIDENCE_MAX",
+    "XAU_DIRECT_LANE_MIN_CONFIDENCE": "XAU_DIRECT_LANE_TRIAL_MAX_CONF_CEIL",
 }
+
+# Weekend-only crypto families
+_CRYPTO_FAMILIES = {"btc_weekend_winner", "eth_weekend_winner", "btc_weekday_lob_momentum", "eth_weekday_overlap_probe"}
 
 _SYSTEM_PROMPT = """You are Dexter Pro's Parameter Optimization Agent — an expert autonomous
 trading system optimizer. You receive structured performance data and market regime context,
@@ -141,9 +144,21 @@ class OptimizationAgent(BaseAgent):
         # ── build AI prompt ─────────────────────────────────────────────────
         prompt = _build_prompt(perf_findings, regime_findings)
 
+        # Log what tunable data we have before AI call
+        family_scores = perf_findings.get("family_scores") or []
+        from datetime import datetime, timezone
+        is_weekend = datetime.now(timezone.utc).weekday() >= 5
+        min_resolved = 3 if is_weekend else 5
+        tunable_count = sum(1 for f in family_scores if f.get("family") in _TUNABLE_PARAMS and f.get("resolved", 0) >= min_resolved)
+        logger.info("[optimization_agent] tunable families with data: %d/%d (weekend=%s)", tunable_count, len(family_scores), is_weekend)
+
+        if tunable_count == 0:
+            return self._skip(f"no tunable families with >= {min_resolved} resolved trades")
+
         # ── call AI ─────────────────────────────────────────────────────────
         ai_raw = self._call_ai(prompt)
         if not ai_raw:
+            logger.warning("[optimization_agent] AI returned empty — Gemini and Ollama both failed")
             return self._skip("AI returned empty response")
 
         # ── parse AI JSON ────────────────────────────────────────────────────
@@ -154,6 +169,8 @@ class OptimizationAgent(BaseAgent):
 
         ai_proposals = list(ai_json.get("proposals") or [])
         skip_reason = str(ai_json.get("skip_reason") or "").strip()
+
+        logger.info("[optimization_agent] AI proposals: %d | skip_reason: %s", len(ai_proposals), skip_reason or "none")
 
         if not ai_proposals:
             return self._skip(skip_reason or "AI proposed no changes")
@@ -187,6 +204,17 @@ class OptimizationAgent(BaseAgent):
                         continue
                 except Exception:
                     pass
+
+                # Safety: ceiling check
+                ceiling_key = _PARAM_CEILINGS.get(param)
+                if ceiling_key:
+                    try:
+                        ceiling = float(getattr(config, ceiling_key, 82.0) or 82.0)
+                        if float(proposed_value) > ceiling:
+                            skipped.append({**prop, "skip_reason": f"above_ceiling_{ceiling}"})
+                            continue
+                    except Exception:
+                        pass
 
                 # Get real current value from config
                 real_current = getattr(config, param, None)
