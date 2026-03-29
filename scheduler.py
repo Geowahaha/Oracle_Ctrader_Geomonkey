@@ -10008,12 +10008,29 @@ class DexterScheduler:
             for trial in pending_notifications:
                 bt_result = dict(trial.get("bt_result") or {})
                 text = self._format_trial_report_text(trial, bt_result)
+                sent = False
                 try:
-                    notifier._send(text, parse_mode=None, feature="winner_mission")
+                    # Primary: sync admin_bot path (same as XAU guard — proven reliable)
+                    from notifier.admin_bot import admin_bot
+                    for cid in self._xau_guard_transition_target_ids():
+                        try:
+                            admin_bot._send_text(int(cid), text)
+                            sent = True
+                        except Exception:
+                            pass
+                except Exception as exc_ab:
+                    logger.debug("[Scheduler] admin_bot trial notify error: %s", exc_ab)
+                if not sent:
+                    try:
+                        # Fallback: async notifier path
+                        sent = bool(notifier._send(text, parse_mode=None, feature="winner_mission"))
+                    except Exception as exc_n:
+                        logger.warning("[Scheduler] Trial notification fallback failed: %s", exc_n)
+                if sent:
                     live_profile_autopilot.mark_trial_notified(str(trial.get("id") or ""))
                     logger.info("[Scheduler] Trial notification sent: %s", trial.get("id"))
-                except Exception as exc_n:
-                    logger.warning("[Scheduler] Trial notification failed: %s", exc_n)
+                else:
+                    logger.warning("[Scheduler] Trial notification FAILED (will retry): %s", trial.get("id"))
         return report
 
     # ── XAU shadow backtest ──────────────────────────────────────────────────

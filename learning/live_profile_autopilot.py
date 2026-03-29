@@ -6715,11 +6715,13 @@ class LiveProfileAutopilot:
         reason: str,
         source: str,
     ) -> str:
-        """Create a new trial record. Returns trial ID. Skips if duplicate pending."""
+        """Create a new trial record. Returns trial ID. Skips if duplicate pending or awaiting approval."""
         trials = self._load_trials()
-        # De-duplicate: skip if same param already pending BT
+        # De-duplicate: skip if same param already in-flight or awaiting admin approval
         for t in trials:
-            if str(t.get("param") or "") == param and str(t.get("status") or "") in ("pending_bt", "bt_running"):
+            if str(t.get("param") or "") == param and str(t.get("status") or "") in (
+                "pending_bt", "bt_running", "bt_passed", "waiting_approval"
+            ):
                 return str(t.get("id") or "")
         # Enforce max pending cap
         pending = [t for t in trials if str(t.get("status") or "") in ("pending_bt", "bt_running")]
