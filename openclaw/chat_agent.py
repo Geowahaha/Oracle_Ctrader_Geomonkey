@@ -42,26 +42,31 @@ def _collect_context() -> dict:
     """Gather live system state for AI context."""
     ctx: dict = {}
 
-    # ── Family performance ────────────────────────────────────────────────────
+    # ── Family performance (current month, matches cTrader statement) ─────────
+    # Query ctrader_deals directly (not via positions JOIN) so orphan deals
+    # — positions opened while streamer was offline — are included correctly.
     try:
         import sqlite3
         db_path = Path(__file__).parent.parent / "data" / "ctrader_openapi.db"
         if db_path.exists():
             with sqlite3.connect(str(db_path), timeout=5) as conn:
                 conn.row_factory = sqlite3.Row
+                # Current month start (UTC) — matches cTrader statement "Current month" filter
+                month_start = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00Z")
                 rows = conn.execute("""
-                    SELECT p.source as family, p.lane,
-                           COUNT(DISTINCT p.position_id) as resolved,
+                    SELECT d.source as family, d.lane,
+                           COUNT(DISTINCT d.position_id) as resolved,
                            ROUND(SUM(d.pnl_usd), 2) as total_pnl_usd,
                            ROUND(AVG(CASE WHEN d.pnl_usd > 0 THEN 1.0 ELSE 0.0 END), 2) as win_rate
-                    FROM ctrader_positions p
-                    JOIN ctrader_deals d ON d.position_id = p.position_id
+                    FROM ctrader_deals d
                     WHERE d.outcome IN (0, 1)
-                      AND p.source != '' AND p.source IS NOT NULL
-                    GROUP BY p.source, p.lane
+                      AND d.source != '' AND d.source IS NOT NULL
+                      AND d.execution_utc >= ?
+                    GROUP BY d.source, d.lane
                     ORDER BY total_pnl_usd DESC
-                """).fetchall()
+                """, (month_start,)).fetchall()
                 ctx["family_performance"] = [dict(r) for r in rows]
+                ctx["family_period"] = f"current month (from {month_start[:10]})"
     except Exception as exc:
         logger.debug("[chat_agent] family scores from DB: %s", exc)
 
