@@ -255,7 +255,7 @@ class OptimizationAgent(BaseAgent):
     # ── AI call ──────────────────────────────────────────────────────────────
 
     def _call_ai(self, prompt: str) -> str:
-        """Call AI — tries Groq → OpenRouter → Gemini in order. Returns empty on all failures."""
+        """Call AI — tries OpenClaw gateway → Groq → OpenRouter → Gemini in order. Returns empty on all failures."""
         from agent.brain import DexterBrain
         from config import config
 
@@ -264,6 +264,34 @@ class OptimizationAgent(BaseAgent):
             {"role": "user", "content": prompt},
         ]
         brain = DexterBrain()
+
+        # ── OpenClaw local gateway (2026.3.24 OpenAI-compat endpoint) ────
+        # Fastest path: local gateway at port 18789 handles provider failover.
+        # Only active if OPENCLAW_GATEWAY_URL is set (e.g. http://localhost:18789)
+        gateway_url = str(getattr(config, "OPENCLAW_GATEWAY_URL", "") or "").strip().rstrip("/")
+        if gateway_url:
+            try:
+                import urllib.request, json as _json
+                payload = _json.dumps({
+                    "model": "auto",
+                    "messages": messages,
+                    "max_tokens": 800,
+                    "temperature": 0.1,
+                }).encode()
+                req = urllib.request.Request(
+                    f"{gateway_url}/v1/chat/completions",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    data = _json.loads(resp.read())
+                content = data["choices"][0]["message"]["content"]
+                if content:
+                    logger.info("[optimization_agent] OpenClaw gateway OK: %d chars", len(content))
+                    return str(content).strip()
+            except Exception as exc:
+                logger.debug("[optimization_agent] OpenClaw gateway skip: %s", exc)
 
         # ── Groq (fastest, reliable) ──────────────────────────────────────
         groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")
