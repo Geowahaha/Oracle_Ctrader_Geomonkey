@@ -889,6 +889,12 @@ class Config:
     CONDUCTOR_FOLLOW_MIN_RESOLVED: int = int(os.getenv("CONDUCTOR_FOLLOW_MIN_RESOLVED", "4") or "4")
     CONDUCTOR_FOLLOW_EXPIRE_MIN: int = int(os.getenv("CONDUCTOR_FOLLOW_EXPIRE_MIN", "90") or "90")
     OPENCLAW_GATEWAY_URL: str = os.getenv("OPENCLAW_GATEWAY_URL", "")
+    OPENCLAW_VERSION_GUARD_ENABLED: bool = os.getenv("OPENCLAW_VERSION_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    OPENCLAW_VERSION_GUARD_INTERVAL_MIN: int = int(os.getenv("OPENCLAW_VERSION_GUARD_INTERVAL_MIN", "240") or "240")
+    # ── Qwen / DashScope (free tier) ─────────────────────────────────────────
+    QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")
+    QWEN_BASE_URL: str = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen-plus")
     STRATEGY_LAB_REPORT_ENABLED: bool = os.getenv("STRATEGY_LAB_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_LAB_REPORT_INTERVAL_MIN: int = int(os.getenv("STRATEGY_LAB_REPORT_INTERVAL_MIN", "15"))
     STRATEGY_LAB_REPORT_ON_START: bool = os.getenv("STRATEGY_LAB_REPORT_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")

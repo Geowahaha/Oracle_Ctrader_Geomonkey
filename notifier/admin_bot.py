@@ -738,6 +738,7 @@ class TelegramAdminBot:
             "plan", "upgrade", "research",
             "grant", "setplan", "revoke", "block", "admin_add", "admin_del", "admin_list", "user_list",
             "trials", "approve", "reject",
+            "update_openclaw", "skip_openclaw", "openclaw_version",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -6738,6 +6739,73 @@ class TelegramAdminBot:
                 )
             except Exception as e:
                 self._send_text(chat_id, f"Error rejecting trial: {e}")
+            return
+
+        if command in {"openclaw_version", "openclaw_status"}:
+            try:
+                from openclaw.version_guard import get_state as _vg_state, check_and_notify as _vg_check
+                state = _vg_state()
+                installed = state.get("installed_version", "unknown")
+                latest = state.get("latest_version", "unknown")
+                update_available = bool(state.get("update_available"))
+                notified_at = state.get("notified_at", "never")
+                updated_at = state.get("updated_at", "never")
+                lines = [
+                    "🦞 *OpenClaw Version Status*",
+                    f"  Installed: `{installed}`",
+                    f"  Latest:    `{latest}`",
+                    f"  Update available: {'✅ YES' if update_available else '✅ Up to date'}",
+                    f"  Last notified: {notified_at[:16] if notified_at != 'never' else 'never'}",
+                    f"  Last updated:  {updated_at[:16] if updated_at != 'never' else 'never'}",
+                ]
+                if update_available:
+                    lines.append(f"\nSend /update_openclaw to upgrade to {latest}")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Version guard error: {exc}")
+            return
+
+        if command in {"update_openclaw"}:
+            if not is_admin:
+                self._send_text(chat_id, "/update_openclaw is admin-only.")
+                return
+            try:
+                from openclaw.version_guard import get_state as _vg_state, do_update as _vg_update
+                state = _vg_state()
+                latest = state.get("latest_version", "unknown")
+                installed = state.get("installed_version", "unknown")
+                if latest == installed and not state.get("update_available"):
+                    self._send_text(chat_id, f"✅ Already at latest: `{installed}`", parse_mode="Markdown")
+                    return
+                self._send_text(chat_id, f"⏳ Updating openclaw `{installed}` → `{latest}`...", parse_mode="Markdown")
+                result = _vg_update()
+                if result["ok"]:
+                    self._send_text(
+                        chat_id,
+                        f"✅ *OpenClaw updated to {result['version']}*\n"
+                        f"Gateway restarted. Qwen + new features active.",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    self._send_text(chat_id, f"❌ Update failed: {result.get('error', 'unknown')}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Update error: {exc}")
+            return
+
+        if command in {"skip_openclaw"}:
+            if not is_admin:
+                self._send_text(chat_id, "/skip_openclaw is admin-only.")
+                return
+            version_to_skip = str(args or "").strip()
+            try:
+                from openclaw.version_guard import _load_state as _vg_load, _save_state as _vg_save
+                state = _vg_load()
+                state["notified_version"] = version_to_skip or state.get("latest_version", "")
+                state["update_available"] = False
+                _vg_save(state)
+                self._send_text(chat_id, f"⏭ Skipped openclaw {version_to_skip}. Next update will notify again.")
+            except Exception as exc:
+                self._send_text(chat_id, f"Skip error: {exc}")
             return
 
         suggestion = self._suggest_command(command)

@@ -13,6 +13,7 @@ Proposal types supported:
 
 import json
 import logging
+import urllib.request
 from typing import Any
 
 from openclaw.agents.base import AgentResult, BaseAgent
@@ -292,6 +293,36 @@ class OptimizationAgent(BaseAgent):
                     return str(content).strip()
             except Exception as exc:
                 logger.debug("[optimization_agent] OpenClaw gateway skip: %s", exc)
+
+        # ── Qwen (DashScope, free tier — added 2026.3.29) ────────────────
+        qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
+        if qwen_key:
+            try:
+                qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
+                qwen_model = str(getattr(config, "QWEN_MODEL", "") or "qwen-plus")
+                payload = json.dumps({
+                    "model": qwen_model,
+                    "messages": messages,
+                    "max_tokens": 800,
+                    "temperature": 0.1,
+                }).encode()
+                req = urllib.request.Request(
+                    f"{qwen_base}/chat/completions",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {qwen_key}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                content = data["choices"][0]["message"]["content"]
+                if content:
+                    logger.info("[optimization_agent] Qwen OK: %d chars", len(content))
+                    return str(content).strip()
+            except Exception as exc:
+                logger.warning("[optimization_agent] Qwen error: %s", exc)
 
         # ── Groq (fastest, reliable) ──────────────────────────────────────
         groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")

@@ -111,7 +111,14 @@ class Conductor:
             opt_result = self._optimization._safe_run(context)
             results["optimization"] = _serialise(opt_result)
 
-        # ── 6. Compose Telegram summary ──────────────────────────────────────
+        # ── 6. OpenClaw version guard (rate-limited to every 4h internally) ────
+        try:
+            from openclaw.version_guard import check_and_notify as _vg_check
+            _vg_check()
+        except Exception as exc:
+            logger.debug("[conductor] version_guard skip: %s", exc)
+
+        # ── 7. Compose Telegram summary ──────────────────────────────────────
         finished_at = _utc_now_iso()
         summary = self._build_summary(results, started_at, finished_at)
 
