@@ -1674,11 +1674,9 @@ class DexterScheduler:
                 experimental_families |= hedge_allowed
             if str(opportunity_sidecar_state.get("status") or "") == "active":
                 xau_opportunity_sidecar_active = True
-                experimental_families.add("xau_scalp_flow_short_sidecar")
-                # Inject FLS if conductor included it in sidecar families (bull regime only)
+                # Inject all families that conductor set for this regime (bear=FSS, bull=FLS)
                 _sidecar_families = set(opportunity_sidecar_state.get("families") or [])
-                if "xau_scalp_flow_long_sidecar" in _sidecar_families:
-                    experimental_families.add("xau_scalp_flow_long_sidecar")
+                experimental_families.update(_sidecar_families)
             manager_opportunity_priority = {
                 str(fam or "").strip().lower(): float(score or 0.0)
                 for fam, score in dict(xau_feed.get("family_priority_map") or {}).items()

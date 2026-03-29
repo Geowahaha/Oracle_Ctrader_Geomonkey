@@ -187,14 +187,14 @@ class Conductor:
             # Determine which follow families to activate based on regime direction
             follow_families: list[str] = []
             if wr >= min_wr and pnl >= 0:
-                # Trending bull: activate FSS (probes failed longs) + FFFS + FLS (long-side follow)
-                if "bull" in regime or regime in ("trending_bull", "crypto_weekend"):
-                    follow_families = ["xau_scalp_flow_short_sidecar", "xau_scalp_failed_fade_follow_stop", "xau_scalp_flow_long_sidecar"]
-                # Trending bear: activate FSS + range repair
-                elif "bear" in regime or "ranging" in regime:
+                # Trending bear: FSS (short, trend-aligned) + range repair — validated Mar 19 (-294pt bear day)
+                if "bear" in regime or "ranging" in regime:
                     follow_families = ["xau_scalp_flow_short_sidecar", "xau_scalp_range_repair"]
+                # Trending bull: FLS (long, trend-aligned) + FFFS (catches failed short fades → long entry)
+                elif "bull" in regime or regime in ("trending_bull", "crypto_weekend"):
+                    follow_families = ["xau_scalp_flow_long_sidecar", "xau_scalp_failed_fade_follow_stop"]
                 else:
-                    follow_families = ["xau_scalp_flow_short_sidecar"]
+                    follow_families = ["xau_scalp_flow_long_sidecar"]
 
             if not follow_families:
                 # Deactivate if WR has dropped below threshold
