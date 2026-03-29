@@ -357,17 +357,36 @@ class OptimizationAgent(BaseAgent):
             except Exception as exc:
                 logger.warning("[optimization_agent] Qwen/OpenRouter error: %s", exc)
 
-        # ── Groq (fastest, reliable) ──────────────────────────────────────
+        # ── Groq QwQ-32B (reasoning model, free, no quota) ───────────────────
+        # QwQ is Qwen's reasoning model — better than llama for structured JSON.
+        # Falls back to llama if QwQ is unavailable/rate-limited.
         groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")
         logger.debug("[optimization_agent] Groq key present: %s", bool(groq_key))
         if groq_key:
-            try:
-                result = brain._chat_openai_compat(messages=messages, provider="groq", max_tokens=800, temperature=0.1)
-                if result:
-                    logger.info("[optimization_agent] Groq OK: %d chars", len(result))
-                    return str(result).strip()
-            except Exception as exc:
-                logger.warning("[optimization_agent] Groq error: %s", exc)
+            # Try QwQ-32B first (reasoning model)
+            for groq_model in ["qwen-qwq-32b", "deepseek-r1-distill-llama-70b", "llama-3.3-70b-versatile"]:
+                try:
+                    payload = json.dumps({
+                        "model": groq_model,
+                        "messages": messages,
+                        "max_tokens": 1200,
+                        "temperature": 0.1,
+                    }).encode()
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=payload,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {groq_key}"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=25) as resp:
+                        data = json.loads(resp.read())
+                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        logger.info("[optimization_agent] Groq/%s OK: %d chars", groq_model, len(content))
+                        return str(content).strip()
+                except Exception as exc:
+                    logger.debug("[optimization_agent] Groq/%s skip: %s", groq_model, exc)
+                    continue
 
         # ── OpenRouter (free models) ──────────────────────────────────────
         if config.OPENROUTER_API_KEY:

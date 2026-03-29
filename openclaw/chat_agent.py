@@ -212,19 +212,20 @@ def _call_ai(messages: list[dict]) -> Optional[str]:
         if result:
             return result
 
-    # ── Groq ─────────────────────────────────────────────────────────────────
+    # ── Groq — try QwQ-32B first (reasoning), then llama fallback ────────────
     groq_key = str(getattr(config, "GROQ_API_KEY", "") or "").strip()
     if groq_key:
-        result = _http_chat(
-            url="https://api.groq.com/openai/v1/chat/completions",
-            model=str(getattr(config, "GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile"),
-            messages=messages,
-            api_key=groq_key,
-            timeout=20,
-            provider="Groq",
-        )
-        if result:
-            return result
+        for groq_model in ["qwen-qwq-32b", "llama-3.3-70b-versatile"]:
+            result, _ = _http_chat_with_usage(
+                url="https://api.groq.com/openai/v1/chat/completions",
+                model=groq_model,
+                messages=messages,
+                api_key=groq_key,
+                timeout=20,
+                provider=f"Groq/{groq_model}",
+            )
+            if result:
+                return result
 
     # ── OpenRouter Qwen fallback ─────────────────────────────────────────────
     or_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip()
