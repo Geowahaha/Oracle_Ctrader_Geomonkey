@@ -187,9 +187,9 @@ class Conductor:
             # Determine which follow families to activate based on regime direction
             follow_families: list[str] = []
             if wr >= min_wr and pnl >= 0:
-                # Trending bull: activate FSS (short-side probe probes failed longs) + FFFS
+                # Trending bull: activate FSS (probes failed longs) + FFFS + FLS (long-side follow)
                 if "bull" in regime or regime in ("trending_bull", "crypto_weekend"):
-                    follow_families = ["xau_scalp_flow_short_sidecar", "xau_scalp_failed_fade_follow_stop"]
+                    follow_families = ["xau_scalp_flow_short_sidecar", "xau_scalp_failed_fade_follow_stop", "xau_scalp_flow_long_sidecar"]
                 # Trending bear: activate FSS + range repair
                 elif "bear" in regime or "ranging" in regime:
                     follow_families = ["xau_scalp_flow_short_sidecar", "xau_scalp_range_repair"]
