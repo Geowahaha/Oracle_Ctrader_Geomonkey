@@ -294,38 +294,7 @@ class OptimizationAgent(BaseAgent):
             except Exception as exc:
                 logger.debug("[optimization_agent] OpenClaw gateway skip: %s", exc)
 
-        # ── Qwen via OpenRouter (free — qwen/qwq-32b:free, no extra key needed) ──
-        or_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip()
-        if or_key:
-            try:
-                qwen_model = str(getattr(config, "QWEN_MODEL", "") or "qwen/qwq-32b:free")
-                payload = json.dumps({
-                    "model": qwen_model,
-                    "messages": messages,
-                    "max_tokens": 800,
-                    "temperature": 0.1,
-                }).encode()
-                req = urllib.request.Request(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    data=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {or_key}",
-                        "HTTP-Referer": "https://github.com/dexter-pro",
-                        "X-Title": "Dexter Pro Optimization Agent",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    data = json.loads(resp.read())
-                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    logger.info("[optimization_agent] Qwen/OpenRouter OK: %d chars", len(content))
-                    return str(content).strip()
-            except Exception as exc:
-                logger.warning("[optimization_agent] Qwen/OpenRouter error: %s", exc)
-
-        # ── Qwen DashScope direct (optional — set QWEN_API_KEY if you have one) ─
+        # ── Qwen DashScope direct (primary — dedicated key, fastest) ─────────
         qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
         if qwen_key:
             try:
@@ -351,6 +320,36 @@ class OptimizationAgent(BaseAgent):
                     return str(content).strip()
             except Exception as exc:
                 logger.warning("[optimization_agent] Qwen/DashScope error: %s", exc)
+
+        # ── Qwen via OpenRouter (fallback — free, no extra key) ───────────────
+        or_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip()
+        if or_key:
+            try:
+                payload = json.dumps({
+                    "model": "qwen/qwq-32b:free",
+                    "messages": messages,
+                    "max_tokens": 800,
+                    "temperature": 0.1,
+                }).encode()
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {or_key}",
+                        "HTTP-Referer": "https://github.com/dexter-pro",
+                        "X-Title": "Dexter Pro Optimization Agent",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read())
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    logger.info("[optimization_agent] Qwen/OpenRouter OK: %d chars", len(content))
+                    return str(content).strip()
+            except Exception as exc:
+                logger.warning("[optimization_agent] Qwen/OpenRouter error: %s", exc)
 
         # ── Groq (fastest, reliable) ──────────────────────────────────────
         groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")
