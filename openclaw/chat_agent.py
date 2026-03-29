@@ -51,8 +51,10 @@ def _collect_context() -> dict:
         if db_path.exists():
             with sqlite3.connect(str(db_path), timeout=5) as conn:
                 conn.row_factory = sqlite3.Row
-                # Current month start (UTC) — matches cTrader statement "Current month" filter
-                month_start = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00Z")
+                # Current week start (Monday 00:00 UTC) — matches cTrader "Current week" statement
+                from datetime import timedelta
+                now_utc = datetime.now(timezone.utc)
+                week_start = (now_utc - timedelta(days=now_utc.weekday())).strftime("%Y-%m-%dT00:00:00Z")
                 rows = conn.execute("""
                     SELECT d.source as family, d.lane,
                            COUNT(DISTINCT d.position_id) as resolved,
@@ -64,9 +66,9 @@ def _collect_context() -> dict:
                       AND d.execution_utc >= ?
                     GROUP BY d.source, d.lane
                     ORDER BY total_pnl_usd DESC
-                """, (month_start,)).fetchall()
+                """, (week_start,)).fetchall()
                 ctx["family_performance"] = [dict(r) for r in rows]
-                ctx["family_period"] = f"current month (from {month_start[:10]})"
+                ctx["family_period"] = f"current week (from {week_start[:10]})"
     except Exception as exc:
         logger.debug("[chat_agent] family scores from DB: %s", exc)
 
