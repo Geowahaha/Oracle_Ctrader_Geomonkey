@@ -56,7 +56,7 @@ def _collect_context() -> dict:
                            ROUND(AVG(CASE WHEN d.pnl_usd > 0 THEN 1.0 ELSE 0.0 END), 2) as win_rate
                     FROM ctrader_positions p
                     JOIN ctrader_deals d ON d.position_id = p.position_id
-                    WHERE d.outcome = 1
+                    WHERE d.outcome IN (0, 1)
                       AND p.source != '' AND p.source IS NOT NULL
                     GROUP BY p.source, p.lane
                     ORDER BY total_pnl_usd DESC
