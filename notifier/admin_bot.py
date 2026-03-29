@@ -740,6 +740,7 @@ class TelegramAdminBot:
             "trials", "approve", "reject",
             "update_openclaw", "skip_openclaw", "openclaw_version",
             "ask", "chat", "q",
+            "budget", "token_budget",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -6750,6 +6751,32 @@ class TelegramAdminBot:
                 )
             except Exception as e:
                 self._send_text(chat_id, f"Error rejecting trial: {e}")
+            return
+
+        if command in {"budget", "token_budget"}:
+            try:
+                from openclaw.token_budget import get_status as _budget_status
+                st = _budget_status()
+                month = st.get("month", "?")
+                models = st.get("models", {})
+                lines = [f"💰 *Qwen Token Budget — {month}*\n"]
+                if not models:
+                    lines.append("  ยังไม่มีการใช้งาน (เริ่มต้นใหม่)")
+                for model, info in models.items():
+                    used = info.get("used_tokens", 0)
+                    budget = info.get("budget_tokens", 900_000)
+                    pct = info.get("pct", 0)
+                    calls = info.get("calls", 0)
+                    bar = "🟢" if pct < 60 else "🟡" if pct < 80 else "🔴"
+                    lines.append(f"{bar} *{model}*")
+                    lines.append(f"  {used:,} / {budget:,} tokens ({pct}%)")
+                    lines.append(f"  {calls} calls this month")
+                    lines.append(f"  Switch to Groq at 95%")
+                    lines.append("")
+                lines.append("_Groq fallback = ฟรีไม่มี quota_")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Budget error: {exc}")
             return
 
         if command in {"ask", "chat", "q"}:

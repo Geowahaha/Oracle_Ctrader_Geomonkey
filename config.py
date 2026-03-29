@@ -894,7 +894,9 @@ class Config:
     # ── Qwen / DashScope (free tier) ─────────────────────────────────────────
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")
     QWEN_BASE_URL: str = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen-plus")  # DashScope model name; OpenRouter fallback uses qwen/qwq-32b:free hardcoded
+    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen-plus")  # conductor uses this; /ask uses qwen-turbo directly
+    QWEN_PLUS_MONTHLY_BUDGET: int = int(os.getenv("QWEN_PLUS_MONTHLY_BUDGET", "900000") or "900000")
+    QWEN_TURBO_MONTHLY_BUDGET: int = int(os.getenv("QWEN_TURBO_MONTHLY_BUDGET", "900000") or "900000")
     STRATEGY_LAB_REPORT_ENABLED: bool = os.getenv("STRATEGY_LAB_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_LAB_REPORT_INTERVAL_MIN: int = int(os.getenv("STRATEGY_LAB_REPORT_INTERVAL_MIN", "15"))
     STRATEGY_LAB_REPORT_ON_START: bool = os.getenv("STRATEGY_LAB_REPORT_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")

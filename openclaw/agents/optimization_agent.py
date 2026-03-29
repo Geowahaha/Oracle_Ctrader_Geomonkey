@@ -294,30 +294,36 @@ class OptimizationAgent(BaseAgent):
             except Exception as exc:
                 logger.debug("[optimization_agent] OpenClaw gateway skip: %s", exc)
 
-        # ── Qwen DashScope direct (primary — dedicated key, fastest) ─────────
+        # ── Qwen-Plus DashScope (conductor-grade — check budget first) ──────────
         qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
         if qwen_key:
             try:
-                qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
+                from openclaw.token_budget import is_blocked as _budget_blocked, record_usage as _record
                 qwen_model_direct = str(getattr(config, "QWEN_MODEL", "") or "qwen-plus")
-                payload = json.dumps({
-                    "model": qwen_model_direct,
-                    "messages": messages,
-                    "max_tokens": 800,
-                    "temperature": 0.1,
-                }).encode()
-                req = urllib.request.Request(
-                    f"{qwen_base}/chat/completions",
-                    data=payload,
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {qwen_key}"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read())
-                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    logger.info("[optimization_agent] Qwen/DashScope OK: %d chars", len(content))
-                    return str(content).strip()
+                if _budget_blocked(qwen_model_direct):
+                    logger.info("[optimization_agent] Qwen/%s budget at 95%% — skipping to Groq", qwen_model_direct)
+                else:
+                    qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
+                    payload = json.dumps({
+                        "model": qwen_model_direct,
+                        "messages": messages,
+                        "max_tokens": 800,
+                        "temperature": 0.1,
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{qwen_base}/chat/completions",
+                        data=payload,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {qwen_key}"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read())
+                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    usage = data.get("usage") or {}
+                    if content:
+                        _record(qwen_model_direct, usage.get("prompt_tokens", 1100), usage.get("completion_tokens", 400))
+                        logger.info("[optimization_agent] Qwen/%s OK: %d chars", qwen_model_direct, len(content))
+                        return str(content).strip()
             except Exception as exc:
                 logger.warning("[optimization_agent] Qwen/DashScope error: %s", exc)
 

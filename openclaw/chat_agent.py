@@ -167,22 +167,36 @@ def ask(question: str) -> str:
 
 
 def _call_ai(messages: list[dict]) -> Optional[str]:
-    """Try AI providers in order — same chain as optimization_agent."""
+    """
+    Provider chain for /ask: uses qwen-turbo (fast, cheap) not qwen-plus.
+    qwen-plus is reserved for conductor/optimization (needs structured JSON).
+    Falls back to Groq (free, unlimited) when turbo budget runs low.
+    """
     from config import config
 
-    # ── Qwen DashScope direct ────────────────────────────────────────────────
+    # ── Qwen-Turbo DashScope (/ask uses turbo — fast, cheap, good enough) ────
     qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
     if qwen_key:
-        result = _http_chat(
-            url=f"{getattr(config, 'QWEN_BASE_URL', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1').rstrip('/')}/chat/completions",
-            model=str(getattr(config, "QWEN_MODEL", "qwen-plus") or "qwen-plus"),
-            messages=messages,
-            api_key=qwen_key,
-            timeout=20,
-            provider="Qwen/DashScope",
-        )
-        if result:
-            return result
+        try:
+            from openclaw.token_budget import is_blocked as _budget_blocked, record_usage as _record
+            turbo_model = "qwen-turbo"
+            if not _budget_blocked(turbo_model):
+                qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
+                result, usage = _http_chat_with_usage(
+                    url=f"{qwen_base}/chat/completions",
+                    model=turbo_model,
+                    messages=messages,
+                    api_key=qwen_key,
+                    timeout=20,
+                    provider="Qwen-Turbo/DashScope",
+                )
+                if result:
+                    _record(turbo_model, usage.get("prompt_tokens", 800), usage.get("completion_tokens", 300))
+                    return result
+            else:
+                logger.info("[chat_agent] qwen-turbo budget at 95%% → Groq")
+        except Exception as exc:
+            logger.warning("[chat_agent] Qwen-Turbo error: %s", exc)
 
     # ── OpenClaw gateway ─────────────────────────────────────────────────────
     gateway_url = str(getattr(config, "OPENCLAW_GATEWAY_URL", "") or "").strip().rstrip("/")
@@ -251,7 +265,21 @@ def _http_chat(
     provider: str = "",
     extra_headers: Optional[dict] = None,
 ) -> Optional[str]:
-    """Generic OpenAI-compat HTTP call."""
+    """Generic OpenAI-compat HTTP call (no usage tracking)."""
+    result, _ = _http_chat_with_usage(url, model, messages, api_key, timeout, provider, extra_headers)
+    return result
+
+
+def _http_chat_with_usage(
+    url: str,
+    model: str,
+    messages: list[dict],
+    api_key: str,
+    timeout: int = 20,
+    provider: str = "",
+    extra_headers: Optional[dict] = None,
+) -> tuple[Optional[str], dict]:
+    """Generic OpenAI-compat HTTP call — returns (content, usage_dict)."""
     try:
         headers = {"Content-Type": "application/json"}
         if api_key:
@@ -268,9 +296,10 @@ def _http_chat(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        usage = data.get("usage") or {}
         if content:
             logger.info("[chat_agent] %s OK: %d chars", provider, len(content))
-            return str(content).strip()
+            return str(content).strip(), usage
     except Exception as exc:
         logger.warning("[chat_agent] %s error: %s", provider, exc)
-    return None
+    return None, {}
