@@ -44,26 +44,25 @@ def _collect_context() -> dict:
 
     # ── Family performance ────────────────────────────────────────────────────
     try:
-        from learning.live_profile_autopilot import live_profile_autopilot as lpa
-        scores = lpa._collect_family_closed_rows() or {}
-        family_summary = []
-        for fam, rows in scores.items():
-            if not rows:
-                continue
-            resolved = len(rows)
-            wins = sum(1 for r in rows if float(r.get("pnl", 0) or 0) > 0)
-            wr = round(wins / resolved, 2) if resolved else 0
-            total_pnl = round(sum(float(r.get("pnl", 0) or 0) for r in rows), 2)
-            family_summary.append({
-                "family": fam,
-                "resolved": resolved,
-                "win_rate": wr,
-                "total_pnl_usd": total_pnl,
-            })
-        family_summary.sort(key=lambda x: x["total_pnl_usd"], reverse=True)
-        ctx["family_performance"] = family_summary
+        import sqlite3
+        db_path = Path(__file__).parent.parent / "data" / "ctrader_openapi.db"
+        if db_path.exists():
+            with sqlite3.connect(str(db_path), timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT family_source as family,
+                           COUNT(*) as resolved,
+                           ROUND(AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END), 2) as win_rate,
+                           ROUND(SUM(pnl), 2) as total_pnl_usd
+                    FROM execution_journal
+                    WHERE status IN ('tp','sl','closed','partial_tp')
+                      AND family_source IS NOT NULL AND family_source != ''
+                    GROUP BY family_source
+                    ORDER BY total_pnl_usd DESC
+                """).fetchall()
+                ctx["family_performance"] = [dict(r) for r in rows]
     except Exception as exc:
-        logger.debug("[chat_agent] family scores: %s", exc)
+        logger.debug("[chat_agent] family scores from DB: %s", exc)
 
     # ── PTS trials ────────────────────────────────────────────────────────────
     try:
