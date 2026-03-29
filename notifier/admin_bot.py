@@ -739,6 +739,7 @@ class TelegramAdminBot:
             "grant", "setplan", "revoke", "block", "admin_add", "admin_del", "admin_list", "user_list",
             "trials", "approve", "reject",
             "update_openclaw", "skip_openclaw", "openclaw_version",
+            "ask", "chat", "q",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -5066,12 +5067,22 @@ class TelegramAdminBot:
             self._handle_admin_command(chat_id, user_id, "upgrade", "", is_admin, lang=lang)
             return
 
-        # No automatic AI fallback here: keep natural-language control local and zero-credit.
+        # Fallback: route to AI chat agent for free-form questions (admin only)
         self._record_intent_event(chat_id, user_id, msg, "unmapped", source="heuristic")
-        if not self._ai_api_allowed(user_id, is_admin):
-            self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
-            return
-        self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
+        if is_admin:
+            try:
+                from openclaw.chat_agent import ask as _ask
+                self._send_text(chat_id, "🤔 กำลังวิเคราะห์...")
+                answer = _ask(msg)
+                self._send_text(chat_id, f"💬 {answer}")
+            except Exception as exc:
+                logger.debug("[admin_bot] AI chat fallback error: %s", exc)
+                self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
+        else:
+            if not self._ai_api_allowed(user_id, is_admin):
+                self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
+                return
+            self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
 
     def _handle_admin_command(self, chat_id: int, user_id: int, command: str, args: str, is_admin: bool, lang: str = "en") -> None:
         from scheduler import scheduler
@@ -6739,6 +6750,35 @@ class TelegramAdminBot:
                 )
             except Exception as e:
                 self._send_text(chat_id, f"Error rejecting trial: {e}")
+            return
+
+        if command in {"ask", "chat", "q"}:
+            question = str(args or "").strip()
+            if not question:
+                self._send_text(
+                    chat_id,
+                    "💬 ถามอะไรก็ได้เกี่ยวกับระบบ:\n\n"
+                    "/ask วันนี้ระบบเป็นยังไง?\n"
+                    "/ask which families are winning?\n"
+                    "/ask should I approve the ETH trial?\n"
+                    "/ask อธิบาย XAU regime ตอนนี้",
+                )
+                return
+            # Show typing indicator via send_chat_action
+            try:
+                from config import config as _cfg
+                _chat_id_str = str(getattr(_cfg, "TELEGRAM_CHAT_ID", "") or "").strip()
+                if _chat_id_str:
+                    self._api_post("sendChatAction", {"chat_id": int(_chat_id_str), "action": "typing"})
+            except Exception:
+                pass
+            try:
+                from openclaw.chat_agent import ask as _ask
+                self._send_text(chat_id, f"🤔 กำลังวิเคราะห์...")
+                answer = _ask(question)
+                self._send_text(chat_id, f"💬 {answer}")
+            except Exception as exc:
+                self._send_text(chat_id, f"❌ Chat error: {exc}")
             return
 
         if command in {"openclaw_version", "openclaw_status"}:
