@@ -894,7 +894,7 @@ class Config:
     # ── Qwen / DashScope (free tier) ─────────────────────────────────────────
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")
     QWEN_BASE_URL: str = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen-plus")
+    QWEN_MODEL: str = os.getenv("QWEN_MODEL", "qwen/qwq-32b:free")  # via OpenRouter; or "qwen-plus" for DashScope
     STRATEGY_LAB_REPORT_ENABLED: bool = os.getenv("STRATEGY_LAB_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_LAB_REPORT_INTERVAL_MIN: int = int(os.getenv("STRATEGY_LAB_REPORT_INTERVAL_MIN", "15"))
     STRATEGY_LAB_REPORT_ON_START: bool = os.getenv("STRATEGY_LAB_REPORT_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")

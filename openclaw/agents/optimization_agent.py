@@ -294,12 +294,11 @@ class OptimizationAgent(BaseAgent):
             except Exception as exc:
                 logger.debug("[optimization_agent] OpenClaw gateway skip: %s", exc)
 
-        # ── Qwen (DashScope, free tier — added 2026.3.29) ────────────────
-        qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
-        if qwen_key:
+        # ── Qwen via OpenRouter (free — qwen/qwq-32b:free, no extra key needed) ──
+        or_key = str(getattr(config, "OPENROUTER_API_KEY", "") or "").strip()
+        if or_key:
             try:
-                qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
-                qwen_model = str(getattr(config, "QWEN_MODEL", "") or "qwen-plus")
+                qwen_model = str(getattr(config, "QWEN_MODEL", "") or "qwen/qwq-32b:free")
                 payload = json.dumps({
                     "model": qwen_model,
                     "messages": messages,
@@ -307,22 +306,51 @@ class OptimizationAgent(BaseAgent):
                     "temperature": 0.1,
                 }).encode()
                 req = urllib.request.Request(
-                    f"{qwen_base}/chat/completions",
+                    "https://openrouter.ai/api/v1/chat/completions",
                     data=payload,
                     headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {qwen_key}",
+                        "Authorization": f"Bearer {or_key}",
+                        "HTTP-Referer": "https://github.com/dexter-pro",
+                        "X-Title": "Dexter Pro Optimization Agent",
                     },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read())
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    logger.info("[optimization_agent] Qwen/OpenRouter OK: %d chars", len(content))
+                    return str(content).strip()
+            except Exception as exc:
+                logger.warning("[optimization_agent] Qwen/OpenRouter error: %s", exc)
+
+        # ── Qwen DashScope direct (optional — set QWEN_API_KEY if you have one) ─
+        qwen_key = str(getattr(config, "QWEN_API_KEY", "") or "").strip()
+        if qwen_key:
+            try:
+                qwen_base = str(getattr(config, "QWEN_BASE_URL", "") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
+                qwen_model_direct = str(getattr(config, "QWEN_MODEL", "") or "qwen-plus")
+                payload = json.dumps({
+                    "model": qwen_model_direct,
+                    "messages": messages,
+                    "max_tokens": 800,
+                    "temperature": 0.1,
+                }).encode()
+                req = urllib.request.Request(
+                    f"{qwen_base}/chat/completions",
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {qwen_key}"},
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read())
-                content = data["choices"][0]["message"]["content"]
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
                 if content:
-                    logger.info("[optimization_agent] Qwen OK: %d chars", len(content))
+                    logger.info("[optimization_agent] Qwen/DashScope OK: %d chars", len(content))
                     return str(content).strip()
             except Exception as exc:
-                logger.warning("[optimization_agent] Qwen error: %s", exc)
+                logger.warning("[optimization_agent] Qwen/DashScope error: %s", exc)
 
         # ── Groq (fastest, reliable) ──────────────────────────────────────
         groq_key = str(getattr(config, "GROQ_API_KEY", "") or "")
