@@ -50,14 +50,15 @@ def _collect_context() -> dict:
             with sqlite3.connect(str(db_path), timeout=5) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute("""
-                    SELECT family_source as family,
-                           COUNT(*) as resolved,
-                           ROUND(AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END), 2) as win_rate,
-                           ROUND(SUM(pnl), 2) as total_pnl_usd
-                    FROM execution_journal
-                    WHERE status IN ('tp','sl','closed','partial_tp')
-                      AND family_source IS NOT NULL AND family_source != ''
-                    GROUP BY family_source
+                    SELECT p.source as family, p.lane,
+                           COUNT(DISTINCT p.position_id) as resolved,
+                           ROUND(SUM(d.pnl_usd), 2) as total_pnl_usd,
+                           ROUND(AVG(CASE WHEN d.pnl_usd > 0 THEN 1.0 ELSE 0.0 END), 2) as win_rate
+                    FROM ctrader_positions p
+                    JOIN ctrader_deals d ON d.position_id = p.position_id
+                    WHERE d.outcome = 1
+                      AND p.source != '' AND p.source IS NOT NULL
+                    GROUP BY p.source, p.lane
                     ORDER BY total_pnl_usd DESC
                 """).fetchall()
                 ctx["family_performance"] = [dict(r) for r in rows]
