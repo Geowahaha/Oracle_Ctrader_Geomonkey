@@ -11406,6 +11406,7 @@ class DexterScheduler:
         self._run_mt5_preclose_flatten()
         self._run_scalping_scan()
         self._run_scalping_timeout_manager()
+        self._run_ctrader_sync()  # startup reconcile — catches deals missed during offline period
         self._run_neural_sync_train()
         self._run_neural_mission_cycle_async(source="scheduler_startup")
         if bool(getattr(config, "SIGNAL_MONITOR_AUTO_PUSH_ENABLED", False)) and bool(getattr(config, "SIGNAL_MONITOR_AUTO_PUSH_ON_START", True)):
