@@ -4200,10 +4200,15 @@ class DexterScheduler:
         day_type = str(chart_state.get("day_type") or "").strip().lower()
         allowed_states = self._parse_lower_csv(getattr(config, "XAU_RANGE_REPAIR_ALLOWED_STATES", ""))
         blocked_day_types = self._parse_lower_csv(getattr(config, "XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES", ""))
+        blocked_sessions = self._parse_lower_csv(getattr(config, "XAU_RANGE_REPAIR_BLOCKED_SESSIONS", ""))
         if allowed_states and state_label not in allowed_states:
             return None, ""
         if blocked_day_types and day_type in blocked_day_types:
             return None, ""
+        if blocked_sessions:
+            signal_session = self._normalized_signature(str(getattr(signal, "session", "") or ""))
+            if any(bs and bs in signal_session for bs in blocked_sessions):
+                return None, ""
         continuation_bias = abs(float(chart_state.get("continuation_bias", 0.0) or 0.0))
         rejection_ratio = float(capture_features.get("rejection_ratio", 0.0) or 0.0)
         bar_volume_proxy = float(capture_features.get("bar_volume_proxy", 0.0) or 0.0)
