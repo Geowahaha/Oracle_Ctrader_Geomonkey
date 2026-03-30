@@ -5401,14 +5401,16 @@ class DexterScheduler:
                 )
             except Exception as e:
                 logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
-        # Pre-load directive once so the family loop can respect blocked_direction.
-        # Canary families previously bypassed _allow_ctrader_source_profile entirely,
-        # meaning a blocked_direction=long directive had zero effect on RR/TDF/etc.
-        # Fix: skip any family whose built signal direction matches the blocked direction,
-        # UNLESS that family is explicitly listed as preferred by the trading manager.
+        # Pre-load directive once so the family loop can respect blocked families/sources.
+        # Canary families previously bypassed _allow_ctrader_source_profile entirely.
+        # Fix: mirror the EXACT same check as _allow_ctrader_source_profile (lines 979-988):
+        # block if direction+entry_type matches AND family is in blocked_families OR source
+        # is in blocked_sources. This keeps behavioral_v2 (pb:canary, not in blocked lists)
+        # running freely while stopping MFU/TDF canary when the directive targets them.
         _xau_directive_blocked_dir = ""
         _xau_directive_blocked_etypes: set = set()
-        _xau_directive_preferred_fams: set = set()
+        _xau_directive_blocked_fams: set = set()
+        _xau_directive_blocked_srcs: set = set()
         if symbol == "XAUUSD":
             _rt_state = self._load_trading_routing_runtime_state()
             _directive = self._active_xau_execution_directive(_rt_state)
@@ -5419,17 +5421,24 @@ class DexterScheduler:
                     for t in list(_directive.get("blocked_entry_types") or [])
                     if str(t).strip()
                 }
-                _xau_directive_preferred_fams = {
+                _xau_directive_blocked_fams = {
                     str(f).strip().lower()
-                    for f in list(_directive.get("preferred_families") or [])
+                    for f in list(_directive.get("blocked_families") or [])
                     if str(f).strip()
+                }
+                _xau_directive_blocked_srcs = {
+                    str(s).strip().lower()
+                    for s in list(_directive.get("blocked_sources") or [])
+                    if str(s).strip()
                 }
         family_candidates = self._load_strategy_family_candidates(symbol=symbol, base_source=base_source)
         for candidate in list(family_candidates or []):
             family_signal, family_source = self._build_family_canary_signal(signal, base_source=base_source, candidate=candidate)
             if family_signal is None or not family_source:
                 continue
-            # Enforce directive direction block for experimental canary families.
+            # Mirror _allow_ctrader_source_profile directive check for canary families.
+            # Blocks only families/sources explicitly listed in the directive — same logic,
+            # same scope. behavioral_v2 (xau_scalp_pullback_limit) is never in blocked_families.
             if symbol == "XAUUSD" and _xau_directive_blocked_dir:
                 _sig_dir = str(getattr(family_signal, "direction", "") or "").strip().lower()
                 _sig_etype = str(getattr(family_signal, "entry_type", "") or "").strip().lower()
@@ -5437,7 +5446,7 @@ class DexterScheduler:
                 if (
                     _sig_dir == _xau_directive_blocked_dir
                     and (not _xau_directive_blocked_etypes or _sig_etype in _xau_directive_blocked_etypes)
-                    and _cand_fam not in _xau_directive_preferred_fams
+                    and ((_cand_fam and _cand_fam in _xau_directive_blocked_fams) or family_source in _xau_directive_blocked_srcs)
                 ):
                     continue
             family_row = {
