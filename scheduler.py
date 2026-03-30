@@ -4230,6 +4230,21 @@ class DexterScheduler:
             return None, ""
         if spread_avg_pct > float(getattr(config, "XAU_RANGE_REPAIR_MAX_SPREAD_AVG_PCT", 0.0022) or 0.0022):
             return None, ""
+        sign = 1.0 if direction == "long" else -1.0
+        # ── Falling-knife guard ─────────────────────────────────────────────────
+        # The existing delta_proxy gate uses abs() so -0.09 (sellers dominating)
+        # passes as easily as +0.09. For a ranging long entry that means we can
+        # fire a limit while price is still cascading down — a falling knife.
+        # Guard: block if raw signed delta is adverse OR tick flow is clearly down.
+        if bool(getattr(config, "XAU_RANGE_REPAIR_KNIFE_GUARD_ENABLED", True)):
+            signed_delta = float(capture_features.get("delta_proxy", 0.0) or 0.0)
+            tick_up = float(capture_features.get("tick_up_ratio", 0.5) or 0.5)
+            max_adv = float(getattr(config, "XAU_RANGE_REPAIR_KNIFE_GUARD_MAX_ADVERSE_DELTA_PROXY", 0.07) or 0.07)
+            min_tick_up = float(getattr(config, "XAU_RANGE_REPAIR_KNIFE_GUARD_MIN_TICK_UP_RATIO", 0.38) or 0.38)
+            adverse_delta = (sign * signed_delta) <= -max_adv
+            tick_falling = (direction == "long" and tick_up < min_tick_up) or (direction == "short" and (1.0 - tick_up) < min_tick_up)
+            if adverse_delta or tick_falling:
+                return None, ""
         lane_signal = copy.deepcopy(signal)
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
         stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
@@ -4237,7 +4252,6 @@ class DexterScheduler:
         base_risk = abs(entry - stop_loss)
         if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
             return None, ""
-        sign = 1.0 if direction == "long" else -1.0
         atr_eff = max(base_risk, atr, entry * 0.0003)
         retest = max(
             base_risk * float(getattr(config, "XAU_RANGE_REPAIR_ENTRY_RISK_RATIO", 0.10) or 0.10),
@@ -4281,9 +4295,12 @@ class DexterScheduler:
                 "continuation_bias": round(continuation_bias, 4),
                 "rejection_ratio": round(rejection_ratio, 4),
                 "delta_proxy_abs": round(delta_proxy, 4),
+                "delta_proxy_signed": round(float(capture_features.get("delta_proxy", 0.0) or 0.0), 4),
+                "tick_up_ratio": round(float(capture_features.get("tick_up_ratio", 0.5) or 0.5), 4),
                 "depth_imbalance_abs": round(depth_imbalance, 4),
                 "spread_expansion": round(spread_expansion, 4),
                 "bar_volume_proxy": round(bar_volume_proxy, 4),
+                "knife_guard_passed": True,
             }
             raw["range_repair_snapshot"] = {
                 "run_id": str(snapshot.get("run_id") or ""),
