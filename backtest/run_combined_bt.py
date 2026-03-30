@@ -290,6 +290,41 @@ def _detailed_family_breakdown(
         regime_label = daily_regime_map.get(day_key, "?").upper()[:6]
         print(f"  {day_key:<12}  {regime_label:<8}  {n:>6}  {wr:>5.1f}%  {pnl:>+8.2f}")
 
+    # ── Session × direction cross-tab ─────────────────────────────────────
+    print("\n  Session × direction cross-tab:")
+    cross_hdr = f"  {'Session/Dir':<20}  {'Trades':>6}  {'WR%':>5}  {'PnL(R)':>8}  {'PF':>5}"
+    print(cross_hdr)
+    print("  " + "-" * 54)
+    for sess in session_order:
+        for dirn in ("long", "short"):
+            sub = [t for t in session_buckets.get(sess, []) if t.direction == dirn]
+            n, wr, pnl, pf = _mini_stats(sub)
+            if n == 0:
+                continue
+            pf_s = f"{pf:.2f}" if pf != float("inf") else " inf"
+            label_s = f"{sess}/{dirn}"
+            flag = "  [WEAK]" if (n >= 5 and wr < 50.0) else ("  [OK]" if n >= 10 and wr >= 65.0 else "")
+            print(f"  {label_s:<20}  {n:>6}  {wr:>5.1f}%  {pnl:>+8.2f}  {pf_s:>5}{flag}")
+
+    # ── Confidence band × direction cross-tab ─────────────────────────────
+    print("\n  Confidence × direction cross-tab:")
+    print(cross_hdr)
+    print("  " + "-" * 54)
+    for band_label, lo, hi in bands:
+        for dirn in ("long", "short"):
+            sub = [
+                t for t in trades
+                if dirn == t.direction
+                and lo <= float((t.signal.get("confidence") if isinstance(t.signal, dict) else 0) or 0) < hi
+            ]
+            n, wr, pnl, pf = _mini_stats(sub)
+            if n == 0:
+                continue
+            pf_s = f"{pf:.2f}" if pf != float("inf") else " inf"
+            label_cd = f"{band_label}/{dirn}"
+            flag = "  [WEAK]" if (n >= 5 and wr < 50.0) else ("  [STAR]" if n >= 10 and wr >= 70.0 else "")
+            print(f"  {label_cd:<20}  {n:>6}  {wr:>5.1f}%  {pnl:>+8.2f}  {pf_s:>5}{flag}")
+
     # ── Outcome distribution ──────────────────────────────────────────────
     print("\n  Outcome distribution:")
     outcome_counts: Dict[str, int] = defaultdict(int)
