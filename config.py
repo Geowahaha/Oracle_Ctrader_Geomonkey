@@ -168,7 +168,7 @@ class Config:
     # ── BTC Range Repair (BRR) — crypto clone of XAU RR, isolated ──
     BTC_RANGE_REPAIR_ENABLED: bool = os.getenv("BTC_RANGE_REPAIR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     BTC_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("BTC_RANGE_REPAIR_LOOKBACK_SEC", "300"))
-    BTC_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("BTC_RANGE_REPAIR_ALLOWED_STATES", "reversal_exhaustion,range_probe")
+    BTC_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("BTC_RANGE_REPAIR_ALLOWED_STATES", "range_probe")
     BTC_RANGE_REPAIR_MAX_CONTINUATION_BIAS: float = float(os.getenv("BTC_RANGE_REPAIR_MAX_CONTINUATION_BIAS", "0.12"))
     BTC_RANGE_REPAIR_MIN_REJECTION_RATIO: float = float(os.getenv("BTC_RANGE_REPAIR_MIN_REJECTION_RATIO", "0.14"))
     BTC_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("BTC_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY", "0.20"))
@@ -264,7 +264,7 @@ class Config:
     )
     XAU_RANGE_REPAIR_ENABLED: bool = os.getenv("XAU_RANGE_REPAIR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("XAU_RANGE_REPAIR_LOOKBACK_SEC", "300"))
-    XAU_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("XAU_RANGE_REPAIR_ALLOWED_STATES", "range_probe,reversal_exhaustion")
+    XAU_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("XAU_RANGE_REPAIR_ALLOWED_STATES", "range_probe")
     XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES", "fast_expansion,panic_spread")
     XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS: float = float(os.getenv("XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS", "0.09"))
     XAU_RANGE_REPAIR_MIN_REJECTION_RATIO: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_REJECTION_RATIO", "0.16"))
@@ -633,7 +633,7 @@ class Config:
     TRADING_MANAGER_XAU_REGIME_TRANSITION_MIN_OPPOSITE_BIAS: float = float(os.getenv("TRADING_MANAGER_XAU_REGIME_TRANSITION_MIN_OPPOSITE_BIAS", "0.03"))
     TRADING_MANAGER_XAU_REGIME_TRANSITION_RANGE_STATES: str = os.getenv(
         "TRADING_MANAGER_XAU_REGIME_TRANSITION_RANGE_STATES",
-        "range_probe,reversal_exhaustion",
+        "range_probe",
     )
     TRADING_MANAGER_XAU_REGIME_TRANSITION_LIMIT_FAMILIES: str = os.getenv(
         "TRADING_MANAGER_XAU_REGIME_TRANSITION_LIMIT_FAMILIES",

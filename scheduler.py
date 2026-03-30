@@ -5401,11 +5401,45 @@ class DexterScheduler:
                 )
             except Exception as e:
                 logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
+        # Pre-load directive once so the family loop can respect blocked_direction.
+        # Canary families previously bypassed _allow_ctrader_source_profile entirely,
+        # meaning a blocked_direction=long directive had zero effect on RR/TDF/etc.
+        # Fix: skip any family whose built signal direction matches the blocked direction,
+        # UNLESS that family is explicitly listed as preferred by the trading manager.
+        _xau_directive_blocked_dir = ""
+        _xau_directive_blocked_etypes: set = set()
+        _xau_directive_preferred_fams: set = set()
+        if symbol == "XAUUSD":
+            _rt_state = self._load_trading_routing_runtime_state()
+            _directive = self._active_xau_execution_directive(_rt_state)
+            if _directive:
+                _xau_directive_blocked_dir = str(_directive.get("blocked_direction") or "").strip().lower()
+                _xau_directive_blocked_etypes = {
+                    str(t).strip().lower()
+                    for t in list(_directive.get("blocked_entry_types") or [])
+                    if str(t).strip()
+                }
+                _xau_directive_preferred_fams = {
+                    str(f).strip().lower()
+                    for f in list(_directive.get("preferred_families") or [])
+                    if str(f).strip()
+                }
         family_candidates = self._load_strategy_family_candidates(symbol=symbol, base_source=base_source)
         for candidate in list(family_candidates or []):
             family_signal, family_source = self._build_family_canary_signal(signal, base_source=base_source, candidate=candidate)
             if family_signal is None or not family_source:
                 continue
+            # Enforce directive direction block for experimental canary families.
+            if symbol == "XAUUSD" and _xau_directive_blocked_dir:
+                _sig_dir = str(getattr(family_signal, "direction", "") or "").strip().lower()
+                _sig_etype = str(getattr(family_signal, "entry_type", "") or "").strip().lower()
+                _cand_fam = str((candidate or {}).get("family") or "").strip().lower()
+                if (
+                    _sig_dir == _xau_directive_blocked_dir
+                    and (not _xau_directive_blocked_etypes or _sig_etype in _xau_directive_blocked_etypes)
+                    and _cand_fam not in _xau_directive_preferred_fams
+                ):
+                    continue
             family_row = {
                 "family": str((candidate or {}).get("family") or ""),
                 "strategy_id": str((candidate or {}).get("strategy_id") or ""),
