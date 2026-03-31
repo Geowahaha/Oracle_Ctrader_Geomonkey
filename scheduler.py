@@ -27,7 +27,7 @@ from scanners.xauusd import xauusd_scanner
 # from scanners.stock_scanner import stock_scanner
 from scanners.scalping_scanner import scalping_scanner
 from notifier.telegram_bot import notifier
-from market.data_fetcher import session_manager
+from market.data_fetcher import session_manager, xauusd_provider
 from market.economic_calendar import economic_calendar
 from market.macro_news import macro_news
 from market.macro_impact_tracker import macro_impact_tracker
@@ -1421,6 +1421,7 @@ class DexterScheduler:
             "xau_scalp_flow_short_sidecar": "fss",
             "xau_scalp_flow_long_sidecar": "fls",
             "xau_scalp_range_repair": "rr",
+            "xau_scalp_prelondon_sweep_cont": "psc",
             "btc_weekday_lob_momentum": "bwl",
             "btc_scalp_flow_short_sidecar": "bfss",
             "btc_scalp_flow_long_sidecar": "bfls",
@@ -1810,6 +1811,17 @@ class DexterScheduler:
                         "family": "xau_scalp_range_repair",
                         "strategy_id": "xau_scalp_range_repair_v1",
                         "priority": 159,
+                        "execution_ready": True,
+                        "experimental": True,
+                    }
+                )
+            if "xau_scalp_prelondon_sweep_cont" in experimental_families and _strategy_lab_family_allowed("xau_scalp_prelondon_sweep_cont"):
+                fallback_experimental.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": "xau_scalp_prelondon_sweep_cont",
+                        "strategy_id": "xau_scalp_prelondon_sweep_cont_v1",
+                        "priority": 155,
                         "execution_ready": True,
                         "experimental": True,
                     }
@@ -3118,6 +3130,16 @@ class DexterScheduler:
                 except Exception:
                     pass
             return lane_signal, lane_source
+        if family == "xau_scalp_prelondon_sweep_cont":
+            lane_signal, lane_source = self._build_xau_psc_canary_signal(signal, base_source=base_source, candidate=candidate)
+            if lane_signal is not None and xau_mtf_guard:
+                try:
+                    raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+                    raw["xau_multi_tf_guard"] = dict(xau_mtf_guard)
+                    lane_signal.raw_scores = raw
+                except Exception:
+                    pass
+            return lane_signal, lane_source
         if family in {"btc_weekday_lob_momentum", "eth_weekday_overlap_probe"}:
             return self._build_crypto_weekday_experimental_signal(signal, base_source=base_source, candidate=candidate)
         if family == "btc_scalp_flow_short_sidecar":
@@ -4327,6 +4349,216 @@ class DexterScheduler:
         except Exception:
             pass
         return shaped, lane_source
+
+    def _build_xau_psc_canary_signal(
+        self, signal, *, base_source: str, candidate: dict
+    ) -> tuple[object | None, str]:
+        """
+        Pre-London Sweep Continuation (PSC) canary.
+        Asian range (17:00-22:00 UTC) establishes H/L.
+        In the 22:00-02:30 UTC window, detect a false-break sweep below
+        Asian low (long) or above Asian high (short) followed by a V-shape
+        recovery, then enter on continuation toward the opposite range extreme.
+        """
+        family = str((candidate or {}).get("family") or "").strip().lower()
+        if signal is None or family != "xau_scalp_prelondon_sweep_cont":
+            return None, ""
+        if not bool(getattr(config, "XAU_PSC_ENABLED", False)):
+            return None, ""
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return None, ""
+        try:
+            # ── 1. Session window guard ──────────────────────────────────────
+            now_utc = datetime.now(timezone.utc)
+            h = now_utc.hour + now_utc.minute / 60.0
+            pre_start = float(getattr(config, "XAU_PSC_PRE_LONDON_START_UTC", 22.0) or 22.0)
+            pre_end = float(getattr(config, "XAU_PSC_PRE_LONDON_END_UTC", 2.5) or 2.5)
+            # Window wraps midnight: valid if h >= 22.0 OR h <= 2.5
+            in_window = (h >= pre_start) or (h <= pre_end)
+            if not in_window:
+                return None, ""
+            # ── 2. Fetch M5 bars (120 bars = 10h, enough for full Asian range) ──
+            df_raw = xauusd_provider.fetch("5m", bars=120)
+            if df_raw is None or df_raw.empty or len(df_raw) < 30:
+                return None, ""
+            df = df_raw.copy()
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+            # ── 3. Asian range (17:00–22:00 UTC before sweep window start) ──
+            today0 = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            boundary_22h = today0.replace(hour=22)
+            if now_utc < boundary_22h:
+                boundary_22h = boundary_22h - timedelta(days=1)
+            asian_end = boundary_22h
+            asian_start = asian_end - timedelta(hours=5)   # 17:00 UTC
+            asian_bars = df[(df.index >= asian_start) & (df.index < asian_end)]
+            if len(asian_bars) < 8:
+                return None, ""
+            asian_high = float(asian_bars["high"].max())
+            asian_low = float(asian_bars["low"].min())
+            asian_range = asian_high - asian_low
+            rng_min = float(getattr(config, "XAU_PSC_ASIAN_RANGE_MIN", 8.0) or 8.0)
+            rng_max = float(getattr(config, "XAU_PSC_ASIAN_RANGE_MAX", 45.0) or 45.0)
+            if not (rng_min <= asian_range <= rng_max):
+                return None, ""
+            # ── 4. Sweep detection (bars since boundary_22h) ─────────────────
+            sweep_bars_df = df[df.index >= boundary_22h]
+            if len(sweep_bars_df) < 3:
+                return None, ""
+            recovery_max_bars = int(getattr(config, "XAU_PSC_RECOVERY_MAX_BARS", 8) or 8)
+            recent = (sweep_bars_df.iloc[-recovery_max_bars:] if len(sweep_bars_df) >= recovery_max_bars else sweep_bars_df)
+            sw_min = float(getattr(config, "XAU_PSC_SWEEP_MIN_DEPTH", 5.0) or 5.0)
+            sw_max = float(getattr(config, "XAU_PSC_SWEEP_MAX_DEPTH", 30.0) or 30.0)
+            sweep_detected = False
+            sweep_extreme = 0.0
+            sweep_depth = 0.0
+            bars_since_sweep = 0
+            if direction == "long":
+                candidate_low = float(recent["low"].min())
+                depth_val = asian_low - candidate_low
+                if sw_min <= depth_val <= sw_max:
+                    sw_idx = int(recent["low"].values.argmin())
+                    post = recent.iloc[sw_idx + 1:]
+                    if len(post) > 0 and float(post["close"].iloc[-1]) > asian_low:
+                        sweep_detected = True
+                        sweep_extreme = candidate_low
+                        sweep_depth = depth_val
+                        bars_since_sweep = len(recent) - 1 - sw_idx
+            else:
+                candidate_high = float(recent["high"].max())
+                depth_val = candidate_high - asian_high
+                if sw_min <= depth_val <= sw_max:
+                    sw_idx = int(recent["high"].values.argmax())
+                    post = recent.iloc[sw_idx + 1:]
+                    if len(post) > 0 and float(post["close"].iloc[-1]) < asian_high:
+                        sweep_detected = True
+                        sweep_extreme = candidate_high
+                        sweep_depth = depth_val
+                        bars_since_sweep = len(recent) - 1 - sw_idx
+            if not sweep_detected:
+                return None, ""
+            # ── 5. No-chase guard ─────────────────────────────────────────────
+            current_price = float(df["close"].iloc[-1])
+            no_chase = float(getattr(config, "XAU_PSC_NO_CHASE_MAX_PIPS", 20.0) or 20.0)
+            if direction == "long" and current_price > asian_low + no_chase:
+                return None, ""
+            if direction == "short" and current_price < asian_high - no_chase:
+                return None, ""
+            # ── 6. Momentum confirmation (must support recovery direction) ───
+            try:
+                snapshot = dict(
+                    live_profile_autopilot.latest_capture_feature_snapshot(
+                        symbol=str(getattr(signal, "symbol", "") or ""),
+                        lookback_sec=int(getattr(config, "XAU_PSC_LOOKBACK_SEC", 300) or 300),
+                        direction=direction,
+                        confidence=float(getattr(signal, "confidence", 0.0) or 0.0),
+                    ) or {}
+                )
+            except Exception:
+                snapshot = {}
+            feats = dict(snapshot.get("features") or (snapshot.get("gate") or {}).get("features") or {})
+            signed_delta = float(feats.get("delta_proxy", 0.0) or 0.0)
+            tick_up = float(feats.get("tick_up_ratio", 0.5) or 0.5)
+            bar_vol = float(feats.get("bar_volume_proxy", 0.0) or 0.0)
+            min_d = float(getattr(config, "XAU_PSC_MIN_SIGNED_DELTA", 0.02) or 0.02)
+            min_t = float(getattr(config, "XAU_PSC_MIN_TICK_UP_RATIO", 0.48) or 0.48)
+            if direction == "long" and signed_delta < -min_d:
+                return None, ""   # still cascading down
+            if direction == "short" and signed_delta > min_d:
+                return None, ""   # still surging up
+            if direction == "long" and tick_up < min_t:
+                return None, ""
+            if direction == "short" and (1.0 - tick_up) < min_t:
+                return None, ""
+            # ── 7. Build price plan ───────────────────────────────────────────
+            lane_signal = copy.deepcopy(signal)
+            entry_buf = float(getattr(config, "XAU_PSC_ENTRY_BUFFER", 1.5) or 1.5)
+            sl_buf = float(getattr(config, "XAU_PSC_SL_BUFFER", 3.0) or 3.0)
+            tp1_rr = float(getattr(config, "XAU_PSC_TP1_RR", 0.55) or 0.55)
+            tp2_rr = float(getattr(config, "XAU_PSC_TP2_RR", 1.10) or 1.10)
+            tp3_rr = float(getattr(config, "XAU_PSC_TP3_RR", 1.80) or 1.80)
+            if direction == "long":
+                new_entry = round(asian_low + entry_buf, 4)
+                new_stop = round(sweep_extreme - sl_buf, 4)
+            else:
+                new_entry = round(asian_high - entry_buf, 4)
+                new_stop = round(sweep_extreme + sl_buf, 4)
+            new_risk = abs(new_entry - new_stop)
+            if new_risk <= 0 or new_entry <= 0:
+                return None, ""
+            # Override TP targets using sweep depth as scale reference
+            sign = 1.0 if direction == "long" else -1.0
+            lane_signal.take_profit_1 = round(new_entry + sign * new_risk * tp1_rr, 4)
+            lane_signal.take_profit_2 = round(new_entry + sign * new_risk * tp2_rr, 4)
+            lane_signal.take_profit_3 = round(new_entry + sign * new_risk * tp3_rr, 4)
+            lane_signal.risk_reward = round(tp2_rr, 2)
+            shaped = self._apply_family_price_plan(
+                lane_signal,
+                family=family,
+                entry=new_entry,
+                stop_loss=new_stop,
+                entry_type="limit",
+            )
+            if shaped is None:
+                return None, ""
+            lane_source = self._strategy_family_lane_source(base_source, family)
+            self._ensure_signal_trace(shaped, source=lane_source)
+            # ── 8. Audit trail ─────────────────────────────────────────────────
+            try:
+                raw = dict(getattr(shaped, "raw_scores", {}) or {})
+                raw["persistent_canary_enabled"] = True
+                raw["persistent_canary_family_enabled"] = True
+                raw["persistent_canary_source"] = lane_source
+                raw["persistent_canary_base_source"] = str(base_source or "").strip().lower()
+                raw["experimental_family"] = True
+                raw["mt5_canary_mode"] = True
+                raw["strategy_family"] = family
+                raw["strategy_id"] = str((candidate or {}).get("strategy_id") or "")
+                raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+                raw["strategy_family_executor"] = "scheduler_canary_psc"
+                raw["strategy_family_alias"] = self._strategy_family_alias(family)
+                raw["chart_state_psc"] = {
+                    "asian_high": round(asian_high, 4),
+                    "asian_low": round(asian_low, 4),
+                    "asian_range": round(asian_range, 4),
+                    "sweep_extreme": round(sweep_extreme, 4),
+                    "sweep_depth": round(sweep_depth, 4),
+                    "bars_since_sweep": bars_since_sweep,
+                    "current_price": round(current_price, 4),
+                    "signed_delta": round(signed_delta, 4),
+                    "tick_up_ratio": round(tick_up, 4),
+                    "bar_volume_proxy": round(bar_vol, 4),
+                    "new_entry": round(new_entry, 4),
+                    "new_stop": round(new_stop, 4),
+                    "new_risk": round(new_risk, 4),
+                    "sweep_window_start_utc": boundary_22h.isoformat(),
+                    "asian_session_utc": f"{asian_start.strftime('%H:%M')}-{asian_end.strftime('%H:%M')} UTC",
+                }
+                raw["mt5_ignore_open_positions"] = True
+                raw["ctrader_risk_usd_override"] = round(
+                    float(getattr(config, "XAU_PSC_CTRADER_RISK_USD", 0.75) or 0.75), 4
+                )
+                raw["mt5_limit_allow_market_fallback"] = False
+                raw = self._apply_xau_observability_tags(
+                    raw,
+                    source=lane_source,
+                    family=family,
+                    chart_state={
+                        "state_label": "prelondon_sweep_continuation",
+                        "day_type": "",
+                    },
+                    follow_up_plan="sweep_recovery_london_continuation",
+                )
+                shaped.raw_scores = raw
+            except Exception:
+                pass
+            return shaped, lane_source
+        except Exception as e:
+            logger.debug("[Scheduler] PSC canary build error: %s", e)
+            return None, ""
 
     def _build_tick_depth_filter_canary_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
         family = str((candidate or {}).get("family") or "").strip().lower()
