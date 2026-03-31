@@ -6469,6 +6469,108 @@ class DexterScheduler:
             out["reason"] = "error"
             return out
 
+    def _xau_scheduled_news_guard(self) -> dict:
+        """
+        Pre/post blocking for scheduled high-impact USD news events.
+        Tier-1 (NFP/FOMC/CPI/PPI/GDP) → kill_switch=True (pre=45min / post=30min).
+        Tier-2 other high-impact USD → active=True only, size reduction (pre=30min / post=15min).
+        Uses economic_calendar feed (ForexFactory XML, cached 5min).
+        """
+        out: dict = {
+            "enabled": bool(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_ENABLED", True)),
+            "active": False,
+            "kill_switch": False,
+        }
+        if not out["enabled"]:
+            out["reason"] = "disabled"
+            return out
+        try:
+            pre_min = max(5, int(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_PRE_MIN", 30) or 30))
+            post_min = max(5, int(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_POST_MIN", 15) or 15))
+            t1_pre_min = max(5, int(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_TIER1_PRE_MIN", 45) or 45))
+            t1_post_min = max(5, int(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_TIER1_POST_MIN", 30) or 30))
+            raw_t1 = str(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_TIER1_EVENTS", "") or "").strip()
+            if raw_t1:
+                t1_keywords: set[str] = {k.strip().lower() for k in raw_t1.split(",") if k.strip()}
+            else:
+                t1_keywords = {
+                    "non-farm", "nonfarm", "non farm",
+                    "fomc", "federal funds rate", "fed funds",
+                    "cpi", "consumer price index", "core cpi",
+                    "ppi", "producer price", "core ppi",
+                    "gdp",
+                    "initial jobless",
+                    "unemployment rate",
+                    "retail sales",
+                    "ism manufacturing", "ism services",
+                    "core pce", "pce price",
+                }
+            now_utc = datetime.now(timezone.utc)
+            max_pre = max(t1_pre_min, pre_min)
+            max_post = max(t1_post_min, post_min)
+            all_events = economic_calendar.fetch_events()
+            hits: list[tuple] = []
+            for ev in all_events:
+                if str(ev.currency or "").upper() != "USD":
+                    continue
+                if str(ev.impact or "").lower() != "high":
+                    continue
+                delta_min = (ev.time_utc - now_utc).total_seconds() / 60.0
+                # positive = future (pre-window), negative = past (post-window)
+                if delta_min > max_pre or delta_min < -max_post:
+                    continue
+                hits.append((ev, delta_min))
+            if not hits:
+                out["reason"] = "clear"
+                return out
+            best_t1: tuple | None = None
+            best_t2: tuple | None = None
+            for ev, delta_min in hits:
+                title_lower = str(ev.title or "").lower()
+                is_t1 = any(kw in title_lower for kw in t1_keywords)
+                if is_t1:
+                    if -t1_post_min <= delta_min <= t1_pre_min:
+                        if best_t1 is None or abs(delta_min) < abs(best_t1[1]):
+                            best_t1 = (ev, delta_min)
+                else:
+                    if -post_min <= delta_min <= pre_min:
+                        if best_t2 is None or abs(delta_min) < abs(best_t2[1]):
+                            best_t2 = (ev, delta_min)
+            if best_t1:
+                ev, delta_min = best_t1
+                phase = "PRE" if delta_min >= 0 else "POST"
+                out.update({
+                    "active": True,
+                    "kill_switch": True,
+                    "tier": "tier1",
+                    "event_title": str(ev.title or ""),
+                    "event_time_utc": ev.time_utc.isoformat(),
+                    "delta_min": round(delta_min, 1),
+                    "phase": phase,
+                    "reason": f"tier1_{phase.lower()}_event",
+                })
+                return out
+            if best_t2:
+                ev, delta_min = best_t2
+                phase = "PRE" if delta_min >= 0 else "POST"
+                out.update({
+                    "active": True,
+                    "kill_switch": False,
+                    "tier": "tier2",
+                    "event_title": str(ev.title or ""),
+                    "event_time_utc": ev.time_utc.isoformat(),
+                    "delta_min": round(delta_min, 1),
+                    "phase": phase,
+                    "reason": f"tier2_{phase.lower()}_event",
+                })
+                return out
+            out["reason"] = "out_of_window"
+            return out
+        except Exception as e:
+            logger.debug("[Scheduler] XAU scheduled news guard skipped: %s", e)
+            out["reason"] = "error"
+            return out
+
     @staticmethod
     def _xau_guard_transition_state_record(news_freeze: dict, shock: dict) -> dict:
         events = [str(item or "").strip() for item in list((news_freeze or {}).get("events") or []) if str(item or "").strip()]
@@ -6618,8 +6720,64 @@ class DexterScheduler:
             signal.raw_scores = raw
         except Exception:
             pass
-        if not bool(state.get("active", False)):
+        # --- Scheduled news guard: eco-calendar pre/post USD event blocking ---
+        sng_state = self._xau_scheduled_news_guard()
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_news_guard_enabled"] = bool(sng_state.get("enabled", False))
+            raw["xau_news_guard_active"] = bool(sng_state.get("active", False))
+            raw["xau_news_guard_kill_switch"] = bool(sng_state.get("kill_switch", False))
+            if sng_state.get("event_title"):
+                raw["xau_news_guard_event"] = str(sng_state.get("event_title") or "")[:120]
+            if sng_state.get("delta_min") is not None:
+                raw["xau_news_guard_delta_min"] = float(sng_state.get("delta_min") or 0.0)
+            if sng_state.get("tier"):
+                raw["xau_news_guard_tier"] = str(sng_state.get("tier") or "")
+            signal.raw_scores = raw
+        except Exception:
+            pass
+        if bool(sng_state.get("kill_switch", False)):
+            _sng_tag = (
+                f"{sng_state.get('tier','?')} {sng_state.get('phase','?')} "
+                f"{float(sng_state.get('delta_min', 0.0) or 0.0):.0f}min "
+                f"{str(sng_state.get('event_title', '?') or '?')[:60]!r}"
+            )
+            logger.info(
+                "[Scheduler] XAU guard | SCHEDULED NEWS KILL | %s | source=%s",
+                _sng_tag, source,
+            )
+            blocked = MT5ExecutionResult(
+                ok=False,
+                status="guard_blocked",
+                message=f"xau scheduled news kill-switch ({_sng_tag})",
+                signal_symbol=str(getattr(signal, "symbol", "") or ""),
+            )
+            return blocked, volume_multiplier
+        # Early exit: neither reactive shock nor scheduled news guard is active
+        if not bool(state.get("active", False)) and not bool(sng_state.get("active", False)):
             return None, volume_multiplier
+        # Tier-2 only (news guard active, reactive shock inactive) → size reduction, no TP change
+        if not bool(state.get("active", False)):
+            _sng_mult = max(0.05, min(1.0, float(getattr(config, "XAU_SCHEDULED_NEWS_GUARD_SIZE_MULT", 0.50) or 0.50)))
+            _base = 1.0 if volume_multiplier is None else float(volume_multiplier)
+            _new_vol = round(_base * _sng_mult, 4)
+            _sng_log = (
+                f"{sng_state.get('tier','?')} {sng_state.get('phase','?')} "
+                f"{float(sng_state.get('delta_min', 0.0) or 0.0):.0f}min "
+                f"{str(sng_state.get('event_title', '?') or '?')[:50]!r}"
+            )
+            logger.info(
+                "[Scheduler] XAU guard | SCHEDULED NEWS ACTIVE | size_mult=%.2f new_vol=%.4f | %s | source=%s",
+                _sng_mult, _new_vol, _sng_log, source,
+            )
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["xau_news_guard_size_mult"] = float(_sng_mult)
+                raw["xau_news_guard_volume_after"] = float(_new_vol)
+                signal.raw_scores = raw
+            except Exception:
+                pass
+            return None, _new_vol
         state_tag = (
             f"shock={float(state.get('shock_score', 0.0) or 0.0):.2f} "
             f"srcQ={float(state.get('source_quality', 0.0) or 0.0):.2f} "
