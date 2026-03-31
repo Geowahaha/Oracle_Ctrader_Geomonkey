@@ -1095,7 +1095,7 @@ class Config:
     XAU_PSC_PRE_LONDON_START_UTC: float = float(os.getenv("XAU_PSC_PRE_LONDON_START_UTC", "22.0"))
     XAU_PSC_PRE_LONDON_END_UTC: float = float(os.getenv("XAU_PSC_PRE_LONDON_END_UTC", "2.5"))
     XAU_PSC_ASIAN_RANGE_MIN: float = float(os.getenv("XAU_PSC_ASIAN_RANGE_MIN", "8.0"))
-    XAU_PSC_ASIAN_RANGE_MAX: float = float(os.getenv("XAU_PSC_ASIAN_RANGE_MAX", "45.0"))
+    XAU_PSC_ASIAN_RANGE_MAX: float = float(os.getenv("XAU_PSC_ASIAN_RANGE_MAX", "60.0"))
     XAU_PSC_SWEEP_MIN_DEPTH: float = float(os.getenv("XAU_PSC_SWEEP_MIN_DEPTH", "5.0"))
     XAU_PSC_SWEEP_MAX_DEPTH: float = float(os.getenv("XAU_PSC_SWEEP_MAX_DEPTH", "30.0"))
     XAU_PSC_RECOVERY_MAX_BARS: int = int(os.getenv("XAU_PSC_RECOVERY_MAX_BARS", "8"))
