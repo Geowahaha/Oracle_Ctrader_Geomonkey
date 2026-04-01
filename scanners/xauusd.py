@@ -51,21 +51,26 @@ class XAUUSDScanner:
             imbalance = float(features.get("depth_imbalance", 0.0))
             tick_velocity = float(features.get("bar_volume_proxy", 0.0))
             
-            # Constraints:
+            delta_thr = float(getattr(config, "MRD_DELTA_BIAS_THRESHOLD", 0.15) or 0.15)
+            imb_thr = float(getattr(config, "MRD_DEPTH_IMBALANCE_THRESHOLD", 0.25) or 0.25)
+            vel_thr = float(getattr(config, "MRD_TICK_VELOCITY_MIN", 0.10) or 0.10)
+            high_conf = float(getattr(config, "MRD_HIGH_CONF_THRESHOLD", 75.0) or 75.0)
+            high_conf_relax = float(getattr(config, "MRD_HIGH_CONF_DELTA_RELAX", 0.10) or 0.10)
+
+            effective_delta_thr = delta_thr + high_conf_relax if signal.confidence >= high_conf else delta_thr
+
             if signal.direction == "long":
-                # We want positive or neutral delta (don't buy in strong sell-off)
-                if delta < -0.15:
+                if delta < -effective_delta_thr:
                     return False, f"negative_delta_bias:{delta:.3f}"
-                if imbalance < -0.25:
+                if imbalance < -imb_thr:
                     return False, f"negative_depth_imbalance:{imbalance:.3f}"
             else:
-                # We want negative or neutral delta (don't sell in strong blow-off)
-                if delta > 0.15:
+                if delta > effective_delta_thr:
                     return False, f"positive_delta_bias:{delta:.3f}"
-                if imbalance > 0.25:
+                if imbalance > imb_thr:
                     return False, f"positive_depth_imbalance:{imbalance:.3f}"
             
-            if tick_velocity < 0.18:
+            if tick_velocity < vel_thr:
                 return False, f"low_tick_velocity:{tick_velocity:.3f}"
                 
             return True, "micro_aligned"
