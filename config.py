@@ -270,7 +270,7 @@ class Config:
         "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_failed_fade_follow_stop,xau_scalp_range_repair",
     )
     XAU_RANGE_REPAIR_ENABLED: bool = os.getenv("XAU_RANGE_REPAIR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-    XAU_RANGE_REPAIR_MIN_CONFIDENCE: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_CONFIDENCE", "65.0"))
+    XAU_RANGE_REPAIR_MIN_CONFIDENCE: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_CONFIDENCE", "0"))
     XAU_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("XAU_RANGE_REPAIR_LOOKBACK_SEC", "300"))
     XAU_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("XAU_RANGE_REPAIR_ALLOWED_STATES", "range_probe")
     XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES", "fast_expansion,panic_spread")

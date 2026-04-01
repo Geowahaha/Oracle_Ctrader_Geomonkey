@@ -4207,10 +4207,11 @@ class DexterScheduler:
         direction = str(getattr(signal, "direction", "") or "").strip().lower()
         if direction not in {"long", "short"}:
             return None, ""
-        rr_min_conf = float(getattr(config, "XAU_RANGE_REPAIR_MIN_CONFIDENCE", 65.0) or 65.0)
-        signal_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
-        if signal_conf < rr_min_conf:
-            return None, ""
+        rr_min_conf = float(getattr(config, "XAU_RANGE_REPAIR_MIN_CONFIDENCE", 0.0) or 0.0)
+        if rr_min_conf > 0:
+            signal_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+            if signal_conf < rr_min_conf:
+                return None, ""
         try:
             snapshot = dict(
                 live_profile_autopilot.latest_capture_feature_snapshot(
