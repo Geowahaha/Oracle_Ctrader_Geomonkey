@@ -3364,6 +3364,15 @@ class CTraderExecutor:
                 meta["market_capture"] = {"ok": False, "status": "capture_error", "message": str(e)}
                 result.execution_meta = meta
             self._update_journal_execution_meta(journal_id, dict(result.execution_meta or {}))
+            try:
+                from copy_trade.manager import copy_trade_manager
+                copy_trade_manager.dispatch_async(
+                    master_payload=payload,
+                    master_result=raw,
+                    source=source,
+                )
+            except Exception as ct_err:
+                logger.debug("[CopyTrade] dispatch skipped: %s", ct_err)
         return result
 
     def health_check(self, *, live: bool = True) -> dict:

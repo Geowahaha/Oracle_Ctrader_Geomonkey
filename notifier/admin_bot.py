@@ -741,6 +741,7 @@ class TelegramAdminBot:
             "update_openclaw", "skip_openclaw", "openclaw_version",
             "ask", "chat", "q",
             "budget", "token_budget",
+            "copy_status", "copy_add_ctrader", "copy_add_mt5", "copy_remove", "copy_pause", "copy_resume", "copy_log",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -6777,6 +6778,134 @@ class TelegramAdminBot:
                 self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
             except Exception as exc:
                 self._send_text(chat_id, f"Budget error: {exc}")
+            return
+
+        if command == "copy_status":
+            try:
+                from copy_trade.manager import copy_trade_manager
+                self._send_text(chat_id, copy_trade_manager.format_telegram_status(), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"CopyTrade error: {exc}")
+            return
+
+        if command == "copy_add_ctrader":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            parts = str(args or "").strip().split()
+            if len(parts) < 2:
+                self._send_text(
+                    chat_id,
+                    "Usage: /copy_add_ctrader <label> <account_id> [risk_mult] [max_risk_usd]\n"
+                    "Example: /copy_add_ctrader MyAccount2 12345678 0.5 25",
+                )
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                label = parts[0]
+                ct_id = int(parts[1])
+                risk_mult = float(parts[2]) if len(parts) > 2 else 1.0
+                max_risk = float(parts[3]) if len(parts) > 3 else 50.0
+                acc = _ct_reg.add_ctrader(label, ct_id, risk_multiplier=risk_mult, max_risk_usd=max_risk)
+                self._send_text(
+                    chat_id,
+                    f"✅ Added cTrader follower:\n"
+                    f"  Label: {acc.label}\n"
+                    f"  Account: {acc.ctrader_account_id}\n"
+                    f"  Risk: {acc.risk_multiplier}x (max ${acc.max_risk_usd})",
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_add_mt5":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            parts = str(args or "").strip().split()
+            if len(parts) < 2:
+                self._send_text(
+                    chat_id,
+                    "Usage: /copy_add_mt5 <label> <login> [server] [risk_mult] [max_risk_usd]\n"
+                    "Example: /copy_add_mt5 MyMT5 5001234 ICMarkets-Live 0.5 25",
+                )
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                label = parts[0]
+                login = int(parts[1])
+                server = parts[2] if len(parts) > 2 else ""
+                risk_mult = float(parts[3]) if len(parts) > 3 else 1.0
+                max_risk = float(parts[4]) if len(parts) > 4 else 50.0
+                acc = _ct_reg.add_mt5(label, mt5_login=login, mt5_server=server, risk_multiplier=risk_mult, max_risk_usd=max_risk)
+                self._send_text(
+                    chat_id,
+                    f"✅ Added MT5 follower:\n"
+                    f"  Label: {acc.label}\n"
+                    f"  Login: {acc.mt5_login}\n"
+                    f"  Server: {acc.mt5_server or 'default'}\n"
+                    f"  Risk: {acc.risk_multiplier}x (max ${acc.max_risk_usd})",
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_remove":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            account_id = str(args or "").strip()
+            if not account_id:
+                self._send_text(chat_id, "Usage: /copy_remove <account_id>\nUse /copy_status to see account IDs.")
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                if _ct_reg.remove(account_id):
+                    self._send_text(chat_id, f"✅ Removed: {account_id}")
+                else:
+                    self._send_text(chat_id, f"❌ Not found: {account_id}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command in ("copy_pause", "copy_resume"):
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            account_id = str(args or "").strip()
+            if not account_id:
+                self._send_text(chat_id, f"Usage: /{command} <account_id>")
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                enabled = command == "copy_resume"
+                if _ct_reg.set_enabled(account_id, enabled):
+                    status = "resumed" if enabled else "paused"
+                    self._send_text(chat_id, f"✅ {account_id} {status}")
+                else:
+                    self._send_text(chat_id, f"❌ Not found: {account_id}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_log":
+            try:
+                from copy_trade.manager import copy_trade_manager
+                logs = copy_trade_manager.get_recent_log(10)
+                if not logs:
+                    self._send_text(chat_id, "No recent copy trade dispatches.")
+                    return
+                lines = ["📊 *Recent Copy Trades*\n"]
+                for entry in reversed(logs):
+                    sym = entry.get("symbol", "")
+                    d = entry.get("direction", "")
+                    ok = entry.get("success", 0)
+                    fail = entry.get("failed", 0)
+                    ts = entry.get("ts", "")
+                    lines.append(f"  {ts} {sym} {d} | ✅{ok} ❌{fail}")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
             return
 
         if command in {"ask", "chat", "q"}:
