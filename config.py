@@ -340,7 +340,7 @@ class Config:
     XAU_MULTI_TF_ENTRY_GUARD_ENABLED: bool = os.getenv("XAU_MULTI_TF_ENTRY_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MULTI_TF_ENTRY_GUARD_FAMILIES: str = os.getenv(
         "XAU_MULTI_TF_ENTRY_GUARD_FAMILIES",
-        "xau_scalp_tick_depth_filter,xau_scalp_flow_short_sidecar,xau_scalp_microtrend_follow_up,xau_scalp_pullback_limit,xau_scalp_breakout_stop",
+        "xau_scalp_tick_depth_filter,xau_scalp_flow_short_sidecar,xau_scalp_microtrend_follow_up,xau_scalp_pullback_limit,xau_scalp_breakout_stop,xau_scalp_range_repair",
     )
     XAU_MULTI_TF_ENTRY_GUARD_REQUIRE_H1_H4_ALIGN: bool = os.getenv("XAU_MULTI_TF_ENTRY_GUARD_REQUIRE_H1_H4_ALIGN", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MULTI_TF_ENTRY_GUARD_ALLOW_COUNTERTREND_CONFIRMED: bool = os.getenv("XAU_MULTI_TF_ENTRY_GUARD_ALLOW_COUNTERTREND_CONFIRMED", "1").strip().lower() in ("1", "true", "yes", "on")
