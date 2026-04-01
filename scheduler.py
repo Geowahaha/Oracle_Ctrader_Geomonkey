@@ -6727,14 +6727,8 @@ class DexterScheduler:
             else:
                 t1_keywords = {
                     "non-farm", "nonfarm", "non farm",
-                    "fomc", "federal funds rate", "fed funds",
-                    "cpi", "consumer price index", "core cpi",
-                    "ppi", "producer price", "core ppi",
-                    "gdp",
-                    "initial jobless",
-                    "unemployment rate",
-                    "retail sales",
-                    "ism manufacturing", "ism services",
+                    "fomc", "federal funds rate",
+                    "cpi", "consumer price index",
                     "core pce", "pce price",
                 }
             now_utc = datetime.now(timezone.utc)
