@@ -181,6 +181,13 @@ class Config:
     BTC_RANGE_REPAIR_TP3_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP3_RR", "1.15"))
     BTC_RANGE_REPAIR_CTRADER_RISK_USD: float = float(os.getenv("BTC_RANGE_REPAIR_CTRADER_RISK_USD", "0.55"))
 
+    # ── XAU MRD — Microstructure Regime Detector (XAUUSD Scanner) ──
+    MRD_DELTA_BIAS_THRESHOLD: float = float(os.getenv("MRD_DELTA_BIAS_THRESHOLD", "0.15"))
+    MRD_DEPTH_IMBALANCE_THRESHOLD: float = float(os.getenv("MRD_DEPTH_IMBALANCE_THRESHOLD", "0.25"))
+    MRD_TICK_VELOCITY_MIN: float = float(os.getenv("MRD_TICK_VELOCITY_MIN", "0.10"))
+    MRD_HIGH_CONF_THRESHOLD: float = float(os.getenv("MRD_HIGH_CONF_THRESHOLD", "75.0"))
+    MRD_HIGH_CONF_DELTA_RELAX: float = float(os.getenv("MRD_HIGH_CONF_DELTA_RELAX", "0.10"))
+
     # ── Crypto MRD — BTC Microstructure Regime Detector (Phase 4) ──
     BTC_MRD_ENABLED: bool = os.getenv("BTC_MRD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     BTC_MRD_LOOKBACK_SEC: int = int(os.getenv("BTC_MRD_LOOKBACK_SEC", "600"))
@@ -670,6 +677,10 @@ class Config:
     CTRADER_MARKET_CAPTURE_DEPTH_LEVELS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_DEPTH_LEVELS", "5"))
     CTRADER_MARKET_CAPTURE_ON_START: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_MARKET_CAPTURE_ON_EXECUTE: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── Copy Trade System ──
+    COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    COPY_TRADE_WORKER_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_WORKER_TIMEOUT_SEC", "25"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC", "6"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS", "240"))
     CTRADER_PENDING_ORDER_SWEEP_ENABLED: bool = os.getenv("CTRADER_PENDING_ORDER_SWEEP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
