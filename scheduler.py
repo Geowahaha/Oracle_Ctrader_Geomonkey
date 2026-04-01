@@ -514,6 +514,7 @@ class DexterScheduler:
                 aligned_side = "short"
         countertrend_confirmed = self._signal_countertrend_confirmed(signal)
         require_align = bool(getattr(config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True))
+        signal_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
         result = {
             "allowed": True,
             "reason": "aligned_or_neutral",
@@ -525,6 +526,17 @@ class DexterScheduler:
             "countertrend_confirmed": countertrend_confirmed,
         }
         if require_align and not aligned_side:
+            partial_align = bool(getattr(config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True))
+            partial_min_conf = float(getattr(config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF", 70.0) or 70.0)
+            if partial_align and direction in {"long", "short"}:
+                trend_map = {"bullish": "long", "bearish": "short"}
+                support_count = sum(
+                    1 for t in (d1_trend, h4_trend, h1_trend) if trend_map.get(t) == direction
+                )
+                result["mtf_support_count"] = support_count
+                if support_count >= 2 and signal_conf >= partial_min_conf:
+                    result["reason"] = f"partial_2of3_aligned:{support_count}/3_conf={signal_conf:.1f}"
+                    return result
             result["allowed"] = False
             result["reason"] = "d1_h4_h1_not_aligned"
             return result
@@ -550,7 +562,7 @@ class DexterScheduler:
             getattr(
                 config,
                 "XAU_MULTI_TF_ENTRY_GUARD_FAMILIES",
-                "xau_scalp_tick_depth_filter,xau_scalp_flow_short_sidecar,xau_scalp_microtrend_follow_up,xau_scalp_pullback_limit,xau_scalp_breakout_stop",
+                "xau_scalp_tick_depth_filter,xau_scalp_flow_short_sidecar,xau_scalp_microtrend_follow_up,xau_scalp_pullback_limit,xau_scalp_breakout_stop,xau_scalp_range_repair",
             )
         )
         family_token = str(family or "").strip().lower()
@@ -4194,6 +4206,10 @@ class DexterScheduler:
             return None, ""
         direction = str(getattr(signal, "direction", "") or "").strip().lower()
         if direction not in {"long", "short"}:
+            return None, ""
+        rr_min_conf = float(getattr(config, "XAU_RANGE_REPAIR_MIN_CONFIDENCE", 65.0) or 65.0)
+        signal_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+        if signal_conf < rr_min_conf:
             return None, ""
         try:
             snapshot = dict(
