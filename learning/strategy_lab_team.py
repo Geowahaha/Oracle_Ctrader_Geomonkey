@@ -210,6 +210,36 @@ class StrategyLabTeamAgent:
             recovery.append(enriched)
         return recovery[:topk]
 
+    def _merge_force_recovery_rows(self, *, symbol: str, ranked: list[dict], recovery: list[dict]) -> list[dict]:
+        """Append STRATEGY_LAB_FORCE_RECOVERY_FAMILIES even when a live_shadow desk is active (recovery desk was skipped)."""
+        if str(symbol or "").strip().upper() != "XAUUSD":
+            return list(recovery or [])
+        force_families = {
+            str(f or "").strip().lower()
+            for f in str(getattr(config, "STRATEGY_LAB_FORCE_RECOVERY_FAMILIES", "") or "").split(",")
+            if str(f or "").strip()
+        }
+        if not force_families:
+            return list(recovery or [])
+        have = {str(r.get("family") or "").strip().lower() for r in (recovery or []) if str(r.get("family") or "").strip()}
+        out = list(recovery or [])
+        for row in list(ranked or []):
+            if not isinstance(row, dict):
+                continue
+            fam = str(row.get("family") or "").strip().lower()
+            if fam not in force_families or fam in have:
+                continue
+            mode = str(row.get("mode") or "").strip().lower()
+            if mode not in {"shadow", "blocked"}:
+                continue
+            if not bool(row.get("execution_ready", False)):
+                continue
+            enriched = dict(row)
+            enriched["recovery_reason"] = "config_force_recovery"
+            out.append(enriched)
+            have.add(fam)
+        return out
+
     def build_report(self, *, strategy_lab_report: dict | None = None) -> dict:
         report = dict(strategy_lab_report or self._load_json(self.strategy_lab_report_path) or {})
         out = {
@@ -278,6 +308,7 @@ class StrategyLabTeamAgent:
             recovery_queue = []
             if not promotion_queue and not live_shadow_queue:
                 recovery_queue = self._build_recovery_queue(symbol=symbol, ranked=ranked)
+            recovery_queue = self._merge_force_recovery_rows(symbol=symbol, ranked=ranked, recovery=recovery_queue)
 
             summary = {
                 "candidate_count": len(ranked),

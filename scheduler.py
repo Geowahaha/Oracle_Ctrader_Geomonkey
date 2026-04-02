@@ -1588,6 +1588,9 @@ class DexterScheduler:
             for item in list(strategy_lab_symbol.get("recovery_families") or [])
             if str(item or "").strip()
         }
+        strategy_lab_exec_bypass = self._parse_lower_csv(
+            str(getattr(config, "PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK", "") or "")
+        )
 
         def _strategy_lab_mode(strategy_id: str, family: str) -> str:
             sid = str(strategy_id or "").strip()
@@ -1607,6 +1610,9 @@ class DexterScheduler:
             return mode
 
         def _strategy_lab_family_allowed(family: str) -> bool:
+            ft = str(family or "").strip().lower()
+            if ft and ft in strategy_lab_exec_bypass:
+                return True
             return _effective_strategy_lab_mode("", family) not in {"blocked", "shadow"}
 
         if symbol_token == "XAUUSD":

@@ -1958,6 +1958,7 @@ class LiveProfileAutopilot:
         lookback_days = max(1, int(days or 21))
         since_iso = _iso(_utc_now() - timedelta(days=lookback_days))
         min_resolved = max(2, int(getattr(config, "CHART_STATE_MEMORY_MIN_RESOLVED", 2) or 2))
+        follow_up_min = max(1, int(getattr(config, "CHART_STATE_MEMORY_FOLLOW_UP_MIN_RESOLVED", 1) or 1))
         out = {
             "ok": True,
             "generated_at": _iso(_utc_now()),
@@ -2161,7 +2162,7 @@ class LiveProfileAutopilot:
                     + (avg_pnl_edge * 2.0)
                 )
                 follow_up_candidate = bool(
-                    resolved >= min_resolved
+                    resolved >= follow_up_min
                     and float(stats.get("pnl_usd", 0.0) or 0.0) > 0.0
                     and float(stats.get("win_rate", 0.0) or 0.0) >= 0.57
                     and str(bucket.get("state_label") or "") in {

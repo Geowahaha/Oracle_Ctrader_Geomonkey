@@ -104,6 +104,12 @@ class Config:
     PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD", "1.25"))
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED: bool = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES: str = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES", "xau_scalp_tick_depth_filter,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_range_repair")
+    # Comma-separated families that ignore Strategy Lab blocked/shadow for persistent canary candidate loading.
+    # Default: XAU flow sidecars (still require pattern + chart contexts / first_sample gates in builders).
+    PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK: str = os.getenv(
+        "PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK",
+        "xau_scalp_flow_short_sidecar,xau_scalp_flow_long_sidecar",
+    )
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS: int = int(os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", "1"))
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_CTRADER_RISK_USD", "0.75"))
     BTC_WEEKDAY_LOB_ALLOWED_SESSIONS: str = os.getenv("BTC_WEEKDAY_LOB_ALLOWED_SESSIONS", "new_york|london,new_york,overlap")
@@ -267,7 +273,7 @@ class Config:
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES: str = os.getenv(
         "TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES",
-        "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_failed_fade_follow_stop,xau_scalp_range_repair",
+        "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_flow_long_sidecar,xau_scalp_failed_fade_follow_stop,xau_scalp_range_repair",
     )
     XAU_RANGE_REPAIR_ENABLED: bool = os.getenv("XAU_RANGE_REPAIR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_RANGE_REPAIR_MIN_CONFIDENCE: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_CONFIDENCE", "0"))
@@ -507,7 +513,7 @@ class Config:
     CTRADER_PM_XAU_ACTIVE_DEFENSE_ENABLED: bool = os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_XAU_ACTIVE_DEFENSE_ALLOWED_SOURCES: str = os.getenv(
         "CTRADER_PM_XAU_ACTIVE_DEFENSE_ALLOWED_SOURCES",
-        "xauusd_scheduled:canary,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:rr:canary",
+        "xauusd_scheduled:canary,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:fls:canary,scalp_xauusd:rr:canary,xauusd_scheduled:winner",
     )
     CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_AGE_MIN", "2.0"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_BAR_VOLUME_PROXY", "0.32"))
@@ -518,10 +524,20 @@ class Config:
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_SCORE: int = int(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_SCORE", "3"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_SCORE: int = int(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_SCORE", "5"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_MAX_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_MAX_R", "0.20"))
+    # When underwater by this many R multiples and microstructure score is bad, cut before full SL (soft stop).
+    CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_ENABLED: bool = os.getenv(
+        "CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_R", "-0.28"))
+    CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_MIN_SCORE: int = int(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_MIN_SCORE", "3"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", "0.42"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", "0.05"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", "0.55"))
     CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN", "0.15"))
+    # When trading manager xau_order_care is inactive, still allow TP extension using config defaults (capture snapshot required).
+    CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE: bool = os.getenv(
+        "CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED: bool = os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT: float = float(os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT", "1.15"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED: bool = os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -951,6 +967,9 @@ class Config:
     CHART_STATE_ROUTER_BONUS_MULT: float = float(os.getenv("CHART_STATE_ROUTER_BONUS_MULT", "0.12"))
     CHART_STATE_ROUTER_MIN_RESOLVED: int = int(os.getenv("CHART_STATE_ROUTER_MIN_RESOLVED", "3"))
     CHART_STATE_ROUTER_FOLLOW_UP_ONLY: bool = os.getenv("CHART_STATE_ROUTER_FOLLOW_UP_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Min resolved trades per bucket to mark follow_up_candidate in chart_state_memory_report (FSS/FLS context loader).
+    # Default 1 allows first profitable continuation bucket to qualify; still requires pnl>0, wr>=0.57, allowed state_label.
+    CHART_STATE_MEMORY_FOLLOW_UP_MIN_RESOLVED: int = int(os.getenv("CHART_STATE_MEMORY_FOLLOW_UP_MIN_RESOLVED", "1"))
     WINNER_MEMORY_LIBRARY_LOOKBACK_DAYS: int = int(os.getenv("WINNER_MEMORY_LIBRARY_LOOKBACK_DAYS", "21"))
     WINNER_MEMORY_LIBRARY_MIN_RESOLVED: int = int(os.getenv("WINNER_MEMORY_LIBRARY_MIN_RESOLVED", "3"))
     WINNER_MEMORY_LIBRARY_MIN_WIN_RATE: float = float(os.getenv("WINNER_MEMORY_LIBRARY_MIN_WIN_RATE", "0.60"))

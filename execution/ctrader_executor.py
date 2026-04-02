@@ -1821,7 +1821,9 @@ class CTraderExecutor:
             return {"active": False}
         order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
         if not order_care_state:
-            return {"active": False, "reason": "order_care_inactive"}
+            if not bool(getattr(config, "CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE", True)):
+                return {"active": False, "reason": "order_care_inactive"}
+            order_care_state = {"overrides": {}}
         if not self._target_valid_for_position(direction, entry, current_tp):
             return {"active": False, "reason": "invalid_current_target"}
         if not self._price_crossed_target(direction, current_price, current_tp):
@@ -2050,6 +2052,21 @@ class CTraderExecutor:
         risk = abs(entry - stop_loss)
         if risk <= 0:
             return {"active": False, "reason": "invalid_risk", "details": details}
+
+        if bool(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_ENABLED", True)) and (r_now is not None):
+            loss_cut_r = float(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_R", -0.28) or -0.28)
+            loss_cut_min_score = max(1, int(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_LOSS_CUT_MIN_SCORE", 3) or 3))
+            if float(r_now) <= loss_cut_r and int(score) >= loss_cut_min_score:
+                return {
+                    "active": True,
+                    "action": "close",
+                    "reason": "xau_active_defense_loss_cut",
+                    "details": {
+                        **details,
+                        "loss_cut_r_threshold": round(loss_cut_r, 4),
+                        "loss_cut_min_score": loss_cut_min_score,
+                    },
+                }
 
         close_score = max(1, int(order_care_overrides.get("close_score", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_SCORE", 5) or 5) or 5))
         close_max_r = float(order_care_overrides.get("close_max_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_CLOSE_MAX_R", 0.20) or 0.20) or 0.20)
