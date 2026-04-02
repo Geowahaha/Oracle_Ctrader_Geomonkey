@@ -1543,22 +1543,34 @@ class ScalpingScanner:
             "alignment": "mixed",
             "strict_aligned_side": "",
             "strict_alignment": "mixed",
+            "d1_open": 0.0,
+            "d1_last": 0.0,
+            "h1_open": 0.0,
+            "h1_last": 0.0,
+            "h4_open": 0.0,
+            "h4_last": 0.0,
         }
         try:
             df_d1 = xauusd_provider.fetch("1d", bars=220)
             if df_d1 is not None and not getattr(df_d1, "empty", True):
+                out["d1_open"] = float(df_d1["open"].iloc[-1] or 0.0)
+                out["d1_last"] = float(df_d1["close"].iloc[-1] or 0.0)
                 out["d1_trend"] = str(self.ta.determine_trend(self.ta.add_all(df_d1.copy())) or "unknown").strip().lower() or "unknown"
         except Exception:
             pass
         try:
             df_h1 = xauusd_provider.fetch("1h", bars=220)
             if df_h1 is not None and not getattr(df_h1, "empty", True):
+                out["h1_open"] = float(df_h1["open"].iloc[-1] or 0.0)
+                out["h1_last"] = float(df_h1["close"].iloc[-1] or 0.0)
                 out["h1_trend"] = str(self.ta.determine_trend(self.ta.add_all(df_h1.copy())) or "unknown").strip().lower() or "unknown"
         except Exception:
             pass
         try:
             df_h4 = xauusd_provider.fetch("4h", bars=220)
             if df_h4 is not None and not getattr(df_h4, "empty", True):
+                out["h4_open"] = float(df_h4["open"].iloc[-1] or 0.0)
+                out["h4_last"] = float(df_h4["close"].iloc[-1] or 0.0)
                 out["h4_trend"] = str(self.ta.determine_trend(self.ta.add_all(df_h4.copy())) or "unknown").strip().lower() or "unknown"
         except Exception:
             pass
@@ -1667,6 +1679,12 @@ class ScalpingScanner:
             "strict_alignment": str(snap.get("strict_alignment") or ("aligned" if strict_aligned_side else "mixed")),
             "strict_aligned_side": strict_aligned_side,
             "countertrend_confirmed": countertrend_confirmed,
+            "d1_open": float(snap.get("d1_open", 0.0) or 0.0),
+            "d1_last": float(snap.get("d1_last", 0.0) or 0.0),
+            "h1_open": float(snap.get("h1_open", 0.0) or 0.0),
+            "h1_last": float(snap.get("h1_last", 0.0) or 0.0),
+            "h4_open": float(snap.get("h4_open", 0.0) or 0.0),
+            "h4_last": float(snap.get("h4_last", 0.0) or 0.0),
         }
         signal.raw_scores = raw
 

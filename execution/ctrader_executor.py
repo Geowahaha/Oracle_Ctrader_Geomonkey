@@ -1289,6 +1289,85 @@ class CTraderExecutor:
             ), meta
         return True, "", meta
 
+    def _apply_openapi_exec_feature_pack(self, signal, *, source: str, symbol: str) -> None:
+        """Attach recent OpenAPI SQLite microstructure stats to signal.raw_scores (pre-dispatch)."""
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return
+        lookback = max(5, int(getattr(config, "CTRADER_EXEC_FEATURE_LOOKBACK_SEC", 32) or 32))
+        max_ticks = max(4, int(getattr(config, "CTRADER_EXEC_FEATURE_MAX_TICKS", 24) or 24))
+        cutoff = time.time() - float(lookback)
+        pack: dict = {
+            "symbol": sym,
+            "source": str(source or ""),
+            "lookback_sec": lookback,
+            "tick_count": 0,
+            "quote_age_sec": None,
+            "spread_pct_median": None,
+            "bid_velocity_pct": None,
+            "depth_bid_sz_l1": None,
+            "depth_ask_sz_l1": None,
+            "depth_imbalance_l1": None,
+            "db_path": str(self.db_path),
+        }
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            ticks = conn.execute(
+                """
+                SELECT bid, ask, spread_pct, event_ts
+                  FROM ctrader_spot_ticks
+                 WHERE UPPER(COALESCE(symbol,''))=?
+                   AND event_ts >= ?
+                 ORDER BY event_ts DESC
+                 LIMIT ?
+                """,
+                (sym, cutoff, max_ticks),
+            ).fetchall()
+            if ticks:
+                spreads = sorted(_safe_float(r["spread_pct"], 0.0) for r in ticks if _safe_float(r["spread_pct"], 0.0) > 0)
+                if spreads:
+                    pack["spread_pct_median"] = round(float(spreads[len(spreads) // 2]), 6)
+                ts_last = _safe_float(ticks[0]["event_ts"], 0.0)
+                if ts_last > 0:
+                    pack["quote_age_sec"] = round(max(0.0, time.time() - ts_last), 3)
+                bids = [_safe_float(r["bid"], 0.0) for r in reversed(ticks)]
+                if len(bids) >= 2:
+                    first, last_b = bids[0], bids[-1]
+                    mid = last_b if last_b > 0 else (first if first > 0 else 0.0)
+                    if mid > 0 and first > 0:
+                        pack["bid_velocity_pct"] = round((last_b - first) / mid * 100.0, 6)
+            pack["tick_count"] = len(ticks)
+            drows = conn.execute(
+                """
+                SELECT side, SUM(size) AS sz
+                  FROM ctrader_depth_quotes
+                 WHERE UPPER(COALESCE(symbol,''))=?
+                   AND event_ts >= ?
+                   AND level_index=0
+                 GROUP BY side
+                """,
+                (sym, cutoff),
+            ).fetchall()
+        bid_sz = 0.0
+        ask_sz = 0.0
+        for r in drows:
+            side = str(r["side"] or "").strip().lower()
+            s = _safe_float(r["sz"], 0.0)
+            if side == "bid":
+                bid_sz = s
+            elif side in {"ask", "sell"}:
+                ask_sz = s
+        if bid_sz > 0 or ask_sz > 0:
+            pack["depth_bid_sz_l1"] = round(bid_sz, 6)
+            pack["depth_ask_sz_l1"] = round(ask_sz, 6)
+            pack["depth_imbalance_l1"] = round((bid_sz - ask_sz) / max(bid_sz + ask_sz, 1e-9), 6)
+        try:
+            raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+            raw_scores["openapi_exec_features"] = pack
+            signal.raw_scores = raw_scores
+        except Exception:
+            pass
+
     def _take_profit_for_signal(self, signal) -> float:
         level = max(1, min(3, int(getattr(config, "CTRADER_TP_LEVEL", 1) or 1)))
         mapping = {
@@ -3294,6 +3373,12 @@ class CTraderExecutor:
         drift_ok, drift_reason, _drift_meta = self._market_entry_drift_guard(signal, source=source)
         if not drift_ok:
             return _early_exit("filtered", drift_reason)
+
+        if bool(getattr(config, "CTRADER_EXEC_FEATURE_PACK_ENABLED", False)):
+            try:
+                self._apply_openapi_exec_feature_pack(signal, source=source, symbol=symbol)
+            except Exception as exc:
+                logger.debug("[CTRADER] exec feature pack skipped: %s", exc)
 
         payload, reason = self._build_payload(signal, source)
         if payload is None:

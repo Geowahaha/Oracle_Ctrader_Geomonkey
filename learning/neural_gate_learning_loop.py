@@ -1,10 +1,10 @@
 """
 learning/neural_gate_learning_loop.py
 
-Continuous feedback loop for MT5 neural execution gate:
-1) Sync gate decisions from mt5_execution_journal.
+Continuous feedback loop for neural execution gate (cTrader OpenAPI SQLite only):
+1) Sync gate decisions from execution_journal (ctrader_openapi.db, journal_id = row_id + offset).
 2) Resolve outcomes from:
-   - real MT5 closed trades (high trust)
+   - real cTrader closed deals / journal close rows (high trust)
    - shadow/counterfactual scalp outcomes (lower trust)
 3) Calibrate per-scope canary policy (XAU scalp by default).
 4) Publish runtime policy JSON + human-readable mission report.
@@ -136,8 +136,6 @@ class NeuralGateLearningLoop:
         mission_dir = data_dir / "mission_reports"
         mission_dir.mkdir(parents=True, exist_ok=True)
 
-        auto_cfg = str(getattr(config, "MT5_AUTOPILOT_DB_PATH", "") or "").strip()
-        self.autopilot_db_path = Path(auto_cfg) if auto_cfg else (data_dir / "mt5_autopilot.db")
         self.scalp_db_path = data_dir / "scalp_signal_history.db"
         loop_cfg = str(getattr(config, "NEURAL_GATE_LEARNING_DB_PATH", "") or "").strip()
         self.loop_db_path = Path(loop_cfg) if loop_cfg else (data_dir / "neural_gate_learning.db")
@@ -152,10 +150,61 @@ class NeuralGateLearningLoop:
         self._init_db()
 
     @property
+    def ctrader_db_path(self) -> Path:
+        db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        data_dir = Path(__file__).resolve().parent.parent / "data"
+        return Path(db_cfg) if db_cfg else (data_dir / "ctrader_openapi.db")
+
+    def _ctrader_journal_offset(self) -> int:
+        return max(1, int(getattr(config, "NEURAL_GATE_JOURNAL_ID_CTRADER_OFFSET", 1_000_000_000) or 1_000_000_000))
+
+    def _ctrader_sync_eligible(self) -> bool:
+        if not bool(getattr(config, "NEURAL_GATE_CTRADER_SYNC_ENABLED", True)):
+            return False
+        if not bool(getattr(config, "CTRADER_ENABLED", False)):
+            return False
+        return self.ctrader_db_path.exists()
+
+    @property
     def enabled(self) -> bool:
-        return bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)) and bool(
-            getattr(config, "MT5_ENABLED", False)
-        )
+        if not bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)):
+            return False
+        return self._ctrader_sync_eligible()
+
+    @staticmethod
+    def _safe_json_dict(raw: str) -> dict:
+        try:
+            v = json.loads(str(raw or "") or "{}")
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+
+    def _ctrader_row_created_iso(self, created_ts: float | None, created_utc: str | None) -> str:
+        try:
+            ts = float(created_ts or 0.0)
+            if ts > 1e8:
+                return _iso(datetime.fromtimestamp(ts, tz=timezone.utc))
+        except Exception:
+            pass
+        raw = str(created_utc or "").strip()
+        if raw:
+            dt = _parse_iso(raw) if raw.endswith("Z") else None
+            if dt is None:
+                try:
+                    norm = raw.replace(" ", "T", 1)
+                    if not norm.endswith("Z"):
+                        norm = f"{norm}Z"
+                    dt = _parse_iso(norm)
+                except Exception:
+                    dt = None
+            if dt is None and len(raw) >= 19:
+                try:
+                    dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    dt = None
+            if dt is not None:
+                return _iso(dt)
+        return _iso()
 
     def _connect_loop(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.loop_db_path), timeout=15)
@@ -163,15 +212,97 @@ class NeuralGateLearningLoop:
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
-    def _connect_autopilot(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.autopilot_db_path), timeout=15)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _connect_scalp(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.scalp_db_path), timeout=15)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _neural_gate_decisions_column_names(conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute("PRAGMA table_info(neural_gate_decisions)").fetchall()
+        return {str(r[1]) for r in rows} if rows else set()
+
+    def _migrate_neural_gate_exec_columns(self, conn: sqlite3.Connection) -> None:
+        """Rename mt5_status/mt5_message -> exec_status/exec_message (SQLite 3.25+); rebuild if unsupported."""
+        chk = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neural_gate_decisions'"
+        ).fetchone()
+        if not chk:
+            return
+        cols = self._neural_gate_decisions_column_names(conn)
+        if "exec_status" in cols and "exec_message" in cols:
+            return
+        if "mt5_status" not in cols and "mt5_message" not in cols:
+            return
+        try:
+            if "mt5_status" in cols and "exec_status" not in cols:
+                conn.execute("ALTER TABLE neural_gate_decisions RENAME COLUMN mt5_status TO exec_status")
+            cols = self._neural_gate_decisions_column_names(conn)
+            if "mt5_message" in cols and "exec_message" not in cols:
+                conn.execute("ALTER TABLE neural_gate_decisions RENAME COLUMN mt5_message TO exec_message")
+        except sqlite3.OperationalError as e:
+            logger.warning("[NeuralGateLoop] exec column rename failed (%s); rebuilding neural_gate_decisions", e)
+            self._rebuild_neural_gate_decisions_exec_columns(conn)
+
+    def _rebuild_neural_gate_decisions_exec_columns(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            DROP INDEX IF EXISTS idx_ngd_scope_time;
+            DROP INDEX IF EXISTS idx_ngd_resolved;
+            ALTER TABLE neural_gate_decisions RENAME TO neural_gate_decisions__old;
+            CREATE TABLE neural_gate_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                journal_id INTEGER UNIQUE NOT NULL,
+                created_at TEXT NOT NULL,
+                account_key TEXT,
+                source TEXT,
+                signal_symbol TEXT,
+                broker_symbol TEXT,
+                direction TEXT,
+                confidence REAL,
+                neural_prob REAL,
+                min_prob REAL,
+                min_prob_reason TEXT,
+                exec_status TEXT,
+                exec_message TEXT,
+                decision TEXT,
+                decision_reason TEXT,
+                entry REAL,
+                stop_loss REAL,
+                take_profit_2 REAL,
+                force_mode INTEGER,
+                m1_not_confirmed INTEGER,
+                canary_applied INTEGER,
+                features_json TEXT,
+                resolved INTEGER NOT NULL DEFAULT 0,
+                outcome_type TEXT,
+                outcome INTEGER,
+                outcome_label TEXT,
+                pnl_usd REAL,
+                outcome_ref TEXT,
+                weight REAL,
+                resolved_at TEXT
+            );
+            INSERT INTO neural_gate_decisions(
+                id, journal_id, created_at, account_key, source, signal_symbol, broker_symbol, direction,
+                confidence, neural_prob, min_prob, min_prob_reason, exec_status, exec_message,
+                decision, decision_reason, entry, stop_loss, take_profit_2, force_mode,
+                m1_not_confirmed, canary_applied, features_json, resolved, outcome_type, outcome,
+                outcome_label, pnl_usd, outcome_ref, weight, resolved_at
+            )
+            SELECT
+                id, journal_id, created_at, account_key, source, signal_symbol, broker_symbol, direction,
+                confidence, neural_prob, min_prob, min_prob_reason,
+                mt5_status, mt5_message,
+                decision, decision_reason, entry, stop_loss, take_profit_2, force_mode,
+                m1_not_confirmed, canary_applied, features_json, resolved, outcome_type, outcome,
+                outcome_label, pnl_usd, outcome_ref, weight, resolved_at
+            FROM neural_gate_decisions__old;
+            DROP TABLE neural_gate_decisions__old;
+            CREATE INDEX IF NOT EXISTS idx_ngd_scope_time ON neural_gate_decisions(source, signal_symbol, created_at);
+            CREATE INDEX IF NOT EXISTS idx_ngd_resolved ON neural_gate_decisions(resolved, source, signal_symbol, created_at);
+            """
+        )
 
     def _init_db(self) -> None:
         with self._lock:
@@ -191,8 +322,8 @@ class NeuralGateLearningLoop:
                         neural_prob REAL,
                         min_prob REAL,
                         min_prob_reason TEXT,
-                        mt5_status TEXT,
-                        mt5_message TEXT,
+                        exec_status TEXT,
+                        exec_message TEXT,
                         decision TEXT,
                         decision_reason TEXT,
                         entry REAL,
@@ -213,6 +344,7 @@ class NeuralGateLearningLoop:
                     )
                     """
                 )
+                self._migrate_neural_gate_exec_columns(conn)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ngd_scope_time ON neural_gate_decisions(source, signal_symbol, created_at)"
                 )
@@ -231,19 +363,45 @@ class NeuralGateLearningLoop:
                 conn.commit()
 
     @staticmethod
-    def _decision_from_mt5(status: str, message: str) -> tuple[str, str]:
+    def _decision_from_ctrader(status: str, message: str) -> tuple[str, str]:
         st = str(status or "").strip().lower()
         msg = str(message or "").strip()
         msg_l = msg.lower()
-        if "neural filter:" in msg_l:
+        if "neural filter:" in msg_l or "below_neural" in msg_l:
             return "neural_block", "below_neural_min_prob"
-        if st in {"filled", "dry_run", "rejected", "error", "invalid_stops"}:
-            return "allow", "passed_neural_gate"
         if st == "guard_blocked":
             return "allow", "blocked_post_neural_guard"
         if st == "skipped":
             return "other_skip", "non_neural_skip"
+        if st in {
+            "filled",
+            "dry_run",
+            "accepted",
+            "rejected",
+            "error",
+            "invalid_stops",
+            "closed",
+            "canceled",
+            "pending",
+            "submitted",
+            "reconciled_open",
+        }:
+            return "allow", "passed_neural_gate"
+        if st in {"filtered", "disabled", "unavailable", "invalid", "blocked"}:
+            return "other_skip", "non_neural_skip"
         return st or "unknown", "unknown"
+
+    @staticmethod
+    def _neural_prob_from_request_json(request_json: str) -> float | None:
+        payload = NeuralGateLearningLoop._safe_json_dict(request_json)
+        raw_scores = dict(payload.get("raw_scores") or {})
+        for key in ("neural_probability", "mt5_neural_probability", "mt5_neural_prob"):
+            if raw_scores.get(key) is not None:
+                return _safe_float(raw_scores.get(key), None)
+        for key in ("neural_probability", "mt5_neural_probability", "mt5_neural_prob"):
+            if payload.get(key) is not None:
+                return _safe_float(payload.get(key), None)
+        return None
 
     @staticmethod
     def _extract_features(extra_json: str) -> tuple[dict, bool, bool, bool, float | None, str]:
@@ -280,35 +438,41 @@ class NeuralGateLearningLoop:
             }
         return features, force_mode, m1_not_confirmed, canary_applied, min_prob, min_prob_reason
 
-    def sync_decisions_from_journal(self, lookback_hours: int = 168) -> dict:
-        since_iso = _iso(_utc_now() - timedelta(hours=max(24, int(lookback_hours or 168))))
+    def sync_decisions_from_ctrader_journal(self, lookback_hours: int = 168) -> dict:
+        if not self._ctrader_sync_eligible():
+            return {"ok": False, "scanned": 0, "inserted": 0, "updated": 0, "message": "ctrader_sync_not_eligible"}
+        since_ts = (_utc_now() - timedelta(hours=max(24, int(lookback_hours or 168)))).timestamp()
+        offset = self._ctrader_journal_offset()
         inserted = 0
         updated = 0
         scanned = 0
-        with closing(self._connect_autopilot()) as src_conn, closing(self._connect_loop()) as dst_conn:
+        with closing(sqlite3.connect(str(self.ctrader_db_path), timeout=15)) as src_conn, closing(self._connect_loop()) as dst_conn:
+            src_conn.row_factory = sqlite3.Row
             rows = src_conn.execute(
                 """
-                SELECT id, created_at, account_key, source, signal_symbol, broker_symbol, direction,
-                       confidence, neural_prob, entry, stop_loss, take_profit_2,
-                       mt5_status, mt5_message, extra_json
-                FROM mt5_execution_journal
-                WHERE created_at >= ?
+                SELECT id, created_ts, created_utc, source, symbol, direction, confidence,
+                       entry, stop_loss, take_profit, broker_symbol, status, message,
+                       request_json, account_id, dry_run
+                FROM execution_journal
+                WHERE created_ts >= ?
                 ORDER BY id ASC
                 """,
-                (since_iso,),
+                (since_ts,),
             ).fetchall()
             scanned = len(rows)
             for r in rows:
-                journal_id = _safe_int(r["id"], 0)
-                if journal_id <= 0:
+                cid = _safe_int(r["id"], 0)
+                if cid <= 0:
                     continue
-                decision, decision_reason = self._decision_from_mt5(r["mt5_status"], r["mt5_message"])
+                journal_id = int(offset + cid)
+                decision, decision_reason = self._decision_from_ctrader(r["status"], r["message"])
                 feat, force_mode, m1_not_conf, canary_applied, min_prob_rs, min_prob_reason_rs = self._extract_features(
-                    str(r["extra_json"] or "")
+                    str(r["request_json"] or "")
                 )
+                neural_prob = self._neural_prob_from_request_json(str(r["request_json"] or ""))
                 min_prob = min_prob_rs
                 if min_prob is None:
-                    sym = _norm_symbol(r["signal_symbol"])
+                    sym = _norm_symbol(r["symbol"])
                     min_prob = _safe_float(
                         (config.get_neural_min_prob_symbol_overrides() or {}).get(
                             sym, getattr(config, "NEURAL_BRAIN_MIN_PROB", 0.55)
@@ -316,25 +480,28 @@ class NeuralGateLearningLoop:
                         getattr(config, "NEURAL_BRAIN_MIN_PROB", 0.55),
                     )
                 min_prob_reason = min_prob_reason_rs or "fallback"
+                account_key = str(int(r["account_id"])) if r["account_id"] is not None else ""
+                created_iso = self._ctrader_row_created_iso(r["created_ts"], str(r["created_utc"] or ""))
+                take_tp2 = _safe_float(r["take_profit"], 0.0)
                 payload = (
                     journal_id,
-                    str(r["created_at"] or ""),
-                    str(r["account_key"] or ""),
+                    created_iso,
+                    account_key,
                     str(r["source"] or ""),
-                    str(r["signal_symbol"] or ""),
+                    str(r["symbol"] or ""),
                     str(r["broker_symbol"] or ""),
                     str(r["direction"] or ""),
                     _safe_float(r["confidence"], 0.0),
-                    (_safe_float(r["neural_prob"], 0.0) if r["neural_prob"] is not None else None),
+                    neural_prob,
                     _safe_float(min_prob, 0.55),
                     str(min_prob_reason or ""),
-                    str(r["mt5_status"] or ""),
-                    str(r["mt5_message"] or ""),
+                    str(r["status"] or ""),
+                    str(r["message"] or ""),
                     str(decision or ""),
                     str(decision_reason or ""),
                     _safe_float(r["entry"], 0.0),
                     _safe_float(r["stop_loss"], 0.0),
-                    _safe_float(r["take_profit_2"], 0.0),
+                    take_tp2,
                     1 if force_mode else 0,
                     1 if m1_not_conf else 0,
                     1 if canary_applied else 0,
@@ -350,7 +517,7 @@ class NeuralGateLearningLoop:
                         UPDATE neural_gate_decisions
                         SET created_at=?, account_key=?, source=?, signal_symbol=?, broker_symbol=?, direction=?,
                             confidence=?, neural_prob=?, min_prob=?, min_prob_reason=?,
-                            mt5_status=?, mt5_message=?, decision=?, decision_reason=?,
+                            exec_status=?, exec_message=?, decision=?, decision_reason=?,
                             entry=?, stop_loss=?, take_profit_2=?, force_mode=?, m1_not_confirmed=?,
                             canary_applied=?, features_json=?
                         WHERE journal_id=?
@@ -386,7 +553,7 @@ class NeuralGateLearningLoop:
                         """
                         INSERT INTO neural_gate_decisions(
                             journal_id, created_at, account_key, source, signal_symbol, broker_symbol, direction,
-                            confidence, neural_prob, min_prob, min_prob_reason, mt5_status, mt5_message,
+                            confidence, neural_prob, min_prob, min_prob_reason, exec_status, exec_message,
                             decision, decision_reason, entry, stop_loss, take_profit_2, force_mode,
                             m1_not_confirmed, canary_applied, features_json,
                             resolved, outcome_type, outcome, outcome_label, pnl_usd, outcome_ref, weight, resolved_at
@@ -401,23 +568,50 @@ class NeuralGateLearningLoop:
             dst_conn.commit()
         return {"ok": True, "scanned": scanned, "inserted": inserted, "updated": updated}
 
-    def _resolve_real_mt5(self, conn: sqlite3.Connection) -> int:
+    def _resolve_real_ctrader(self, conn: sqlite3.Connection) -> int:
+        offset = self._ctrader_journal_offset()
         updated = 0
         rows = conn.execute(
             """
-            SELECT d.id, d.journal_id, j.resolved, j.pnl
+            SELECT d.id, d.journal_id, j.id AS ejid, j.status, j.execution_meta_json, j.response_json, j.dry_run
             FROM neural_gate_decisions d
-            JOIN ap.mt5_execution_journal j ON j.id = d.journal_id
+            JOIN ct.execution_journal j ON j.id = (d.journal_id - ?)
             WHERE d.resolved=0
               AND d.decision='allow'
-              AND j.mt5_status IN ('filled','dry_run')
+              AND d.journal_id >= ?
             ORDER BY d.id ASC
-            """
+            """,
+            (offset, offset),
         ).fetchall()
-        for did, _jid, resolved, pnl in rows:
-            if int(resolved or 0) != 1:
+        for row in rows:
+            if int(row["dry_run"] or 0) == 1:
                 continue
-            pnl_f = _safe_float(pnl, 0.0)
+            ejid = int(row["ejid"] or 0)
+            st = str(row["status"] or "").strip().lower()
+            meta = self._safe_json_dict(str(row["execution_meta_json"] or ""))
+            resp = self._safe_json_dict(str(row["response_json"] or ""))
+            pnl_f: float | None = None
+            if st == "closed":
+                closed = meta.get("closed") if isinstance(meta.get("closed"), dict) else {}
+                cd = resp.get("close_deal") if isinstance(resp.get("close_deal"), dict) else {}
+                if closed.get("pnl_usd") is not None:
+                    pnl_f = _safe_float(closed.get("pnl_usd"), None)
+                if pnl_f is None and cd.get("pnl_usd") is not None:
+                    pnl_f = _safe_float(cd.get("pnl_usd"), None)
+            if pnl_f is None:
+                agg = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(pnl_usd), 0) AS s, COUNT(*) AS n
+                    FROM ct.ctrader_deals
+                    WHERE journal_id=? AND has_close_detail=1
+                    """,
+                    (ejid,),
+                ).fetchone()
+                if agg is not None and int(agg[1] or 0) > 0:
+                    pnl_f = _safe_float(agg[0], None)
+            if pnl_f is None:
+                continue
+            pnl_f = float(pnl_f)
             if abs(pnl_f) < 1e-12:
                 outcome = None
                 label = "flat"
@@ -430,11 +624,11 @@ class NeuralGateLearningLoop:
             conn.execute(
                 """
                 UPDATE neural_gate_decisions
-                SET resolved=1, outcome_type='real_mt5', outcome=?, outcome_label=?, pnl_usd=?,
-                    outcome_ref='mt5_execution_journal', weight=1.0, resolved_at=?
+                SET resolved=1, outcome_type='real_ctrader', outcome=?, outcome_label=?, pnl_usd=?,
+                    outcome_ref='ctrader_execution_journal', weight=1.0, resolved_at=?
                 WHERE id=?
                 """,
-                (outcome, label, pnl_f, _iso(), int(did)),
+                (outcome, label, pnl_f, _iso(), int(row["id"])),
             )
             updated += 1
         return updated
@@ -490,8 +684,16 @@ class NeuralGateLearningLoop:
         unresolved = 0
         with closing(self._connect_loop()) as loop_conn:
             loop_conn.row_factory = sqlite3.Row
-            loop_conn.execute("ATTACH DATABASE ? AS ap", (str(self.autopilot_db_path),))
-            resolved_real = self._resolve_real_mt5(loop_conn)
+            if self._ctrader_sync_eligible():
+                try:
+                    loop_conn.execute("ATTACH DATABASE ? AS ct", (str(self.ctrader_db_path),))
+                    resolved_real += self._resolve_real_ctrader(loop_conn)
+                except Exception as e:
+                    logger.warning("[NeuralGateLoop] ctrader attach/resolve error: %s", e)
+                try:
+                    loop_conn.execute("DETACH DATABASE ct")
+                except Exception:
+                    pass
             with closing(self._connect_scalp()) as scalp_conn:
                 rows = loop_conn.execute(
                     """
@@ -528,10 +730,6 @@ class NeuralGateLearningLoop:
                 loop_conn.execute("SELECT COUNT(*) FROM neural_gate_decisions WHERE resolved=0").fetchone()[0], 0
             )
             loop_conn.commit()
-            try:
-                loop_conn.execute("DETACH DATABASE ap")
-            except Exception:
-                pass
         return {
             "ok": True,
             "resolved_real": resolved_real,
@@ -558,7 +756,7 @@ class NeuralGateLearningLoop:
             rows = conn.execute(
                 """
                 SELECT id, journal_id, created_at, source, signal_symbol, direction,
-                       confidence, neural_prob, min_prob, decision, decision_reason, mt5_status,
+                       confidence, neural_prob, min_prob, decision, decision_reason, exec_status,
                        force_mode, m1_not_confirmed, canary_applied,
                        outcome_type, outcome, outcome_label, pnl_usd, weight
                 FROM neural_gate_decisions
@@ -594,7 +792,7 @@ class NeuralGateLearningLoop:
                         "min_prob": _safe_float(r["min_prob"], 0.0),
                         "decision": str(r["decision"] or ""),
                         "decision_reason": str(r["decision_reason"] or ""),
-                        "mt5_status": str(r["mt5_status"] or ""),
+                        "exec_status": str(r["exec_status"] or ""),
                         "force_mode": bool(_safe_int(r["force_mode"], 0)),
                         "m1_not_confirmed": bool(_safe_int(r["m1_not_confirmed"], 0)),
                         "canary_applied": bool(_safe_int(r["canary_applied"], 0)),
@@ -622,7 +820,7 @@ class NeuralGateLearningLoop:
         rejects = sum(
             1
             for r in recent
-            if str(r.get("mt5_status", "")).lower() in {"rejected", "error", "invalid_stops"}
+            if str(r.get("exec_status", "")).lower() in {"rejected", "error", "invalid_stops"}
         )
         rejection_rate = (rejects / attempts) if attempts > 0 else 0.0
         resolved_recent = [r for r in recent if r.get("outcome") in (0, 1)]
@@ -695,18 +893,18 @@ class NeuralGateLearningLoop:
         canary_attempts = [
             r
             for r in canary_rows
-            if str(r.get("mt5_status", "")).strip().lower() in attempt_status
+            if str(r.get("exec_status", "")).strip().lower() in attempt_status
         ]
         filled = [
             r
             for r in canary_rows
-            if str(r.get("mt5_status", "")).strip().lower() in filled_status
+            if str(r.get("exec_status", "")).strip().lower() in filled_status
         ]
         neural_blocked = [r for r in eligible if str(r.get("decision", "")).strip().lower() == "neural_block"]
         rejected = [
             r
             for r in canary_rows
-            if str(r.get("mt5_status", "")).strip().lower() in {"rejected", "error", "invalid_stops"}
+            if str(r.get("exec_status", "")).strip().lower() in {"rejected", "error", "invalid_stops"}
         ]
 
         fill_rate = (len(filled) / eligible_n) if eligible_n > 0 else None
@@ -919,7 +1117,7 @@ class NeuralGateLearningLoop:
             real = [
                 r
                 for r in rows
-                if r.get("decision") == "allow" and r.get("outcome_type") == "real_mt5"
+                if r.get("decision") == "allow" and str(r.get("outcome_type") or "") == "real_ctrader"
             ]
             candidate = [
                 r
@@ -984,7 +1182,7 @@ class NeuralGateLearningLoop:
                 by_hour.setdefault(key, {"counterfactual": [], "real_filled": []})
                 if r.get("outcome_type") == "shadow_counterfactual":
                     by_hour[key]["counterfactual"].append(r)
-                elif r.get("outcome_type") == "real_mt5":
+                elif str(r.get("outcome_type") or "") == "real_ctrader":
                     by_hour[key]["real_filled"].append(r)
 
             by_hour_rows = []
@@ -1081,7 +1279,7 @@ class NeuralGateLearningLoop:
             return LoopRun(False, 0, 0, 0, 0, False, "disabled", policy_path=str(self.policy_path))
         lookback_hours = max(24, int(getattr(config, "NEURAL_GATE_LEARNING_LOOKBACK_HOURS", 168) or 168))
         try:
-            sync = self.sync_decisions_from_journal(lookback_hours=lookback_hours)
+            sync = self.sync_decisions_from_ctrader_journal(lookback_hours=lookback_hours)
             res = self.resolve_outcomes()
             policy = self.calibrate_and_publish_policy()
             scope = policy.get("scope", {}) if isinstance(policy, dict) else {}
@@ -1102,15 +1300,18 @@ class NeuralGateLearningLoop:
                     (_iso(), json.dumps(payload, ensure_ascii=True, separators=(",", ":"))),
                 )
                 conn.commit()
+            sync_n = 0
+            if isinstance(sync, dict) and sync.get("ok"):
+                sync_n = int(sync.get("inserted", 0) or 0) + int(sync.get("updated", 0) or 0)
             msg = (
-                f"ok sync={int(sync.get('inserted', 0)) + int(sync.get('updated', 0))} "
+                f"ok sync={sync_n} "
                 f"resolved_real={int(res.get('resolved_real', 0))} "
                 f"resolved_shadow={int(res.get('resolved_shadow', 0))} "
                 f"policy_active={bool(scope_cfg.get('active', False))}"
             )
             return LoopRun(
                 True,
-                int(sync.get("inserted", 0)) + int(sync.get("updated", 0)),
+                sync_n,
                 int(res.get("resolved_real", 0)),
                 int(res.get("resolved_shadow", 0)),
                 int(res.get("unresolved", 0)),
