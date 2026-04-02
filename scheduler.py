@@ -7409,6 +7409,20 @@ class DexterScheduler:
                     logger.debug("[Scheduler] cTrader sync ct-only watch follow-up failed", exc_info=True)
             else:
                 logger.warning("[CTRADER] sync failed: %s", rpt.get("error") or rpt.get("message"))
+            if bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)):
+                try:
+                    gate_loop = neural_gate_learning_loop.run_cycle()
+                    if gate_loop.ok:
+                        logger.info(
+                            "[NeuralGateLoop] %s%s%s",
+                            gate_loop.message,
+                            (f" policy={gate_loop.policy_path}" if gate_loop.policy_path else ""),
+                            (f" report={gate_loop.report_path}" if gate_loop.report_path else ""),
+                        )
+                    else:
+                        logger.info("[NeuralGateLoop] skipped: %s", gate_loop.message)
+                except Exception as e:
+                    logger.warning("[NeuralGateLoop] cycle error: %s", e)
         except Exception as e:
             logger.warning("[CTRADER] sync error: %s", e)
 
@@ -7713,19 +7727,6 @@ class DexterScheduler:
                     logger.debug("[MT5PM-Learn] sync skipped: %s", pm_learn.get("error", "unknown"))
             except Exception as e:
                 logger.debug("[MT5PM-Learn] sync error: %s", e)
-            try:
-                gate_loop = neural_gate_learning_loop.run_cycle()
-                if gate_loop.ok:
-                    logger.info(
-                        "[NeuralGateLoop] %s%s%s",
-                        gate_loop.message,
-                        (f" policy={gate_loop.policy_path}" if gate_loop.policy_path else ""),
-                        (f" report={gate_loop.report_path}" if gate_loop.report_path else ""),
-                    )
-                else:
-                    logger.info("[NeuralGateLoop] skipped: %s", gate_loop.message)
-            except Exception as e:
-                logger.warning("[NeuralGateLoop] cycle error: %s", e)
             if bool(getattr(config, "CANARY_POST_TRADE_AUDIT_ENABLED", False)):
                 try:
                     self._run_canary_post_trade_audit(force=False)
@@ -8648,6 +8649,28 @@ class DexterScheduler:
                 ctrader_res = self._maybe_execute_ctrader_signal(signal, source=source)
                 if ctrader_res is not None:
                     item["executed_ctrader"] = bool(getattr(ctrader_res, "ok", False) or getattr(ctrader_res, "dry_run", False))
+                # cTrader-only shadow support:
+                # Previously, XAU shadow journal was filled only when MT5 live filter blocked
+                # the signal (MT5_ENABLED path). When MT5 is disabled, we still want
+                # parameter trial BT (e.g. XAU_RANGE_REPAIR_MIN_CONFIDENCE) to have data,
+                # so we store signals that cTrader skipped.
+                if (
+                    ctrader_res is None
+                    and not bool(getattr(config, "MT5_ENABLED", False))
+                    and bool(getattr(config, "XAU_SHADOW_BACKTEST_ENABLED", True))
+                    and (not bool(self._is_pytest_runtime()))
+                    and str(symbol or "").strip().upper() == "XAUUSD"
+                ):
+                    try:
+                        raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                        block_reason = (
+                            str(raw_scores.get("ctrader_source_profile_reason") or "")
+                            or str(raw_scores.get("ctrader_dispatch_reason") or "")
+                            or "ctrader_skipped"
+                        )
+                        self._store_shadow_signal(signal, block_reason=block_reason)
+                    except Exception:
+                        pass
                 canary_report = self._maybe_execute_persistent_canary(signal, source=source)
                 item["executed_canary_mt5"] = bool(canary_report.get("mt5", False))
                 item["executed_canary_ctrader"] = bool(canary_report.get("ctrader", False))
