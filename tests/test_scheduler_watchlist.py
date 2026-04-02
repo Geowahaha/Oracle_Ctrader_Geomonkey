@@ -3217,6 +3217,74 @@ class SchedulerWatchlistTests(unittest.TestCase):
         guard = dict(getattr(sig, "raw_scores", {}).get("xau_direct_lane_mtf_guard") or {})
         self.assertEqual(str(guard.get("aligned_side") or ""), "long")
 
+    def test_scalp_xau_live_filter_intrabar_3of3_bearish_sets_fss_routing_hint(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=72.0)
+        sig.direction = "short"
+        sig.raw_scores.update(
+            {
+                "signal_d1_trend": "bullish",
+                "signal_h4_trend": "bullish",
+                "signal_h1_trend": "bullish",
+                "continuation_bias": -0.22,
+                "delta_proxy": -0.17,
+                "bar_volume_proxy": 0.62,
+                "xau_multi_tf_snapshot": {
+                    "d1_open": 4635.0,
+                    "d1_last": 4610.0,
+                    "h4_open": 4625.0,
+                    "h4_last": 4608.0,
+                    "h1_open": 4618.0,
+                    "h1_last": 4607.0,
+                    "strict_alignment": "mixed",
+                    "strict_aligned_side": "",
+                },
+            }
+        )
+        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True):
+            allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
+        self.assertTrue(allow)
+        self.assertEqual(reason, "live_band_pass")
+        guard = dict(getattr(sig, "raw_scores", {}).get("xau_direct_lane_mtf_guard") or {})
+        self.assertTrue(bool(guard.get("xau_fss_sell_routing_hint")))
+        self.assertEqual(str(guard.get("xau_mtf_mode") or ""), "intrabar")
+        self.assertTrue(bool((getattr(sig, "raw_scores", {}) or {}).get("xau_fss_sell_routing_hint")))
+
+    def test_scalp_xau_live_filter_intrabar_partial_sell_requires_flow_confirm(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=69.0)
+        sig.direction = "short"
+        sig.raw_scores.update(
+            {
+                "continuation_bias": -0.02,
+                "delta_proxy": -0.01,
+                "bar_volume_proxy": 0.12,
+                "xau_multi_tf_snapshot": {
+                    "d1_open": 4635.0,
+                    "d1_last": 4610.0,   # bearish
+                    "h4_open": 4625.0,
+                    "h4_last": 4608.0,   # bearish
+                    "h1_open": 4618.0,
+                    "h1_last": 4618.0,   # neutral (near open)
+                    "strict_alignment": "mixed",
+                    "strict_aligned_side": "",
+                },
+            }
+        )
+        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF", 66.0), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_PARTIAL_FLOW_CONFIRM_ENABLED", True):
+            allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
+        self.assertFalse(allow)
+        self.assertIn("partial_align_no_flow_confirm", reason)
+        guard = dict(getattr(sig, "raw_scores", {}).get("xau_direct_lane_mtf_guard") or {})
+        self.assertEqual(str(guard.get("reason") or ""), "partial_align_no_flow_confirm")
+        self.assertEqual(int(guard.get("mtf_support_count") or 0), 2)
+
     def test_ctrader_direct_winner_lane_still_uses_d1_h4_h1_guard(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("XAUUSD", confidence=74.0)
@@ -4583,6 +4651,30 @@ class SchedulerWatchlistTests(unittest.TestCase):
     def test_xau_scheduled_mtf_guard_config_default(self):
         """Verify scheduled canary MTF guard is enabled by default."""
         self.assertTrue(bool(getattr(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", False)))
+
+    def test_classify_family_canary_build_miss_stamp_and_mtf(self):
+        dexter = scheduler_module.DexterScheduler()
+        cand = {"family": "xau_scalp_flow_short_sidecar", "strategy_id": "xau_scalp_flow_short_sidecar_v1"}
+        sig = make_signal("XAUUSD")
+        st, r = dexter._classify_family_canary_build_miss(sig, cand)
+        self.assertEqual(st, "family_builder")
+        self.assertIn("unstamped", r)
+
+        dexter._stamp_family_canary_skip(
+            sig, family="xau_scalp_flow_short_sidecar", stage="pattern_gate", reason="fss_pattern_token_not_allowed"
+        )
+        st, r = dexter._classify_family_canary_build_miss(sig, cand)
+        self.assertEqual(st, "pattern_gate")
+        self.assertEqual(r, "fss_pattern_token_not_allowed")
+
+        sig2 = make_signal("XAUUSD")
+        rs = dict(sig2.raw_scores or {})
+        rs["xau_multi_tf_guard_block"] = True
+        rs["xau_multi_tf_guard_reason"] = "mtf_unit_test"
+        sig2.raw_scores = rs
+        st, r = dexter._classify_family_canary_build_miss(sig2, cand)
+        self.assertEqual(st, "multi_tf_guard")
+        self.assertEqual(r, "mtf_unit_test")
 
 
 if __name__ == "__main__":

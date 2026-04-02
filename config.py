@@ -355,6 +355,13 @@ class Config:
     SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN: bool = os.getenv("SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN: bool = os.getenv("SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF", "70.0"))
+    SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR: bool = os.getenv("SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_DIRECT_MTF_NEUTRAL_OPEN_BUFFER_PCT: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_NEUTRAL_OPEN_BUFFER_PCT", "0.00015"))
+    SCALP_XAU_DIRECT_MTF_PARTIAL_FLOW_CONFIRM_ENABLED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_FLOW_CONFIRM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONTINUATION_BIAS: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONTINUATION_BIAS", "0.10"))
+    SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_DELTA_PROXY: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_DELTA_PROXY", "0.08"))
+    SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY", "0.38"))
+    SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", "0").strip().lower() in ("1", "true", "yes", "on")
     XAU_MICROTREND_FOLLOW_UP_ENABLED: bool = os.getenv("XAU_MICROTREND_FOLLOW_UP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED: int = int(os.getenv("XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED", "3"))
@@ -894,6 +901,9 @@ class Config:
     XAU_DIRECT_LANE_TRIAL_NOTIFY_TELEGRAM: bool = os.getenv("XAU_DIRECT_LANE_TRIAL_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_DIRECT_LANE_TRIAL_MAX_PENDING: int = int(os.getenv("XAU_DIRECT_LANE_TRIAL_MAX_PENDING", "3"))
     # Shadow backtest — simulate blocked XAU direct lane signals against candle history
+    XAU_FAMILY_CANARY_GATE_JOURNAL_ENABLED: bool = os.getenv(
+        "XAU_FAMILY_CANARY_GATE_JOURNAL_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
     XAU_SHADOW_BACKTEST_ENABLED: bool = os.getenv("XAU_SHADOW_BACKTEST_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_SHADOW_BACKTEST_RESOLVE_HOURS: float = float(os.getenv("XAU_SHADOW_BACKTEST_RESOLVE_HOURS", "4.0"))
     XAU_SHADOW_BACKTEST_MIN_SAMPLE: int = int(os.getenv("XAU_SHADOW_BACKTEST_MIN_SAMPLE", "5"))
@@ -1856,6 +1866,13 @@ class Config:
     NEURAL_GATE_LEARNING_LOOKBACK_HOURS: int = int(os.getenv("NEURAL_GATE_LEARNING_LOOKBACK_HOURS", "168"))
     NEURAL_GATE_LEARNING_DB_PATH: str = os.getenv("NEURAL_GATE_LEARNING_DB_PATH", "data/neural_gate_learning.db")
     NEURAL_GATE_LEARNING_REPORT_EACH_CYCLE: bool = os.getenv("NEURAL_GATE_LEARNING_REPORT_EACH_CYCLE", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Neural gate learning loop reads only cTrader OpenAPI execution_journal (journal_id = row_id + offset).
+    NEURAL_GATE_CTRADER_SYNC_ENABLED: bool = os.getenv("NEURAL_GATE_CTRADER_SYNC_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    NEURAL_GATE_JOURNAL_ID_CTRADER_OFFSET: int = int(os.getenv("NEURAL_GATE_JOURNAL_ID_CTRADER_OFFSET", "1000000000"))
+    # Pre-dispatch microstructure snapshot from local OpenAPI SQLite (ticks/depth), merged into signal.raw_scores.
+    CTRADER_EXEC_FEATURE_PACK_ENABLED: bool = os.getenv("CTRADER_EXEC_FEATURE_PACK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_EXEC_FEATURE_LOOKBACK_SEC: int = int(os.getenv("CTRADER_EXEC_FEATURE_LOOKBACK_SEC", "32"))
+    CTRADER_EXEC_FEATURE_MAX_TICKS: int = int(os.getenv("CTRADER_EXEC_FEATURE_MAX_TICKS", "24"))
     NEURAL_GATE_SHADOW_MATCH_WINDOW_SEC: int = int(os.getenv("NEURAL_GATE_SHADOW_MATCH_WINDOW_SEC", "300"))
     NEURAL_GATE_SHADOW_MATCH_ENTRY_TOL: float = float(os.getenv("NEURAL_GATE_SHADOW_MATCH_ENTRY_TOL", "0.20"))
     NEURAL_GATE_SHADOW_WEIGHT: float = float(os.getenv("NEURAL_GATE_SHADOW_WEIGHT", "0.35"))

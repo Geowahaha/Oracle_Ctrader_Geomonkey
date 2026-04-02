@@ -293,6 +293,61 @@ class DexterScheduler:
         return token or "unknown"
 
     @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _trend_from_open_last(open_price: float, last_price: float, neutral_buffer_pct: float) -> str:
+        if open_price <= 0 or last_price <= 0:
+            return "unknown"
+        threshold = abs(open_price) * max(0.0, float(neutral_buffer_pct))
+        delta = float(last_price) - float(open_price)
+        if abs(delta) <= threshold:
+            return "neutral"
+        return "bullish" if delta > 0 else "bearish"
+
+    def _signal_effective_tf_trend_token(self, signal, *, tf_token: str, fallback_token: str) -> tuple[str, dict]:
+        mode = "closed"
+        buffer_hit = False
+        snap = {}
+        if not bool(getattr(config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True)):
+            return str(fallback_token or "unknown"), {"mode": mode, "buffer_hit": buffer_hit}
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            snap = dict(raw.get("xau_multi_tf_snapshot") or {})
+        except Exception:
+            raw = {}
+            snap = {}
+        tf = str(tf_token or "").strip().lower()
+        provider_tf = {"d1": "1d", "h1": "1h", "h4": "4h"}.get(tf, tf)
+        open_px = self._safe_float(snap.get(f"{tf}_open", 0.0), 0.0)
+        last_px = self._safe_float(snap.get(f"{tf}_last", 0.0), 0.0)
+        if open_px <= 0 or last_px <= 0:
+            try:
+                df = xauusd_provider.fetch(provider_tf, bars=3)
+                if df is not None and not getattr(df, "empty", True):
+                    open_px = self._safe_float(df["open"].iloc[-1], 0.0)
+                    last_px = self._safe_float(df["close"].iloc[-1], 0.0)
+            except Exception:
+                pass
+        if open_px > 0 and last_px > 0:
+            mode = "intrabar"
+            buffer_pct = self._safe_float(getattr(config, "SCALP_XAU_DIRECT_MTF_NEUTRAL_OPEN_BUFFER_PCT", 0.00015), 0.00015)
+            intrabar = self._trend_from_open_last(open_px, last_px, buffer_pct)
+            buffer_hit = intrabar == "neutral"
+            if intrabar in {"bullish", "bearish"}:
+                return intrabar, {
+                    "mode": mode,
+                    "buffer_hit": buffer_hit,
+                    "open": open_px,
+                    "last": last_px,
+                }
+        return str(fallback_token or "unknown"), {"mode": mode, "buffer_hit": buffer_hit, "open": open_px, "last": last_px}
+
+    @staticmethod
     def _signal_countertrend_confirmed(signal) -> bool:
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
@@ -498,9 +553,12 @@ class DexterScheduler:
             direction = "long"
         elif direction == "sell":
             direction = "short"
-        d1_trend = self._signal_d1_trend_token(signal)
-        h1_trend = self._signal_h1_trend_token(signal)
-        h4_trend = self._signal_h4_trend_token(signal)
+        d1_base = self._signal_d1_trend_token(signal)
+        h1_base = self._signal_h1_trend_token(signal)
+        h4_base = self._signal_h4_trend_token(signal)
+        d1_trend, d1_meta = self._signal_effective_tf_trend_token(signal, tf_token="d1", fallback_token=d1_base)
+        h1_trend, h1_meta = self._signal_effective_tf_trend_token(signal, tf_token="h1", fallback_token=h1_base)
+        h4_trend, h4_meta = self._signal_effective_tf_trend_token(signal, tf_token="h4", fallback_token=h4_base)
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
         except Exception:
@@ -524,6 +582,21 @@ class DexterScheduler:
             "h4_trend": h4_trend,
             "aligned_side": aligned_side,
             "countertrend_confirmed": countertrend_confirmed,
+            "xau_mtf_mode": "intrabar" if "intrabar" in {str(d1_meta.get("mode")), str(h1_meta.get("mode")), str(h4_meta.get("mode"))} else "closed",
+            "xau_mtf_open_buffer_hit": bool(d1_meta.get("buffer_hit") or h1_meta.get("buffer_hit") or h4_meta.get("buffer_hit")),
+        }
+        continuation_bias = abs(self._safe_float(raw.get("continuation_bias", 0.0), 0.0))
+        delta_proxy = abs(self._safe_float(raw.get("delta_proxy", 0.0), 0.0))
+        bar_volume_proxy = self._safe_float(raw.get("bar_volume_proxy", 0.0), 0.0)
+        min_cb = self._safe_float(getattr(config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONTINUATION_BIAS", 0.10), 0.10)
+        min_dp = self._safe_float(getattr(config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_DELTA_PROXY", 0.08), 0.08)
+        min_bv = self._safe_float(getattr(config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY", 0.38), 0.38)
+        flow_confirmed = continuation_bias >= min_cb and delta_proxy >= min_dp and bar_volume_proxy >= min_bv
+        result["xau_mtf_flow_confirmed"] = bool(flow_confirmed)
+        result["xau_mtf_flow_snapshot"] = {
+            "continuation_bias_abs": continuation_bias,
+            "delta_proxy_abs": delta_proxy,
+            "bar_volume_proxy": bar_volume_proxy,
         }
         if require_align and not aligned_side:
             partial_align = bool(getattr(config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True))
@@ -535,7 +608,32 @@ class DexterScheduler:
                 )
                 result["mtf_support_count"] = support_count
                 if support_count >= 2 and signal_conf >= partial_min_conf:
+                    if (
+                        direction == "short"
+                        and bool(getattr(config, "SCALP_XAU_DIRECT_MTF_PARTIAL_FLOW_CONFIRM_ENABLED", True))
+                        and not (flow_confirmed or countertrend_confirmed)
+                    ):
+                        result["allowed"] = False
+                        result["reason"] = "partial_align_no_flow_confirm"
+                        return result
                     result["reason"] = f"partial_2of3_aligned:{support_count}/3_conf={signal_conf:.1f}"
+                    if (
+                        direction == "short"
+                        and support_count >= 3
+                        and bool(flow_confirmed)
+                        and bool(getattr(config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True))
+                    ):
+                        result["xau_fss_sell_routing_hint"] = True
+                        raw["xau_fss_sell_routing_hint"] = True
+                        raw["xau_fss_sell_routing_reason"] = "intrabar_3of3_bearish_flow_confirmed"
+                    raw["xau_mtf_mode"] = result["xau_mtf_mode"]
+                    raw["xau_mtf_open_buffer_hit"] = result["xau_mtf_open_buffer_hit"]
+                    raw["xau_mtf_support_count"] = support_count
+                    raw["xau_mtf_flow_confirmed"] = bool(flow_confirmed)
+                    try:
+                        signal.raw_scores = raw
+                    except Exception:
+                        pass
                     return result
             result["allowed"] = False
             result["reason"] = "d1_h4_h1_not_aligned"
@@ -547,6 +645,22 @@ class DexterScheduler:
             result["allowed"] = False
             result["reason"] = f"d1_h4_h1_block:{direction}_vs_{aligned_side}"
             return result
+        if (
+            aligned_side == "short"
+            and direction == "short"
+            and bool(flow_confirmed)
+            and bool(getattr(config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True))
+        ):
+            result["xau_fss_sell_routing_hint"] = True
+            raw["xau_fss_sell_routing_hint"] = True
+            raw["xau_fss_sell_routing_reason"] = "d1_h4_h1_bearish_flow_confirmed"
+        raw["xau_mtf_mode"] = result["xau_mtf_mode"]
+        raw["xau_mtf_open_buffer_hit"] = result["xau_mtf_open_buffer_hit"]
+        raw["xau_mtf_flow_confirmed"] = bool(flow_confirmed)
+        try:
+            signal.raw_scores = raw
+        except Exception:
+            pass
         result["reason"] = "d1_h4_h1_aligned"
         return result
 
@@ -898,6 +1012,26 @@ class DexterScheduler:
             pass
         if not bool((mtf_guard or {}).get("allowed")):
             return False, str((mtf_guard or {}).get("reason") or "d1_h4_h1_blocked")
+        # Winner long in partial 2/3 mode can still catch falling knives when flow is weak.
+        # Require flow confirmation for winner longs unless countertrend is explicitly confirmed.
+        if src == "scalp_xauusd:winner":
+            guard_reason = str((mtf_guard or {}).get("reason") or "")
+            guard_flow_confirmed = bool((mtf_guard or {}).get("xau_mtf_flow_confirmed"))
+            guard_countertrend = bool((mtf_guard or {}).get("countertrend_confirmed"))
+            direction = str((mtf_guard or {}).get("direction") or self._signal_direction_token(signal) or "").strip().lower()
+            if direction == "long" and guard_reason.startswith("partial_2of3_aligned:") and not (guard_flow_confirmed or guard_countertrend):
+                return False, "winner_partial_long_no_flow_confirm"
+
+            # During manager transition mode that pauses limit-taking, do not allow winner-limit entries.
+            try:
+                runtime_state = self._load_trading_routing_runtime_state()
+                transition = self._active_xau_regime_transition(runtime_state)
+                mode = str((transition or {}).get("mode") or "").strip().lower()
+                entry_type = str(getattr(signal, "entry_type", "") or "").strip().lower()
+                if mode == "live_range_transition_limit_pause" and entry_type == "limit":
+                    return False, "winner_limit_paused_by_transition"
+            except Exception:
+                pass
         return True, "live_band_pass"
 
     def _allow_ctrader_source_profile(self, signal, source: str) -> tuple[bool, str]:
@@ -3359,18 +3493,38 @@ class DexterScheduler:
         if signal is None or family != "xau_scalp_flow_short_sidecar":
             return None, ""
         if not bool(getattr(config, "XAU_FLOW_SHORT_SIDECAR_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="family_disabled", reason="XAU_FLOW_SHORT_SIDECAR_ENABLED=0"
+            )
             return None, ""
         lane_signal = copy.deepcopy(signal)
         direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
         if direction != "short":
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="direction_gate", reason="fss_requires_short_direction"
+            )
             return None, ""
         try:
             _raw_check = dict(getattr(lane_signal, "raw_scores", {}) or {})
             _behavioral_trigger = bool(_raw_check.get("behavioral_trigger"))
+            _mtf_sell_hint = bool(
+                bool(getattr(config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True))
+                and _raw_check.get("xau_fss_sell_routing_hint")
+            )
+            if _mtf_sell_hint:
+                _behavioral_trigger = True
+                _raw_check["xau_fss_sell_routed_by_mtf"] = True
+                lane_signal.raw_scores = _raw_check
         except Exception:
             _behavioral_trigger = False
         contexts = self._load_xau_flow_short_sidecar_contexts()
         if not contexts and not _behavioral_trigger:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="pattern_context",
+                reason="fss_no_chart_contexts_and_no_behavioral_bypass",
+            )
             return None, ""
         allowed_patterns = self._xau_flow_short_allowed_pattern_tokens()
         pattern_ok = self._xau_flow_short_signal_pattern_matches(
@@ -3378,6 +3532,9 @@ class DexterScheduler:
             allowed_patterns,
         )
         if not pattern_ok and not _behavioral_trigger:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="pattern_gate", reason="fss_pattern_token_not_allowed"
+            )
             return None, ""
         session_sig = self._signal_session_signature(lane_signal)
         timeframe_token = self._signal_timeframe_token(lane_signal)
@@ -3499,6 +3656,9 @@ class DexterScheduler:
                 }
                 first_sample_mode = True
         if not matched_context:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="pattern_context", reason="fss_context_no_match"
+            )
             return None, ""
         snapshot = dict(
             live_profile_autopilot.latest_capture_feature_snapshot(
@@ -3510,6 +3670,9 @@ class DexterScheduler:
             or {}
         )
         if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="feature_snapshot", reason="fss_tick_feature_snapshot_unavailable"
+            )
             return None, ""
         capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
         continuation_bias = float(((matched_context.get("continuation_bias") or chart_state.get("continuation_bias") or 0.0) or 0.0))
@@ -3522,6 +3685,12 @@ class DexterScheduler:
         # Guard B+C: behavioral_trigger bypass — require NEGATIVE delta_proxy (real selling flow)
         # positive delta_proxy = buyers dominating = macro recovery = end-of-short-trend → block FSS
         if _behavioral_trigger and delta_proxy >= 0:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="flow_guard",
+                reason="fss_behavioral_requires_negative_delta_proxy",
+            )
             return None, ""
         follow_plan = str(matched_context.get("follow_up_plan") or "").strip().lower()
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
@@ -3529,6 +3698,9 @@ class DexterScheduler:
         atr = abs(float(getattr(lane_signal, "atr", 0.0) or 0.0))
         base_risk = abs(entry - stop_loss)
         if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="signal_geometry", reason="fss_invalid_entry_stop_geometry"
+            )
             return None, ""
         atr_eff = max(base_risk, atr, entry * 0.0003)
         use_break_stop = bool(
@@ -4095,9 +4267,15 @@ class DexterScheduler:
         if signal is None or family != "xau_scalp_microtrend_follow_up":
             return None, ""
         if not bool(getattr(config, "XAU_MICROTREND_FOLLOW_UP_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="family_disabled", reason="XAU_MICROTREND_FOLLOW_UP_ENABLED=0"
+            )
             return None, ""
         matched, matched_context = self._signal_matches_xau_microtrend_follow_up_context(signal)
         if not matched:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="pattern_context", reason="mfu_chart_state_context_no_match"
+            )
             return None, ""
         lane_signal = copy.deepcopy(signal)
         direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
@@ -4106,6 +4284,9 @@ class DexterScheduler:
         atr = abs(float(getattr(lane_signal, "atr", 0.0) or 0.0))
         base_risk = abs(entry - stop_loss)
         if direction not in {"long", "short"} or entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="signal_geometry", reason="mfu_invalid_entry_stop_geometry"
+            )
             return None, ""
         sign = 1.0 if direction == "long" else -1.0
         capture_features = dict(((matched_context.get("snapshot") or {}).get("features") or ((matched_context.get("snapshot") or {}).get("gate") or {}).get("features") or {}))
@@ -4140,6 +4321,9 @@ class DexterScheduler:
             entry_type = "limit"
         shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type=entry_type)
         if shaped is None:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="price_plan", reason="mfu_apply_family_price_plan_returned_none"
+            )
             return None, ""
         lane_source = self._strategy_family_lane_source(base_source, family)
         self._ensure_signal_trace(shaped, source=lane_source)
@@ -5688,8 +5872,24 @@ class DexterScheduler:
                 }
         family_candidates = self._load_strategy_family_candidates(symbol=symbol, base_source=base_source)
         for candidate in list(family_candidates or []):
+            try:
+                _r0 = dict(getattr(signal, "raw_scores", {}) or {})
+                _r0.pop("family_canary_skip", None)
+                signal.raw_scores = _r0
+            except Exception:
+                pass
             family_signal, family_source = self._build_family_canary_signal(signal, base_source=base_source, candidate=candidate)
             if family_signal is None or not family_source:
+                if symbol == "XAUUSD":
+                    st, rsn = self._classify_family_canary_build_miss(signal, candidate)
+                    self._store_xau_family_canary_gate_journal(
+                        signal,
+                        candidate=candidate,
+                        base_source=base_source,
+                        lane_source="",
+                        gate_stage=st,
+                        reason=rsn,
+                    )
                 continue
             # Mirror _allow_ctrader_source_profile directive check for canary families.
             # Blocks only families/sources explicitly listed in the directive — same logic,
@@ -5703,6 +5903,17 @@ class DexterScheduler:
                     and (not _xau_directive_blocked_etypes or _sig_etype in _xau_directive_blocked_etypes)
                     and ((_cand_fam and _cand_fam in _xau_directive_blocked_fams) or family_source in _xau_directive_blocked_srcs)
                 ):
+                    self._store_xau_family_canary_gate_journal(
+                        signal,
+                        candidate=candidate,
+                        base_source=base_source,
+                        lane_source=str(family_source or ""),
+                        gate_stage="trading_manager_directive",
+                        reason=(
+                            f"directive_block:dir={_sig_dir}:etype={_sig_etype}"
+                            f":family={_cand_fam}:src={family_source}"
+                        ),
+                    )
                     continue
             family_row = {
                 "family": str((candidate or {}).get("family") or ""),
@@ -8664,7 +8875,8 @@ class DexterScheduler:
                     try:
                         raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
                         block_reason = (
-                            str(raw_scores.get("ctrader_source_profile_reason") or "")
+                            str(raw_scores.get("ctrader_pre_dispatch_reason") or "")
+                            or str(raw_scores.get("ctrader_source_profile_reason") or "")
                             or str(raw_scores.get("ctrader_dispatch_reason") or "")
                             or "ctrader_skipped"
                         )
@@ -10531,6 +10743,139 @@ class DexterScheduler:
         return report
 
     # ── XAU shadow backtest ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _stamp_family_canary_skip(signal, *, family: str, stage: str, reason: str) -> None:
+        if signal is None:
+            return
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["family_canary_skip"] = {
+                "family": str(family or "").strip().lower(),
+                "stage": str(stage or ""),
+                "reason": str(reason or ""),
+            }
+            signal.raw_scores = raw
+        except Exception:
+            pass
+
+    def _classify_family_canary_build_miss(self, signal, candidate: dict | None) -> tuple[str, str]:
+        fam = str((candidate or {}).get("family") or "").strip().lower()
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        skip = raw.get("family_canary_skip")
+        if isinstance(skip, dict) and str(skip.get("family") or "").strip().lower() == fam:
+            return str(skip.get("stage") or "family_builder"), str(skip.get("reason") or "")
+        if raw.get("xau_multi_tf_guard_block"):
+            return "multi_tf_guard", str(raw.get("xau_multi_tf_guard_reason") or "")
+        if raw.get("pb_falling_knife_block"):
+            return "pb_falling_knife", str(raw.get("pb_falling_knife_block_reason") or "")
+        if raw.get("xau_openapi_entry_router_block"):
+            return "entry_router", str(raw.get("xau_openapi_entry_router_block_reason") or "")
+        return "family_builder", f"{fam or 'unknown'}:build_returned_none_unstamped"
+
+    def _family_canary_gate_raw_excerpt(self, signal) -> dict:
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        excerpt: dict = {}
+        for k in (
+            "xau_multi_tf_guard_reason",
+            "pb_falling_knife_block_reason",
+            "xau_openapi_entry_router_block_reason",
+            "neural_probability",
+            "neural_adjust_reason",
+            "family_canary_skip",
+            "ctrader_pre_dispatch_gate",
+            "ctrader_pre_dispatch_reason",
+        ):
+            if k in raw and raw[k] is not None and raw[k] != "":
+                try:
+                    excerpt[k] = raw[k] if k != "family_canary_skip" else dict(raw[k])
+                except Exception:
+                    excerpt[k] = str(raw[k])
+        return excerpt
+
+    def _store_xau_family_canary_gate_journal(
+        self,
+        signal,
+        *,
+        candidate: dict | None,
+        base_source: str,
+        lane_source: str,
+        gate_stage: str,
+        reason: str,
+    ) -> None:
+        if not bool(getattr(config, "XAU_FAMILY_CANARY_GATE_JOURNAL_ENABLED", True)):
+            return
+        if self._is_pytest_runtime():
+            return
+        import json as _json
+        import sqlite3 as _sqlite3
+        from datetime import datetime, timezone
+
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return
+        try:
+            sym = str(getattr(signal, "symbol", "XAUUSD") or "XAUUSD").strip().upper()
+            if sym != "XAUUSD":
+                return
+            signal_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            fam = str((candidate or {}).get("family") or "").strip().lower()
+            strat = str((candidate or {}).get("strategy_id") or "")
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            np_val = raw.get("neural_probability")
+            try:
+                neural_p = float(np_val) if np_val is not None else None
+            except Exception:
+                neural_p = None
+            excerpt = self._family_canary_gate_raw_excerpt(signal)
+            excerpt["strategy_id"] = strat
+            excerpt_json = _json.dumps(excerpt)
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS xau_family_canary_gate_journal (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        signal_utc TEXT NOT NULL,
+                        symbol TEXT NOT NULL DEFAULT 'XAUUSD',
+                        base_source TEXT NOT NULL DEFAULT '',
+                        family TEXT NOT NULL DEFAULT '',
+                        lane_source TEXT NOT NULL DEFAULT '',
+                        gate_stage TEXT NOT NULL DEFAULT '',
+                        reason TEXT NOT NULL DEFAULT '',
+                        direction TEXT,
+                        confidence REAL,
+                        neural_probability REAL,
+                        raw_scores_excerpt TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO xau_family_canary_gate_journal
+                        (signal_utc, symbol, base_source, family, lane_source, gate_stage,
+                         reason, direction, confidence, neural_probability, raw_scores_excerpt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_utc,
+                        sym,
+                        str(base_source or "").strip().lower(),
+                        fam,
+                        str(lane_source or "").strip().lower(),
+                        str(gate_stage or ""),
+                        str(reason or "")[:1024],
+                        direction,
+                        conf,
+                        neural_p,
+                        excerpt_json,
+                    ),
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.debug("[FamilyCanaryGate] store failed: %s", exc)
 
     def _store_shadow_signal(self, signal, *, block_reason: str) -> None:
         """Persist a blocked XAU direct-lane signal for shadow simulation."""
