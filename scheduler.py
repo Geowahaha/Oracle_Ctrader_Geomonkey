@@ -111,6 +111,7 @@ class DexterScheduler:
         self._mt5_repeat_guard_state = {"version": 1, "symbols": {}}
         self._mt5_repeat_guard_last_save_ts: float = 0.0
         self._last_bypass_tp_diag_ts: float = 0.0
+        self._post_sl_reversal_last_fired_ts: float = 0.0
         self._signal_trace_lock = threading.Lock()
         self._signal_trace_seq: int = 0
         cfg_guard_path = str(getattr(config, "MT5_REPEAT_ERROR_GUARD_PATH", "") or "").strip()
@@ -1025,7 +1026,10 @@ class DexterScheduler:
             allowed_sessions = set(config.get_mt5_scalp_xau_live_sessions() or set())
             if allowed_sessions and not self._session_signature_matches(session_sig, allowed_sessions):
                 return False, f"session_not_allowed:{session_sig or '-'}"
-        if bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)):
+        _is_sweep_reversal = bool((dict(getattr(signal, "raw_scores", {}) or {})).get("sweep_reversal"))
+        if bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)) and not (
+            _is_sweep_reversal and bool(getattr(config, "POST_SL_REVERSAL_BYPASS_CONF_BAND", True))
+        ):
             try:
                 conf = float(getattr(signal, "confidence", 0.0) or 0.0)
             except Exception:
@@ -1036,6 +1040,8 @@ class DexterScheduler:
                 return False, f"conf_below_live_band:{conf:.1f}<{conf_min:.1f}"
             if conf >= conf_max:
                 return False, f"conf_above_live_band:{conf:.1f}>={conf_max:.1f}"
+        if _is_sweep_reversal and bool(getattr(config, "POST_SL_REVERSAL_BYPASS_MTF", False)):
+            return True, "live_band_pass_sweep_reversal"
         mtf_guard = self._scalp_xau_direct_mtf_guard(signal)
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
@@ -7257,6 +7263,93 @@ class DexterScheduler:
             "sent": sent,
         }
 
+    def _check_post_sl_reversal_signal(self) -> bool:
+        """
+        Check XAUUSD M1 for sweep + reversal pattern and fire a market re-entry
+        directly into the main cTrader lane if confirmed.
+
+        Runs every ~30s inside _run_xau_guard_transition_watch.
+        Governed by POST_SL_REVERSAL_COOLDOWN_SECONDS to prevent over-trading.
+        Returns True if a signal was dispatched.
+        """
+        if not bool(getattr(config, "POST_SL_REVERSAL_ENABLED", False)):
+            return False
+        if bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True)) and session_manager.is_xauusd_holiday():
+            return False
+        if not session_manager.is_xauusd_market_open():
+            return False
+        cooldown = float(getattr(config, "POST_SL_REVERSAL_COOLDOWN_SECONDS", 300.0) or 300.0)
+        if (time.time() - self._post_sl_reversal_last_fired_ts) < cooldown:
+            return False
+        try:
+            sweep = scalping_scanner.detect_xau_sweep_reversal()
+        except Exception as e:
+            logger.debug("[PostSLReversal] detect error: %s", e)
+            return False
+        if not bool(sweep.get("confirmed")):
+            logger.debug("[PostSLReversal] no pattern: %s", sweep.get("reason", "-"))
+            return False
+        direction = str(sweep.get("direction") or "long").strip().lower()
+        sweep_level = float(sweep.get("sweep_level") or 0.0)
+        current_price = float(sweep.get("current_close") or 0.0)
+        atr = float(sweep.get("atr") or 1.0)
+        wick_ratio = float(sweep.get("sweep_wick_ratio") or 0.0)
+        if current_price <= 0 or atr <= 0:
+            return False
+        sl_buf = atr * float(getattr(config, "POST_SL_REVERSAL_SL_BUFFER_ATR", 0.20) or 0.20)
+        tp1_r = float(getattr(config, "POST_SL_REVERSAL_TP1_R", 1.5) or 1.5)
+        tp2_r = float(getattr(config, "POST_SL_REVERSAL_TP2_R", 2.5) or 2.5)
+        tp3_r = float(getattr(config, "POST_SL_REVERSAL_TP3_R", 3.5) or 3.5)
+        conf = float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0)
+        if direction == "long":
+            sl = sweep_level - sl_buf
+            risk = max(current_price - sl, 0.5)
+            tp1 = current_price + risk * tp1_r
+            tp2 = current_price + risk * tp2_r
+            tp3 = current_price + risk * tp3_r
+        else:
+            sl = sweep_level + sl_buf
+            risk = max(sl - current_price, 0.5)
+            tp1 = current_price - risk * tp1_r
+            tp2 = current_price - risk * tp2_r
+            tp3 = current_price - risk * tp3_r
+        from analysis.signals import TradeSignal
+        sig = TradeSignal()
+        sig.symbol = "XAUUSD"
+        sig.direction = direction
+        sig.confidence = conf
+        sig.entry = current_price
+        sig.entry_type = "market"
+        sig.stop_loss = round(sl, 2)
+        sig.take_profit_1 = round(tp1, 2)
+        sig.take_profit_2 = round(tp2, 2)
+        sig.take_profit_3 = round(tp3, 2)
+        sig.atr = round(atr, 3)
+        sig.pattern = f"SWEEP_REVERSAL_{direction.upper()}"
+        sig.raw_scores = {
+            "sweep_reversal": True,
+            "sweep_level": round(sweep_level, 2),
+            "sweep_wick_ratio": round(wick_ratio, 3),
+            "post_sl_reversal_signal": True,
+        }
+        logger.info(
+            "[PostSLReversal] sweep confirmed dir=%s sweep_level=%.2f wick=%.2f entry=%.2f sl=%.2f tp1=%.2f",
+            direction, sweep_level, wick_ratio, current_price, sl, tp1,
+        )
+        result = self._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+        if result is not None:
+            self._post_sl_reversal_last_fired_ts = time.time()
+            try:
+                notifier.send_alert(
+                    f"\U0001f9f2 [Sweep Reversal] {direction.upper()} XAUUSD\n"
+                    f"Entry: {current_price:.2f} | SL: {sl:.2f} | TP1: {tp1:.2f}\n"
+                    f"Sweep @ {sweep_level:.2f} | Wick {wick_ratio:.0%}"
+                )
+            except Exception:
+                pass
+            return True
+        return False
+
     def _run_xau_guard_transition_watch(self, force: bool = False) -> dict:
         if (not bool(getattr(config, "XAU_GUARD_TRANSITION_ALERT_ENABLED", True))) and (not force):
             return {"enabled": False, "status": "disabled"}
@@ -7325,6 +7418,10 @@ class DexterScheduler:
             row["summary_text"] = str(publish_meta.get("text", "") or "")
             row["admin_sent"] = int(publish_meta.get("sent", 0) or 0)
             dispatched.append(row)
+        try:
+            self._check_post_sl_reversal_signal()
+        except Exception:
+            logger.debug("[PostSLReversal] check error", exc_info=True)
         return {
             "enabled": True,
             "status": "alerted" if dispatched else "unchanged",

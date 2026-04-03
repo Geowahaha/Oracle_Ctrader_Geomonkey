@@ -2296,5 +2296,90 @@ class ScalpingScanner:
                      symbol_up, signal.confidence, signal.direction, signal.entry, signal.stop_loss, signal.take_profit_1)
         return ScalpingScanResult(source=src, symbol=symbol_up, status="ready", reason="ok", signal=signal, trigger=trigger)
 
+    def detect_xau_sweep_reversal(self) -> dict:
+        """
+        Detect stop hunt sweep + reversal pattern on XAUUSD M1.
+
+        Pattern (LONG):
+          - Bar[-2] (sweep bar): long lower wick (wick_ratio >= min), close near top of bar
+          - Bar[-1] (recovery bar): close above body_top of sweep bar
+
+        Pattern (SHORT):
+          - Bar[-2]: long upper wick, close near bottom of bar
+          - Bar[-1]: close below body_bottom of sweep bar
+
+        Returns dict:
+          confirmed: bool
+          direction: 'long' | 'short'
+          sweep_level: float  (sweep_low for long, sweep_high for short)
+          sweep_wick_ratio: float
+          current_close: float
+          atr: float
+          pattern: str
+          reason: str (when confirmed=False)
+        """
+        if not bool(getattr(config, "POST_SL_REVERSAL_ENABLED", False)):
+            return {"confirmed": False, "reason": "disabled"}
+        tf = str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m") or "1m")
+        bars = 10
+        try:
+            df = xauusd_provider.fetch(tf, bars=bars)
+        except Exception as e:
+            return {"confirmed": False, "reason": f"fetch_error:{e}"}
+        if df is None or getattr(df, "empty", True) or len(df) < 4:
+            return {"confirmed": False, "reason": "no_data"}
+        sweep_bar = df.iloc[-2]
+        recovery_bar = df.iloc[-1]
+        try:
+            s_high = float(sweep_bar["high"])
+            s_low = float(sweep_bar["low"])
+            s_open = float(sweep_bar["open"])
+            s_close = float(sweep_bar["close"])
+            r_close = float(recovery_bar["close"])
+        except Exception as e:
+            return {"confirmed": False, "reason": f"parse_error:{e}"}
+        bar_range = s_high - s_low
+        min_pips = float(getattr(config, "POST_SL_REVERSAL_MIN_SWEEP_PIPS", 3.0) or 3.0)
+        if bar_range < min_pips:
+            return {"confirmed": False, "reason": f"range_too_small:{bar_range:.2f}<{min_pips}"}
+        try:
+            highs = df["high"].tail(10).astype(float).values
+            lows = df["low"].tail(10).astype(float).values
+            atr = float((highs - lows).mean())
+        except Exception:
+            atr = bar_range
+        atr = max(atr, bar_range, 0.5)
+        min_wick = float(getattr(config, "POST_SL_REVERSAL_MIN_WICK_RATIO", 0.55) or 0.55)
+        body_bottom = min(s_open, s_close)
+        body_top = max(s_open, s_close)
+        lower_wick = body_bottom - s_low
+        upper_wick = s_high - body_top
+        lower_wick_ratio = lower_wick / bar_range if bar_range > 0 else 0.0
+        upper_wick_ratio = upper_wick / bar_range if bar_range > 0 else 0.0
+        # LONG: sweep bar has long lower wick + recovery bar closes above body_top
+        if lower_wick_ratio >= min_wick and r_close > body_top:
+            return {
+                "confirmed": True,
+                "direction": "long",
+                "sweep_level": s_low,
+                "sweep_wick_ratio": round(lower_wick_ratio, 3),
+                "current_close": r_close,
+                "atr": round(atr, 3),
+                "pattern": "sweep_reversal_long",
+            }
+        # SHORT: sweep bar has long upper wick + recovery bar closes below body_bottom
+        if upper_wick_ratio >= min_wick and r_close < body_bottom:
+            return {
+                "confirmed": True,
+                "direction": "short",
+                "sweep_level": s_high,
+                "sweep_wick_ratio": round(upper_wick_ratio, 3),
+                "current_close": r_close,
+                "atr": round(atr, 3),
+                "pattern": "sweep_reversal_short",
+            }
+        best = max(lower_wick_ratio, upper_wick_ratio)
+        return {"confirmed": False, "reason": f"wick_ratio_low:{best:.2f}<{min_wick}"}
+
 
 scalping_scanner = ScalpingScanner()
