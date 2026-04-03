@@ -5980,20 +5980,32 @@ class DexterScheduler:
             self._maybe_execute_mt5_signal(mt5_signal, source=lane_source)
             report["mt5"] = True
         if bool(profile.get("direct_enabled", False)) and bool(profile.get("ctrader_enabled", False)):
-            ctr_signal = _prepare_copy()
-            try:
-                result = ctrader_executor.execute_signal(ctr_signal, source=lane_source)
-                report["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
-                logger.info(
-                    "[CTRADER][CANARY] %s %s -> %s (%s) %s",
-                    str(getattr(result, "status", "") or ""),
-                    str(getattr(result, "signal_symbol", getattr(ctr_signal, "symbol", "")) or ""),
-                    str(getattr(result, "broker_symbol", "-") or "-"),
-                    lane_source,
-                    str(getattr(result, "message", "") or ""),
-                )
-            except Exception as e:
-                logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
+            _canary_xau = str(symbol or "").strip().upper() in {"XAUUSD", "GOLD"}
+            _canary_holiday_blocked = (
+                _canary_xau
+                and bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True))
+                and session_manager.is_xauusd_holiday()
+            )
+            _canary_closed_blocked = _canary_xau and not session_manager.is_xauusd_market_open()
+            if _canary_holiday_blocked:
+                logger.info("[CTRADER][CANARY] skipped source=%s symbol=%s reason=xauusd_market_holiday", lane_source, symbol)
+            elif _canary_closed_blocked:
+                logger.info("[CTRADER][CANARY] skipped source=%s symbol=%s reason=xauusd_market_closed", lane_source, symbol)
+            else:
+                ctr_signal = _prepare_copy()
+                try:
+                    result = ctrader_executor.execute_signal(ctr_signal, source=lane_source)
+                    report["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
+                    logger.info(
+                        "[CTRADER][CANARY] %s %s -> %s (%s) %s",
+                        str(getattr(result, "status", "") or ""),
+                        str(getattr(result, "signal_symbol", getattr(ctr_signal, "symbol", "")) or ""),
+                        str(getattr(result, "broker_symbol", "-") or "-"),
+                        lane_source,
+                        str(getattr(result, "message", "") or ""),
+                    )
+                except Exception as e:
+                    logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
         # Pre-load directive once so the family loop can respect blocked families/sources.
         # Canary families previously bypassed _allow_ctrader_source_profile entirely.
         # Fix: mirror the EXACT same check as _allow_ctrader_source_profile (lines 979-988):
