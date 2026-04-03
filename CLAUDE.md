@@ -206,32 +206,9 @@ D:\\dexter\_pro\_v3\_fixed\\
 |`.env.local`|Raw thresholds 1200+ lines — never hardcode from here|
 |`main.py`|Entry point, process start|
 |`execution/`|Order placement + position manager|
-|`api/`|All brok## Recent Changes
-
-### 2026-03-24 — Deep Data Architecture phase preparation (Pre-Phase Backup)
-
-Status: **BACKUP COMPLETE** (Safe Restore Point Created)
-Branch: `backtester-xauusd`
-Tag: `v3-fixed-profitable-20260324`
-
-**Backup Locations:**
-- **Git:** Pushed to `origin` and `dexter` remotes (Tag: `v3-fixed-profitable-20260324`)
-- **Local DB/Config Backup:** `C:\dexter_backups\`
-  - `ctrader_openapi__backup__20260324_before-deep-data.db` (2.3GB)
-  - `candle_data__backup__20260324.db`
-  - `.env.local__backup__20260324`
-  - `config__backup__20260324.py`
-- **Restore Docs:** `RESTORE_POINT_2026-03-24.txt` at project root.
-
-**Current Phase Completed (Deep Data - Gate 3):**
-- Implemented `TickBarEngine` (Quote-level exact Timestamp bars).
-- Built and Tuned `Microstructure Regime Detector (MRD)` offline to score 0.757 exactly at the `13:05:19Z` entry.
-- Deployed MRD into `scanners/scalping_scanner.py` as a **Live Guard**. It dynamically intercepts XAUUSD shorts if `Recovery Score > 0.65`, entirely starving the downstream canary/swarm matrix of fake-out trades during a macro-recovery floor.
-- Code successfully pushed to Github (`backtester-xauusd`) and manually deployed to Oracle VM (`129.150.36.17`). Service `dexter-monitor` is currently active and healthy.
-
-**Next Immediate Objective:**
-- Validate and tune Order-Flow Asymmetry Scanner (OFAS).
-- Investigate missing tick gap (05:00 - 09:50 UTC on Mar 23) in cTrader Stream.
+|`api/`|All broker wrappers (cTrader OpenAPI, MT5, Binance, Bybit)|
+|`docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md`|XAU gate journal stamps, entry template + M1 bias chain, VM aggregate checklist — **mission next steps**|
+|`docs/AGENT_SYNC_BOARD.md`|**Bilateral agent coordination** — read/update at session start; owner checks progress here (no middleman for routine status)|
 
 ## Session Startup
 
@@ -239,107 +216,42 @@ Tag: `v3-fixed-profitable-20260324`
 /add scheduler.py
 /add config.py
 /add data/runtime/trading_manager_state.json
+/add docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md
+/add docs/AGENT_SYNC_BOARD.md
 ```
 
-Say: "Continue from 2026-03-24 pre-deep-data backup. What is current system state?"
+**Agent coordination:** open **`docs/AGENT_SYNC_BOARD.md`** first — refresh **Quick status** + **Owner — latest** + append **Activity log**; peer agents monitor the same file.
+
+**XAU mission (sequenced):** open `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` **§4.1** (phases **A→E**) and **§5**; execute in order.
+
+Optional: *"Continue from 2026-04 handoff. What is current system state?"*
 
 ## Never Ask Me About
 
 * Basic Python, installing packages, general coding concepts
 * Anything not related to this trading system's live behavior
-Focus: multi-family trading logic, AI reasoning, self-learning adaptation, position management, live-market safety, signal routing bugs.idental exposure)
-* SSH keys moved to: `C:\\Users\\mrgeo\\.ssh\\`
-* `.gitignore` must cover: `.env.local`, `\*.key`, `\*.pem`, `\*.pub`, `\*.zip`
+
+**Focus:** multi-family trading logic, AI reasoning, self-learning adaptation, position management, live-market safety, signal routing bugs.
+
+* SSH keys: `C:\Users\mrgeo\.ssh\`
+* `.gitignore` must cover: `.env.local`, `*.key`, `*.pem`, `*.pub`, `*.zip`
 
 ## Recent Changes
 
-### 2026-03-20 — FSS Pattern Gate + High-Confidence Bridge
+### 2026-04 — XAU gate telemetry, entry template chain, mission handoff
 
-Files: `scheduler.py`, `config.py`, `tests/test\_scheduler\_watchlist.py`
-Status: LIVE — PID 20028 since 09:35:57 ICT
+**Scope:** `_stamp_family_canary_skip` (FF, PB/BS, FLS, FSS behavioral + min-conf, PSC), `learning/entry_template_catalog.py`, `scanners/scalping_scanner.py` M1 bias, `config.py`, `tmp_vm_gate_bucket_report.py`, tests.
 
-Root cause: `scalp\_xauusd:fss:canary` not firing on confidence=82.0 setup
-despite delta\_proxy=0.1391, bar\_volume\_proxy=1.0 (flow was strong).
+**Playbook:** `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` — **§4.1** phases **A→E** first, then **§5** sub-checklist. Canary floor: **always** read live `.env.local` (`NEURAL_GATE_CANARY_MIN_CONFIDENCE`; docs show an example only).
 
-Fix 1: Pattern bridge — FSS now accepts
-"Behavioral Sweep-Retest + Liquidity Continuation" on continuation desk
-Fix 2: `high\_confidence\_bridge` — 80+ borrows 70-79.9 band context
-New key: `XAU\_FLOW\_SHORT\_SIDECAR\_FIRST\_SAMPLE\_ALLOW\_HIGH\_CONFIDENCE\_BRIDGE`
-Flag written to raw\_scores for audit trail.
+### 2026-03-24 — Deep Data Architecture (backup + Gate 3)
 
-Watch: Does `scalp\_xauusd:fss:canary` now appear as `sell\_stop`?
-Check: `SELECT \* FROM execution\_journal WHERE source LIKE '%fss%' ORDER BY id DESC LIMIT 5`
+Tag `v3-fixed-profitable-20260324`, `RESTORE_POINT_2026-03-24.txt`, `C:\dexter_backups\`. Shipped: `TickBarEngine`, MRD live in `scanners/scalping_scanner.py`, VM `dexter-monitor`. **Next:** OFAS; cTrader tick gap 2026-03-23 05:00–09:50 UTC.
 
-DO NOT revert without new regression test.
+### 2026-03-20 — FSS pattern gate + high-confidence bridge
 
-## Session Startup
-
-```
-/add scheduler.py
-/add config.py
-/add data/runtime/trading\_manager\_state.json
-```
-
-Say: "Continue from 2026-03-20 FSS fix. What is current system state?"
-
-## Never Ask Me About
-
-* Basic Python, installing packages, general coding concepts
-* Anything not related to this trading system's live behavior
-Focus: multi-family trading logic, AI reasoning, self-learning adaptation,
-position management, live-market safety, signal routing bugs.
+`scheduler.py`, `config.py`, `tests/test_scheduler_watchlist.py`; `XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_ALLOW_HIGH_CONFIDENCE_BRIDGE` in `raw_scores`. No revert without regression tests.
 
 ## Current Branch State (update every session)
 
-Active branches:
-
-* main → production, stable, do not touch
-* fss-fixes-only → Fix 1 + Fix 3 only, ready to merge
-* fls-development → FLS new feature, in development
-
-Last session: 2026-03-21
-
-* Fix 2 cooldown REMOVED (redundant, blocks opportunity)
-* Fix 1 + Fix 3 confirmed safe
-* FLS unauthorized code separated to fls-development branch
-* Unauthorized: CTRADER\_PM\_XAU\_EXTENSION\_MIN\_CONFIDENCE (not approved)
-
-Next session todo:
-
-* Verify fss-fixes-only is clean (2 lines only)
-* Merge fss-fixes-only → main
-* Build FLS test lane in fls-development
-
-● Now let me check the scanner's datetime usage to know exactly what to patch.
-
-  Searched for 3 patterns (ctrl+o to expand)
-
-● Let me read the key sections in the scanner that use datetime.now().
-
-  Read 1 file (ctrl+o to expand)
-
-● Let me look at how session_info is used in the scanner's direction logic.
-
-  Searched for 1 pattern, read 2 files (ctrl+o to expand)
-
-● Now I see the full issue. The _backtest_session_info() calls _original_get_info() which uses real datetime.now() for session detection. All 829 bars
-  see the same Saturday session instead of their actual historical session. Let me also check what now is used for at line 323.
-
-  Read 1 file (ctrl+o to expand)
-
-● Now I see all the issues. datetime.now() at lines 323, 339, 363 uses real Saturday time for PDH/PDL and session window calculations. This corrupts the
-   liquidity map analysis. The fix needs three things:
-
-  1. Patch datetime in scanner module to use cursor time
-  2. Fix get_session_info() to use cursor time for session detection
-  3. Suppress EcoCalendar to prevent 429 spam
-
-  Read 1 file (ctrl+o to expand)
-  ⎿  You're out of extra usage · resets 5am (Asia/Bangkok)
-
-✻ Worked for 19m 58s
-
-● Background command "Run 3-day XAUUSD backtest with session_info patch" completed (exit code 0)
-  ⎿  You're out of extra usage · resets 5am (Asia/Bangkok)
-
-❯ /rate-limit-options
+Verify with `git branch -a`. Historical note (2026-03-21): `main`, `fss-fixes-only`, `fls-development` — refresh before relying on merge state.

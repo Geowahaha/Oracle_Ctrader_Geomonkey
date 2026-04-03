@@ -5,25 +5,33 @@ Loads from .env.local first (highest priority), then falls back to .env
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Optional
 from dotenv import load_dotenv
 
 # ── Load order: .env.local → .env ────────────────────────────────────────────
 _BASE = Path(__file__).parent
 
+# In pytest runs we avoid loading user-local `.env.local` to keep unit tests deterministic.
+# Note: `PYTEST_CURRENT_TEST` may not be set yet during module import, so also detect via argv.
+_is_pytest = bool((os.getenv("PYTEST_CURRENT_TEST", "") or "").strip()) or any(
+    "pytest" in str(a).lower() for a in sys.argv
+)
+
 # .env.local overrides everything — this is your real config file
 _env_local = _BASE / ".env.local"
-if _env_local.exists():
-    load_dotenv(dotenv_path=_env_local, override=True)
-    print("[Config] Loaded: .env.local")
-else:
-    # Fallback to plain .env if present
-    _env_file = _BASE / ".env"
-    if _env_file.exists():
-        load_dotenv(dotenv_path=_env_file, override=True)
-        print("[Config] Loaded: .env (tip: rename to .env.local)")
+if not _is_pytest:
+    if _env_local.exists():
+        load_dotenv(dotenv_path=_env_local, override=True)
+        print("[Config] Loaded: .env.local")
     else:
-        print("[Config] WARNING: No .env.local found - using system environment variables only")
+        # Fallback to plain .env if present
+        _env_file = _BASE / ".env"
+        if _env_file.exists():
+            load_dotenv(dotenv_path=_env_file, override=True)
+            print("[Config] Loaded: .env (tip: rename to .env.local)")
+        else:
+            print("[Config] WARNING: No .env.local found - using system environment variables only")
 
 
 class Config:
@@ -363,6 +371,20 @@ class Config:
     SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY", "0.38"))
     SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ENTRY_TEMPLATE_CATALOG_ENABLED: bool = os.getenv("ENTRY_TEMPLATE_CATALOG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ENTRY_TEMPLATE_CATALOG_PATH: str = os.getenv("ENTRY_TEMPLATE_CATALOG_PATH", "").strip()
+    # Optional pre-neural confidence tailwind from mined impulse capture stats (0 = off).
+    ENTRY_TEMPLATE_CONF_TAILWIND_MAX: float = float(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MAX", "0"))
+    ENTRY_TEMPLATE_CONF_TAILWIND_MIN_CAPTURE: float = float(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MIN_CAPTURE", "0.52"))
+    ENTRY_TEMPLATE_CONF_TAILWIND_MIN_IMPULSES: int = int(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MIN_IMPULSES", "30"))
+    ENTRY_TEMPLATE_SCANNER_BIAS_ENABLED: bool = os.getenv("ENTRY_TEMPLATE_SCANNER_BIAS_ENABLED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    ENTRY_TEMPLATE_SCANNER_MAX_SHIFT_RISK_RATIO: float = float(os.getenv("ENTRY_TEMPLATE_SCANNER_MAX_SHIFT_RISK_RATIO", "0.22"))
+    ENTRY_TEMPLATE_SCANNER_MIN_OFFSET_RISK_TO_ACT: float = float(os.getenv("ENTRY_TEMPLATE_SCANNER_MIN_OFFSET_RISK_TO_ACT", "0.04"))
     XAU_MICROTREND_FOLLOW_UP_ENABLED: bool = os.getenv("XAU_MICROTREND_FOLLOW_UP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED: int = int(os.getenv("XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED", "3"))
     XAU_MICROTREND_FOLLOW_UP_MIN_STATE_SCORE: float = float(os.getenv("XAU_MICROTREND_FOLLOW_UP_MIN_STATE_SCORE", "18"))

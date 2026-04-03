@@ -3273,7 +3273,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
                 },
             }
         )
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF", 66.0), \
@@ -3396,6 +3397,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CHOCH_LIMIT_PULLBACK_RISK_RATIO", 0.12), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -3436,6 +3438,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_NEURAL_PROB", 0.65), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -3499,6 +3502,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
             mock_dt.now.return_value = weekend_dt
@@ -3542,6 +3546,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_NEURAL_PROB", 0.65), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
             mock_dt.now.return_value = weekend_dt
@@ -3612,6 +3617,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -4675,6 +4681,18 @@ class SchedulerWatchlistTests(unittest.TestCase):
         st, r = dexter._classify_family_canary_build_miss(sig2, cand)
         self.assertEqual(st, "multi_tf_guard")
         self.assertEqual(r, "mtf_unit_test")
+
+    def test_family_canary_ff_stamps_executor_only_reason(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD")
+        cand = {"family": "xau_scalp_failed_fade_follow_stop", "strategy_id": "xau_scalp_failed_fade_follow_stop_v1"}
+        with patch.object(dexter, "_xau_multi_tf_entry_guard", return_value={"blocked": False, "allowed": True}):
+            lane, _src = dexter._build_family_canary_signal(sig, base_source="scalp_xauusd", candidate=cand)
+        self.assertIsNone(lane)
+        skip = dict(getattr(sig, "raw_scores", {}) or {}).get("family_canary_skip") or {}
+        self.assertEqual(skip.get("family"), "xau_scalp_failed_fade_follow_stop")
+        self.assertEqual(skip.get("stage"), "family_builder")
+        self.assertIn("executor_spawned", skip.get("reason", ""))
 
 
 if __name__ == "__main__":
