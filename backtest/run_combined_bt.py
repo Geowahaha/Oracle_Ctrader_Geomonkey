@@ -550,9 +550,12 @@ def run_combined(
         # ── Session manager patches ────────────────────────────────────────
         from market.data_fetcher import session_manager
         _original_is_open = session_manager.is_xauusd_market_open
+        _original_is_holiday = session_manager.is_xauusd_holiday
         _original_get_info = session_manager.get_session_info
         session_manager.is_xauusd_market_open = lambda *a, **kw: True
+        session_manager.is_xauusd_holiday = lambda *a, **kw: False
         originals["__session_manager_patch"] = _original_is_open
+        originals["__session_holiday_patch"] = _original_is_holiday
 
         def _backtest_session_info():
             """Build session info from cursor time, not real clock."""
@@ -787,6 +790,13 @@ def run_combined(
                 session_manager.is_xauusd_market_open = originals.pop("__session_manager_patch")
             except Exception:
                 originals.pop("__session_manager_patch", None)
+
+        if "__session_holiday_patch" in originals:
+            try:
+                from market.data_fetcher import session_manager
+                session_manager.is_xauusd_holiday = originals.pop("__session_holiday_patch")
+            except Exception:
+                originals.pop("__session_holiday_patch", None)
 
         if "__session_info_patch" in originals:
             try:
