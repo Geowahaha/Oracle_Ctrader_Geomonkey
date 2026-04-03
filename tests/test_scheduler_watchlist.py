@@ -1082,6 +1082,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
              patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0), \
@@ -3179,7 +3180,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
         sig = make_signal("XAUUSD", confidence=78.0)
         sig.session = "new_york"
 
-        with patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0), \
              patch.object(scheduler_module.config, "get_mt5_scalp_xau_live_sessions", return_value={"new_york"}):
@@ -3207,7 +3209,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
             }
         )
 
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False):
             allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
@@ -3241,7 +3244,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
                 },
             }
         )
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True):
             allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
@@ -3273,7 +3277,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
                 },
             }
         )
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True), \
@@ -3309,6 +3314,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", False), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd:winner"}), \

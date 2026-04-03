@@ -1733,6 +1733,7 @@ class Config:
     SCALPING_ALERT_COOLDOWN_SEC: int = int(os.getenv("SCALPING_ALERT_COOLDOWN_SEC", "120"))
     SCALPING_DUPLICATE_SUPPRESS_SEC: int = int(os.getenv("SCALPING_DUPLICATE_SUPPRESS_SEC", "1800"))
     SCALPING_XAU_MARKET_CLOSED_GUARD_ENABLED: bool = os.getenv("SCALPING_XAU_MARKET_CLOSED_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_HOLIDAY_GUARD_ENABLED: bool = os.getenv("XAU_HOLIDAY_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_NOTIFY_TELEGRAM: bool = os.getenv("SCALPING_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_EXECUTE_MT5: bool = os.getenv("SCALPING_EXECUTE_MT5", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_CLOSE_TIMEOUT_MIN: int = int(os.getenv("SCALPING_CLOSE_TIMEOUT_MIN", "35"))

@@ -1015,6 +1015,11 @@ class DexterScheduler:
             return True, "crypto_live_enabled"
         if src not in {"scalp_xauusd", "scalp_xauusd:winner"}:
             return True, "not_xau_scalp"
+        if bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True)):
+            if session_manager.is_xauusd_holiday():
+                return False, "xauusd_market_holiday"
+        if not session_manager.is_xauusd_market_open():
+            return False, "xauusd_market_closed"
         if bool(getattr(config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", False)):
             session_sig = self._signal_session_signature(signal)
             allowed_sessions = set(config.get_mt5_scalp_xau_live_sessions() or set())

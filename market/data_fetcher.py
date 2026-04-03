@@ -8,7 +8,7 @@ FIX v3.1:
 """
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 import pandas as pd
 import numpy as np
@@ -495,8 +495,54 @@ class SessionManager:
         return False
 
     @staticmethod
+    def _easter_sunday(year: int) -> date:
+        """Butcher's algorithm — computes Easter Sunday for a Gregorian year."""
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        ll = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * ll) // 451
+        month = (h + ll - 7 * m + 114) // 31
+        day = ((h + ll - 7 * m + 114) % 31) + 1
+        return date(year, month, day)
+
+    @staticmethod
+    def xauusd_market_holidays(year: int) -> frozenset:
+        """
+        Returns the set of dates (UTC) when XAUUSD spot gold is closed.
+        Gold is closed on: Good Friday, Christmas Day, New Year's Day.
+        """
+        easter = SessionManager._easter_sunday(year)
+        good_friday = easter - timedelta(days=2)
+        holidays = {
+            good_friday,
+            date(year, 12, 25),   # Christmas Day
+            date(year, 1, 1),     # New Year's Day
+        }
+        return frozenset(holidays)
+
+    @staticmethod
+    def is_xauusd_holiday(now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if today (UTC) is a XAUUSD market holiday."""
+        now = now_utc or datetime.now(timezone.utc)
+        today = now.date()
+        return today in SessionManager.xauusd_market_holidays(today.year)
+
+    @staticmethod
     def is_xauusd_market_open(now_utc: Optional[datetime] = None) -> bool:
-        return not SessionManager.is_fx_weekend_closed(now_utc=now_utc)
+        if SessionManager.is_fx_weekend_closed(now_utc=now_utc):
+            return False
+        if bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True)):
+            if SessionManager.is_xauusd_holiday(now_utc=now_utc):
+                return False
+        return True
 
     @staticmethod
     def is_high_volatility_window() -> bool:
