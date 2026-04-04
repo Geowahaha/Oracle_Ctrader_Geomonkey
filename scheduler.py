@@ -11405,6 +11405,94 @@ class DexterScheduler:
                 logger.debug("[Scheduler] Family calibration telegram send failed", exc_info=True)
         return report
 
+    # ── Sharpness Feedback Loop (self-improving) ────────────────────────────
+
+    def _run_sharpness_feedback_report(self, force: bool = False) -> dict:
+        """Run sharpness correlation + calibration + family decay report."""
+        if not bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {"ok": False, "status": "no_db"}
+        try:
+            from learning.sharpness_feedback import build_sharpness_feedback_report, format_sharpness_feedback_text
+            current_weights = {
+                "XAU_ENTRY_SHARPNESS_W_MOMENTUM": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0),
+                "XAU_ENTRY_SHARPNESS_W_FLOW": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0),
+                "XAU_ENTRY_SHARPNESS_W_ABSORPTION": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0),
+                "XAU_ENTRY_SHARPNESS_W_STABILITY": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0),
+                "XAU_ENTRY_SHARPNESS_W_POSITIONING": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0),
+            }
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.row_factory = _sqlite3.Row
+                report = build_sharpness_feedback_report(
+                    conn,
+                    days=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", 14) or 14)),
+                    symbol="XAUUSD",
+                    current_weights=current_weights,
+                    min_trades_for_calibration=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_MIN_TRADES", 10) or 10)),
+                    decay_recent_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_RECENT_TRADES", 20) or 20)),
+                    decay_baseline_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_BASELINE_TRADES", 60) or 60)),
+                    decay_threshold=max(0.01, float(getattr(config, "XAU_FAMILY_DECAY_THRESHOLD", 0.15) or 0.15)),
+                )
+        except Exception as exc:
+            logger.error("[Scheduler] Sharpness feedback report error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        try:
+            report_store.save_report("sharpness_feedback_report", report)
+        except Exception:
+            pass
+        summary = dict((report or {}).get("summary") or {})
+        if bool(report.get("ok")):
+            logger.info(
+                "[Scheduler] Sharpness feedback: trades=%s composite_r=%s calibrate=%s decay_alerts=%s",
+                int(summary.get("n_trades_with_sharpness", 0) or 0),
+                round(float(summary.get("composite_r", 0.0) or 0.0), 4),
+                bool(summary.get("calibration_ready")),
+                int(summary.get("n_decay_alerts", 0) or 0),
+            )
+        else:
+            logger.warning("[Scheduler] Sharpness feedback failed: %s", report.get("error"))
+        # Auto-calibrate weights if enabled and report says apply
+        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)):
+            self._apply_sharpness_auto_calibrate(report)
+        # Telegram notification
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", True)) and (bool(report.get("ok")) or force):
+            try:
+                from learning.sharpness_feedback import format_sharpness_feedback_text
+                notifier._send(
+                    format_sharpness_feedback_text(report),
+                    parse_mode=None,
+                    feature="winner_mission",
+                )
+            except Exception:
+                logger.debug("[Scheduler] Sharpness feedback telegram send failed", exc_info=True)
+        return report
+
+    def _apply_sharpness_auto_calibrate(self, report: dict) -> None:
+        """Apply weight recommendations from sharpness feedback if auto-calibrate is enabled."""
+        calibration = dict((report or {}).get("calibration") or {})
+        if not bool(calibration.get("apply")):
+            return
+        recommendations = list(calibration.get("recommendations") or [])
+        applied = []
+        for rec in recommendations:
+            if str(rec.get("action", "hold") or "hold") == "hold":
+                continue
+            config_key = str(rec.get("config_key", "") or "")
+            new_val = float(rec.get("recommended", 1.0) or 1.0)
+            min_w = max(0.1, float(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT", 0.5) or 0.5))
+            max_w = max(1.0, float(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT", 2.0) or 2.0))
+            clamped = max(min_w, min(max_w, new_val))
+            if config_key and hasattr(config, config_key):
+                old_val = float(getattr(config, config_key, 1.0) or 1.0)
+                if abs(clamped - old_val) > 0.001:
+                    setattr(config, config_key, clamped)
+                    applied.append(f"{config_key}: {old_val:.3f} -> {clamped:.3f}")
+        if applied:
+            logger.info("[Scheduler] Sharpness auto-calibrate applied: %s", applied)
+
     @staticmethod
     def _format_tick_depth_replay_report_text(report: dict) -> str:
         if not bool((report or {}).get("ok")):
@@ -12370,6 +12458,16 @@ class DexterScheduler:
                 f"  Family calibration report: every {family_calibration_mins}m "
                 f"(lookback={max(1, int(getattr(config, 'FAMILY_CALIBRATION_REPORT_LOOKBACK_DAYS', 21) or 21))}d)\n"
             )
+        sharpness_feedback_line = ""
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)):
+            sharpness_fb_mins = max(30, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN", 120) or 120))
+            schedule.every(sharpness_fb_mins).minutes.do(self._run_sharpness_feedback_report)
+            sharpness_feedback_line = (
+                f"  Sharpness feedback loop: every {sharpness_fb_mins}m "
+                f"(lookback={max(1, int(getattr(config, 'XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS', 14) or 14))}d"
+                f" auto-cal={'ON' if bool(getattr(config, 'XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED', False)) else 'OFF'}"
+                f" decay={'ON' if bool(getattr(config, 'XAU_FAMILY_DECAY_ENABLED', True)) else 'OFF'})\n"
+            )
         ctrader_market_capture_line = ""
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_ENABLED", False)):
             capture_mins = max(1, int(getattr(config, "CTRADER_MARKET_CAPTURE_INTERVAL_MIN", 5) or 5))
@@ -12542,6 +12640,7 @@ class DexterScheduler:
             f"{conductor_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
+            f"{sharpness_feedback_line}"
             f"{ctrader_market_capture_line}"
             f"{ctrader_replay_lab_line}"
             f"{mission_progress_line}"
@@ -12619,6 +12718,8 @@ class DexterScheduler:
             self._run_conductor_cycle(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)) and bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ON_START", True)):
+            self._run_sharpness_feedback_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):
             self._run_strategy_lab_report(force=True)
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_MARKET_CAPTURE_ON_START", False)):
@@ -12704,6 +12805,8 @@ class DexterScheduler:
             results["strategy_lab_report"] = self._run_strategy_lab_report(force=True)
         if task in ("family_calibration", "calibration", "family_calibration_report"):
             results["family_calibration_report"] = self._run_family_calibration_report(force=True)
+        if task in ("sharpness_feedback", "sharpness_report", "sharpness"):
+            results["sharpness_feedback_report"] = self._run_sharpness_feedback_report(force=True)
         if task in ("ctrader_capture", "market_capture", "ctrader_market_capture"):
             results["ctrader_market_capture"] = self._run_ctrader_market_capture(force=True)
         if task in ("ctrader_replay", "replay_lab", "ctrader_tick_depth_replay_lab"):

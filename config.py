@@ -537,6 +537,23 @@ class Config:
     XAU_ENTRY_SHARPNESS_W_ABSORPTION: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_ABSORPTION", "1.0"))
     XAU_ENTRY_SHARPNESS_W_STABILITY: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_STABILITY", "1.0"))
     XAU_ENTRY_SHARPNESS_W_POSITIONING: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_POSITIONING", "1.0"))
+    # ── Sharpness Feedback Loop (self-improving) ────────────────────────────
+    XAU_SHARPNESS_FEEDBACK_ENABLED: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN", "120"))
+    XAU_SHARPNESS_FEEDBACK_ON_START: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", "14"))
+    XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_MIN_TRADES: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_MIN_TRADES", "10"))
+    # ── Sharpness Auto-Calibration ──────────────────────────────────────────
+    XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED: bool = os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP", "0.15"))
+    XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT", "0.5"))
+    XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT", "2.0"))
+    # ── Family Performance Decay Detector ───────────────────────────────────
+    XAU_FAMILY_DECAY_ENABLED: bool = os.getenv("XAU_FAMILY_DECAY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_FAMILY_DECAY_RECENT_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_RECENT_TRADES", "20"))
+    XAU_FAMILY_DECAY_BASELINE_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_BASELINE_TRADES", "60"))
+    XAU_FAMILY_DECAY_THRESHOLD: float = float(os.getenv("XAU_FAMILY_DECAY_THRESHOLD", "0.15"))
     CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS: int = int(os.getenv("CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS", "18"))
     XAU_TD_VS_PB_COMPARE_MIN_RESOLVED: int = int(os.getenv("XAU_TD_VS_PB_COMPARE_MIN_RESOLVED", "4"))
     CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE: bool = os.getenv("CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE", "1").strip().lower() in ("1", "true", "yes", "on")
