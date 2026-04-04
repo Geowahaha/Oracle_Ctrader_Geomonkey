@@ -11488,9 +11488,10 @@ class DexterScheduler:
             report_store.save_report("sharpness_feedback_report", xau_report)
         except Exception:
             pass
-        # Auto-calibrate from XAUUSD only (primary symbol)
-        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)) and "XAUUSD" in all_reports:
-            self._apply_sharpness_auto_calibrate(all_reports["XAUUSD"])
+        # Auto-calibrate from all symbols with sharpness data
+        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)):
+            for sym, sym_report in all_reports.items():
+                self._apply_sharpness_auto_calibrate(sym_report, symbol=sym)
         # Telegram: combined
         if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", True)) and (telegram_lines or force):
             try:
@@ -11501,7 +11502,7 @@ class DexterScheduler:
                 logger.debug("[Scheduler] Sharpness feedback telegram send failed", exc_info=True)
         return {"ok": True, "symbols": list(all_reports.keys()), "reports": {k: bool(v.get("ok")) for k, v in all_reports.items()}}
 
-    def _apply_sharpness_auto_calibrate(self, report: dict) -> None:
+    def _apply_sharpness_auto_calibrate(self, report: dict, symbol: str = "XAUUSD") -> None:
         """Apply weight recommendations from sharpness feedback if auto-calibrate is enabled."""
         calibration = dict((report or {}).get("calibration") or {})
         if not bool(calibration.get("apply")):
@@ -11522,20 +11523,20 @@ class DexterScheduler:
                     setattr(config, config_key, clamped)
                     applied.append(f"{config_key}: {old_val:.3f} -> {clamped:.3f}")
         if applied:
-            logger.info("[Scheduler] Sharpness auto-calibrate applied: %s", applied)
+            logger.info("[Scheduler] Sharpness auto-calibrate [%s] applied: %s", symbol, applied)
             if bool(getattr(config, "STRATEGY_EVOLUTION_ENABLED", True)):
                 try:
                     from learning.strategy_evolution import log_change
                     correlation = dict((report or {}).get("correlation") or {})
                     log_change(
                         change_type="weight_calibration",
-                        description=f"Sharpness weights adjusted: {', '.join(applied)}",
+                        description=f"[{symbol}] Sharpness weights adjusted: {', '.join(applied)}",
                         component="analysis/entry_sharpness.py",
                         metric_before={"composite_r": float((correlation.get("composite") or {}).get("r", 0) or 0)},
                         impact="pending",
                         auto=True,
                         source="sharpness_feedback",
-                        metadata={"applied": applied, "n_trades": int(correlation.get("n_trades", 0) or 0)},
+                        metadata={"symbol": symbol, "applied": applied, "n_trades": int(correlation.get("n_trades", 0) or 0)},
                     )
                 except Exception:
                     logger.debug("[Scheduler] Strategy evolution log failed", exc_info=True)

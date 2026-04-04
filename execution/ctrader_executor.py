@@ -2221,6 +2221,64 @@ class CTraderExecutor:
             "details": details,
         }
 
+    def _crypto_dom_defense_plan(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_price: float,
+        r_now: Optional[float],
+        age_min: float,
+    ) -> dict:
+        """DOM-only active defense for non-XAU symbols (BTC/ETH).
+
+        Lighter than full XAU active defense — only checks DOM liquidity shift.
+        Tightens stop or closes when DOM shows severe adverse liquidity.
+        """
+        if self._is_xau_symbol(symbol):
+            return {"active": False, "reason": "xau_uses_full_active_defense"}
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {"active": False, "reason": "dom_disabled"}
+        min_age = max(1.0, float(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_AGE_MIN", 2.0) or 2.0))
+        if age_min < min_age:
+            return {"active": False, "reason": "too_young"}
+        if stop_loss <= 0 or entry <= 0:
+            return {"active": False, "reason": "invalid_entry_or_stop"}
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            import sqlite3 as _sqlite3_cdom
+            _cdom_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+            if not _cdom_db.exists():
+                return {"active": False, "reason": "no_db"}
+            with _sqlite3_cdom.connect(str(_cdom_db), timeout=5) as _cdom_conn:
+                _cdom_conn.row_factory = _sqlite3_cdom.Row
+                dom_result = analyze_dom_liquidity(_cdom_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+            if not bool(dom_result.get("ok")):
+                return {"active": False, "reason": "dom_no_data"}
+            adverse = dict(dom_result.get("adverse") or {})
+            adverse_score = int(adverse.get("adverse_score", 0) or 0)
+            severity = str(adverse.get("severity", "none") or "none")
+            recommendation = str(adverse.get("recommendation", "hold") or "hold")
+            details = {"dom_adverse_score": adverse_score, "dom_severity": severity, "dom_recommendation": recommendation, "symbol": symbol}
+            if severity == "severe" and (r_now is not None) and float(r_now) <= 0.15:
+                return {"active": True, "action": "close", "reason": "crypto_dom_defense_close", "details": details}
+            if adverse_score >= 2:
+                keep_r = 0.35 if severity == "severe" else 0.50
+                new_sl = entry - (risk * keep_r) if direction == "long" else entry + (risk * keep_r)
+                if direction == "long":
+                    new_sl = max(stop_loss, new_sl)
+                else:
+                    new_sl = min(stop_loss, new_sl)
+                return {"active": True, "action": "tighten", "reason": "crypto_dom_defense_tighten", "new_stop_loss": round(new_sl, 4), "new_take_profit": 0.0, "details": details}
+            return {"active": False, "reason": "dom_not_adverse", "details": details}
+        except Exception:
+            return {"active": False, "reason": "dom_error"}
+
     def _scheduled_canary_rebalanced_stop(
         self,
         *,
@@ -5224,66 +5282,89 @@ class CTraderExecutor:
                                 "details": details,
                         })
                     continue
-                if not self._is_scheduled_canary_source(source):
-                    if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
-                        no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)
-                        no_follow_max_r = float(order_care_overrides.get("no_follow_max_r", 0.0) or 0.0)
-                        be_trigger_r = float(order_care_overrides.get("be_trigger_r", 0.0) or 0.0)
-                        be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
-                        trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
-                        stop_tol = max(abs(entry) * 0.000001, 0.01)
-                        if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
+            # DOM-only defense for non-XAU symbols (BTC/ETH)
+            if not self._is_xau_symbol(symbol) and symbol.upper() in {"BTCUSD", "ETHUSD"}:
+                try:
+                    crypto_dom = self._crypto_dom_defense_plan(symbol=symbol, direction=direction, entry=entry, stop_loss=stop_loss, current_price=ref, r_now=r_now, age_min=age_min)
+                    if bool(crypto_dom.get("active")):
+                        c_action = str(crypto_dom.get("action") or "").strip().lower()
+                        c_details = dict(crypto_dom.get("details") or {})
+                        if c_action == "close":
                             res = self.close_position(position_id=position_id, volume=volume)
                             if bool(res.ok):
-                                report["closed_profit_positions"] += 1
+                                report["pm_actions"].append({"position_id": position_id, "source": source, "symbol": symbol, "action": str(crypto_dom.get("reason") or "crypto_dom_defense_close"), "reference_price": round(ref, 4), "r_now": (None if r_now is None else round(float(r_now), 4)), "details": c_details})
+                            continue
+                        if c_action == "tighten":
+                            c_new_sl = _safe_float(crypto_dom.get("new_stop_loss"), 0.0)
+                            c_stop_tol = max(abs(entry) * 0.000001, 0.01)
+                            if self._stop_valid_for_position(direction, entry, c_new_sl) and abs(c_new_sl - stop_loss) > c_stop_tol:
+                                res = self.amend_position_sltp(position_id=position_id, stop_loss=c_new_sl, take_profit=target_tp, trailing_stop_loss=False)
+                                if bool(res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append({"position_id": position_id, "source": source, "symbol": symbol, "action": str(crypto_dom.get("reason") or "crypto_dom_defense_tighten"), "reference_price": round(ref, 4), "new_stop_loss": round(c_new_sl, 4), "r_now": (None if r_now is None else round(float(r_now), 4)), "details": c_details})
+                            continue
+                except Exception:
+                    logger.debug("[PM] crypto_dom_defense error for %s", symbol, exc_info=True)
+            if not self._is_scheduled_canary_source(source):
+                if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
+                    no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)
+                    no_follow_max_r = float(order_care_overrides.get("no_follow_max_r", 0.0) or 0.0)
+                    be_trigger_r = float(order_care_overrides.get("be_trigger_r", 0.0) or 0.0)
+                    be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
+                    trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
+                    stop_tol = max(abs(entry) * 0.000001, 0.01)
+                    if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
+                        res = self.close_position(position_id=position_id, volume=volume)
+                        if bool(res.ok):
+                            report["closed_profit_positions"] += 1
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": "xau_order_care_no_follow_close",
+                                "reference_price": round(ref, 4),
+                                "r_now": round(float(r_now), 4),
+                                "age_min": round(float(age_min), 2),
+                                "mode": str(order_care_state.get("mode") or ""),
+                            })
+                        continue
+                    if (r_now is not None) and float(r_now) >= be_trigger_r:
+                        r_current = float(r_now)
+                        trail_lock_r = float(be_lock_r)
+                        if r_current >= 1.0:
+                            trail_lock_r = max(trail_lock_r, 0.50)
+                        if r_current >= 2.0:
+                            trail_lock_r = max(trail_lock_r, 1.00)
+                        if r_current >= 3.0:
+                            trail_lock_r = max(trail_lock_r, 2.00)
+                        be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
+                        improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
+                        trimmed_tp = target_tp
+                        if trim_tp_r > 0:
+                            candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
+                            if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
+                                trimmed_tp = candidate_tp
+                        if improves and abs(be_sl - stop_loss) > stop_tol:
+                            res = self.amend_position_sltp(
+                                position_id=position_id,
+                                stop_loss=be_sl,
+                                take_profit=trimmed_tp,
+                                trailing_stop_loss=False,
+                            )
+                            if bool(res.ok):
+                                report["amended_positions"] += 1
                                 report["pm_actions"].append({
                                     "position_id": position_id,
                                     "source": source,
                                     "symbol": symbol,
-                                    "action": "xau_order_care_no_follow_close",
+                                    "action": "xau_order_care_breakeven",
                                     "reference_price": round(ref, 4),
+                                    "new_stop_loss": round(be_sl, 4),
+                                    "take_profit": round(trimmed_tp, 4),
                                     "r_now": round(float(r_now), 4),
-                                    "age_min": round(float(age_min), 2),
                                     "mode": str(order_care_state.get("mode") or ""),
                                 })
                             continue
-                        if (r_now is not None) and float(r_now) >= be_trigger_r:
-                            r_current = float(r_now)
-                            trail_lock_r = float(be_lock_r)
-                            if r_current >= 1.0:
-                                trail_lock_r = max(trail_lock_r, 0.50)
-                            if r_current >= 2.0:
-                                trail_lock_r = max(trail_lock_r, 1.00)
-                            if r_current >= 3.0:
-                                trail_lock_r = max(trail_lock_r, 2.00)
-                            be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
-                            improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
-                            trimmed_tp = target_tp
-                            if trim_tp_r > 0:
-                                candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-                                if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
-                                    trimmed_tp = candidate_tp
-                            if improves and abs(be_sl - stop_loss) > stop_tol:
-                                res = self.amend_position_sltp(
-                                    position_id=position_id,
-                                    stop_loss=be_sl,
-                                    take_profit=trimmed_tp,
-                                    trailing_stop_loss=False,
-                                )
-                                if bool(res.ok):
-                                    report["amended_positions"] += 1
-                                    report["pm_actions"].append({
-                                        "position_id": position_id,
-                                        "source": source,
-                                        "symbol": symbol,
-                                        "action": "xau_order_care_breakeven",
-                                        "reference_price": round(ref, 4),
-                                        "new_stop_loss": round(be_sl, 4),
-                                        "take_profit": round(trimmed_tp, 4),
-                                        "r_now": round(float(r_now), 4),
-                                        "mode": str(order_care_state.get("mode") or ""),
-                                    })
-                                continue
                     if ":canary" in source and risk > 0 and self._target_valid_for_position(direction, entry, target_tp):
                         canary_be_trigger_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_TRIGGER_R", 0.80) or 0.80)
                         canary_be_lock_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_LOCK_R", 0.05) or 0.05)
