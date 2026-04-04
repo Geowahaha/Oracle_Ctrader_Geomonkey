@@ -2464,9 +2464,21 @@ class DexterScheduler:
         low_rejection = rejection_ratio <= float(getattr(config, "XAU_PB_FALLING_KNIFE_BLOCK_MAX_REJECTION_RATIO", 0.18) or 0.18)
         state_block = state_label in blocked_states
         flow_block = day_type in blocked_day_types and adverse_delta and adverse_refill and high_volume and low_rejection
-        if not state_block and not flow_block:
+        # Sharpness-based supplementary knife detection
+        sharpness_block = False
+        pb_sharpness: dict = {}
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                pb_sharpness = _compute_sharpness(features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                sharpness_block = int(pb_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_PB_KNIFE_THRESHOLD", 35) or 35))
+            except Exception:
+                pass
+        if not state_block and not flow_block and not sharpness_block:
             return {}
         reasons: list[str] = []
+        if sharpness_block:
+            reasons.append(f"sharpness_knife:{pb_sharpness.get('sharpness_score', 0)}")
         if state_block:
             reasons.append(f"state:{state_label}")
         if flow_block:
@@ -2490,6 +2502,7 @@ class DexterScheduler:
                 "rejection_ratio": round(rejection_ratio, 4),
                 "bar_volume_proxy": round(bar_volume_proxy, 4),
             },
+            "sharpness": dict(pb_sharpness) if pb_sharpness else {},
             "gate_reasons": [str(item or "").strip() for item in list(gate.get("reasons") or []) if str(item or "").strip()],
         }
 
@@ -2532,6 +2545,19 @@ class DexterScheduler:
         state_label = str(chart_state.get("state_label") or "").strip().lower()
         day_type = str(chart_state.get("day_type") or features.get("day_type") or "trend").strip().lower() or "trend"
         sign = 1.0 if direction == "long" else -1.0
+        # ── Entry Sharpness Score (deep data analytics) ──────────────────
+        sharpness_result: dict = {}
+        sharpness_score: int = 50
+        sharpness_band: str = "normal"
+        _sharpness_has_data = bool(features.get("spots_count") or (features.get("delta_proxy") is not None and features.get("bar_volume_proxy") is not None))
+        if _sharpness_has_data and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                sharpness_result = _compute_sharpness(features, direction, weights={"momentum": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0), "flow": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0), "absorption": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0), "stability": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0), "positioning": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0)}, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                sharpness_score = int(sharpness_result.get("sharpness_score", 50) or 50)
+                sharpness_band = str(sharpness_result.get("sharpness_band", "normal") or "normal")
+            except Exception:
+                pass
         spread_avg_pct = float(features.get("spread_avg_pct", 0.0) or 0.0)
         spread_expansion = float(features.get("spread_expansion", 1.0) or 1.0)
         delta_proxy = float(features.get("delta_proxy", 0.0) or 0.0)
@@ -2598,8 +2624,11 @@ class DexterScheduler:
         if state_label in limit_states:
             absorption_score += 1
             absorption_reasons.append(f"state:{state_label}")
+        # Sharpness-based knife block (composite deep analytics)
+        sharpness_knife = bool(sharpness_band == "knife" and sharpness_score < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD", 30) or 30)))
         hostile_flow = bool(
-            day_type in hostile_day_types
+            sharpness_knife
+            or day_type in hostile_day_types
             or state_label in hostile_states
             or spread_avg_pct > (max_spread_pct * 1.12)
             or spread_expansion > (max_spread_expansion * 1.08)
@@ -2618,6 +2647,8 @@ class DexterScheduler:
         trigger_scale = 1.0
         risk_multiplier = 1.0
         if hostile_flow:
+            if sharpness_knife:
+                reasons.append(f"sharpness_knife:{sharpness_score}")
             if day_type in hostile_day_types:
                 reasons.append(f"day_type:{day_type}")
             if state_label in hostile_states:
@@ -2660,6 +2691,7 @@ class DexterScheduler:
                     "bar_volume_proxy": round(bar_volume_proxy, 4),
                     "tick_up_ratio": round(tick_up_ratio, 4),
                 },
+                "sharpness": dict(sharpness_result) if sharpness_result else {},
             }
         stop_min_score = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_STOP_MIN_SCORE", 5) or 5))
         limit_min_score = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_MIN_SCORE", 4) or 4))
@@ -2691,6 +2723,19 @@ class DexterScheduler:
                 mode = "fast_stop"
                 trigger_scale = max(0.50, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_FAST_STOP_TRIGGER_SCALE", 0.82) or 0.82))
                 reasons = continuation_reasons[:5]
+        # ── Sharpness-based adjustments (caution / sharp) ────────────────
+        if sharpness_band == "caution" and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            if next_entry_type in {"buy_stop", "sell_stop"}:
+                next_entry_type = "limit"
+                mode = "sharpness_downgrade_to_limit"
+                reasons = list(sharpness_result.get("sharpness_reasons") or [])[:4]
+            risk_multiplier *= max(0.25, float(getattr(config, "XAU_ENTRY_SHARPNESS_CAUTION_RISK_MULT", 0.75) or 0.75))
+        elif sharpness_band == "sharp" and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            sharp_min_cont = max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_SHARP_PROMOTE_MIN_CONT_SCORE", 4) or 4))
+            if next_entry_type == "limit" and continuation_score >= sharp_min_cont:
+                next_entry_type = stop_target
+                mode = "sharpness_promote_to_stop"
+                reasons = list(sharpness_result.get("sharpness_reasons") or [])[:4] + continuation_reasons[:2]
         return {
             "blocked": False,
             "family": family,
@@ -2723,6 +2768,7 @@ class DexterScheduler:
                 "bar_volume_proxy": round(bar_volume_proxy, 4),
                 "tick_up_ratio": round(tick_up_ratio, 4),
             },
+            "sharpness": dict(sharpness_result) if sharpness_result else {},
         }
 
     def _load_xau_microtrend_follow_up_contexts(self) -> list[dict]:
@@ -3379,6 +3425,7 @@ class DexterScheduler:
                     raw["pb_falling_knife_block_snapshot"] = dict(pb_flow_guard.get("snapshot") or {})
                     raw["pb_falling_knife_block_chart_state"] = dict(pb_flow_guard.get("chart_state") or {})
                     raw["pb_falling_knife_block_features"] = dict(pb_flow_guard.get("features") or {})
+                    raw["pb_falling_knife_block_sharpness"] = dict(pb_flow_guard.get("sharpness") or {})
                     signal.raw_scores = raw
                 except Exception:
                     pass
@@ -3524,6 +3571,7 @@ class DexterScheduler:
                     "snapshot": dict(entry_router.get("snapshot") or {}),
                     "chart_state": dict(entry_router.get("chart_state") or {}),
                     "features": dict(entry_router.get("features") or {}),
+                    "sharpness": dict(entry_router.get("sharpness") or {}),
                 }
                 router_risk_mult = max(0.25, float(entry_router.get("risk_multiplier", 1.0) or 1.0))
                 if abs(router_risk_mult - 1.0) > 1e-9:
@@ -4583,6 +4631,15 @@ class DexterScheduler:
             tick_falling = (direction == "long" and tick_up < min_tick_up) or (direction == "short" and (1.0 - tick_up) < min_tick_up)
             if adverse_delta or tick_falling:
                 return None, ""
+        # ── Sharpness composite knife guard (catches edge cases binary checks miss) ─
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                rr_sharpness = _compute_sharpness(capture_features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                if int(rr_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_RR_KNIFE_THRESHOLD", 30) or 30)):
+                    return None, ""
+            except Exception:
+                pass
         lane_signal = copy.deepcopy(signal)
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
         stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
@@ -7296,6 +7353,19 @@ class DexterScheduler:
         wick_ratio = float(sweep.get("sweep_wick_ratio") or 0.0)
         if current_price <= 0 or atr <= 0:
             return False
+        # ── Sharpness guard — block sweep reversal in knife microstructure ──
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                sweep_snap = dict(live_profile_autopilot.latest_capture_feature_snapshot(symbol="XAUUSD", lookback_sec=int(getattr(config, "XAU_TICK_DEPTH_FILTER_LOOKBACK_SEC", 240) or 240), direction=direction, confidence=float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0)) or {})
+                sweep_features = dict((sweep_snap.get("gate") or {}).get("features") or sweep_snap.get("features") or {})
+                if sweep_features:
+                    from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                    sweep_sharpness = _compute_sharpness(sweep_features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                    if int(sweep_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD", 30) or 30)):
+                        logger.info("[PostSLReversal] blocked by sharpness knife score=%s", sweep_sharpness.get("sharpness_score"))
+                        return False
+            except Exception:
+                pass
         sl_buf = atr * float(getattr(config, "POST_SL_REVERSAL_SL_BUFFER_ATR", 0.20) or 0.20)
         tp1_r = float(getattr(config, "POST_SL_REVERSAL_TP1_R", 1.5) or 1.5)
         tp2_r = float(getattr(config, "POST_SL_REVERSAL_TP2_R", 2.5) or 2.5)

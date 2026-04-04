@@ -701,6 +701,13 @@ def summarize_market_capture(spots_rows: list, depth_rows: list) -> dict:
         "mid_open": mids[0] if mids else 0.0,
         "mid_close": mids[-1] if mids else 0.0,
     }
+    # Deep microstructure features (entry sharpness analytics)
+    try:
+        from analysis.entry_sharpness import compute_deep_features
+        deep = compute_deep_features(mids=mids, move_deltas=move_deltas, spot_ts=spot_ts, spread_pcts=spread_pcts, depth_points=depth_points)
+        out.update(deep)
+    except Exception:
+        pass
     day_type = classify_xau_day_type(out)
     out["day_type"] = str(day_type.get("day_type") or "trend")
     out["day_type_reasons"] = list(day_type.get("reasons") or [])
