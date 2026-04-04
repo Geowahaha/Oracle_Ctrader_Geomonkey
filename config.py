@@ -544,6 +544,7 @@ class Config:
     XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", "14"))
     XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_SHARPNESS_FEEDBACK_MIN_TRADES: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_MIN_TRADES", "10"))
+    SELF_IMPROVING_SYMBOLS: str = os.getenv("SELF_IMPROVING_SYMBOLS", "XAUUSD,BTCUSD,ETHUSD")
     # ── Sharpness Auto-Calibration ──────────────────────────────────────────
     XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED: bool = os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP", "0.15"))

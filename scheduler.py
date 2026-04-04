@@ -3576,14 +3576,16 @@ class DexterScheduler:
                 # Attach Volume Profile context if available
                 if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
                     try:
-                        vp_report = dict(report_store.get_report("volume_profile") or {})
+                        _vp_sym = str(getattr(signal, "symbol", "XAUUSD") or "XAUUSD").strip().upper()
+                        vp_report = dict(report_store.get_report(f"volume_profile_{_vp_sym.lower()}") or report_store.get_report("volume_profile") or {})
                         vp_data = dict(vp_report.get("vp") or {})
                         if vp_data.get("poc"):
-                            from analysis.volume_profile import check_entry_vs_profile
+                            from analysis.volume_profile import check_entry_vs_profile, get_tick_config
                             entry_price = float(getattr(signal, "entry", 0.0) or 0.0)
                             direction = str(getattr(signal, "direction", "") or "").strip().lower()
                             if entry_price > 0 and direction:
-                                vp_check = check_entry_vs_profile(entry_price, direction, vp_data, bucket_ticks=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_BUCKET_TICKS", 10) or 10)))
+                                _tc = get_tick_config(_vp_sym)
+                                vp_check = check_entry_vs_profile(entry_price, direction, vp_data, tick_size=float(_tc.get("tick_size", 0.01)), bucket_ticks=int(_tc.get("bucket_ticks", 10)))
                                 raw["xau_openapi_entry_router"]["volume_profile"] = {"poc": float(vp_data.get("poc", 0) or 0), "va_high": float(vp_data.get("va_high", 0) or 0), "va_low": float(vp_data.get("va_low", 0) or 0), **vp_check}
                     except Exception:
                         pass
@@ -11421,68 +11423,83 @@ class DexterScheduler:
 
     # ── Sharpness Feedback Loop (self-improving) ────────────────────────────
 
+    def _get_self_improving_symbols(self) -> list[str]:
+        """Get list of symbols for self-improving AI features."""
+        raw = str(getattr(config, "SELF_IMPROVING_SYMBOLS", "XAUUSD,BTCUSD,ETHUSD") or "XAUUSD")
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
     def _run_sharpness_feedback_report(self, force: bool = False) -> dict:
-        """Run sharpness correlation + calibration + family decay report."""
+        """Run sharpness correlation + calibration + family decay report for all symbols."""
         if not bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)):
             return {"ok": False, "status": "disabled"}
         import sqlite3 as _sqlite3
         db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
         if not db_path.exists():
             return {"ok": False, "status": "no_db"}
+        symbols = self._get_self_improving_symbols()
+        current_weights = {
+            "XAU_ENTRY_SHARPNESS_W_MOMENTUM": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_FLOW": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_ABSORPTION": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_STABILITY": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_POSITIONING": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0),
+        }
+        all_reports: dict[str, dict] = {}
+        telegram_lines: list[str] = []
         try:
             from learning.sharpness_feedback import build_sharpness_feedback_report, format_sharpness_feedback_text
-            current_weights = {
-                "XAU_ENTRY_SHARPNESS_W_MOMENTUM": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0),
-                "XAU_ENTRY_SHARPNESS_W_FLOW": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0),
-                "XAU_ENTRY_SHARPNESS_W_ABSORPTION": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0),
-                "XAU_ENTRY_SHARPNESS_W_STABILITY": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0),
-                "XAU_ENTRY_SHARPNESS_W_POSITIONING": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0),
-            }
             with _sqlite3.connect(str(db_path), timeout=10) as conn:
                 conn.row_factory = _sqlite3.Row
-                report = build_sharpness_feedback_report(
-                    conn,
-                    days=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", 14) or 14)),
-                    symbol="XAUUSD",
-                    current_weights=current_weights,
-                    min_trades_for_calibration=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_MIN_TRADES", 10) or 10)),
-                    decay_recent_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_RECENT_TRADES", 20) or 20)),
-                    decay_baseline_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_BASELINE_TRADES", 60) or 60)),
-                    decay_threshold=max(0.01, float(getattr(config, "XAU_FAMILY_DECAY_THRESHOLD", 0.15) or 0.15)),
-                )
+                for sym in symbols:
+                    try:
+                        report = build_sharpness_feedback_report(
+                            conn,
+                            days=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", 14) or 14)),
+                            symbol=sym,
+                            current_weights=current_weights,
+                            min_trades_for_calibration=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_MIN_TRADES", 10) or 10)),
+                            decay_recent_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_RECENT_TRADES", 20) or 20)),
+                            decay_baseline_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_BASELINE_TRADES", 60) or 60)),
+                            decay_threshold=max(0.01, float(getattr(config, "XAU_FAMILY_DECAY_THRESHOLD", 0.15) or 0.15)),
+                        )
+                        all_reports[sym] = report
+                        report_store.save_report(f"sharpness_feedback_report_{sym.lower()}", report)
+                        summary = dict((report or {}).get("summary") or {})
+                        n_trades = int(summary.get("n_trades_with_sharpness", 0) or 0)
+                        if n_trades > 0:
+                            logger.info(
+                                "[Scheduler] Sharpness feedback %s: trades=%s composite_r=%s calibrate=%s decay_alerts=%s",
+                                sym, n_trades,
+                                round(float(summary.get("composite_r", 0.0) or 0.0), 4),
+                                bool(summary.get("calibration_ready")),
+                                int(summary.get("n_decay_alerts", 0) or 0),
+                            )
+                            telegram_lines.append(format_sharpness_feedback_text(report).replace("Sharpness Feedback Report", f"Sharpness [{sym}]"))
+                        else:
+                            logger.debug("[Scheduler] Sharpness feedback %s: no trades with sharpness", sym)
+                    except Exception as exc:
+                        logger.debug("[Scheduler] Sharpness feedback %s error: %s", sym, exc)
         except Exception as exc:
             logger.error("[Scheduler] Sharpness feedback report error: %s", exc, exc_info=True)
             return {"ok": False, "error": str(exc)}
+        # Save combined report for backwards compat
+        xau_report = all_reports.get("XAUUSD") or next(iter(all_reports.values()), {"ok": True})
         try:
-            report_store.save_report("sharpness_feedback_report", report)
+            report_store.save_report("sharpness_feedback_report", xau_report)
         except Exception:
             pass
-        summary = dict((report or {}).get("summary") or {})
-        if bool(report.get("ok")):
-            logger.info(
-                "[Scheduler] Sharpness feedback: trades=%s composite_r=%s calibrate=%s decay_alerts=%s",
-                int(summary.get("n_trades_with_sharpness", 0) or 0),
-                round(float(summary.get("composite_r", 0.0) or 0.0), 4),
-                bool(summary.get("calibration_ready")),
-                int(summary.get("n_decay_alerts", 0) or 0),
-            )
-        else:
-            logger.warning("[Scheduler] Sharpness feedback failed: %s", report.get("error"))
-        # Auto-calibrate weights if enabled and report says apply
-        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)):
-            self._apply_sharpness_auto_calibrate(report)
-        # Telegram notification
-        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", True)) and (bool(report.get("ok")) or force):
+        # Auto-calibrate from XAUUSD only (primary symbol)
+        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)) and "XAUUSD" in all_reports:
+            self._apply_sharpness_auto_calibrate(all_reports["XAUUSD"])
+        # Telegram: combined
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", True)) and (telegram_lines or force):
             try:
-                from learning.sharpness_feedback import format_sharpness_feedback_text
-                notifier._send(
-                    format_sharpness_feedback_text(report),
-                    parse_mode=None,
-                    feature="winner_mission",
-                )
+                if not telegram_lines:
+                    telegram_lines = ["\U0001f4ca Sharpness Feedback Report\nNo trades with sharpness data yet."]
+                notifier._send("\n\n".join(telegram_lines), parse_mode=None, feature="winner_mission")
             except Exception:
                 logger.debug("[Scheduler] Sharpness feedback telegram send failed", exc_info=True)
-        return report
+        return {"ok": True, "symbols": list(all_reports.keys()), "reports": {k: bool(v.get("ok")) for k, v in all_reports.items()}}
 
     def _apply_sharpness_auto_calibrate(self, report: dict) -> None:
         """Apply weight recommendations from sharpness feedback if auto-calibrate is enabled."""
@@ -11526,48 +11543,61 @@ class DexterScheduler:
     # ── Volume Profile ──────────────────────────────────────────────────────
 
     def _run_volume_profile_report(self, force: bool = False) -> dict:
-        """Compute session Volume Profile from M1 bars."""
+        """Compute session Volume Profile from M1 bars for all self-improving symbols."""
         if not bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
             return {"ok": False, "status": "disabled"}
         import sqlite3 as _sqlite3
         db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
         if not db_path.exists():
             return {"ok": False, "status": "no_db"}
+        symbols = self._get_self_improving_symbols()
+        all_reports: dict[str, dict] = {}
         try:
-            from analysis.volume_profile import build_session_volume_profile
+            from analysis.volume_profile import build_session_volume_profile, get_tick_config
             with _sqlite3.connect(str(db_path), timeout=10) as conn:
                 conn.row_factory = _sqlite3.Row
-                report = build_session_volume_profile(
-                    conn,
-                    symbol="XAUUSD",
-                    hours_back=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_HOURS_BACK", 24) or 24)),
-                    session="full",
-                    bucket_ticks=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_BUCKET_TICKS", 10) or 10)),
-                    va_pct=max(0.5, min(0.95, float(getattr(config, "XAU_VOLUME_PROFILE_VA_PCT", 0.70) or 0.70))),
-                )
+                for sym in symbols:
+                    try:
+                        tc = get_tick_config(sym)
+                        report = build_session_volume_profile(
+                            conn,
+                            symbol=sym,
+                            hours_back=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_HOURS_BACK", 24) or 24)),
+                            session="full",
+                            tick_size=float(tc.get("tick_size", 0.01)),
+                            bucket_ticks=int(tc.get("bucket_ticks", 10)),
+                            va_pct=max(0.5, min(0.95, float(getattr(config, "XAU_VOLUME_PROFILE_VA_PCT", 0.70) or 0.70))),
+                        )
+                        all_reports[sym] = report
+                        vp_data = dict(report.get("vp") or {})
+                        vp_data.pop("profile", None)
+                        report_store.save_report(f"volume_profile_{sym.lower()}", {**report, "vp": vp_data})
+                        if bool(report.get("ok")):
+                            vp = dict(report.get("vp") or {})
+                            logger.info(
+                                "[Scheduler] Volume profile %s: POC=%.2f VA=[%.2f,%.2f] bars=%d HVN=%d LVN=%d",
+                                sym,
+                                float(vp.get("poc", 0) or 0),
+                                float(vp.get("va_low", 0) or 0),
+                                float(vp.get("va_high", 0) or 0),
+                                int(report.get("bars_used", 0) or 0),
+                                len(list(vp.get("hvn_levels") or [])),
+                                len(list(vp.get("lvn_levels") or [])),
+                            )
+                    except Exception as exc:
+                        logger.debug("[Scheduler] Volume profile %s error: %s", sym, exc)
         except Exception as exc:
             logger.error("[Scheduler] Volume profile error: %s", exc, exc_info=True)
             return {"ok": False, "error": str(exc)}
-        try:
-            vp_data = dict(report.get("vp") or {})
-            vp_data.pop("profile", None)  # strip full profile from report store (too large)
-            report_store.save_report("volume_profile", {**report, "vp": vp_data})
-        except Exception:
-            pass
-        if bool(report.get("ok")):
-            vp = dict(report.get("vp") or {})
-            logger.info(
-                "[Scheduler] Volume profile: POC=%.2f VA=[%.2f,%.2f] bars=%d HVN=%d LVN=%d",
-                float(vp.get("poc", 0) or 0),
-                float(vp.get("va_low", 0) or 0),
-                float(vp.get("va_high", 0) or 0),
-                int(report.get("bars_used", 0) or 0),
-                len(list(vp.get("hvn_levels") or [])),
-                len(list(vp.get("lvn_levels") or [])),
-            )
-        else:
-            logger.debug("[Scheduler] Volume profile: %s", report.get("status"))
-        return report
+        # Backwards-compat: save XAUUSD as default "volume_profile"
+        if "XAUUSD" in all_reports:
+            try:
+                vp_data = dict(all_reports["XAUUSD"].get("vp") or {})
+                vp_data.pop("profile", None)
+                report_store.save_report("volume_profile", {**all_reports["XAUUSD"], "vp": vp_data})
+            except Exception:
+                pass
+        return {"ok": True, "symbols": list(all_reports.keys()), "reports": {k: bool(v.get("ok")) for k, v in all_reports.items()}}
 
     # ── DOM Liquidity Shift ─────────────────────────────────────────────────
 

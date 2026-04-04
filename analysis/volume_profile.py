@@ -31,6 +31,18 @@ DEFAULT_VA_PCT = 0.70          # 70% of volume = value area
 DEFAULT_HVN_PERCENTILE = 80    # top 20% volume = HVN
 DEFAULT_LVN_PERCENTILE = 20    # bottom 20% volume = LVN
 
+# Per-symbol tick sizes and default bucket multipliers
+SYMBOL_TICK_CONFIG = {
+    "XAUUSD": {"tick_size": 0.01, "bucket_ticks": 10},    # $0.10 per bucket
+    "BTCUSD": {"tick_size": 1.0, "bucket_ticks": 50},     # $50 per bucket
+    "ETHUSD": {"tick_size": 0.01, "bucket_ticks": 500},   # $5 per bucket
+}
+
+
+def get_tick_config(symbol: str) -> dict:
+    """Get tick_size and default bucket_ticks for a symbol."""
+    return dict(SYMBOL_TICK_CONFIG.get(symbol.upper(), {"tick_size": DEFAULT_TICK_SIZE, "bucket_ticks": 10}))
+
 
 def _safe_float(v, default: float = 0.0) -> float:
     try:

@@ -236,22 +236,41 @@ Optional: *"Continue from 2026-04 handoff. What is current system state?"*
 * SSH keys: `C:\Users\mrgeo\.ssh\`
 * `.gitignore` must cover: `.env.local`, `*.key`, `*.pem`, `*.pub`, `*.zip`
 
+## Trading Philosophy
+
+See `docs/TRADING_PHILOSOPHY.md` for the full EliteQuantTrader profile.
+
+**Actionable principles already integrated into code:**
+- Sniper entries via multi-layer confluence: Entry Sharpness Score (8 microstructure features, 5 dimensions, 0-100 composite)
+- Order flow confirmation at entry: delta_proxy, tick_up_ratio, depth_imbalance, depth_absorption_rate
+- Dynamic entry type routing: knife→block, caution→limit+risk reduction, sharp→promote to stop
+- Self-evolving: winner logic, chart state memory, live profile autopilot, family promotion/demotion
+- Multi-agent: openclaw/ Conductor + Risk/Perf/Regime/Opt agents
+
+**Future edge layers (from philosophy, not yet implemented):**
+- Volume Profile (HVN/LVN/POC) for structural SL/TP placement
+- DOM-driven adaptive trailing (liquidity shift detection)
+- Statistical regime detection (HMM/clustering beyond rule-based day_type)
+
 ## Recent Changes
 
-### 2026-04 — XAU gate telemetry, entry template chain, mission handoff
+### 2026-04-04 — Entry Sharpness Score + sweep reversal sharpness guard
 
-**Scope:** `_stamp_family_canary_skip` (FF, PB/BS, FLS, FSS behavioral + min-conf, PSC), `learning/entry_template_catalog.py`, `scanners/scalping_scanner.py` M1 bias, `config.py`, `tmp_vm_gate_bucket_report.py`, tests.
+`analysis/entry_sharpness.py` (new), `scheduler.py`, `config.py`, `learning/live_profile_autopilot.py`. 8 deep microstructure features + composite scorer integrated into PB knife guard, entry router (knife/caution/sharp bands), RR knife guard, sweep reversal gate. 16 new `XAU_ENTRY_SHARPNESS_*` config keys. Full observability via raw_scores. 51 tests (41 unit + 10 integration). Branch: `deploy-xau-family-canary`, deployed to VM.
 
-**Playbook:** `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` — **§4.1** phases **A→E** first, then **§5** sub-checklist. Canary floor: **always** read live `.env.local` (`NEURAL_GATE_CANARY_MIN_CONFIDENCE`; docs show an example only).
+### 2026-04-03 — XAUUSD session filter fix + MTF bypass + holiday guard
 
-### 2026-03-24 — Deep Data Architecture (backup + Gate 3)
+Session filter bug (`session_sig not in set` → `_session_signature_matches`), all-unknown MTF bypass, aligned_side override, FFFS explicit skip, FSS/FLS conf gate, entry template scaffold (disabled), 5 BTC LOB test fixes. Commit `0cf600f`.
 
-Tag `v3-fixed-profitable-20260324`, `RESTORE_POINT_2026-03-24.txt`, `C:\dexter_backups\`. Shipped: `TickBarEngine`, MRD live in `scanners/scalping_scanner.py`, VM `dexter-monitor`. **Next:** OFAS; cTrader tick gap 2026-03-23 05:00–09:50 UTC.
+### 2026-04-02 — Post-SL sweep reversal re-entry
 
-### 2026-03-20 — FSS pattern gate + high-confidence bridge
+`_check_post_sl_reversal_signal` — M1 wick detection, market re-entry via main cTrader lane. Holiday guard for tests. Commits `f3b8c92`, `53939b0`, `cf72eea`, `7a45e84`.
 
-`scheduler.py`, `config.py`, `tests/test_scheduler_watchlist.py`; `XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_ALLOW_HIGH_CONFIDENCE_BRIDGE` in `raw_scores`. No revert without regression tests.
+### 2026-03-31 — News guard + PSC family + RR/canary fixes
+
+Scheduled news guard (T1 kill PRE45/POST30, T2 size x0.50), PSC canary (Pre-London sweep+cont), RR conf gate removal. Commits `ce0dc65`, `672206e`, `3aa7461`.
 
 ## Current Branch State (update every session)
 
-Verify with `git branch -a`. Historical note (2026-03-21): `main`, `fss-fixes-only`, `fls-development` — refresh before relying on merge state.
+Branch: `deploy-xau-family-canary` — active development branch, deployed to VM.
+Verify with `git branch -a`.
