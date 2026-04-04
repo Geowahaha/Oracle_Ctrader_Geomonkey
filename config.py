@@ -554,6 +554,19 @@ class Config:
     XAU_FAMILY_DECAY_RECENT_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_RECENT_TRADES", "20"))
     XAU_FAMILY_DECAY_BASELINE_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_BASELINE_TRADES", "60"))
     XAU_FAMILY_DECAY_THRESHOLD: float = float(os.getenv("XAU_FAMILY_DECAY_THRESHOLD", "0.15"))
+    # ── Volume Profile ──────────────────────────────────────────────────────
+    XAU_VOLUME_PROFILE_ENABLED: bool = os.getenv("XAU_VOLUME_PROFILE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_VOLUME_PROFILE_HOURS_BACK: int = int(os.getenv("XAU_VOLUME_PROFILE_HOURS_BACK", "24"))
+    XAU_VOLUME_PROFILE_BUCKET_TICKS: int = int(os.getenv("XAU_VOLUME_PROFILE_BUCKET_TICKS", "10"))
+    XAU_VOLUME_PROFILE_VA_PCT: float = float(os.getenv("XAU_VOLUME_PROFILE_VA_PCT", "0.70"))
+    XAU_VOLUME_PROFILE_INTERVAL_MIN: int = int(os.getenv("XAU_VOLUME_PROFILE_INTERVAL_MIN", "30"))
+    # ── DOM Liquidity Shift Detector ────────────────────────────────────────
+    XAU_DOM_LIQUIDITY_SHIFT_ENABLED: bool = os.getenv("XAU_DOM_LIQUIDITY_SHIFT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", "30"))
+    XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", "6"))
+    # ── Strategy Evolution Log ──────────────────────────────────────────────
+    STRATEGY_EVOLUTION_ENABLED: bool = os.getenv("STRATEGY_EVOLUTION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    STRATEGY_EVOLUTION_NOTIFY_TELEGRAM: bool = os.getenv("STRATEGY_EVOLUTION_NOTIFY_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
     CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS: int = int(os.getenv("CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS", "18"))
     XAU_TD_VS_PB_COMPARE_MIN_RESOLVED: int = int(os.getenv("XAU_TD_VS_PB_COMPARE_MIN_RESOLVED", "4"))
     CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE: bool = os.getenv("CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE", "1").strip().lower() in ("1", "true", "yes", "on")

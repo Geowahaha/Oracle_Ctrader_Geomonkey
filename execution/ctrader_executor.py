@@ -2113,6 +2113,27 @@ class CTraderExecutor:
         if day_type in {"repricing", "fast_expansion", "panic_spread"}:
             score += 1
 
+        # DOM liquidity shift (Tier 2 enhancement)
+        dom_shift_details = {}
+        if bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            try:
+                from analysis.dom_liquidity_shift import analyze_dom_liquidity
+                import sqlite3 as _sqlite3_dom
+                _dom_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+                if _dom_db.exists():
+                    with _sqlite3_dom.connect(str(_dom_db), timeout=5) as _dom_conn:
+                        _dom_conn.row_factory = _sqlite3_dom.Row
+                        dom_result = analyze_dom_liquidity(_dom_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+                    if bool(dom_result.get("ok")):
+                        adverse = dict(dom_result.get("adverse") or {})
+                        dom_adverse_score = int(adverse.get("adverse_score", 0) or 0)
+                        if dom_adverse_score >= 2:
+                            score += 1
+                            reasons.append("dom_liquidity_adverse")
+                        dom_shift_details = {"dom_adverse_score": dom_adverse_score, "dom_severity": str(adverse.get("severity", "") or ""), "dom_recommendation": str(adverse.get("recommendation", "") or "")}
+            except Exception:
+                pass
+
         details = {
             "run_id": str(snapshot.get("run_id") or ""),
             "day_type": day_type,
@@ -2124,6 +2145,8 @@ class CTraderExecutor:
             "rejection_ratio": round(rejection_ratio, 4),
             "reasons": list(reasons),
         }
+        if dom_shift_details:
+            details["dom_liquidity"] = dom_shift_details
         if order_care_state:
             details["order_care_mode"] = str(order_care_state.get("mode") or "")
         if stop_loss <= 0 or entry <= 0:

@@ -3573,6 +3573,20 @@ class DexterScheduler:
                     "features": dict(entry_router.get("features") or {}),
                     "sharpness": dict(entry_router.get("sharpness") or {}),
                 }
+                # Attach Volume Profile context if available
+                if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+                    try:
+                        vp_report = dict(report_store.get_report("volume_profile") or {})
+                        vp_data = dict(vp_report.get("vp") or {})
+                        if vp_data.get("poc"):
+                            from analysis.volume_profile import check_entry_vs_profile
+                            entry_price = float(getattr(signal, "entry", 0.0) or 0.0)
+                            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+                            if entry_price > 0 and direction:
+                                vp_check = check_entry_vs_profile(entry_price, direction, vp_data, bucket_ticks=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_BUCKET_TICKS", 10) or 10)))
+                                raw["xau_openapi_entry_router"]["volume_profile"] = {"poc": float(vp_data.get("poc", 0) or 0), "va_high": float(vp_data.get("va_high", 0) or 0), "va_low": float(vp_data.get("va_low", 0) or 0), **vp_check}
+                    except Exception:
+                        pass
                 router_risk_mult = max(0.25, float(entry_router.get("risk_multiplier", 1.0) or 1.0))
                 if abs(router_risk_mult - 1.0) > 1e-9:
                     raw["ctrader_risk_usd_override"] = round(
@@ -11492,6 +11506,97 @@ class DexterScheduler:
                     applied.append(f"{config_key}: {old_val:.3f} -> {clamped:.3f}")
         if applied:
             logger.info("[Scheduler] Sharpness auto-calibrate applied: %s", applied)
+            if bool(getattr(config, "STRATEGY_EVOLUTION_ENABLED", True)):
+                try:
+                    from learning.strategy_evolution import log_change
+                    correlation = dict((report or {}).get("correlation") or {})
+                    log_change(
+                        change_type="weight_calibration",
+                        description=f"Sharpness weights adjusted: {', '.join(applied)}",
+                        component="analysis/entry_sharpness.py",
+                        metric_before={"composite_r": float((correlation.get("composite") or {}).get("r", 0) or 0)},
+                        impact="pending",
+                        auto=True,
+                        source="sharpness_feedback",
+                        metadata={"applied": applied, "n_trades": int(correlation.get("n_trades", 0) or 0)},
+                    )
+                except Exception:
+                    logger.debug("[Scheduler] Strategy evolution log failed", exc_info=True)
+
+    # ── Volume Profile ──────────────────────────────────────────────────────
+
+    def _run_volume_profile_report(self, force: bool = False) -> dict:
+        """Compute session Volume Profile from M1 bars."""
+        if not bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {"ok": False, "status": "no_db"}
+        try:
+            from analysis.volume_profile import build_session_volume_profile
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.row_factory = _sqlite3.Row
+                report = build_session_volume_profile(
+                    conn,
+                    symbol="XAUUSD",
+                    hours_back=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_HOURS_BACK", 24) or 24)),
+                    session="full",
+                    bucket_ticks=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_BUCKET_TICKS", 10) or 10)),
+                    va_pct=max(0.5, min(0.95, float(getattr(config, "XAU_VOLUME_PROFILE_VA_PCT", 0.70) or 0.70))),
+                )
+        except Exception as exc:
+            logger.error("[Scheduler] Volume profile error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        try:
+            vp_data = dict(report.get("vp") or {})
+            vp_data.pop("profile", None)  # strip full profile from report store (too large)
+            report_store.save_report("volume_profile", {**report, "vp": vp_data})
+        except Exception:
+            pass
+        if bool(report.get("ok")):
+            vp = dict(report.get("vp") or {})
+            logger.info(
+                "[Scheduler] Volume profile: POC=%.2f VA=[%.2f,%.2f] bars=%d HVN=%d LVN=%d",
+                float(vp.get("poc", 0) or 0),
+                float(vp.get("va_low", 0) or 0),
+                float(vp.get("va_high", 0) or 0),
+                int(report.get("bars_used", 0) or 0),
+                len(list(vp.get("hvn_levels") or [])),
+                len(list(vp.get("lvn_levels") or [])),
+            )
+        else:
+            logger.debug("[Scheduler] Volume profile: %s", report.get("status"))
+        return report
+
+    # ── DOM Liquidity Shift ─────────────────────────────────────────────────
+
+    def _get_dom_liquidity_shift(self, *, symbol: str = "XAUUSD", direction: str = "long") -> dict:
+        """Compute DOM liquidity shift for position manager active defense integration.
+
+        Returns the adverse assessment dict or empty if disabled/unavailable.
+        """
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {}
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            with _sqlite3.connect(str(db_path), timeout=5) as conn:
+                conn.row_factory = _sqlite3.Row
+                result = analyze_dom_liquidity(
+                    conn,
+                    symbol=symbol,
+                    direction=direction,
+                    lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)),
+                    max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)),
+                )
+            return result
+        except Exception as exc:
+            logger.debug("[Scheduler] DOM liquidity shift error: %s", exc)
+            return {}
 
     @staticmethod
     def _format_tick_depth_replay_report_text(report: dict) -> str:
@@ -12468,6 +12573,15 @@ class DexterScheduler:
                 f" auto-cal={'ON' if bool(getattr(config, 'XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED', False)) else 'OFF'}"
                 f" decay={'ON' if bool(getattr(config, 'XAU_FAMILY_DECAY_ENABLED', True)) else 'OFF'})\n"
             )
+        volume_profile_line = ""
+        if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            vp_mins = max(10, int(getattr(config, "XAU_VOLUME_PROFILE_INTERVAL_MIN", 30) or 30))
+            schedule.every(vp_mins).minutes.do(self._run_volume_profile_report)
+            volume_profile_line = (
+                f"  Volume profile: every {vp_mins}m "
+                f"(lookback={max(1, int(getattr(config, 'XAU_VOLUME_PROFILE_HOURS_BACK', 24) or 24))}h"
+                f" bucket={max(1, int(getattr(config, 'XAU_VOLUME_PROFILE_BUCKET_TICKS', 10) or 10))}ticks)\n"
+            )
         ctrader_market_capture_line = ""
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_ENABLED", False)):
             capture_mins = max(1, int(getattr(config, "CTRADER_MARKET_CAPTURE_INTERVAL_MIN", 5) or 5))
@@ -12641,6 +12755,7 @@ class DexterScheduler:
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
             f"{sharpness_feedback_line}"
+            f"{volume_profile_line}"
             f"{ctrader_market_capture_line}"
             f"{ctrader_replay_lab_line}"
             f"{mission_progress_line}"
@@ -12720,6 +12835,8 @@ class DexterScheduler:
             self._run_family_calibration_report(force=True)
         if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)) and bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ON_START", True)):
             self._run_sharpness_feedback_report(force=True)
+        if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            self._run_volume_profile_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):
             self._run_strategy_lab_report(force=True)
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_MARKET_CAPTURE_ON_START", False)):
@@ -12807,6 +12924,10 @@ class DexterScheduler:
             results["family_calibration_report"] = self._run_family_calibration_report(force=True)
         if task in ("sharpness_feedback", "sharpness_report", "sharpness"):
             results["sharpness_feedback_report"] = self._run_sharpness_feedback_report(force=True)
+        if task in ("volume_profile", "vp", "vp_report"):
+            results["volume_profile"] = self._run_volume_profile_report(force=True)
+        if task in ("dom_liquidity", "dom_shift", "liquidity_shift"):
+            results["dom_liquidity"] = self._get_dom_liquidity_shift(symbol="XAUUSD", direction="long")
         if task in ("ctrader_capture", "market_capture", "ctrader_market_capture"):
             results["ctrader_market_capture"] = self._run_ctrader_market_capture(force=True)
         if task in ("ctrader_replay", "replay_lab", "ctrader_tick_depth_replay_lab"):
