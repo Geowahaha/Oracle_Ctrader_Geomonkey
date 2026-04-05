@@ -278,6 +278,87 @@ def detect_adverse_liquidity(
 
 
 # ---------------------------------------------------------------------------
+# 3b. Favorable liquidity detection (for TP extension)
+# ---------------------------------------------------------------------------
+
+def detect_favorable_liquidity(
+    shift: dict,
+    direction: str,
+) -> dict:
+    """Determine if liquidity shift is favorable — supports holding/extending TP.
+
+    Mirror of detect_adverse_liquidity:
+    For longs: bid building + ask draining = favorable (support growing, resistance fading)
+    For shorts: ask building + bid draining = favorable (resistance growing, support fading)
+
+    Returns {
+        is_favorable: bool,
+        strength: str,              # 'none' | 'mild' | 'moderate' | 'strong'
+        favorable_score: int,       # 0-3 (higher = more favorable)
+        recommendation: str,        # 'hold' | 'extend_tp' | 'trail_wide'
+        reasons: list[str],
+        details: dict,
+    }
+    """
+    bid_shift = str(shift.get("bid_wall_shift", "stable") or "stable")
+    ask_shift = str(shift.get("ask_wall_shift", "stable") or "stable")
+    liq_score = int(shift.get("liquidity_score", 0) or 0)
+    imbalance_trend = float(shift.get("imbalance_trend", 0.0) or 0.0)
+
+    favorable_score = 0
+    reasons = []
+
+    if direction == "long":
+        if bid_shift == "building":
+            favorable_score += 1
+            reasons.append("bid_support_building")
+        if ask_shift == "draining":
+            favorable_score += 1
+            reasons.append("ask_resistance_draining")
+        if imbalance_trend > 0.10:
+            favorable_score += 1
+            reasons.append("imbalance_turning_bullish")
+    else:
+        if ask_shift == "building":
+            favorable_score += 1
+            reasons.append("ask_resistance_building")
+        if bid_shift == "draining":
+            favorable_score += 1
+            reasons.append("bid_support_draining")
+        if imbalance_trend < -0.10:
+            favorable_score += 1
+            reasons.append("imbalance_turning_bearish")
+
+    is_favorable = favorable_score >= 2
+    if favorable_score >= 3:
+        strength = "strong"
+        recommendation = "trail_wide"
+    elif favorable_score >= 2:
+        strength = "moderate"
+        recommendation = "extend_tp"
+    elif favorable_score >= 1:
+        strength = "mild"
+        recommendation = "hold"
+    else:
+        strength = "none"
+        recommendation = "hold"
+
+    return {
+        "is_favorable": is_favorable,
+        "strength": strength,
+        "favorable_score": favorable_score,
+        "recommendation": recommendation,
+        "reasons": reasons,
+        "details": {
+            "bid_shift": bid_shift,
+            "ask_shift": ask_shift,
+            "liquidity_score": liq_score,
+            "imbalance_trend": round(imbalance_trend, 4),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # 4. Full liquidity shift analysis (convenience)
 # ---------------------------------------------------------------------------
 
@@ -307,11 +388,13 @@ def analyze_dom_liquidity(
 
     shift = compute_liquidity_shift(snapshots)
     adverse = detect_adverse_liquidity(shift, direction)
+    favorable = detect_favorable_liquidity(shift, direction)
 
     return {
         "ok": True,
         "shift": shift,
         "adverse": adverse,
+        "favorable": favorable,
         "snapshots_used": len(snapshots),
         "symbol": symbol,
         "direction": direction,

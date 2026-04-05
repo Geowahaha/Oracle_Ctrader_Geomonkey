@@ -1998,6 +1998,27 @@ class CTraderExecutor:
         else:
             reasons.append("day_type_not_supportive")
 
+        # DOM favorable liquidity boost (+1 score when DOM supports direction)
+        dom_favorable_details = {}
+        if bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            try:
+                from analysis.dom_liquidity_shift import analyze_dom_liquidity
+                import sqlite3 as _sqlite3_ext
+                _ext_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+                if _ext_db.exists():
+                    with _sqlite3_ext.connect(str(_ext_db), timeout=5) as _ext_conn:
+                        _ext_conn.row_factory = _sqlite3_ext.Row
+                        dom_result = analyze_dom_liquidity(_ext_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+                    if bool(dom_result.get("ok")):
+                        favorable = dict(dom_result.get("favorable") or {})
+                        fav_score = int(favorable.get("favorable_score", 0) or 0)
+                        if fav_score >= 2:
+                            score += 1
+                            reasons.append("dom_liquidity_favorable")
+                        dom_favorable_details = {"dom_favorable_score": fav_score, "dom_strength": str(favorable.get("strength", "") or ""), "dom_recommendation": str(favorable.get("recommendation", "") or "")}
+            except Exception:
+                pass
+
         details = {
             "run_id": str(snapshot.get("run_id") or ""),
             "day_type": day_type,
@@ -2011,6 +2032,8 @@ class CTraderExecutor:
             "rejection_ratio": round(rejection_ratio, 4),
             "reasons": list(reasons),
         }
+        if dom_favorable_details:
+            details["dom_liquidity"] = dom_favorable_details
         if order_care_state:
             details["order_care_mode"] = str(order_care_state.get("mode") or "")
         if score < extension_score:
@@ -2276,6 +2299,77 @@ class CTraderExecutor:
                     new_sl = min(stop_loss, new_sl)
                 return {"active": True, "action": "tighten", "reason": "crypto_dom_defense_tighten", "new_stop_loss": round(new_sl, 4), "new_take_profit": 0.0, "details": details}
             return {"active": False, "reason": "dom_not_adverse", "details": details}
+        except Exception:
+            return {"active": False, "reason": "dom_error"}
+
+    def _crypto_dom_tp_extension_plan(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        planned_tp: float,
+        current_tp: float,
+        current_price: float,
+        r_now: Optional[float],
+        age_min: float,
+    ) -> dict:
+        """DOM-based TP extension for BTC/ETH when liquidity is favorable.
+
+        When DOM shows favorable conditions (support building for longs,
+        resistance building for shorts), extend TP to capture more profit.
+        """
+        if self._is_xau_symbol(symbol):
+            return {"active": False, "reason": "xau_uses_full_extension"}
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {"active": False, "reason": "dom_disabled"}
+        if stop_loss <= 0 or entry <= 0:
+            return {"active": False, "reason": "invalid_entry_or_stop"}
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+        if not self._target_valid_for_position(direction, entry, current_tp):
+            return {"active": False, "reason": "invalid_current_target"}
+        if not self._price_crossed_target(direction, current_price, current_tp):
+            return {"active": False, "reason": "target_not_crossed"}
+        if (r_now is not None) and float(r_now) < 0.3:
+            return {"active": False, "reason": "profit_too_small"}
+        if age_min < 1.0:
+            return {"active": False, "reason": "too_young"}
+        current_target_r = abs(current_tp - entry) / risk
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            import sqlite3 as _sqlite3_cext
+            _cext_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+            if not _cext_db.exists():
+                return {"active": False, "reason": "no_db"}
+            with _sqlite3_cext.connect(str(_cext_db), timeout=5) as _cext_conn:
+                _cext_conn.row_factory = _sqlite3_cext.Row
+                dom_result = analyze_dom_liquidity(_cext_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+            if not bool(dom_result.get("ok")):
+                return {"active": False, "reason": "dom_no_data"}
+            favorable = dict(dom_result.get("favorable") or {})
+            fav_score = int(favorable.get("favorable_score", 0) or 0)
+            strength = str(favorable.get("strength", "none") or "none")
+            if fav_score < 2:
+                return {"active": False, "reason": "dom_not_favorable", "details": {"dom_favorable_score": fav_score, "dom_strength": strength}}
+            step_r = 0.35 if strength == "strong" else 0.25
+            lock_r = 0.15 if strength == "strong" else 0.10
+            target_r = max(current_target_r + step_r, 1.0)
+            new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
+            if not self._target_valid_for_position(direction, entry, new_tp):
+                return {"active": False, "reason": "invalid_extension_target"}
+            if not self._target_more_favorable(direction, entry, new_tp, current_tp):
+                return {"active": False, "reason": "extension_not_improving"}
+            if self._price_crossed_target(direction, current_price, new_tp):
+                return {"active": False, "reason": "extension_already_crossed"}
+            candidate_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+            new_sl = max(stop_loss, candidate_sl) if direction == "long" else min(stop_loss, candidate_sl)
+            if not self._stop_valid_for_position(direction, entry, new_sl):
+                new_sl = stop_loss
+            details = {"dom_favorable_score": fav_score, "dom_strength": strength, "dom_reasons": list(favorable.get("reasons") or []), "current_target_r": round(current_target_r, 4), "new_target_r": round(target_r, 4), "symbol": symbol}
+            return {"active": True, "action": "extend", "reason": "crypto_dom_tp_extension", "new_stop_loss": round(new_sl, 4), "new_take_profit": round(new_tp, 4), "details": details}
         except Exception:
             return {"active": False, "reason": "dom_error"}
 
@@ -5108,6 +5202,12 @@ class CTraderExecutor:
                     age_min=age_min,
                     r_now=r_now,
                 )
+                # Fallback: crypto DOM TP extension for BTC/ETH
+                if not bool(extension.get("active")) and not self._is_xau_symbol(symbol) and symbol.upper() in {"BTCUSD", "ETHUSD"}:
+                    try:
+                        extension = self._crypto_dom_tp_extension_plan(symbol=symbol, direction=direction, entry=entry, stop_loss=stop_loss, planned_tp=planned_tp, current_tp=target_tp, current_price=ref, r_now=r_now, age_min=age_min)
+                    except Exception:
+                        logger.debug("[PM] crypto_dom_tp_extension error for %s", symbol, exc_info=True)
                 if bool(extension.get("active")):
                     new_sl = _safe_float(extension.get("new_stop_loss"), 0.0)
                     new_tp = _safe_float(extension.get("new_take_profit"), 0.0)
