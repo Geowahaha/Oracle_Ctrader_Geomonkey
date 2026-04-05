@@ -565,6 +565,9 @@ class Config:
     XAU_DOM_LIQUIDITY_SHIFT_ENABLED: bool = os.getenv("XAU_DOM_LIQUIDITY_SHIFT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", "30"))
     XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", "6"))
+    # Crypto DOM defense anti-MM-trap safeguards
+    CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R: float = float(os.getenv("CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R", "0.50"))
+    CRYPTO_DOM_TP_MAX_EXTENSION_R: float = float(os.getenv("CRYPTO_DOM_TP_MAX_EXTENSION_R", "3.0"))
     # ── Strategy Evolution Log ──────────────────────────────────────────────
     STRATEGY_EVOLUTION_ENABLED: bool = os.getenv("STRATEGY_EVOLUTION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     STRATEGY_EVOLUTION_NOTIFY_TELEGRAM: bool = os.getenv("STRATEGY_EVOLUTION_NOTIFY_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")

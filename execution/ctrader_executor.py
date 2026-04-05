@@ -2259,6 +2259,14 @@ class CTraderExecutor:
 
         Lighter than full XAU active defense — only checks DOM liquidity shift.
         Tightens stop or closes when DOM shows severe adverse liquidity.
+
+        Anti-MM-trap safeguards:
+        1. Profit buffer: skip tighten when position is healthy (r_now > 0.5R)
+           — if position is working, DOM blip is likely MM noise, not real shift
+        2. Require 3+ snapshots: more data points for reliable shift signal
+        3. Close only when severe + already losing (r_now <= 0.15)
+        4. Never tighten past breakeven from adverse alone
+        5. Conservative keep_r (50-65% of risk) — leaves room for normal volatility
         """
         if self._is_xau_symbol(symbol):
             return {"active": False, "reason": "xau_uses_full_active_defense"}
@@ -2267,6 +2275,10 @@ class CTraderExecutor:
         min_age = max(1.0, float(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_AGE_MIN", 2.0) or 2.0))
         if age_min < min_age:
             return {"active": False, "reason": "too_young"}
+        # Safeguard 1: Profit buffer — position is working well, don't panic on DOM noise
+        profit_buffer_r = float(getattr(config, "CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R", 0.50) or 0.50)
+        if (r_now is not None) and float(r_now) > profit_buffer_r:
+            return {"active": False, "reason": "position_healthy_skip_dom"}
         if stop_loss <= 0 or entry <= 0:
             return {"active": False, "reason": "invalid_entry_or_stop"}
         risk = abs(entry - stop_loss)
@@ -2283,22 +2295,32 @@ class CTraderExecutor:
                 dom_result = analyze_dom_liquidity(_cdom_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
             if not bool(dom_result.get("ok")):
                 return {"active": False, "reason": "dom_no_data"}
+            # Safeguard 2: Require 3+ snapshots for reliable shift signal
+            snapshots_used = int(dom_result.get("snapshots_used", 0) or 0)
+            if snapshots_used < 3:
+                return {"active": False, "reason": "insufficient_snapshots", "details": {"snapshots_used": snapshots_used}}
             adverse = dict(dom_result.get("adverse") or {})
             adverse_score = int(adverse.get("adverse_score", 0) or 0)
             severity = str(adverse.get("severity", "none") or "none")
             recommendation = str(adverse.get("recommendation", "hold") or "hold")
-            details = {"dom_adverse_score": adverse_score, "dom_severity": severity, "dom_recommendation": recommendation, "symbol": symbol}
+            details = {"dom_adverse_score": adverse_score, "dom_severity": severity, "dom_recommendation": recommendation, "symbol": symbol, "snapshots_used": snapshots_used}
+            # Safeguard 3: Close only when severe + already in loss/near breakeven
             if severity == "severe" and (r_now is not None) and float(r_now) <= 0.15:
                 return {"active": True, "action": "close", "reason": "crypto_dom_defense_close", "details": details}
-            if adverse_score >= 2:
-                keep_r = 0.35 if severity == "severe" else 0.50
-                new_sl = entry - (risk * keep_r) if direction == "long" else entry + (risk * keep_r)
-                if direction == "long":
-                    new_sl = max(stop_loss, new_sl)
-                else:
-                    new_sl = min(stop_loss, new_sl)
-                return {"active": True, "action": "tighten", "reason": "crypto_dom_defense_tighten", "new_stop_loss": round(new_sl, 4), "new_take_profit": 0.0, "details": details}
-            return {"active": False, "reason": "dom_not_adverse", "details": details}
+            # Safeguard 4+5: Conservative tighten — only score 3 (severe), keep 65% risk
+            # Score 2 (moderate): keep 65% of risk — leaves plenty of room
+            if adverse_score >= 3:
+                keep_r = 0.50
+            elif adverse_score >= 2:
+                keep_r = 0.65
+            else:
+                return {"active": False, "reason": "dom_not_adverse", "details": details}
+            new_sl = entry - (risk * keep_r) if direction == "long" else entry + (risk * keep_r)
+            if direction == "long":
+                new_sl = max(stop_loss, new_sl)
+            else:
+                new_sl = min(stop_loss, new_sl)
+            return {"active": True, "action": "tighten", "reason": "crypto_dom_defense_tighten", "new_stop_loss": round(new_sl, 4), "new_take_profit": 0.0, "details": details}
         except Exception:
             return {"active": False, "reason": "dom_error"}
 
@@ -2319,6 +2341,12 @@ class CTraderExecutor:
 
         When DOM shows favorable conditions (support building for longs,
         resistance building for shorts), extend TP to capture more profit.
+
+        Anti-MM-trap safeguards:
+        1. Require 3+ snapshots: avoid spoofing on 1-2 snapshot window
+        2. Max extension cap: 3.0R max to prevent chasing unrealistic targets
+        3. lock_r always locks profit above entry when extending
+        4. Only extend when already in meaningful profit (r_now >= 0.5)
         """
         if self._is_xau_symbol(symbol):
             return {"active": False, "reason": "xau_uses_full_extension"}
@@ -2333,11 +2361,16 @@ class CTraderExecutor:
             return {"active": False, "reason": "invalid_current_target"}
         if not self._price_crossed_target(direction, current_price, current_tp):
             return {"active": False, "reason": "target_not_crossed"}
-        if (r_now is not None) and float(r_now) < 0.3:
+        # Safeguard 4: must be in meaningful profit — don't extend near breakeven
+        if (r_now is not None) and float(r_now) < 0.5:
             return {"active": False, "reason": "profit_too_small"}
         if age_min < 1.0:
             return {"active": False, "reason": "too_young"}
         current_target_r = abs(current_tp - entry) / risk
+        # Safeguard 2: cap max extension
+        max_extension_r = float(getattr(config, "CRYPTO_DOM_TP_MAX_EXTENSION_R", 3.0) or 3.0)
+        if current_target_r >= max_extension_r:
+            return {"active": False, "reason": "max_extension_reached", "details": {"current_target_r": round(current_target_r, 4), "max_r": max_extension_r}}
         try:
             from analysis.dom_liquidity_shift import analyze_dom_liquidity
             import sqlite3 as _sqlite3_cext
@@ -2349,6 +2382,10 @@ class CTraderExecutor:
                 dom_result = analyze_dom_liquidity(_cext_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
             if not bool(dom_result.get("ok")):
                 return {"active": False, "reason": "dom_no_data"}
+            # Safeguard 1: Require 3+ snapshots for reliable favorable signal
+            snapshots_used = int(dom_result.get("snapshots_used", 0) or 0)
+            if snapshots_used < 3:
+                return {"active": False, "reason": "insufficient_snapshots", "details": {"snapshots_used": snapshots_used}}
             favorable = dict(dom_result.get("favorable") or {})
             fav_score = int(favorable.get("favorable_score", 0) or 0)
             strength = str(favorable.get("strength", "none") or "none")
@@ -2356,7 +2393,8 @@ class CTraderExecutor:
                 return {"active": False, "reason": "dom_not_favorable", "details": {"dom_favorable_score": fav_score, "dom_strength": strength}}
             step_r = 0.35 if strength == "strong" else 0.25
             lock_r = 0.15 if strength == "strong" else 0.10
-            target_r = max(current_target_r + step_r, 1.0)
+            target_r = min(current_target_r + step_r, max_extension_r)
+            target_r = max(target_r, 1.0)
             new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
             if not self._target_valid_for_position(direction, entry, new_tp):
                 return {"active": False, "reason": "invalid_extension_target"}
@@ -2364,11 +2402,12 @@ class CTraderExecutor:
                 return {"active": False, "reason": "extension_not_improving"}
             if self._price_crossed_target(direction, current_price, new_tp):
                 return {"active": False, "reason": "extension_already_crossed"}
+            # Safeguard 3: lock profit above entry
             candidate_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
             new_sl = max(stop_loss, candidate_sl) if direction == "long" else min(stop_loss, candidate_sl)
             if not self._stop_valid_for_position(direction, entry, new_sl):
                 new_sl = stop_loss
-            details = {"dom_favorable_score": fav_score, "dom_strength": strength, "dom_reasons": list(favorable.get("reasons") or []), "current_target_r": round(current_target_r, 4), "new_target_r": round(target_r, 4), "symbol": symbol}
+            details = {"dom_favorable_score": fav_score, "dom_strength": strength, "dom_reasons": list(favorable.get("reasons") or []), "current_target_r": round(current_target_r, 4), "new_target_r": round(target_r, 4), "max_extension_r": max_extension_r, "snapshots_used": snapshots_used, "symbol": symbol}
             return {"active": True, "action": "extend", "reason": "crypto_dom_tp_extension", "new_stop_loss": round(new_sl, 4), "new_take_profit": round(new_tp, 4), "details": details}
         except Exception:
             return {"active": False, "reason": "dom_error"}
