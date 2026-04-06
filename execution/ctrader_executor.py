@@ -5157,7 +5157,10 @@ class CTraderExecutor:
                         _new_sl = (entry + _be_buffer) if direction == "long" else (entry - _be_buffer)
                     _improves = (_new_sl > stop_loss) if direction == "long" else (_new_sl < stop_loss)
                     _tol = max(abs(entry) * 0.000001, 0.01)
-                    if _improves and abs(_new_sl - stop_loss) > _tol and self._stop_valid_for_position(direction, entry, _new_sl):
+                    # For profit-lock, SL can be on the profit side of entry.
+                    # Validate against current price: long SL < ref, short SL > ref.
+                    _sl_vs_price_ok = (_new_sl < ref) if direction == "long" else (_new_sl > ref)
+                    if _improves and abs(_new_sl - stop_loss) > _tol and _new_sl > 0 and _sl_vs_price_ok:
                         _keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
                         res = self.amend_position_sltp(
                             position_id=position_id, stop_loss=_new_sl,
