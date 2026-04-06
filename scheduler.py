@@ -1495,6 +1495,16 @@ class DexterScheduler:
             meta["winner_reason"] = "allow_all"
             return base_source, meta
 
+        # ── Standalone scanners: bypass winner routing, dispatch directly ──────
+        # FiboAdvance is a self-contained scanner with its own confluence logic.
+        # It does not participate in winner/regime routing — pass through directly
+        # if the base source is allowed.
+        _standalone_sources = {"fibo_xauusd"}
+        if src in _standalone_sources and src in allowed_sources:
+            meta["dispatch_source"] = base_source
+            meta["winner_reason"] = "standalone_direct_pass"
+            return base_source, meta
+
         winner_source = ""
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
