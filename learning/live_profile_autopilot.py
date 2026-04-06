@@ -7522,14 +7522,34 @@ class LiveProfileAutopilot:
                 self._save_state(state)
                 out["rollback"] = {"status": "stable", "evaluation": eval_payload}
             else:
-                active["evaluation"] = eval_payload
-                state["active_bundle"] = active
-                self._save_state(state)
-                out["rollback"] = {"status": "waiting_sample", "evaluation": eval_payload}
-                out["ok"] = True
-                out["status"] = "waiting_active_canary"
-                self._save_report_snapshot("auto_apply_live_profile_report", out)
-                return out
+                max_wait_min = float(getattr(config, "AUTO_APPLY_LIVE_PROFILE_MAX_WAIT_MIN", 20.0) or 20.0)
+                applied_at_str = str(active.get("applied_at") or "")
+                timed_out = False
+                if applied_at_str:
+                    try:
+                        from datetime import timezone as _tz
+                        applied_dt = datetime.fromisoformat(applied_at_str.replace("Z", "+00:00"))
+                        waited_min = (_utc_now() - applied_dt.replace(tzinfo=_tz.utc) if applied_dt.tzinfo is None else _utc_now() - applied_dt).total_seconds() / 60.0
+                        timed_out = waited_min >= max_wait_min
+                    except Exception:
+                        pass
+                if timed_out:
+                    active["status"] = "timed_out"
+                    active["timed_out_at"] = _iso(_utc_now())
+                    active["evaluation"] = eval_payload
+                    state.setdefault("history", []).append(dict(active))
+                    state["active_bundle"] = None
+                    self._save_state(state)
+                    out["rollback"] = {"status": "timed_out", "evaluation": eval_payload}
+                else:
+                    active["evaluation"] = eval_payload
+                    state["active_bundle"] = active
+                    self._save_state(state)
+                    out["rollback"] = {"status": "waiting_sample", "evaluation": eval_payload}
+                    out["ok"] = True
+                    out["status"] = "waiting_active_canary"
+                    self._save_report_snapshot("auto_apply_live_profile_report", out)
+                    return out
         else:
             out["rollback"] = {"status": "none"}
 
