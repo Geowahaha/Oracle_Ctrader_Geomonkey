@@ -5278,6 +5278,29 @@ class CTraderExecutor:
             age_min = self._position_age_min(pos)
             order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
             order_care_overrides = dict(order_care_state.get("overrides") or {})
+
+            # ── Force-close directive: close all positions in target direction ──
+            force_close_dir = str(order_care_state.get("force_close_direction") or "").strip().lower()
+            force_close_reason = str(order_care_state.get("force_close_reason") or "order_care_force_close")
+            if force_close_dir and direction == force_close_dir:
+                res = self.close_position(position_id=position_id, volume=0)
+                action_entry = {
+                    "journal_id": (journal_id or None),
+                    "position_id": position_id,
+                    "source": source,
+                    "symbol": symbol,
+                    "action": "order_care_force_close",
+                    "direction": direction,
+                    "reason": force_close_reason,
+                    "reference_price": round(ref, 4),
+                    "entry_price": round(entry, 4),
+                    "ok": bool(res.ok),
+                }
+                logger.info("[PM] force_close_direction=%s pos=%s %s@%s reason=%s ok=%s", force_close_dir, position_id, symbol, round(ref, 4), force_close_reason, res.ok)
+                report["pm_actions"].append(action_entry)
+                if bool(res.ok):
+                    report["closed_profit_positions"] += 1
+                continue
             planned_tp_valid = self._target_valid_for_position(direction, entry, planned_tp)
             live_tp_valid = self._target_valid_for_position(direction, entry, live_tp)
             live_target_more_favorable = planned_tp_valid and live_tp_valid and self._target_more_favorable(direction, entry, live_tp, planned_tp)
