@@ -5132,6 +5132,9 @@ class CTraderExecutor:
             # ----------------------------------
 
             # ── Fibo time-based profit lock (runs before active defense) ────
+            if "fibo" in source:
+                _profit_pts_dbg = (ref - entry) if direction == "long" else (entry - ref)
+                logger.info("[PM:FiboDebug] pos=%s src=%s r_now=%s age=%.1f profit_pts=%.2f ref=%.2f entry=%.2f sl=%.2f enabled=%s", position_id, source, r_now, age_min, _profit_pts_dbg, ref, entry, stop_loss, bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)))
             if "fibo" in source and bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)) and r_now is not None and r_now > 0:
                 _fibo_be_min = float(getattr(config, "FIBO_PM_BE_AFTER_MIN", 20))
                 _fibo_lock_tiers = [
