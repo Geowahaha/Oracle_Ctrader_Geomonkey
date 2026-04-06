@@ -4963,6 +4963,7 @@ class CTraderExecutor:
             journal_obj = dict(journal_row) if journal_row is not None else {}
             journal_id = int(journal_obj.get("id", 0) or 0)
             source = str(item.get("source") or pos.get("source") or "").strip().lower()
+            lane = str(item.get("lane", "") or pos.get("lane", "") or "").strip().lower()
             symbol = str(pos.get("symbol", "") or "").strip().upper()
             direction = str(pos.get("direction", "") or "").strip().lower()
             position_id = int(_safe_float(pos.get("position_id"), 0))
@@ -4971,6 +4972,9 @@ class CTraderExecutor:
             stop_loss = _safe_float(pos.get("stop_loss"), 0.0)
             live_tp = _safe_float(pos.get("take_profit"), 0.0)
             if position_id <= 0 or entry <= 0 or direction not in {"long", "short"}:
+                continue
+            if source == "untagged_external" or lane == "external":
+                logger.warning("[PM] skip external position %s (%s) — source=%s lane=%s — not managed by Dexter", position_id, symbol, source, lane)
                 continue
             risk = abs(entry - stop_loss) if stop_loss > 0 else 0.0
             if stop_loss > 0 and risk <= 0:
@@ -5917,6 +5921,16 @@ class CTraderExecutor:
                 source = str(meta.get("source") or "").strip().lower()
                 symbol = str(pos.get("symbol") or meta.get("symbol") or "").strip().upper()
                 lane = str(meta.get("lane") or self._source_lane(source))
+                if not source and symbol:
+                    logger.warning(
+                        "[CTrader:Reconcile] position %s (%s) has NO source tag — "
+                        "label=%s comment=%s — marking as untagged_external",
+                        position_id, symbol,
+                        str(pos.get("label", "") or "")[:60],
+                        str(pos.get("comment", "") or "")[:60],
+                    )
+                    source = "untagged_external"
+                    lane = "external"
                 untracked_unsafe = False
                 journal_row = self._find_journal_match(
                     conn,
@@ -6078,9 +6092,10 @@ class CTraderExecutor:
                             "last_seen_utc": now_iso,
                         },
                         "source": source,
+                        "lane": lane,
                         "journal_row": journal_row,
                     })
-                if auto_close_unsafe and (untracked_unsafe or self._unsafe_untracked_position(pos, journal_id=journal_id)):
+                if auto_close_unsafe and lane != "external" and source != "untagged_external" and (untracked_unsafe or self._unsafe_untracked_position(pos, journal_id=journal_id)):
                     pending_close.append({"position_id": position_id, "source": source, "symbol": symbol})
             if seen_positions:
                 placeholders = ",".join(["?"] * len(seen_positions))

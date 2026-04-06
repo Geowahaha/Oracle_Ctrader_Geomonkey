@@ -26,6 +26,8 @@ from scanners.xauusd import xauusd_scanner
 # from scanners.fx_major_scanner import fx_major_scanner
 # from scanners.stock_scanner import stock_scanner
 from scanners.scalping_scanner import scalping_scanner
+from scanners.fibo_advance import FiboAdvanceScanner
+fibo_advance_scanner = FiboAdvanceScanner()
 from notifier.telegram_bot import notifier
 from market.data_fetcher import session_manager, xauusd_provider
 from market.economic_calendar import economic_calendar
@@ -1061,14 +1063,22 @@ class DexterScheduler:
             if direction == "long" and guard_reason.startswith("partial_2of3_aligned:") and not (guard_flow_confirmed or guard_countertrend):
                 return False, "winner_partial_long_no_flow_confirm"
 
-            # During manager transition mode that pauses limit-taking, do not allow winner-limit entries.
+            # During manager transition mode, do not allow ANY winner entries.
+            # Range transition = market structure shifting — winner regime from
+            # previous state is stale, both limit and market orders are unsafe.
             try:
                 runtime_state = self._load_trading_routing_runtime_state()
                 transition = self._active_xau_regime_transition(runtime_state)
+                directive = self._active_xau_execution_directive(runtime_state)
                 mode = str((transition or {}).get("mode") or "").strip().lower()
-                entry_type = str(getattr(signal, "entry_type", "") or "").strip().lower()
-                if mode == "live_range_transition_limit_pause" and entry_type == "limit":
-                    return False, "winner_limit_paused_by_transition"
+                if mode == "live_range_transition_limit_pause":
+                    return False, f"winner_paused_by_transition:{mode}"
+                # Also respect execution directive blocked_families for winner lane
+                if directive:
+                    blocked_families = {str(f or "").strip().lower() for f in list(directive.get("blocked_families") or []) if str(f or "").strip()}
+                    blocked_sources = {str(s or "").strip().lower() for s in list(directive.get("blocked_sources") or []) if str(s or "").strip()}
+                    if "scalp_xauusd:winner" in blocked_sources or "xau_scalp_microtrend" in blocked_families:
+                        return False, f"winner_blocked_by_directive:{str(directive.get('mode') or 'directive')}"
             except Exception:
                 pass
         return True, "live_band_pass"
@@ -7854,7 +7864,7 @@ class DexterScheduler:
             )
             return None
         if str(dispatch_source or "").strip().lower() in {"scalp_xauusd", "scalp_xauusd:winner"}:
-            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source="scalp_xauusd")
+            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source=dispatch_source)
             if not allow_xau:
                 skip_reason = str(xau_reason or "xau_live_filter_blocked")
                 logger.info(
@@ -9114,6 +9124,57 @@ class DexterScheduler:
         except Exception as e:
             logger.warning("[Scheduler] scalping store failed: %s", e)
             return None
+
+    def _run_fibo_advance_scan(self, force_alert: bool = False):
+        """
+        Fibonacci Advance scanner — dual-speed Sniper (H4+H1) and Scout (H1+M15).
+        Runs independently on its own interval. Does NOT interfere with any existing
+        scanner or family routing.  Source: fibo_xauusd / Family: xau_fibo_advance.
+        """
+        if not bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
+            return
+        try:
+            signal = fibo_advance_scanner.scan()
+            if signal is None:
+                logger.debug("[FiboAdvance:Scheduler] No signal this cycle")
+                return
+
+            source = "fibo_xauusd"
+            self._ensure_signal_trace(signal, source=source)
+            logger.info(
+                "[FiboAdvance:Scheduler] Signal | %s | %s | conf:%.1f | entry:%.2f | pattern:%s",
+                signal.direction.upper(), signal.pattern,
+                signal.confidence, signal.entry,
+                signal.pattern,
+            )
+
+            # Telegram notification
+            try:
+                self._send_signal_with_trace(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] notify error: %s", e)
+
+            # Neural brain recording (statistics + auto-improvement)
+            try:
+                if bool(getattr(config, "SIGNAL_FEEDBACK_ENABLED", False)):
+                    neural_brain.record_signal_sent(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] neural_brain error: %s", e)
+
+            # cTrader live execution (governed by CTRADER_AUTOTRADE_ENABLED + FIBO_ADVANCE_ENABLED)
+            try:
+                self._maybe_execute_ctrader_signal(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] ctrader execute error: %s", e)
+
+            # Persistent canary — family tracking + statistics (safe, non-blocking)
+            try:
+                self._maybe_execute_persistent_canary(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] canary error: %s", e)
+
+        except Exception as e:
+            logger.warning("[FiboAdvance:Scheduler] scan error: %s", e, exc_info=True)
 
     def _run_scalping_scan(self, force: bool = False):
         """
@@ -12464,6 +12525,15 @@ class DexterScheduler:
 
         # ── Continuous scanners ──────────────────────────────────────────────
         schedule.every(xauusd_mins).minutes.do(self._run_xauusd_scan)
+
+        # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
+        if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
+            fibo_interval_sec = max(60, int(getattr(config, "FIBO_ADVANCE_SCAN_INTERVAL_SEC", 300) or 300))
+            if fibo_interval_sec < 60:
+                schedule.every(fibo_interval_sec).seconds.do(self._run_fibo_advance_scan)
+            else:
+                schedule.every(fibo_interval_sec // 60).minutes.do(self._run_fibo_advance_scan)
+            logger.info("[FiboAdvance] Scheduled every %ds (Sniper+Scout dual-speed)", fibo_interval_sec)
         # DISABLED: non-cTrader scans — BTC/ETH handled by scalping scanner via cTrader OpenAPI
         # schedule.every(crypto_mins).minutes.do(self._run_crypto_scan)
         # schedule.every(max(1, fx_mins)).minutes.do(self._run_fx_scan)
