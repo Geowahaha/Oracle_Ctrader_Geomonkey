@@ -5448,6 +5448,58 @@ class CTraderExecutor:
                             continue
                 except Exception:
                     logger.debug("[PM] crypto_dom_defense error for %s", symbol, exc_info=True)
+            # ── Fibo time-based profit lock ─────────────────────────────────
+            # For fibo positions with wide SL (swing-style), tighten SL
+            # progressively based on hold time when in profit.
+            # Tiers: BE → lock 30% → lock 50% → lock 70% of unrealized profit.
+            if "fibo" in source and bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)) and r_now is not None and r_now > 0:
+                _fibo_be_min = float(getattr(config, "FIBO_PM_BE_AFTER_MIN", 20))
+                _fibo_lock_tiers = [
+                    (float(getattr(config, "FIBO_PM_LOCK_30_AFTER_MIN", 45)), 0.30),
+                    (float(getattr(config, "FIBO_PM_LOCK_50_AFTER_MIN", 90)), 0.50),
+                    (float(getattr(config, "FIBO_PM_LOCK_70_AFTER_MIN", 150)), 0.70),
+                ]
+                _lock_pct = 0.0
+                _fibo_tighten = False
+                for _tier_min, _tier_pct in reversed(_fibo_lock_tiers):
+                    if age_min >= _tier_min:
+                        _lock_pct = _tier_pct
+                        _fibo_tighten = True
+                        break
+                if not _fibo_tighten and age_min >= _fibo_be_min:
+                    _fibo_tighten = True
+                _profit_pts = (ref - entry) if direction == "long" else (entry - ref)
+                if _fibo_tighten and _profit_pts > 0:
+                    _be_buffer = max(abs(entry) * 0.00005, 0.5)
+                    if _lock_pct > 0:
+                        _new_sl = (entry + _profit_pts * _lock_pct) if direction == "long" else (entry - _profit_pts * _lock_pct)
+                    else:
+                        _new_sl = (entry + _be_buffer) if direction == "long" else (entry - _be_buffer)
+                    _improves = (_new_sl > stop_loss) if direction == "long" else (_new_sl < stop_loss)
+                    _tol = max(abs(entry) * 0.000001, 0.01)
+                    if _improves and abs(_new_sl - stop_loss) > _tol and self._stop_valid_for_position(direction, entry, _new_sl):
+                        _keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else target_tp
+                        res = self.amend_position_sltp(
+                            position_id=position_id,
+                            stop_loss=_new_sl,
+                            take_profit=_keep_tp if self._target_valid_for_position(direction, entry, _keep_tp) else 0.0,
+                            trailing_stop_loss=False,
+                        )
+                        if bool(res.ok):
+                            report["amended_positions"] += 1
+                            _tier_label = "be" if _lock_pct <= 0 else ("lock_%d" % int(_lock_pct * 100))
+                            report["pm_actions"].append({
+                                "position_id": position_id, "source": source, "symbol": symbol,
+                                "action": "fibo_time_profit_lock_%s" % _tier_label,
+                                "reference_price": round(ref, 4), "new_stop_loss": round(_new_sl, 4),
+                                "r_now": round(float(r_now), 4), "age_min": round(float(age_min), 1),
+                                "lock_pct": _lock_pct, "profit_pts": round(_profit_pts, 2),
+                            })
+                            logger.info(
+                                "[PM:FiboTimeLock] pos=%s %s %s | age=%.0fm | profit=%.1fpts | lock=%d%% | new_sl=%.2f",
+                                position_id, symbol, direction, age_min, _profit_pts, int(_lock_pct * 100), _new_sl,
+                            )
+                        continue
             if not self._is_scheduled_canary_source(source):
                 if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
                     no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)

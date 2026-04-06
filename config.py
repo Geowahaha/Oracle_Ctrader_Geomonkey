@@ -147,6 +147,12 @@ class Config:
     FIBO_SCOUT_CTRADER_RISK_USD: float = float(os.getenv("FIBO_SCOUT_CTRADER_RISK_USD", "0.5"))
     FIBO_SCOUT_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_SCOUT_SHARPNESS_KNIFE_THR", "25"))
     FIBO_SCOUT_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_SCOUT_MAX_IMPULSE_AGE_BARS", "30"))
+    # Fibo Position Manager — time-based profit lock (progressive SL tightening)
+    FIBO_PM_TIME_LOCK_ENABLED: bool = os.getenv("FIBO_PM_TIME_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_PM_BE_AFTER_MIN: float = float(os.getenv("FIBO_PM_BE_AFTER_MIN", "20"))
+    FIBO_PM_LOCK_30_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_30_AFTER_MIN", "45"))
+    FIBO_PM_LOCK_50_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_50_AFTER_MIN", "90"))
+    FIBO_PM_LOCK_70_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_70_AFTER_MIN", "150"))
     # Comma-separated families that ignore Strategy Lab blocked/shadow for persistent canary candidate loading.
     # Default: XAU flow sidecars (still require pattern + chart contexts / first_sample gates in builders).
     PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK: str = os.getenv(
