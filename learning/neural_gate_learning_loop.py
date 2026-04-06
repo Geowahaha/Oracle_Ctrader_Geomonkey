@@ -589,6 +589,9 @@ class NeuralGateLearningLoop:
             ejid = int(row["ejid"] or 0)
             st = str(row["status"] or "").strip().lower()
             meta = self._safe_json_dict(str(row["execution_meta_json"] or ""))
+            if bool(meta.get("exclude_from_training")):
+                logger.info("[NeuralGate] skip journal_id=%s exclude_from_training reason=%s", ejid, meta.get("exclude_reason", ""))
+                continue
             resp = self._safe_json_dict(str(row["response_json"] or ""))
             pnl_f: float | None = None
             if st == "closed":

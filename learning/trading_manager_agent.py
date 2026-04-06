@@ -2385,6 +2385,8 @@ class TradingManagerAgent:
             direction = self._trade_direction(row["direction"] or request_payload.get("direction") or req_payload.get("direction") or "")
             entry_type = str(row["entry_type"] or request_payload.get("entry_type") or req_payload.get("entry_type") or "").strip().lower()
             execution_meta = _safe_json_dict(str(row["execution_meta_json"] or ""))
+            if bool(execution_meta.get("exclude_from_training")):
+                continue
             closed = dict(execution_meta.get("closed") or {})
             grouped.setdefault(run_id, []).append(
                 {
