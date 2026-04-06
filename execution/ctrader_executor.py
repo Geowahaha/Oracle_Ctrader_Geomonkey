@@ -5154,16 +5154,22 @@ class CTraderExecutor:
                 _profit_pts = (ref - entry) if direction == "long" else (entry - ref)
                 if _fibo_tighten and _profit_pts > 0:
                     _be_buffer = max(abs(entry) * 0.00005, 0.5)
+                    # Tighten SL towards entry from original wide SL:
+                    # lock_pct of the distance from original SL to entry is recovered.
+                    # E.g. short: SL=4807, entry=4706 → risk=101pts.
+                    # lock 50% → new_sl = entry + risk*(1-0.50) = entry + 50.5 = 4756.5
+                    _orig_risk = abs(stop_loss - entry)
                     if _lock_pct > 0:
-                        _new_sl = (entry + _profit_pts * _lock_pct) if direction == "long" else (entry - _profit_pts * _lock_pct)
+                        _keep_risk = _orig_risk * (1.0 - _lock_pct)
                     else:
-                        _new_sl = (entry + _be_buffer) if direction == "long" else (entry - _be_buffer)
+                        _keep_risk = _be_buffer  # just entry ± buffer for breakeven
+                    if direction == "long":
+                        _new_sl = entry - _keep_risk
+                    else:
+                        _new_sl = entry + _keep_risk
                     _improves = (_new_sl > stop_loss) if direction == "long" else (_new_sl < stop_loss)
                     _tol = max(abs(entry) * 0.000001, 0.01)
-                    # For profit-lock, SL can be on the profit side of entry.
-                    # Validate against current price: long SL < ref, short SL > ref.
-                    _sl_vs_price_ok = (_new_sl < ref) if direction == "long" else (_new_sl > ref)
-                    if _improves and abs(_new_sl - stop_loss) > _tol and _new_sl > 0 and _sl_vs_price_ok:
+                    if _improves and abs(_new_sl - stop_loss) > _tol and self._stop_valid_for_position(direction, entry, _new_sl):
                         _keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
                         res = self.amend_position_sltp(
                             position_id=position_id, stop_loss=_new_sl,
