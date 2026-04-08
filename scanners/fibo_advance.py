@@ -111,7 +111,7 @@ class FiboAdvanceScanner:
         except Exception:
             self._last_scan_diagnostics = {}
 
-    # ── Circuit Breaker + Trade Result Reporting ───────────────────────────────
+    # ── Soft Circuit Breaker + Trade Result Reporting ───────────────────────────
 
     def report_trade_result(self, pnl_usd: float) -> None:
         """
@@ -130,10 +130,11 @@ class FiboAdvanceScanner:
             self._consecutive_losses = 0
         self._daily_trades += 1
 
-    def _check_circuit_breaker(self) -> tuple[bool, str]:
+    def _check_circuit_breaker(self) -> tuple[bool, str, float]:
         """
-        Circuit breaker: pause scanner after consecutive losses or daily loss cap.
-        Returns (allowed, reason).
+        Soft circuit breaker: 3 levels — warning, caution, emergency.
+        Only emergency (level 3) actually blocks. Levels 1-2 reduce confidence.
+        Returns (allowed, reason, confidence_modifier).
         """
         today = date.today()
         if self._last_reset_date != today:
@@ -143,22 +144,42 @@ class FiboAdvanceScanner:
             self._last_reset_date = today
 
         if self._pause_until and datetime.now(timezone.utc) < self._pause_until:
-            return False, f"paused_until_{self._pause_until.isoformat()}"
+            return False, f"paused_until_{self._pause_until.isoformat()}", 0.0
 
-        max_consec = int(_cfg("FIBO_ADVANCE_MAX_CONSEC_LOSSES", 3))
-        if self._consecutive_losses >= max_consec:
-            pause_min = int(_cfg("FIBO_ADVANCE_PAUSE_AFTER_CONSEC_LOSS_MIN", 60))
+        # Level 3 — Emergency: hard stop
+        max_consec_hard = int(_cfg("FIBO_ADVANCE_HARD_CONSEC_LOSSES", 10))
+        daily_cap_hard = float(_cfg("FIBO_ADVANCE_HARD_DAILY_LOSS_USD", 150.0))
+
+        if self._consecutive_losses >= max_consec_hard:
+            pause_min = int(_cfg("FIBO_ADVANCE_HARD_PAUSE_MIN", 120))
             self._pause_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self._consecutive_losses = 0
-            return False, f"consec_loss_limit:{max_consec}→paused_{pause_min}min"
+            return False, f"emergency_consec:{max_consec_hard}→paused_{pause_min}min", 0.0
 
-        daily_cap = float(_cfg("FIBO_ADVANCE_DAILY_LOSS_CAP_USD", 20.0))
-        if self._daily_losses_usd <= -daily_cap:
+        if self._daily_losses_usd <= -daily_cap_hard:
             self._pause_until = datetime.now(timezone.utc).replace(
                 hour=23, minute=59, second=59)
-            return False, f"daily_loss_cap_hit:${abs(self._daily_losses_usd):.2f}"
+            return False, f"emergency_daily_loss:${abs(self._daily_losses_usd):.2f}", 0.0
 
-        return True, "circuit_ok"
+        # Level 2 — Caution: significant confidence reduction
+        if self._consecutive_losses >= 5:
+            logger.info("[FiboAdvance:CB] Caution: %d consec losses → conf -25", self._consecutive_losses)
+            return True, "caution_consec_5", -25.0
+
+        if self._daily_losses_usd <= -75.0:
+            logger.info("[FiboAdvance:CB] Caution: daily loss $%.2f → conf -30", abs(self._daily_losses_usd))
+            return True, "caution_daily_75", -30.0
+
+        # Level 1 — Warning: mild confidence reduction
+        if self._consecutive_losses >= 3:
+            logger.info("[FiboAdvance:CB] Warning: %d consec losses → conf -10", self._consecutive_losses)
+            return True, "warning_consec_3", -10.0
+
+        if self._daily_losses_usd <= -30.0:
+            logger.info("[FiboAdvance:CB] Warning: daily loss $%.2f → conf -15", abs(self._daily_losses_usd))
+            return True, "warning_daily_30", -15.0
+
+        return True, "circuit_ok", 0.0
 
     # ── Fibonacci Killer Detection ─────────────────────────────────────────────
 
@@ -296,8 +317,8 @@ class FiboAdvanceScanner:
             from analysis.entry_sharpness import compute_entry_sharpness_score
             sharpness = compute_entry_sharpness_score(features, direction)
         except Exception as e:
-            logger.warning("[FiboAdvance] sharpness check ERROR — BLOCKING: %s", e)
-            return False, "sharpness_error_blocked", {"sharpness_score": 0, "sharpness_band": "knife"}
+            logger.warning("[FiboAdvance] sharpness check error — degrading: %s", e)
+            return True, "sharpness_error_degraded", {"sharpness_score": 25, "sharpness_band": "caution"}
 
         score = int(sharpness.get("sharpness_score", 50) or 50)
         band  = str(sharpness.get("sharpness_band", "normal") or "normal")
@@ -395,12 +416,14 @@ class FiboAdvanceScanner:
 
         return True, f"fresh_impulse:{bars_since_swing_end}bars"
 
-    # ── Trend Alignment Gate ───────────────────────────────────────────────────
+    # ── Trend Confidence Modifier ───────────────────────────────────────────
 
-    def _check_trend_alignment(self, df_d1: Optional[pd.DataFrame],
-                               df_h4: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    def _trend_confidence_modifier(self, df_d1: Optional[pd.DataFrame],
+                                   df_h4: pd.DataFrame, direction: str) -> tuple[float, str]:
         """
-        Don't enter against the dominant trend. D1 + H4 must not both oppose direction.
+        Returns confidence adjustment based on trend alignment.
+        Negative = counter-trend penalty, Positive = aligned bonus.
+        Does NOT block signals — lets brain learn from all setups.
         """
         try:
             df_h4c = ta.add_ema(df_h4.copy(), periods=[21, 50])
@@ -420,15 +443,21 @@ class FiboAdvanceScanner:
                 d1_bearish = d1_close < d1_ema21 < d1_ema50
                 d1_bullish = d1_close > d1_ema21 > d1_ema50
 
+            # Counter-trend penalty (D1+H4 both oppose direction)
             if direction == "long" and d1_bearish and h4_bearish:
-                return False, f"counter_trend_block:d1=bearish,h4=bearish"
+                return -15.0, "counter_trend_penalty:d1=bearish,h4=bearish"
             if direction == "short" and d1_bullish and h4_bullish:
-                return False, f"counter_trend_block:d1=bullish,h4=bullish"
+                return -15.0, "counter_trend_penalty:d1=bullish,h4=bullish"
 
-            return True, "trend_aligned"
+            # Aligned bonus (D1+H4 both support direction)
+            if (d1_bullish and h4_bullish and direction == "long") or \
+               (d1_bearish and h4_bearish and direction == "short"):
+                return +5.0, "trend_aligned_bonus"
+
+            return 0.0, "trend_neutral"
         except Exception as e:
-            logger.debug("[FiboAdvance] trend alignment error: %s", e)
-            return True, "trend_check_error_passthrough"
+            logger.debug("[FiboAdvance] trend check error: %s", e)
+            return 0.0, "trend_check_error_passthrough"
 
     # ── H4 Bias — Structure-Based (Institution Grade) ─────────────────────────
 
@@ -576,7 +605,7 @@ class FiboAdvanceScanner:
             tp3 = ext_1618 if ext_1618 < entry else entry - risk * 2.618
 
         rr = round(abs(tp2 - entry) / risk, 2) if risk > 0 else 0.0
-        if rr < float(_cfg("FIBO_ADVANCE_MIN_RR", 1.5)):
+        if rr < float(_cfg("FIBO_ADVANCE_MIN_RR", 1.2)):
             return None
 
         # ── Confidence = Fib confluence + SMC + RSI + VP + MTF stacking ───
@@ -592,7 +621,7 @@ class FiboAdvanceScanner:
             rsi_boost = 6.0
 
         confidence = round(min(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus, 96.0), 1)
-        min_conf   = float(_cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 68.0))
+        min_conf   = float(_cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 62.0))
         if confidence < min_conf:
             return None
 
@@ -712,7 +741,7 @@ class FiboAdvanceScanner:
             return None
 
         # Lower score threshold for scout (more opportunities)
-        scout_min_score = float(_cfg("FIBO_SCOUT_MIN_FIBO_SCORE", 35.0))
+        scout_min_score = float(_cfg("FIBO_SCOUT_MIN_FIBO_SCORE", 28.0))
         if fibo_ctx.fibo_confluence_score < scout_min_score:
             return None
 
@@ -773,7 +802,7 @@ class FiboAdvanceScanner:
             tp3 = ext_1618 if ext_1618 < entry else entry - risk * 1.618
 
         rr = round(abs(tp2 - entry) / risk, 2) if risk > 0 else 0.0
-        if rr < float(_cfg("FIBO_SCOUT_MIN_RR", 1.2)):
+        if rr < float(_cfg("FIBO_SCOUT_MIN_RR", 1.0)):
             return None
 
         smc_boost  = min(smc_context.confidence * 0.20, 10.0) if smc_context else 0.0
@@ -781,7 +810,7 @@ class FiboAdvanceScanner:
             fibo_ctx.fibo_confluence_score + smc_boost + 5.0 + vp_adj + mtf_bonus,
             88.0,
         ), 1)
-        min_conf   = float(_cfg("FIBO_SCOUT_MIN_CONFIDENCE", 62.0))
+        min_conf   = float(_cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0))
         if confidence < min_conf:
             return None
 
@@ -896,8 +925,8 @@ class FiboAdvanceScanner:
             logger.debug("[FiboAdvance] Skipping — outside London/NY session")
             return None
 
-        # ── Circuit breaker check ──────────────────────────────────────────────
-        cb_ok, cb_reason = self._check_circuit_breaker()
+        # ── Circuit breaker check (soft — only emergency blocks) ─────────────
+        cb_ok, cb_reason, cb_conf_mod = self._check_circuit_breaker()
         if not cb_ok:
             self._set_diag(status="circuit_breaker", unmet=["circuit_breaker"],
                            notes=[cb_reason])
@@ -995,88 +1024,89 @@ class FiboAdvanceScanner:
                 if not fresh_ok:
                     logger.debug("[FiboAdvance:Sniper] %s", fresh_reason)
                 else:
-                    # ── Gate: Trend alignment (D1 + H4) ────────────────────
-                    trend_ok, trend_reason = self._check_trend_alignment(
+                    # ── Trend confidence modifier (D1 + H4) ─────────────────
+                    trend_mod, trend_reason = self._trend_confidence_modifier(
                         df_d1, df_h4, direction)
-                    if not trend_ok:
-                        logger.info("[FiboAdvance:Sniper] trend blocked: %s", trend_reason)
+                    if trend_mod != 0:
+                        logger.info("[FiboAdvance:Sniper] trend %s: %+.0f conf", trend_reason, trend_mod)
+                    # ── Gate: Entry Sharpness Score ────────────────────────
+                    sharp_ok, sharp_reason, sharpness = self._check_entry_sharpness(
+                        direction, snapshot, mode="sniper"
+                    )
+                    if not sharp_ok:
+                        logger.info("[FiboAdvance:Sniper] blocked: %s", sharp_reason)
                     else:
-                        # ── Gate: Entry Sharpness Score ────────────────────────
-                        sharp_ok, sharp_reason, sharpness = self._check_entry_sharpness(
-                            direction, snapshot, mode="sniper"
+                        # ── Gate: Volume Profile confluence ───────────────
+                        vp_adj, vp_reason, vp_check = self._check_volume_profile(
+                            fibo_ctx.nearest_level_price, direction
                         )
-                        if not sharp_ok:
-                            logger.info("[FiboAdvance:Sniper] blocked: %s", sharp_reason)
-                        else:
-                            # ── Gate: Volume Profile confluence ───────────────
-                            vp_adj, vp_reason, vp_check = self._check_volume_profile(
-                                fibo_ctx.nearest_level_price, direction
-                            )
 
-                            # ── Gate: Microstructure ──────────────────────────
-                            micro_ok, micro_reason = self._check_microstructure(direction, 70.0, snapshot)
-                            if micro_ok:
-                                signal = self._build_signal(
-                                    direction=direction,
-                                    fibo_ctx=fibo_ctx,
-                                    current_price=current_price,
-                                    atr=atr_h1,
-                                    rsi=rsi,
-                                    session_info=session_info,
-                                    smc_context=smc_context,
-                                    df_entry=df_h1,
-                                    vp_adj=vp_adj,
-                                    vp_reason=vp_reason,
-                                    sharpness=sharpness,
+                        # ── Gate: Microstructure ──────────────────────────
+                        micro_ok, micro_reason = self._check_microstructure(direction, 70.0, snapshot)
+                        if micro_ok:
+                            signal = self._build_signal(
+                                direction=direction,
+                                fibo_ctx=fibo_ctx,
+                                current_price=current_price,
+                                atr=atr_h1,
+                                rsi=rsi,
+                                session_info=session_info,
+                                smc_context=smc_context,
+                                df_entry=df_h1,
+                                vp_adj=vp_adj,
+                                vp_reason=vp_reason,
+                                sharpness=sharpness,
+                                mode="sniper",
+                            )
+                            if signal is not None:
+                                # Apply confidence modifiers (weight, not gate)
+                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod, 10.0), 1)
+                                # Mark as Sniper for pattern
+                                signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
+                                signal.raw_scores["mode"] = "sniper"
+                                signal.reasons.append(fresh_reason)
+                                sniper_fired = True
+                                self.signal_count += 1
+                                self.last_signal = signal
+                                self._set_diag(
+                                    status="sniper_signal_generated",
                                     mode="sniper",
+                                    direction=direction,
+                                    confidence=signal.confidence,
+                                    entry=signal.entry,
+                                    stop_loss=signal.stop_loss,
+                                    fib_level=fibo_ctx.nearest_level_ratio,
+                                    fib_score=fibo_ctx.fibo_confluence_score,
+                                    in_golden_pocket=fibo_ctx.in_golden_pocket,
+                                    impulse_strength=fib.impulse_strength,
+                                    killer_cleared=True,
+                                    sharpness_score=int(sharpness.get("sharpness_score", 0) or 0),
+                                    sharpness_band=str(sharpness.get("sharpness_band", "") or ""),
+                                    vp_reason=vp_reason,
+                                    notes=signal.reasons,
                                 )
-                                if signal is not None:
-                                    # Mark as Sniper for pattern
-                                    signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
-                                    signal.raw_scores["mode"] = "sniper"
-                                    signal.reasons.append(fresh_reason)
-                                    sniper_fired = True
-                                    self.signal_count += 1
-                                    self.last_signal = signal
-                                    self._set_diag(
-                                        status="sniper_signal_generated",
-                                        mode="sniper",
-                                        direction=direction,
-                                        confidence=signal.confidence,
-                                        entry=signal.entry,
-                                        stop_loss=signal.stop_loss,
-                                        fib_level=fibo_ctx.nearest_level_ratio,
-                                        fib_score=fibo_ctx.fibo_confluence_score,
-                                        in_golden_pocket=fibo_ctx.in_golden_pocket,
-                                        impulse_strength=fib.impulse_strength,
-                                        killer_cleared=True,
-                                        sharpness_score=int(sharpness.get("sharpness_score", 0) or 0),
-                                        sharpness_band=str(sharpness.get("sharpness_band", "") or ""),
-                                        vp_reason=vp_reason,
-                                        notes=signal.reasons,
-                                    )
-                                    logger.info(
-                                        "[FiboAdvance:Sniper] SIGNAL #%d | %s | Conf:%.1f | "
-                                        "Fib:%.3f | GP:%s | Entry:%.2f | SL:%.2f | TP2:%.2f | RR:%.2f | "
-                                        "Sharpness:%d(%s) | VP:%s",
-                                        self.signal_count, direction.upper(), signal.confidence,
-                                        fibo_ctx.nearest_level_ratio, fibo_ctx.in_golden_pocket,
-                                        signal.entry, signal.stop_loss, signal.take_profit_2, signal.risk_reward,
-                                        int(sharpness.get("sharpness_score", 0) or 0),
-                                        str(sharpness.get("sharpness_band", "") or ""),
-                                        vp_reason,
-                                    )
-                                    return signal
+                                logger.info(
+                                    "[FiboAdvance:Sniper] SIGNAL #%d | %s | Conf:%.1f | "
+                                    "Fib:%.3f | GP:%s | Entry:%.2f | SL:%.2f | TP2:%.2f | RR:%.2f | "
+                                    "Sharpness:%d(%s) | VP:%s | Trend:%s",
+                                    self.signal_count, direction.upper(), signal.confidence,
+                                    fibo_ctx.nearest_level_ratio, fibo_ctx.in_golden_pocket,
+                                    signal.entry, signal.stop_loss, signal.take_profit_2, signal.risk_reward,
+                                    int(sharpness.get("sharpness_score", 0) or 0),
+                                    str(sharpness.get("sharpness_band", "") or ""),
+                                    vp_reason, trend_reason,
+                                )
+                                return signal
 
         # ══ SCOUT MODE: H1 impulse → M15 entry (fires while waiting for Sniper) ══
         if not sniper_fired and bool(_cfg("FIBO_SCOUT_ENABLED", True)):
-            # Auto-disable Scout when Sniper has consecutive losses (don't double down)
-            min_consec_disable = int(_cfg("FIBO_SCOUT_DISABLE_ON_CONSEC_LOSS", 2))
-            if self._consecutive_losses >= min_consec_disable:
-                logger.debug("[FiboAdvance] Scout disabled — %d consecutive losses", self._consecutive_losses)
-                self._set_diag(status="scout_disabled_consec_loss", h4_bias=h4_bias,
-                               consec_losses=self._consecutive_losses)
-                return None
+            # Soft penalty when Sniper has consecutive losses (don't hard-block)
+            scout_conf_penalty = 0.0
+            min_consec_warn = int(_cfg("FIBO_SCOUT_CONSEC_LOSS_WARN", 2))
+            if self._consecutive_losses >= min_consec_warn:
+                scout_conf_penalty = -10.0 * (self._consecutive_losses - min_consec_warn + 1)
+                logger.debug("[FiboAdvance] Scout conf penalty: %.0f (%d consec losses)",
+                             scout_conf_penalty, self._consecutive_losses)
             logger.debug("[FiboAdvance] Sniper not ready — trying SCOUT mode (H1→M15)")
             scout_signal = self._scout_scan(
                 df_h1=df_h1,
@@ -1090,6 +1120,10 @@ class FiboAdvanceScanner:
                 h4_bias=h4_bias,
             )
             if scout_signal is not None:
+                # Apply soft penalty for consecutive losses
+                if scout_conf_penalty < 0:
+                    scout_signal.confidence = round(max(scout_signal.confidence + scout_conf_penalty, 10.0), 1)
+                    scout_signal.reasons.append(f"scout_conf_penalty:{scout_conf_penalty:.0f}")
                 self.signal_count += 1
                 self.last_signal = scout_signal
                 self._set_diag(
