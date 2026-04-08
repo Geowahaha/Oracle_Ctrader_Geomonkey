@@ -2,11 +2,32 @@
 
 > ไฟล์นี้คือ "สมอง" สำหรับ AI ตัวถัดไป อ่านไฟล์นี้ก่อนจะรู้ทุกอย่าง
 
-## 🎯 สถานะปัจจุบัน (2026-04-08 14:55 UTC+8)
+---
+
+## 🚀 คำสั่งรับงานต่อ (COPY-PASTE ได้เลย)
+
+```
+อ่าน HANDOFF_FIBO_HARDENING.md ใน repo Oracle_Ctrader_Geomonkey แล้วทำงานต่อทันที
+
+งานต่อไป: Session filter → weight (ข้อ 2 ใน Recommended Next Actions)
+- เปลี่ยน session gate ใน scanners/fibo_advance.py scan() method
+- จาก binary block (ถ้าไม่ใช่ London/NY → return None) → confidence modifier
+- Asian session: conf -8 to -12 (liquidity ต่ำ แต่ setups มีอยู่)
+- คง hard block เฉพาะ market_closed เท่านั้น
+- เขียน unit tests เพิ่ม ≥ 5 cases
+- อัพเดท HANDOFF_FIBO_HARDENING.md
+- commit + push
+
+อย่าแก้ไฟล์อื่นนอกจาก scanners/fibo_advance.py และ tests/
+```
+
+---
+
+## 🎯 สถานะปัจจุบัน (2026-04-08 15:08 UTC+8)
 
 ### Project: Oracle_Ctrader_Geomonkey (Dexter Pro v3)
 - Repo: https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git
-- Branch: `main` (latest commit: neural-aware risk management)
+- Branch: `main` (latest commit: `c62cb06` — weighted Fibonacci Killer)
 - PR #1 merged ✅ | Neural-aware refactor deployed ✅ | **Weighted Killer deployed ✅**
 
 ### สิ่งที่ทำเสร็จแล้ว (DON'T REDO):
@@ -58,12 +79,16 @@ Key change: ATR expansion, delta, volume, spread alone can NEVER block — only 
 Hard block requires: state_label (7pts) + at least 1 other significant condition.
 ```
 
-### ยังไม่ได้ทำ (DO NEXT):
-1. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง neural-aware refactor
-2. ❌ **Backtest with cTrader data** — ต้อง Windows dev machine
-3. ⚠️ **Revoke PAT token** — `ghp_x7VVX...` ที่ใช้ push
-4. ❌ **xauusd.py circuit breaker** — ถ้า PnL fibo ดี อาจเพิ่มให้ family อื่น
-5. ❌ **Position sizing by equity** — Priority 2 ใน original review
+### ยังไม่ได้ทำ (DO NEXT — เรียงตามลำดับควรทำ):
+1. 🔥 **Session filter → weight** — เปลี่ยน London/NY binary gate → confidence modifier (Asian conf -8 to -12)
+2. 🔥 **Momentum-adaptive TP extension** — step_r คำนวณจาก momentum score แทน fixed 0.25R
+3. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
+4. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars
+5. ❌ **Structure-aware SL trailing** — SL เลื่อนตาม SMC swing (ใหญ่, ทำทีหลัง)
+6. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง weighted killer deploy
+7. ❌ **Backtest with cTrader data** — ต้อง Windows dev machine
+8. ❌ **xauusd.py circuit breaker** — ถ้า PnL fibo ดี อาจเพิ่มให้ family อื่น
+9. ❌ **Position sizing by equity** — Priority 2 ใน original review
 
 ### Files changed (3 files):
 - `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + **weighted Fibonacci killer**
@@ -86,13 +111,15 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 - `config.py` — all env vars, 260KB
 
 ### Fibonacci Advance Scanner:
-- `scanners/fibo_advance.py` — the main file we changed
+- `scanners/fibo_advance.py` — the main file we changed (1150 lines)
 - Line 66: `_cfg()` — config helper (FIXED)
-- Line 111-170: soft circuit breaker 3 levels (NEW)
-- Line 395-435: trend confidence modifier (NEW — replaces trend alignment gate)
-- Line 900-906: circuit breaker check in scan() (NEW)
-- Line 1027-1030: trend modifier applied to sniper signal (NEW)
-- Line 1074-1079: scout soft penalty (NEW — replaces hard disable)
+- Line 133-215: soft circuit breaker 3 levels
+- Line 186-310: **weighted Fibonacci killer** (NEW — replaces binary gate)
+- Line 484-540: trend confidence modifier
+- Line 1040-1051: killer check in scan() + weight logging
+- Line 1129: all modifiers applied: `signal.confidence += trend_mod + cb_conf_mod + killer_weight`
+- Line 1133: killer info in raw_scores
+- Line 1194-1202: scout signal killer weight application
 
 ### Scheduler:
 - `scheduler.py` line 9141-9184: `_feed_fibo_trade_results()` (NEW)
