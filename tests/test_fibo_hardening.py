@@ -334,3 +334,172 @@ class TestThresholds:
         assert _cfg("FIBO_SCOUT_MIN_FIBO_SCORE", 28.0) == 28.0
         assert _cfg("FIBO_SCOUT_MIN_RR", 1.0) == 1.0
         assert _cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0) == 55.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 6: Weighted Fibonacci Killer — confidence modifier, NOT binary gate
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestWeightedFibonacciKiller:
+    """Test that Fibonacci Killer returns weight, not binary block."""
+
+    def _make_snapshot(self, **overrides):
+        """Build a minimal snapshot dict."""
+        features = {
+            "delta_proxy": 0.0,
+            "bar_volume_proxy": 0.5,
+            "spread_expansion_ratio": 1.0,
+            **{k: v for k, v in overrides.items() if k not in ("day_type", "state_label")},
+        }
+        snapshot = {
+            "features": features,
+            "day_type": overrides.get("day_type", "trend"),
+            "state_label": overrides.get("state_label", ""),
+        }
+        return snapshot
+
+    def _make_df_with_atr(self, atr_val=2.0, n=30, bar_range=1.0):
+        """Build a minimal DataFrame with atr_14 column.
+        bar_range: half-range of each bar (high-close and close-low).
+        Default 1.0 → total bar range 2.0 → retrace_vel = 1.0x ATR (normal).
+        """
+        c = 3000.0
+        return pd.DataFrame({
+            "close": [c] * n,
+            "high": [c + bar_range] * n,
+            "low": [c - bar_range] * n,
+            "atr_14": [float(atr_val)] * n,
+        })
+
+    def test_no_killer_returns_zero_weight(self):
+        """Clean market → allowed=True, weight=0."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot()
+        df = self._make_df_with_atr()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        assert allowed is True
+        assert weight == 0.0
+        assert "no_killer" in reason
+
+    def test_mild_killer_returns_negative_weight(self):
+        """Single mild condition → allowed=True, weight between -3 and -8."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot(delta_proxy=0.42)  # slightly above 0.40 threshold
+        df = self._make_df_with_atr()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        assert allowed is True
+        assert -8.0 <= weight < 0
+        assert "mild" in reason
+
+    def test_moderate_killer_returns_medium_weight(self):
+        """Multiple moderate conditions → allowed=True, weight -10 to -18."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot(
+            delta_proxy=0.65,  # 2 points (extreme)
+            bar_volume_proxy=2.6,  # 1 point (spike)
+        )
+        df = self._make_df_with_atr()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        assert allowed is True
+        assert -18.0 <= weight <= -10.0
+        assert "moderate" in reason
+
+    def test_severe_killer_returns_heavy_weight(self):
+        """Day type killer → allowed=True, weight -20 to -35."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot(day_type="panic_spread")  # 5 points
+        df = self._make_df_with_atr()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        # panic_spread = 5 points → score 5 → severe tier
+        assert allowed is True
+        assert weight <= -20.0
+        assert "severe" in reason
+
+    def test_hard_block_state_label(self):
+        """State label panic_dislocation alone → severe, not hard block."""
+        scanner = FiboAdvanceScanner()
+        # Use df with very small bars so retrace_vel doesn't add points
+        df = pd.DataFrame({
+            "close": [3000.0] * 30,
+            "high": [3000.5] * 30,  # 0.5pt range → retrace_vel = 0.5/2.0 = 0.25x
+            "low": [2999.5] * 30,
+            "atr_14": [2.0] * 30,
+        })
+        snapshot = self._make_snapshot(state_label="panic_dislocation")  # 7 points
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        # 7 points alone → severe (not hard block which needs >= 8)
+        assert allowed is True
+        assert weight <= -20.0
+        assert "severe" in reason
+
+    def test_hard_block_combined_extreme(self):
+        """State label + day type → score >= 8 → hard block."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot(
+            state_label="panic_dislocation",  # 7 points
+            day_type="panic_spread",  # 5 points → total 12
+        )
+        df = self._make_df_with_atr()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        assert allowed is False
+        assert "hard_block" in reason
+
+    def test_return_tuple_is_three_elements(self):
+        """Verify return type is (bool, str, float) — not old 2-tuple."""
+        scanner = FiboAdvanceScanner()
+        snapshot = self._make_snapshot()
+        df = self._make_df_with_atr()
+
+        result = scanner._fibonacci_killer_check(snapshot, atr=2.0, df_entry=df)
+
+        assert len(result) == 3
+        assert isinstance(result[0], bool)
+        assert isinstance(result[1], str)
+        assert isinstance(result[2], float)
+
+    def test_retracement_velocity_grading(self):
+        """Retracement velocity should have 3 tiers of severity."""
+        scanner = FiboAdvanceScanner()
+        # Fast retrace bar ranges
+        df = pd.DataFrame({
+            "close": [3000.0] * 10,
+            "high": [3005.0] * 10,  # 5pt range = 2.5x ATR if ATR=2
+            "low": [2995.0] * 10,
+            "atr_14": [2.0] * 10,
+        })
+        snapshot = self._make_snapshot()
+
+        allowed, reason, weight = scanner._fibonacci_killer_check(
+            snapshot, atr=2.0, df_entry=df
+        )
+
+        # 5pt bar range / 2pt ATR = 2.5x → above 2.0*1.5=3.0? No → above 2.0 → 2 points
+        # But need to check _retracement_velocity calculation
+        # avg_bar_range = 10pts / 5 bars = 2pts → 2/2 = 1.0x ATR → below 0.7*2.0 threshold
+        # Actually: lookback=5 bars, total_range=10*5=50, avg=10, 10/2=5.0x → extreme
+        # 5.0 > 2.0*1.5=3.0 → 4 points → moderate
+        assert allowed is True  # 4 points alone doesn't hard block

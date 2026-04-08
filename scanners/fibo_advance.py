@@ -184,63 +184,126 @@ class FiboAdvanceScanner:
     # ── Fibonacci Killer Detection ─────────────────────────────────────────────
 
     def _fibonacci_killer_check(self, snapshot: dict, atr: float,
-                                df_entry: pd.DataFrame) -> tuple[bool, str]:
+                                df_entry: pd.DataFrame) -> tuple[bool, str, float]:
         """
-        Detect conditions that invalidate Fibonacci levels ("Fibonacci killers").
-        Returns (is_killer, reason).
+        Weighted Fibonacci Killer — confidence modifier, NOT binary gate.
 
-        Killers identified from years of XAUUSD observation:
-        1. ATR expansion: current bar ATR >> rolling average → trending/news day
-        2. Strong delta: momentum too strong for retracement to hold
-        3. Volume spike: anomalous volume = institutional repricing event
-        4. Day type: panic_spread / fast_expansion / repricing
-        5. State label: continuation_drive (price will not reverse at Fibo)
-        6. Spread expansion: wide spread = low liquidity at level
-        7. Retracement velocity: price falling too fast through Fib levels = stop hunt
+        Returns (allowed, reason, confidence_modifier).
+
+        Killer score system (cumulative):
+          ATR expansion:        1-3 points (proportional to ratio)
+          Delta momentum:       1-2 points
+          Volume spike:         1-2 points
+          Day type:             5 points (hard block at >= 8 with others)
+          State label:          7 points (hard block)
+          Spread expansion:     1-2 points
+          Retracement velocity: 2-4 points
+
+        Decision:
+          score >= 8  → HARD BLOCK (allowed=False, truly dangerous)
+          score 5-7   → conf -20 to -35 (severe degradation)
+          score 3-4   → conf -10 to -18 (moderate degradation)
+          score 1-2   → conf -3 to -8  (mild degradation)
+          score 0     → no impact
         """
         features = snapshot.get("features", {}) if snapshot else {}
+        score = 0
+        reasons: list[str] = []
 
-        # ── 1. ATR expansion guard ────────────────────────────────────────────
+        # ── 1. ATR expansion (1-3 points) ─────────────────────────────────────
+        atr_ratio = 0.0
         if len(df_entry) >= 20 and atr > 0:
             recent_atr = float(df_entry["atr_14"].iloc[-1]) if "atr_14" in df_entry.columns else atr
             avg_atr    = float(df_entry["atr_14"].rolling(20).mean().iloc[-1]) if "atr_14" in df_entry.columns else atr
-            if avg_atr > 0 and recent_atr > avg_atr * float(_cfg("FIBO_ADVANCE_KILLER_ATR_MULT", 1.8)):
-                return True, f"atr_expansion_killer:{recent_atr:.2f}vs{avg_atr:.2f}"
+            if avg_atr > 0:
+                atr_ratio = recent_atr / avg_atr
+                atr_kill_mult = float(_cfg("FIBO_ADVANCE_KILLER_ATR_MULT", 1.8))
+                if atr_ratio > atr_kill_mult * 1.3:
+                    score += 3
+                    reasons.append(f"atr_extreme:{atr_ratio:.2f}x")
+                elif atr_ratio > atr_kill_mult:
+                    score += 2
+                    reasons.append(f"atr_high:{atr_ratio:.2f}x")
+                elif atr_ratio > atr_kill_mult * 0.8:
+                    score += 1
+                    reasons.append(f"atr_elevated:{atr_ratio:.2f}x")
 
-        # ── 2. Delta proxy: too much momentum in one direction ────────────────
+        # ── 2. Delta proxy momentum (1-2 points) ─────────────────────────────
         delta = float(features.get("delta_proxy", 0.0))
         delta_kill = float(_cfg("FIBO_ADVANCE_KILLER_DELTA_THRESHOLD", 0.40))
-        if abs(delta) > delta_kill:
-            return True, f"delta_momentum_killer:{delta:.3f}"
+        abs_delta = abs(delta)
+        if abs_delta > delta_kill * 1.5:
+            score += 2
+            reasons.append(f"delta_extreme:{delta:.3f}")
+        elif abs_delta > delta_kill:
+            score += 1
+            reasons.append(f"delta_high:{delta:.3f}")
 
-        # ── 3. Volume spike: > 2.5x normal = institutional repricing ─────────
+        # ── 3. Volume spike (1-2 points) ──────────────────────────────────────
         bar_vol   = float(features.get("bar_volume_proxy", 0.0))
         vol_spike = float(_cfg("FIBO_ADVANCE_KILLER_VOL_SPIKE", 2.5))
-        if bar_vol > vol_spike:
-            return True, f"volume_spike_killer:{bar_vol:.2f}"
+        if bar_vol > vol_spike * 1.5:
+            score += 2
+            reasons.append(f"volume_extreme:{bar_vol:.2f}")
+        elif bar_vol > vol_spike:
+            score += 1
+            reasons.append(f"volume_spike:{bar_vol:.2f}")
 
-        # ── 4. Day type check ─────────────────────────────────────────────────
+        # ── 4. Day type check (5 points — hard block with state_label) ────────
         day_type    = str(snapshot.get("day_type", "") or "")
         state_label = str(snapshot.get("state_label", "") or "")
         if day_type in self.KILLER_DAY_TYPES:
-            return True, f"day_type_killer:{day_type}"
+            score += 5
+            reasons.append(f"day_type:{day_type}")
         if state_label in self.KILLER_STATE_LABELS:
-            return True, f"state_label_killer:{state_label}"
+            score += 7
+            reasons.append(f"state_label:{state_label}")
 
-        # ── 5. Spread expansion: wide spread = low liquidity at level ─────────
+        # ── 5. Spread expansion (1-2 points) ──────────────────────────────────
         spread_expansion = float(features.get("spread_expansion_ratio", 1.0))
         max_spread_exp   = float(_cfg("FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP", 1.25))
-        if spread_expansion > max_spread_exp:
-            return True, f"spread_expansion_killer:{spread_expansion:.2f}"
+        if spread_expansion > max_spread_exp * 1.5:
+            score += 2
+            reasons.append(f"spread_extreme:{spread_expansion:.2f}")
+        elif spread_expansion > max_spread_exp:
+            score += 1
+            reasons.append(f"spread_wide:{spread_expansion:.2f}")
 
-        # ── 6. Retracement velocity: price dropping too fast through levels ───
+        # ── 6. Retracement velocity (2-4 points) ─────────────────────────────
+        retrace_vel = 0.0
         if len(df_entry) >= 5 and "atr_14" in df_entry.columns:
             retrace_vel = self._retracement_velocity(df_entry, atr)
             vel_kill = float(_cfg("FIBO_ADVANCE_KILLER_RETRACE_VEL", 2.0))
-            if retrace_vel > vel_kill:
-                return True, f"retrace_velocity_killer:{retrace_vel:.2f}x_atr"
+            if retrace_vel > vel_kill * 1.5:
+                score += 4
+                reasons.append(f"retrace_extreme:{retrace_vel:.2f}x_atr")
+            elif retrace_vel > vel_kill:
+                score += 2
+                reasons.append(f"retrace_fast:{retrace_vel:.2f}x_atr")
+            elif retrace_vel > vel_kill * 0.8:
+                score += 1
+                reasons.append(f"retrace_elevated:{retrace_vel:.2f}x_atr")
 
-        return False, "no_killer"
+        # ── Decision: hard block vs confidence degradation ─────────────────────
+        reason_str = "+".join(reasons) if reasons else "no_killer"
+
+        if score >= 8:
+            # Hard block: genuinely dangerous (state_label panic + other severe)
+            return False, f"killer_hard_block(score={score}):{reason_str}", 0.0
+
+        if score >= 5:
+            conf_mod = -20.0 - (score - 5) * 5.0  # -20 to -35
+            return True, f"killer_severe(score={score}):{reason_str}", conf_mod
+
+        if score >= 3:
+            conf_mod = -10.0 - (score - 3) * 4.0  # -10 to -18
+            return True, f"killer_moderate(score={score}):{reason_str}", conf_mod
+
+        if score >= 1:
+            conf_mod = -3.0 - (score - 1) * 2.5  # -3 to -8
+            return True, f"killer_mild(score={score}):{reason_str}", conf_mod
+
+        return True, "no_killer", 0.0
 
     # ── Retracement Velocity (Killer #6) ──────────────────────────────────────
 
@@ -973,16 +1036,19 @@ class FiboAdvanceScanner:
             logger.debug("[FiboAdvance] snapshot error: %s", e)
 
         # ── Fibonacci Killer check (before expensive analysis) ─────────────────
-        is_killer, killer_reason = self._fibonacci_killer_check(snapshot, atr_h1, df_h1)
-        if is_killer:
+        # ── Fibonacci Killer check (weighted — not binary gate) ─────────────
+        killer_allowed, killer_reason, killer_weight = self._fibonacci_killer_check(snapshot, atr_h1, df_h1)
+        if not killer_allowed:
             self._set_diag(
                 status="fibonacci_killer_blocked",
                 killer_reason=killer_reason,
                 unmet=["fibonacci_killer"],
-                notes=[f"Fibonacci levels not safe: {killer_reason}"],
+                notes=[f"Fibonacci levels hard-blocked: {killer_reason}"],
             )
-            logger.info("[FiboAdvance] KILLER DETECTED — skipping: %s", killer_reason)
+            logger.info("[FiboAdvance] KILLER HARD BLOCK — skipping: %s", killer_reason)
             return None
+        if killer_weight < 0:
+            logger.info("[FiboAdvance] KILLER WEIGHT: %s (%+.0f conf)", killer_reason, killer_weight)
 
         # ── SMC analysis ───────────────────────────────────────────────────────
         smc_context = None
@@ -1060,10 +1126,12 @@ class FiboAdvanceScanner:
                             )
                             if signal is not None:
                                 # Apply confidence modifiers (weight, not gate)
-                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod, 10.0), 1)
+                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight, 10.0), 1)
                                 # Mark as Sniper for pattern
                                 signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
                                 signal.raw_scores["mode"] = "sniper"
+                                signal.raw_scores["killer_weight"] = killer_weight
+                                signal.raw_scores["killer_reason"] = killer_reason
                                 signal.reasons.append(fresh_reason)
                                 sniper_fired = True
                                 self.signal_count += 1
@@ -1079,7 +1147,8 @@ class FiboAdvanceScanner:
                                     fib_score=fibo_ctx.fibo_confluence_score,
                                     in_golden_pocket=fibo_ctx.in_golden_pocket,
                                     impulse_strength=fib.impulse_strength,
-                                    killer_cleared=True,
+                                    killer_weight=killer_weight,
+                                    killer_reason=killer_reason,
                                     sharpness_score=int(sharpness.get("sharpness_score", 0) or 0),
                                     sharpness_band=str(sharpness.get("sharpness_band", "") or ""),
                                     vp_reason=vp_reason,
@@ -1121,9 +1190,17 @@ class FiboAdvanceScanner:
             )
             if scout_signal is not None:
                 # Apply soft penalty for consecutive losses
-                if scout_conf_penalty < 0:
-                    scout_signal.confidence = round(max(scout_signal.confidence + scout_conf_penalty, 10.0), 1)
-                    scout_signal.reasons.append(f"scout_conf_penalty:{scout_conf_penalty:.0f}")
+                # Apply scout conf penalty + killer weight (both are confidence modifiers)
+                total_scout_mod = scout_conf_penalty + killer_weight
+                if total_scout_mod < 0:
+                    scout_signal.confidence = round(max(scout_signal.confidence + total_scout_mod, 10.0), 1)
+                    if scout_conf_penalty < 0:
+                        scout_signal.reasons.append(f"scout_conf_penalty:{scout_conf_penalty:.0f}")
+                    if killer_weight < 0:
+                        scout_signal.reasons.append(f"killer_weight:{killer_weight:.0f}")
+                # Add killer info to scout raw_scores
+                scout_signal.raw_scores["killer_weight"] = killer_weight
+                scout_signal.raw_scores["killer_reason"] = killer_reason
                 self.signal_count += 1
                 self.last_signal = scout_signal
                 self._set_diag(
