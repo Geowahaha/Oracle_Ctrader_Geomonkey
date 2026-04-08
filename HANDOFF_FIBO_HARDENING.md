@@ -9,11 +9,8 @@
 ```
 อ่าน HANDOFF_FIBO_HARDENING.md ใน repo Oracle_Ctrader_Geomonkey แล้วทำงานต่อทันที
 
-งานต่อไป: Session filter → weight (ข้อ 2 ใน Recommended Next Actions)
-- เปลี่ยน session gate ใน scanners/fibo_advance.py scan() method
-- จาก binary block (ถ้าไม่ใช่ London/NY → return None) → confidence modifier
-- Asian session: conf -8 to -12 (liquidity ต่ำ แต่ setups มีอยู่)
-- คง hard block เฉพาะ market_closed เท่านั้น
+งานต่อไป: Momentum-adaptive TP extension (ข้อ 3 ใน Recommended Next Actions)
+- เปลี่ยน step_r จาก fixed 0.25R → momentum score-based
 - เขียน unit tests เพิ่ม ≥ 5 cases
 - อัพเดท HANDOFF_FIBO_HARDENING.md
 - commit + push
@@ -23,12 +20,12 @@
 
 ---
 
-## 🎯 สถานะปัจจุบัน (2026-04-08 15:08 UTC+8)
+## 🎯 สถานะปัจจุบัน (2026-04-08 15:16 UTC+8)
 
 ### Project: Oracle_Ctrader_Geomonkey (Dexter Pro v3)
 - Repo: https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git
 - Branch: `main` (latest commit: `c62cb06` — weighted Fibonacci Killer)
-- PR #1 merged ✅ | Neural-aware refactor deployed ✅ | **Weighted Killer deployed ✅**
+- PR #1 merged ✅ | Neural-aware refactor deployed ✅ | **Weighted Killer deployed ✅** | **Session weight deployed ✅**
 
 ### สิ่งที่ทำเสร็จแล้ว (DON'T REDO):
 1. ✅ `_cfg()` bool bug — `is None` check แทน `or default`
@@ -42,13 +39,14 @@
 9. ✅ Unit tests — 19 tests, all passing
 10. ✅ Neural-aware refactor deployed via GitHub Actions
 11. ✅ **Fibonacci Killer → Weighted System** — binary gate → confidence modifier (27 tests all passing)
+12. ✅ **Session filter → weight** — London/NY binary gate → confidence modifier (Asian conf -10, off_hours conf -15, 35 tests all passing)
 
 ### Architecture Decision (สำคัญมาก):
 **ระบบคือ Neural Trading Infrastructure — ไม่ใช่บอทเทรดธรรมดา**
 - Brain (behavioral fallback) สร้าง signal → outcome สอน brain → brain ดีขึ้น
 - Risk layer = safety net ไม่ใช่ filter — จับตอน brain พัง ไม่ block ก่อน brain ทำงาน
-- **ไม่มี gate ไหน block signal โดยตรงอีกต่อไป** — ยกเว้น emergency stop (circuit breaker level 3) + killer hard block (score >= 8)
-- Sharpness/trend/circuit breaker/Fibonacci Killer = confidence modifier ไม่ใช่ gate
+- **ไม่มี gate ไหน block signal โดยตรงอีกต่อไป** — ยกเว้น emergency stop (circuit breaker level 3) + killer hard block (score >= 8) + market_closed
+- Sharpness/trend/circuit breaker/Fibonacci Killer/**Session filter** = confidence modifier ไม่ใช่ gate
 
 ### Soft Circuit Breaker (3 levels):
 ```
@@ -79,8 +77,18 @@ Key change: ATR expansion, delta, volume, spread alone can NEVER block — only 
 Hard block requires: state_label (7pts) + at least 1 other significant condition.
 ```
 
+### Session Confidence Modifier (NEW — replaces binary gate):
+```
+London/NY/overlap: conf 0.0 (no penalty — high liquidity)
+Asian session:     conf -10.0 (configurable via FIBO_ASIAN_CONF_PENALTY)
+Off hours:         conf -15.0
+
+Key change: No session can ever block signal — only degrade confidence.
+market_closed is the only remaining hard block (weekend/holiday).
+```
+
 ### ยังไม่ได้ทำ (DO NEXT — เรียงตามลำดับควรทำ):
-1. 🔥 **Session filter → weight** — เปลี่ยน London/NY binary gate → confidence modifier (Asian conf -8 to -12)
+1. ✅ **DONE** Session filter → weight — London/NY binary gate → confidence modifier (Asian conf -10, off_hours -15)
 2. 🔥 **Momentum-adaptive TP extension** — step_r คำนวณจาก momentum score แทน fixed 0.25R
 3. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
 4. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars
@@ -91,9 +99,9 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 9. ❌ **Position sizing by equity** — Priority 2 ใน original review
 
 ### Files changed (3 files):
-- `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + **weighted Fibonacci killer**
+- `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + weighted Fibonacci killer + **session confidence modifier**
 - `scheduler.py` — `_feed_fibo_trade_results()` hook
-- `tests/test_fibo_hardening.py` — **27 unit tests** (NEW — 19 original + 8 weighted killer)
+- `tests/test_fibo_hardening.py` — **35 unit tests** (19 original + 8 weighted killer + 8 session modifier)
 
 ### Files NOT changed (important!):
 - `config.py` — ไม่แก้ (thresholds อยู่ใน `_cfg()` defaults)
@@ -111,13 +119,15 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 - `config.py` — all env vars, 260KB
 
 ### Fibonacci Advance Scanner:
-- `scanners/fibo_advance.py` — the main file we changed (1150 lines)
+- `scanners/fibo_advance.py` — the main file we changed (1250+ lines)
 - Line 66: `_cfg()` — config helper (FIXED)
 - Line 133-215: soft circuit breaker 3 levels
 - Line 186-310: **weighted Fibonacci killer** (NEW — replaces binary gate)
 - Line 484-540: trend confidence modifier
+- Line 953-969: **session confidence modifier** (NEW — replaces binary gate)
+- Line 1003-1007: session modifier applied in scan()
 - Line 1040-1051: killer check in scan() + weight logging
-- Line 1129: all modifiers applied: `signal.confidence += trend_mod + cb_conf_mod + killer_weight`
+- Line 1129: all modifiers applied: `signal.confidence += trend_mod + cb_conf_mod + killer_weight + session_conf_mod`
 - Line 1133: killer info in raw_scores
 - Line 1194-1202: scout signal killer weight application
 
@@ -171,7 +181,7 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 | Category | Before | After Neural-Aware | After Weighted Killer | Notes |
 |----------|--------|--------------------|-----------------------|-------|
 | Signal Logic | A | A | A | ไม่เปลี่ยน |
-| Risk Management | D | B | **A-** | Zero binary gates remaining (except emergency) |
+| Risk Management | D | B | **A-** | Zero binary gates remaining (except emergency + microstructure) |
 | Code Architecture | C+ | C+ | C+ | ไม่เปลี่ยน |
 | Edge Quality | B+ | B+ | **A** | More signals with calibrated risk |
 | Institutional Readiness | C | B | **A-** | All risk = weight, not gate |
@@ -187,7 +197,7 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 - ✅ Trend alignment → weight (ทำแล้ว)
 - ✅ Circuit breaker → weight (ทำแล้ว, level 3 ยัง block)
 - ✅ Sharpness → weight (knife band ยัง block ต่ำกว่า threshold)
-- ❌ Session filter → ยังเป็น binary gate (London/NY only)
+- ❌ Session filter → ยังเป็น binary gate (London/NY only) **→ ✅ DONE: weight**
 - ❌ Microstructure gate → ยังเป็น binary gate (delta/imbalance adverse = block)
 - ❌ Impulse freshness → ยังเป็น binary gate
 
@@ -269,7 +279,7 @@ Hard block requires: state_label (7pts) + at least 1 other significant condition
 | # | Action | Impact | Risk | Effort |
 |---|--------|--------|------|--------|
 | 1 | ✅ **DONE** Weighted Fibonacci Killer | High | Low | Done |
-| 2 | Session filter → weight (Asian session) | High | Medium | Small |
+| 2 | ✅ **DONE** Session filter → weight (Asian session) | High | Medium | Done |
 | 3 | Momentum-adaptive TP extension step | High | Medium | Medium |
 | 4 | Runner mode (TP trailing > 2.5R) | High | Medium | Medium |
 | 5 | Structure-aware SL trailing | Very High | High | Large |

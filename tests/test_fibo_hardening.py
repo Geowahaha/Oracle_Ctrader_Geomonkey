@@ -503,3 +503,71 @@ class TestWeightedFibonacciKiller:
         # Actually: lookback=5 bars, total_range=10*5=50, avg=10, 10/2=5.0x → extreme
         # 5.0 > 2.0*1.5=3.0 → 4 points → moderate
         assert allowed is True  # 4 points alone doesn't hard block
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 6: Session Confidence Modifier — weight not gate
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestSessionConfidenceModifier:
+    """Session filter changed from binary gate to confidence modifier."""
+
+    def test_london_session_no_penalty(self):
+        """London session → no confidence penalty."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"london"})
+        assert mod == 0.0
+        assert reason == "london_ny"
+
+    def test_new_york_session_no_penalty(self):
+        """New York session → no confidence penalty."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"new_york"})
+        assert mod == 0.0
+        assert reason == "london_ny"
+
+    def test_overlap_session_no_penalty(self):
+        """Overlap (London+NY both active) → no confidence penalty."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"london", "new_york", "overlap"})
+        assert mod == 0.0
+        assert reason == "london_ny"
+
+    def test_asian_session_default_penalty(self):
+        """Asian session only → default penalty -10.0."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"asian"})
+        assert -12.0 <= mod <= -8.0
+        assert reason == "asian_session"
+
+    def test_asian_with_london_no_penalty(self):
+        """Asian + London overlap (edge case) → London overrides, no penalty."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"asian", "london"})
+        assert mod == 0.0
+        assert reason == "london_ny"
+
+    def test_off_hours_heavy_penalty(self):
+        """Off hours → heavy penalty -15.0."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier({"off_hours"})
+        assert mod == -15.0
+        assert reason == "off_hours"
+
+    def test_empty_set_treated_as_off_hours(self):
+        """Empty session set (edge case) → treated as asian/off_hours penalty."""
+        mod, reason = FiboAdvanceScanner._session_confidence_modifier(set())
+        # No london/ny, no off_hours → falls to asian default
+        assert mod <= -8.0
+        assert reason == "asian_session"
+
+    def test_session_never_blocks(self):
+        """No session modifier should ever return a value that blocks (≥ -100)."""
+        test_cases = [
+            {"london"},
+            {"new_york"},
+            {"asian"},
+            {"overlap"},
+            {"off_hours"},
+            {"asian", "london"},
+            {"asian", "overlap"},
+            set(),
+        ]
+        for sessions in test_cases:
+            mod, reason = FiboAdvanceScanner._session_confidence_modifier(sessions)
+            # Worst case: off_hours at -15 → far from blocking
+            assert mod >= -20.0, f"Session {sessions} gave {mod} which is too harsh"

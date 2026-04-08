@@ -947,6 +947,26 @@ class FiboAdvanceScanner:
             liquidity_pools_count=len(smc_context.liquidity_pools) if smc_context else 0,
         )
 
+    # ── Session Confidence Modifier ────────────────────────────────────────
+
+    @staticmethod
+    def _session_confidence_modifier(active_sessions: set[str]) -> tuple[float, str]:
+        """
+        Compute session-based confidence modifier (weight, not gate).
+
+        London/NY/overlap → no penalty (0.0)
+        Asian session     → conf -8 to -12 (configurable via FIBO_ASIAN_CONF_PENALTY)
+        Off hours         → conf -15
+        """
+        has_london_or_ny = bool(active_sessions.intersection({"london", "new_york"}))
+        if has_london_or_ny:
+            return 0.0, "london_ny"
+        elif "off_hours" in active_sessions:
+            return -15.0, "off_hours"
+        else:
+            penalty = float(_cfg("FIBO_ASIAN_CONF_PENALTY", -10.0))
+            return penalty, "asian_session"
+
     # ── Main Scan ──────────────────────────────────────────────────────────────
 
     def scan(self) -> Optional[TradeSignal]:
@@ -981,12 +1001,12 @@ class FiboAdvanceScanner:
             self._set_diag(status="market_closed", unmet=["market_closed"])
             return None
 
-        # Session gate: London and NY only
+        # Session confidence modifier (weight, not gate)
+        # London/NY → no penalty; Asian → conf -8 to -12; off_hours → conf -15
         active_sessions = set(session_info.get("active_sessions", []) or [])
-        if not active_sessions.intersection({"london", "new_york"}):
-            self._set_diag(status="session_skip", unmet=["non_london_ny_session"])
-            logger.debug("[FiboAdvance] Skipping — outside London/NY session")
-            return None
+        session_conf_mod, session_reason = self._session_confidence_modifier(active_sessions)
+        if session_conf_mod < 0:
+            logger.debug("[FiboAdvance] Session weight: %+.0f (%s)", session_conf_mod, session_reason)
 
         # ── Circuit breaker check (soft — only emergency blocks) ─────────────
         cb_ok, cb_reason, cb_conf_mod = self._check_circuit_breaker()
@@ -1126,12 +1146,14 @@ class FiboAdvanceScanner:
                             )
                             if signal is not None:
                                 # Apply confidence modifiers (weight, not gate)
-                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight, 10.0), 1)
+                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight + session_conf_mod, 10.0), 1)
                                 # Mark as Sniper for pattern
                                 signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
                                 signal.raw_scores["mode"] = "sniper"
                                 signal.raw_scores["killer_weight"] = killer_weight
                                 signal.raw_scores["killer_reason"] = killer_reason
+                                signal.raw_scores["session_weight"] = session_conf_mod
+                                signal.raw_scores["session_reason"] = session_reason
                                 signal.reasons.append(fresh_reason)
                                 sniper_fired = True
                                 self.signal_count += 1
@@ -1190,17 +1212,21 @@ class FiboAdvanceScanner:
             )
             if scout_signal is not None:
                 # Apply soft penalty for consecutive losses
-                # Apply scout conf penalty + killer weight (both are confidence modifiers)
-                total_scout_mod = scout_conf_penalty + killer_weight
+                # Apply scout conf penalty + killer weight + session (all are confidence modifiers)
+                total_scout_mod = scout_conf_penalty + killer_weight + session_conf_mod
                 if total_scout_mod < 0:
                     scout_signal.confidence = round(max(scout_signal.confidence + total_scout_mod, 10.0), 1)
                     if scout_conf_penalty < 0:
                         scout_signal.reasons.append(f"scout_conf_penalty:{scout_conf_penalty:.0f}")
                     if killer_weight < 0:
                         scout_signal.reasons.append(f"killer_weight:{killer_weight:.0f}")
-                # Add killer info to scout raw_scores
+                    if session_conf_mod < 0:
+                        scout_signal.reasons.append(f"session_weight:{session_conf_mod:.0f}")
+                # Add killer + session info to scout raw_scores
                 scout_signal.raw_scores["killer_weight"] = killer_weight
                 scout_signal.raw_scores["killer_reason"] = killer_reason
+                scout_signal.raw_scores["session_weight"] = session_conf_mod
+                scout_signal.raw_scores["session_reason"] = session_reason
                 self.signal_count += 1
                 self.last_signal = scout_signal
                 self._set_diag(
