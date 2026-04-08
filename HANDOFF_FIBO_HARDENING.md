@@ -9,7 +9,7 @@
 ```
 อ่าน HANDOFF_FIBO_HARDENING.md ใน repo Oracle_Ctrader_Geomonkey แล้วทำงานต่อทันที
 
-งานต่อไป: Runner mode (ข้อ 4 ใน Recommended Next Actions)
+งานต่อไป: Runner mode (ข้อ 5 ใน Recommended Next Actions)
 - TP trailing เมื่อ R > 1.5 + momentum strong
 - ปล่อยให้ winner run แทน fixed TP
 - เขียน unit tests เพิ่ม ≥ 5 cases
@@ -22,7 +22,7 @@
 
 ---
 
-## 🎯 สถานะปัจจุบัน (2026-04-08 16:08 UTC+8)
+## 🎯 สถานะปัจจุบัน (2026-04-08 17:23 UTC+8)
 
 ### Project: Oracle_Ctrader_Geomonkey (Dexter Pro v3)
 - Repo: https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git
@@ -43,6 +43,9 @@
 11. ✅ **Session filter → weight** — London/NY binary gate → confidence modifier (Asian conf -10, off_hours conf -15)
 12. ✅ **Momentum-adaptive TP extension** — step_r จาก fixed 0.25R → adaptive 0.15/0.25/0.35 ตาม momentum strength
 13. ✅ **Momentum exhaustion profit lock** — detect momentum death → lock profit before evaporate (fibo-only, 3/5 signals required)
+14. ✅ **D1 Strong Trend Filter** — prevent April 7 disaster: D1 strong bearish vs long = -25 conf, D1+H4 combined = -20, D1-only = -12
+15. ✅ **Session Direction Bias** — Asian/off-hours counter-D1 = -12 extra penalty (thin liquidity follows trend)
+16. ✅ **Faster Circuit Breaker** — 5 consec losses = soft pause 30min (was conf -25), Level 1 increased to -15
 
 ### Architecture Decision (สำคัญมาก):
 **ระบบคือ Neural Trading Infrastructure — ไม่ใช่บอทเทรดธรรมดา**
@@ -55,11 +58,12 @@
 - ALL risk layers = confidence modifier ไม่ใช่ gate:
   - Sharpness, Trend, Circuit breaker, Fibonacci Killer, Session filter → weight
 
-### Soft Circuit Breaker (3 levels):
+### Soft Circuit Breaker (4 levels):
 ```
-Level 1 (Warning):   3 consec loss  → conf -10    / daily -$30  → conf -15
-Level 2 (Caution):   5 consec loss  → conf -25    / daily -$75  → conf -30
-Level 3 (Emergency): 10 consec loss → pause 2hr   / daily -$150 → pause midnight
+Level 1 (Warning):    3 consec loss  → conf -15    / daily -$30  → conf -20
+Level 2 (Caution):    4 consec loss  → conf -25    / daily -$75  → conf -30
+Level 2.5 (Soft Pause): 5 consec loss → BLOCK 30min (prevent April 7 disaster)
+Level 3 (Emergency):  10 consec loss → pause 2hr   / daily -$150 → pause midnight
 ```
 
 ### Weighted Fibonacci Killer:
@@ -86,6 +90,31 @@ Decision:
 London/NY/overlap: conf 0.0
 Asian session:     conf -10.0 (FIBO_ASIAN_CONF_PENALTY)
 Off hours:         conf -15.0
+```
+
+### D1 Trend Direction Filter (NEW — prevents April 7 disaster):
+```
+_trend_confidence_modifier() enhanced:
+  D1 strong trend (EMA spread > 0.5%) + counter-direction:  conf -25.0
+  D1+H4 both oppose direction:                               conf -20.0
+  D1 opposes, H4 neutral:                                    conf -12.0
+  D1+H4 both support direction:                              conf +5.0
+  H4 supports, D1 neutral:                                   conf +2.0
+  Neutral:                                                   conf 0.0
+
+Config: FIBO_TREND_STRONG_EMA_SPREAD_PCT (default 0.5)
+```
+
+### Session Direction Bias (NEW — low-liquidity trend following):
+```
+_session_direction_bias(direction, d1_bias, active_sessions):
+  London/NY active:                    0.0 (no bias)
+  Asian/off-hours + counter-D1:        conf -12.0
+  Asian/off-hours + aligned D1:        0.0
+  D1 neutral:                          0.0
+
+Config: FIBO_SESSION_DIRECTION_BIAS_PENALTY (default -12.0)
+Wired: Both sniper AND scout signals
 ```
 
 ### Momentum-Adaptive TP Extension (NEW):
@@ -129,21 +158,18 @@ Guards:
 1. ✅ **DONE** Session filter → weight
 2. ✅ **DONE** Momentum-adaptive TP extension — step_r adaptive 0.15/0.25/0.35
 3. ✅ **DONE** Momentum exhaustion profit lock — lock profit when momentum dies
-4. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
-5. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars (ง่าย, ทำได้เร็ว)
-6. ❌ **Structure-aware SL trailing** — SL เลื่อนตาม SMC swing (ใหญ่, ทำทีหลัง)
-7. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง deploy ทั้งหมด
-8. ❌ **Backtest with cTrader data** — ต้อง Windows dev machine
-9. ❌ **xauusd.py circuit breaker** — ถ้า PnL fibo ดี อาจเพิ่มให้ family อื่น
-10. ❌ **Position sizing by equity** — Priority 2 ใน original review
+4. ✅ **DONE** D1 Strong Trend Filter — prevent April 7 disaster
+5. ✅ **DONE** Session Direction Bias — low-liquidity trend following
+6. ✅ **DONE** Faster Circuit Breaker — 5 consec loss = soft pause 30min
+7. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
+8. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars (ง่าย, ทำได้เร็ว)
+9. ❌ **Structure-aware SL trailing** — SL เลื่อนตาม SMC swing (ใหญ่, ทำทีหลัง)
+10. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง deploy ทั้งหมด
 
-### Files changed (total 5 files + 1 new):
-- `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + weighted Fibonacci killer + session confidence modifier
-- `execution/ctrader_executor.py` — **momentum-adaptive step_r** + **momentum exhaustion profit lock** (_xau_momentum_exhaustion_lock)
-- `config.py` — 8 exhaustion lock config keys
-- `scheduler.py` — `_feed_fibo_trade_results()` hook
-- `tests/test_fibo_hardening.py` — 35 unit tests (19+8+8)
-- `tests/test_momentum_adaptive.py` — **10 unit tests** (NEW file, 7 exhaustion + 3 adaptive step_r)
+### Files changed (total 3 files):
+- `scanners/fibo_advance.py` — D1 strong trend filter + session direction bias + faster circuit breaker (soft pause)
+- `config.py` — 4 new config keys (FIBO_TREND_STRONG_EMA_SPREAD_PCT, FIBO_SESSION_DIRECTION_BIAS_PENALTY, FIBO_ADVANCE_SOFT_PAUSE_CONSEC, FIBO_ADVANCE_SOFT_PAUSE_MIN)
+- `tests/test_fibo_hardening.py` — 52 unit tests (35 old + 17 new: 5 D1 trend + 6 session bias + 6 circuit breaker)
 
 ### Files NOT changed:
 - `scanners/xauusd.py` — ไม่แตะ (microstructure `return True` = correct architecture)
@@ -159,14 +185,17 @@ Guards:
 - `config.py` — all env vars, 260KB
 
 ### Fibonacci Advance Scanner:
-- `scanners/fibo_advance.py` (1250+ lines)
+- `scanners/fibo_advance.py` (1320+ lines)
 - Line 66: `_cfg()` — config helper
-- Line 133-215: soft circuit breaker 3 levels
-- Line 186-310: weighted Fibonacci killer
-- Line 484-540: trend confidence modifier
-- Line 953-969: **session confidence modifier** (`_session_confidence_modifier()`)
-- Line 1003-1007: session modifier applied in scan()
-- Line 1129: all modifiers: `signal.confidence += trend_mod + cb_conf_mod + killer_weight + session_conf_mod`
+- Line 133-215: soft circuit breaker 4 levels (with soft pause at 5 consec losses)
+- Line 217-340: weighted Fibonacci killer
+- Line 484-560: **trend confidence modifier** (enhanced — D1 strong trend filter)
+- Line 990-1020: session confidence modifier (`_session_confidence_modifier()`)
+- Line 1020-1045: **session direction bias** (`_session_direction_bias()`) — NEW
+- Line 1060+: main scan method
+- Line 1148-1158: D1 bias calculation — NEW
+- Line 1221: sniper signal: all modifiers (trend + cb + killer + session + sess_dir_bias)
+- Line 1295-1320: scout signal: all modifiers (trend + cb + killer + session + sess_dir_bias)
 
 ### Position Manager (ctrader_executor.py):
 - `execution/ctrader_executor.py` (6400+ lines)
@@ -217,9 +246,9 @@ config.py → depends on who reads it
 - ต้อง PAT token เพื่อ push — ถาม user
 - Commit author: `git config user.name "Somchai 🦞"` + `git config user.email "somchai@openclaw.ai"`
 
-### 45 Tests สถานะ:
+### 52 Tests สถานะ:
 ```
-tests/test_fibo_hardening.py (35):
+tests/test_fibo_hardening.py (52):
   TestSoftCircuitBreaker: 8 tests
   TestTrendConfidenceModifier: 5 tests
   TestScoutSoftPenalty: 2 tests
@@ -227,6 +256,9 @@ tests/test_fibo_hardening.py (35):
   TestThresholds: 2 tests
   TestWeightedFibonacciKiller: 8 tests
   TestSessionConfidenceModifier: 8 tests
+  TestD1StrongTrendFilter: 5 tests          ← NEW
+  TestSessionDirectionBias: 6 tests         ← NEW
+  TestFasterCircuitBreaker: 6 tests         ← NEW
 
 tests/test_momentum_adaptive.py (10):
   TestMomentumExhaustionLock: 7 tests
@@ -238,7 +270,7 @@ Run: python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive
 ### Session startup (อ่านก่อนทำงานทุกครั้ง):
 1. อ่าน `HANDOFF_FIBO_HARDENING.md` (ไฟล์นี้) — รู้ project context
 2. อ่าน `CLAUDE.md` — รู้ project rules
-3. `cd Oracle_Ctrader_Geomonkey && python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive.py -v` — เช็ค tests ก่อนแก้
+3. `cd Oracle_Ctrader_Geomonkey && python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive.py -v` — เช็ค 62 tests ก่อนแก้
 
 ## 📊 Grade Status (2026-04-08 16:08 UTC+8)
 
@@ -254,6 +286,7 @@ Run: python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive
 
 ## 📊 Git Log (latest 5 commits)
 ```
+(tbd) feat: D1 trend filter + session direction bias + faster circuit breaker
 ad4d5c0 feat: momentum-adaptive TP extension + exhaustion profit lock
 d0f63e4 feat: session filter → confidence modifier (weight, not gate)
 c7a6f94 docs: update HANDOFF with pickup instructions for next agent
@@ -268,7 +301,9 @@ c62cb06 feat: convert Fibonacci Killer from binary gate to weighted confidence s
 | 2 | Session filter → weight | High | Medium | — | ✅ DONE |
 | 3 | Momentum-adaptive TP extension | High | Medium | — | ✅ DONE |
 | 4 | Momentum exhaustion profit lock | High | Low | — | ✅ DONE |
-| 5 | **Runner mode (TP trailing > 1.5R)** | **High** | **Medium** | **Medium** | **🔥 NEXT** |
-| 6 | Impulse freshness relax (40→60 bars) | Medium | Low | Tiny | ⚡ Quick win |
-| 7 | Structure-aware SL trailing | Very High | High | Large | ❌ Later |
-| 8 | Monitor PnL (post-deploy) | — | — | — | ❌ After live |
+| 5 | **D1 Strong Trend Filter** | **High** | **Low** | **—** | **✅ DONE** |
+| 6 | **Session Direction Bias** | **High** | **Low** | **—** | **✅ DONE** |
+| 7 | **Faster Circuit Breaker (soft pause)** | **High** | **Low** | **—** | **✅ DONE** |
+| 8 | **Runner mode (TP trailing > 1.5R)** | **High** | **Medium** | **Medium** | **🔥 NEXT** |
+| 9 | Impulse freshness relax (40→60 bars) | Medium | Low | Tiny | ⚡ Quick win |
+| 10 | Structure-aware SL trailing | Very High | High | Large | ❌ Later |

@@ -161,10 +161,20 @@ class FiboAdvanceScanner:
                 hour=23, minute=59, second=59)
             return False, f"emergency_daily_loss:${abs(self._daily_losses_usd):.2f}", 0.0
 
+        # Level 2.5 — Soft pause at 5 consecutive losses (prevent April 7 disaster)
+        # After 5 straight losses, pause 30min to let market settle
+        soft_pause_threshold = int(_cfg("FIBO_ADVANCE_SOFT_PAUSE_CONSEC", 5))
+        if self._consecutive_losses >= soft_pause_threshold:
+            soft_pause_min = int(_cfg("FIBO_ADVANCE_SOFT_PAUSE_MIN", 30))
+            self._pause_until = datetime.now(timezone.utc) + timedelta(minutes=soft_pause_min)
+            logger.info("[FiboAdvance:CB] Soft pause: %d consec losses → pause %dmin",
+                        self._consecutive_losses, soft_pause_min)
+            return False, f"soft_pause_consec:{self._consecutive_losses}→{soft_pause_min}min", 0.0
+
         # Level 2 — Caution: significant confidence reduction
-        if self._consecutive_losses >= 5:
+        if self._consecutive_losses >= 4:
             logger.info("[FiboAdvance:CB] Caution: %d consec losses → conf -25", self._consecutive_losses)
-            return True, "caution_consec_5", -25.0
+            return True, "caution_consec_4", -25.0
 
         if self._daily_losses_usd <= -75.0:
             logger.info("[FiboAdvance:CB] Caution: daily loss $%.2f → conf -30", abs(self._daily_losses_usd))
@@ -172,12 +182,12 @@ class FiboAdvanceScanner:
 
         # Level 1 — Warning: mild confidence reduction
         if self._consecutive_losses >= 3:
-            logger.info("[FiboAdvance:CB] Warning: %d consec losses → conf -10", self._consecutive_losses)
-            return True, "warning_consec_3", -10.0
+            logger.info("[FiboAdvance:CB] Warning: %d consec losses → conf -15", self._consecutive_losses)
+            return True, "warning_consec_3", -15.0
 
         if self._daily_losses_usd <= -30.0:
-            logger.info("[FiboAdvance:CB] Warning: daily loss $%.2f → conf -15", abs(self._daily_losses_usd))
-            return True, "warning_daily_30", -15.0
+            logger.info("[FiboAdvance:CB] Warning: daily loss $%.2f → conf -20", abs(self._daily_losses_usd))
+            return True, "warning_daily_30", -20.0
 
         return True, "circuit_ok", 0.0
 
@@ -479,7 +489,7 @@ class FiboAdvanceScanner:
 
         return True, f"fresh_impulse:{bars_since_swing_end}bars"
 
-    # ── Trend Confidence Modifier ───────────────────────────────────────────
+    # ── Trend Confidence Modifier (Enhanced — D1 Strong Trend Filter) ───────
 
     def _trend_confidence_modifier(self, df_d1: Optional[pd.DataFrame],
                                    df_h4: pd.DataFrame, direction: str) -> tuple[float, str]:
@@ -487,6 +497,9 @@ class FiboAdvanceScanner:
         Returns confidence adjustment based on trend alignment.
         Negative = counter-trend penalty, Positive = aligned bonus.
         Does NOT block signals — lets brain learn from all setups.
+
+        Enhanced: D1 strong trend alone triggers -25 penalty (prevents April 7 type
+        disasters where bot kept buying in clear daily downtrend).
         """
         try:
             df_h4c = ta.add_ema(df_h4.copy(), periods=[21, 50])
@@ -498,6 +511,8 @@ class FiboAdvanceScanner:
 
             d1_bearish = False
             d1_bullish = False
+            d1_strong_bearish = False
+            d1_strong_bullish = False
             if df_d1 is not None and not df_d1.empty and len(df_d1) >= 50:
                 df_d1c = ta.add_ema(df_d1.copy(), periods=[21, 50])
                 d1_ema21 = float(df_d1c["ema_21"].iloc[-1])
@@ -506,16 +521,41 @@ class FiboAdvanceScanner:
                 d1_bearish = d1_close < d1_ema21 < d1_ema50
                 d1_bullish = d1_close > d1_ema21 > d1_ema50
 
-            # Counter-trend penalty (D1+H4 both oppose direction)
-            if direction == "long" and d1_bearish and h4_bearish:
-                return -15.0, "counter_trend_penalty:d1=bearish,h4=bearish"
-            if direction == "short" and d1_bullish and h4_bullish:
-                return -15.0, "counter_trend_penalty:d1=bullish,h4=bullish"
+                # Strong trend: EMA spread > 0.5% of price (clear directional bias)
+                ema_spread_pct = abs(d1_ema21 - d1_ema50) / d1_close * 100 if d1_close > 0 else 0
+                strong_threshold = float(_cfg("FIBO_TREND_STRONG_EMA_SPREAD_PCT", 0.5))
+                if d1_bearish and ema_spread_pct >= strong_threshold:
+                    d1_strong_bearish = True
+                if d1_bullish and ema_spread_pct >= strong_threshold:
+                    d1_strong_bullish = True
 
-            # Aligned bonus (D1+H4 both support direction)
+            # ══ STRONG COUNTER-TREND (D1 alone — prevents April 7 disaster) ══
+            # If D1 is in a STRONG bearish trend and we want to go long → heavy penalty
+            if direction == "long" and d1_strong_bearish:
+                return -25.0, "d1_strong_bearish_vs_long"
+            if direction == "short" and d1_strong_bullish:
+                return -25.0, "d1_strong_bullish_vs_short"
+
+            # ══ COMBINED COUNTER-TREND (D1+H4 both oppose) ══════════════════
+            if direction == "long" and d1_bearish and h4_bearish:
+                return -20.0, "counter_trend_penalty:d1=bearish,h4=bearish"
+            if direction == "short" and d1_bullish and h4_bullish:
+                return -20.0, "counter_trend_penalty:d1=bullish,h4=bullish"
+
+            # ══ D1-ONLY COUNTER-TREND (D1 opposes, H4 neutral) ══════════════
+            if direction == "long" and d1_bearish and not h4_bullish:
+                return -12.0, "d1_bearish_h4_neutral_vs_long"
+            if direction == "short" and d1_bullish and not h4_bearish:
+                return -12.0, "d1_bullish_h4_neutral_vs_short"
+
+            # ══ ALIGNED BONUS (D1+H4 both support direction) ════════════════
             if (d1_bullish and h4_bullish and direction == "long") or \
                (d1_bearish and h4_bearish and direction == "short"):
                 return +5.0, "trend_aligned_bonus"
+
+            # ══ H4-ONLY ALIGNED (H4 supports, D1 neutral) ═══════════════════
+            if (h4_bullish and direction == "long") or (h4_bearish and direction == "short"):
+                return +2.0, "h4_aligned"
 
             return 0.0, "trend_neutral"
         except Exception as e:
@@ -967,6 +1007,30 @@ class FiboAdvanceScanner:
             penalty = float(_cfg("FIBO_ASIAN_CONF_PENALTY", -10.0))
             return penalty, "asian_session"
 
+    @staticmethod
+    def _session_direction_bias(direction: str, d1_bias: str,
+                                active_sessions: set[str]) -> tuple[float, str]:
+        """
+        During low-liquidity sessions (Asian/off_hours), apply extra penalty
+        for trading counter to D1 trend.
+
+        Rationale: In thin liquidity, price tends to follow the dominant trend.
+        Counter-trend setups during Asian session have much lower win rate.
+        (April 7 disaster: bot kept buying in Asian/off-hours during D1 downtrend)
+
+        Returns (confidence_modifier, reason).
+        """
+        has_london_or_ny = bool(active_sessions.intersection({"london", "new_york"}))
+        if has_london_or_ny:
+            return 0.0, "session_bias_nylon"
+
+        # Low liquidity session — check if direction aligns with D1
+        if d1_bias in ("long", "short") and d1_bias != direction:
+            penalty = float(_cfg("FIBO_SESSION_DIRECTION_BIAS_PENALTY", -12.0))
+            return penalty, f"low_liq_counter_d1:{d1_bias}"
+
+        return 0.0, "session_bias_ok"
+
     # ── Main Scan ──────────────────────────────────────────────────────────────
 
     def scan(self) -> Optional[TradeSignal]:
@@ -1085,6 +1149,21 @@ class FiboAdvanceScanner:
         # Fetch D1 data for trend alignment gate
         df_d1 = xauusd_provider.fetch("1d", bars=60)
 
+        # Determine D1 bias for session direction bias check
+        d1_bias = "neutral"
+        if df_d1 is not None and not df_d1.empty and len(df_d1) >= 50:
+            try:
+                df_d1c = ta.add_ema(df_d1.copy(), periods=[21, 50])
+                d1_ema21 = float(df_d1c["ema_21"].iloc[-1])
+                d1_ema50 = float(df_d1c["ema_50"].iloc[-1])
+                d1_close = float(df_d1c["close"].iloc[-1])
+                if d1_close > d1_ema21 > d1_ema50:
+                    d1_bias = "long"
+                elif d1_close < d1_ema21 < d1_ema50:
+                    d1_bias = "short"
+            except Exception:
+                pass
+
         # ══ SNIPER MODE: H4 impulse → H1 Golden Pocket ═══════════════════════
         logger.debug("[FiboAdvance] Trying SNIPER mode (H4→H1)")
         fibo_ctx = fibo.analyze(
@@ -1145,15 +1224,23 @@ class FiboAdvanceScanner:
                                 mode="sniper",
                             )
                             if signal is not None:
+                                # Session direction bias (extra penalty in low-liquidity counter-D1)
+                                sess_dir_bias, sess_dir_reason = self._session_direction_bias(
+                                    direction, d1_bias, active_sessions)
                                 # Apply confidence modifiers (weight, not gate)
-                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight + session_conf_mod, 10.0), 1)
+                                signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight + session_conf_mod + sess_dir_bias, 10.0), 1)
                                 # Mark as Sniper for pattern
                                 signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
                                 signal.raw_scores["mode"] = "sniper"
+                                signal.raw_scores["trend_mod"] = trend_mod
+                                signal.raw_scores["trend_reason"] = trend_reason
+                                signal.raw_scores["cb_conf_mod"] = cb_conf_mod
                                 signal.raw_scores["killer_weight"] = killer_weight
                                 signal.raw_scores["killer_reason"] = killer_reason
                                 signal.raw_scores["session_weight"] = session_conf_mod
                                 signal.raw_scores["session_reason"] = session_reason
+                                signal.raw_scores["session_dir_bias"] = sess_dir_bias
+                                signal.raw_scores["session_dir_reason"] = sess_dir_reason
                                 signal.reasons.append(fresh_reason)
                                 sniper_fired = True
                                 self.signal_count += 1
@@ -1211,22 +1298,40 @@ class FiboAdvanceScanner:
                 h4_bias=h4_bias,
             )
             if scout_signal is not None:
+                # Trend modifier for scout direction
+                scout_trend_mod, scout_trend_reason = self._trend_confidence_modifier(
+                    df_d1, df_h4, scout_signal.direction)
+                # Session direction bias for scout too
+                scout_sess_bias, scout_sess_reason = self._session_direction_bias(
+                    scout_signal.direction, d1_bias, active_sessions)
                 # Apply soft penalty for consecutive losses
-                # Apply scout conf penalty + killer weight + session (all are confidence modifiers)
-                total_scout_mod = scout_conf_penalty + killer_weight + session_conf_mod
+                # Apply scout conf penalty + trend + killer weight + session + direction bias (all weight)
+                total_scout_mod = (scout_conf_penalty + scout_trend_mod + killer_weight
+                                   + session_conf_mod + scout_sess_bias + cb_conf_mod)
                 if total_scout_mod < 0:
                     scout_signal.confidence = round(max(scout_signal.confidence + total_scout_mod, 10.0), 1)
                     if scout_conf_penalty < 0:
                         scout_signal.reasons.append(f"scout_conf_penalty:{scout_conf_penalty:.0f}")
+                    if scout_trend_mod < 0:
+                        scout_signal.reasons.append(f"trend:{scout_trend_reason}")
                     if killer_weight < 0:
                         scout_signal.reasons.append(f"killer_weight:{killer_weight:.0f}")
                     if session_conf_mod < 0:
                         scout_signal.reasons.append(f"session_weight:{session_conf_mod:.0f}")
-                # Add killer + session info to scout raw_scores
+                    if scout_sess_bias < 0:
+                        scout_signal.reasons.append(f"session_dir_bias:{scout_sess_bias:.0f}")
+                    if cb_conf_mod < 0:
+                        scout_signal.reasons.append(f"circuit_breaker:{cb_conf_mod:.0f}")
+                # Add all modifiers to scout raw_scores
+                scout_signal.raw_scores["trend_mod"] = scout_trend_mod
+                scout_signal.raw_scores["trend_reason"] = scout_trend_reason
                 scout_signal.raw_scores["killer_weight"] = killer_weight
                 scout_signal.raw_scores["killer_reason"] = killer_reason
                 scout_signal.raw_scores["session_weight"] = session_conf_mod
                 scout_signal.raw_scores["session_reason"] = session_reason
+                scout_signal.raw_scores["session_dir_bias"] = scout_sess_bias
+                scout_signal.raw_scores["session_dir_reason"] = scout_sess_reason
+                scout_signal.raw_scores["cb_conf_mod"] = cb_conf_mod
                 self.signal_count += 1
                 self.last_signal = scout_signal
                 self._set_diag(

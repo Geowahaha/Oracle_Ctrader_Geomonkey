@@ -133,6 +133,12 @@ class Config:
     FIBO_ADVANCE_KILLER_VOL_SPIKE: float = float(os.getenv("FIBO_ADVANCE_KILLER_VOL_SPIKE", "2.5"))
     FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP: float = float(os.getenv("FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP", "1.25"))
     FIBO_ADVANCE_KILLER_RETRACE_VEL: float = float(os.getenv("FIBO_ADVANCE_KILLER_RETRACE_VEL", "2.0"))
+    # Trend awareness (prevent April 7 disaster — strong D1 trend filter)
+    FIBO_TREND_STRONG_EMA_SPREAD_PCT: float = float(os.getenv("FIBO_TREND_STRONG_EMA_SPREAD_PCT", "0.5"))
+    FIBO_SESSION_DIRECTION_BIAS_PENALTY: float = float(os.getenv("FIBO_SESSION_DIRECTION_BIAS_PENALTY", "-12.0"))
+    # Soft pause after consecutive losses (faster circuit breaker)
+    FIBO_ADVANCE_SOFT_PAUSE_CONSEC: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_CONSEC", "5"))
+    FIBO_ADVANCE_SOFT_PAUSE_MIN: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_MIN", "30"))
     FIBO_ADVANCE_SCAN_INTERVAL_SEC: int = int(os.getenv("FIBO_ADVANCE_SCAN_INTERVAL_SEC", "300"))
     # Institution-grade gates
     FIBO_ADVANCE_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_ADVANCE_SHARPNESS_KNIFE_THR", "30"))
