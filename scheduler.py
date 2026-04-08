@@ -7992,6 +7992,12 @@ class DexterScheduler:
                     self._run_ct_only_watch_report(force=False)
                 except Exception:
                     logger.debug("[Scheduler] cTrader sync ct-only watch follow-up failed", exc_info=True)
+
+                # ── Feed fibo_advance trade results to circuit breaker ──────
+                try:
+                    self._feed_fibo_trade_results(rpt)
+                except Exception:
+                    logger.debug("[Scheduler] fibo trade result feed failed", exc_info=True)
             else:
                 logger.warning("[CTRADER] sync failed: %s", rpt.get("error") or rpt.get("message"))
             if bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)):
@@ -9134,6 +9140,46 @@ class DexterScheduler:
         except Exception as e:
             logger.warning("[Scheduler] scalping store failed: %s", e)
             return None
+
+    def _feed_fibo_trade_results(self, sync_report: dict) -> None:
+        """
+        After cTrader sync, check for newly closed fibo_xauusd trades and feed
+        their PnL to the fibo_advance scanner's circuit breaker.
+        """
+        closed_ids = list(sync_report.get("closed_position_ids") or [])
+        if not closed_ids:
+            return
+        # Also check for reconciled deals (closed positions that matched journal)
+        if int(sync_report.get("reconciled_journal", 0) or 0) == 0 and not closed_ids:
+            return
+
+        db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+        if not db_path.exists():
+            return
+
+        try:
+            import sqlite3
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Get recently closed fibo_xauusd deals (last 10 minutes)
+                rows = conn.execute(
+                    """
+                    SELECT source, COALESCE(pnl_usd, 0.0) as pnl_usd
+                      FROM ctrader_deals
+                     WHERE LOWER(COALESCE(source,'')) IN ('fibo_xauusd', 'xau_fibo_advance')
+                       AND status IN ('closed', 'reconciled')
+                       AND closed_utc >= datetime('now', '-10 minutes')
+                     ORDER BY closed_utc DESC
+                    """
+                ).fetchall()
+
+                for row in rows:
+                    pnl = float(row["pnl_usd"] or 0.0)
+                    fibo_advance_scanner.report_trade_result(pnl)
+                    logger.debug("[Scheduler] fed fibo result: pnl=%.2f", pnl)
+        except Exception as e:
+            logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
 
     def _run_fibo_advance_scan(self, force_alert: bool = False):
         """
