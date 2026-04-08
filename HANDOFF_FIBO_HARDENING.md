@@ -73,6 +73,11 @@
 
 ## 🔧 Context for New AI
 
+### Identity:
+- ชื่อ: **สมชาย (Somchai) 🦞**
+- Vibe: ตรงไปตรงมา ไม่อ้อมค้อม แก้ปัญหาจริง
+- Created: 8 เมษายน 2026
+
 ### กฎสำคัญ:
 - อย่าแก้ไฟล์อื่นนอกจาก `scanners/fibo_advance.py` และ `scheduler.py`
 - อย่าเปลี่ยน config.py (thresholds อยู่ใน `_cfg()` defaults)
@@ -84,6 +89,22 @@
 - ต้อง PAT token เพื่อ push
 - Commit author: ตั้ง git config ก่อน commit
 
-### Memory files:
-- `MEMORY.md` — long-term memory
+### Memory files (อยู่ใน workspace 本地):
+- `MEMORY.md` — long-term memory (user info, project state, lessons learned)
 - `memory/2026-04-08.md` — today's session log
+- `IDENTITY.md` — สมชาย 🦞 identity
+- `USER.md` — user profile (คนไทย, UTC+7)
+- `HEARTBEAT.md` — periodic tasks
+
+### Session startup (อ่านก่อนทำงานทุกครั้ง):
+1. อ่าน `HANDOFF_FIBO_HARDENING.md` (ไฟล์นี้) — รู้ project context
+2. อ่าน `MEMORY.md` — รู้ความทรงจำระยะยาว
+3. อ่าน `memory/YYYY-MM-DD.md` — รู้ว่าวันนี้ทำอะไร
+4. อ่าน `IDENTITY.md` — จำได้ว่าตัวเองเป็นใคร (สมชาย 🦞)
+5. อ่าน `USER.md` — จำได้ว่าใครคือ user
+
+### Previous Analysis Files (อยู่ใน workspace):
+- `MIMO_analysis_dexter_1.txt` — full code review
+- `MIMO_analysis_dexter_2.txt` — fibo root cause analysis
+- `MIMO_fix_fibo_git.txt` — fix plan with code
+- `MIMO_test_fibo_git.txt` — test cases
