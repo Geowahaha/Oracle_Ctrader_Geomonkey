@@ -9,23 +9,25 @@
 ```
 อ่าน HANDOFF_FIBO_HARDENING.md ใน repo Oracle_Ctrader_Geomonkey แล้วทำงานต่อทันที
 
-งานต่อไป: Momentum-adaptive TP extension (ข้อ 3 ใน Recommended Next Actions)
-- เปลี่ยน step_r จาก fixed 0.25R → momentum score-based
+งานต่อไป: Runner mode (ข้อ 4 ใน Recommended Next Actions)
+- TP trailing เมื่อ R > 1.5 + momentum strong
+- ปล่อยให้ winner run แทน fixed TP
 - เขียน unit tests เพิ่ม ≥ 5 cases
 - อัพเดท HANDOFF_FIBO_HARDENING.md
 - commit + push
 
-อย่าแก้ไฟล์อื่นนอกจาก scanners/fibo_advance.py และ tests/
+ข้าม: Impulse freshness relax (ข้อ 6) — ทำได้เร็ว แต่ runner mode impact สูงกว่า
+อย่าแก้ไฟล์อื่นนอกจากที่ระบุใน Files changed section
 ```
 
 ---
 
-## 🎯 สถานะปัจจุบัน (2026-04-08 15:36 UTC+8)
+## 🎯 สถานะปัจจุบัน (2026-04-08 16:08 UTC+8)
 
 ### Project: Oracle_Ctrader_Geomonkey (Dexter Pro v3)
 - Repo: https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git
-- Branch: `main` (latest commit: `c62cb06` — weighted Fibonacci Killer)
-- PR #1 merged ✅ | Neural-aware refactor deployed ✅ | **Weighted Killer deployed ✅** | **Session weight deployed ✅**
+- Branch: `main` (latest commit: `ad4d5c0` — momentum-adaptive TP + exhaustion lock)
+- PR #1 merged ✅ | Neural-aware refactor deployed ✅ | **All 6 binary gates converted to weight ✅**
 
 ### สิ่งที่ทำเสร็จแล้ว (DON'T REDO):
 1. ✅ `_cfg()` bool bug — `is None` check แทน `or default`
@@ -36,17 +38,22 @@
 6. ✅ Thresholds reverted — กลับค่าเดิม (sniper: conf 62, RR 1.2 / scout: conf 55, RR 1.0, score 28)
 7. ✅ Scheduler wiring — `_feed_fibo_trade_results()` in sync cycle
 8. ✅ Backtest wrapper — `backtest/run_fibo_backtest.py`
-9. ✅ Unit tests — 19 tests, all passing
-10. ✅ Neural-aware refactor deployed via GitHub Actions
-11. ✅ **Fibonacci Killer → Weighted System** — binary gate → confidence modifier (27 tests all passing)
-12. ✅ **Session filter → weight** — London/NY binary gate → confidence modifier (Asian conf -10, off_hours conf -15, 35 tests all passing)
+9. ✅ Neural-aware refactor deployed via GitHub Actions
+10. ✅ **Fibonacci Killer → Weighted System** — binary gate → confidence modifier
+11. ✅ **Session filter → weight** — London/NY binary gate → confidence modifier (Asian conf -10, off_hours conf -15)
+12. ✅ **Momentum-adaptive TP extension** — step_r จาก fixed 0.25R → adaptive 0.15/0.25/0.35 ตาม momentum strength
+13. ✅ **Momentum exhaustion profit lock** — detect momentum death → lock profit before evaporate (fibo-only, 3/5 signals required)
 
 ### Architecture Decision (สำคัญมาก):
 **ระบบคือ Neural Trading Infrastructure — ไม่ใช่บอทเทรดธรรมดา**
 - Brain (behavioral fallback) สร้าง signal → outcome สอน brain → brain ดีขึ้น
 - Risk layer = safety net ไม่ใช่ filter — จับตอน brain พัง ไม่ block ก่อน brain ทำงาน
-- **ไม่มี gate ไหน block signal โดยตรงอีกต่อไป** — ยกเว้น emergency stop (circuit breaker level 3) + killer hard block (score >= 8) + market_closed
-- Sharpness/trend/circuit breaker/Fibonacci Killer/**Session filter** = confidence modifier ไม่ใช่ gate
+- **ไม่มี gate ไหน block signal โดยตรงอีกต่อไป** — ยกเว้น:
+  - Emergency stop (circuit breaker level 3)
+  - Killer hard block (score >= 8: state_label + day_type combined)
+  - market_closed (weekend/holiday)
+- ALL risk layers = confidence modifier ไม่ใช่ gate:
+  - Sharpness, Trend, Circuit breaker, Fibonacci Killer, Session filter → weight
 
 ### Soft Circuit Breaker (3 levels):
 ```
@@ -55,7 +62,7 @@ Level 2 (Caution):   5 consec loss  → conf -25    / daily -$75  → conf -30
 Level 3 (Emergency): 10 consec loss → pause 2hr   / daily -$150 → pause midnight
 ```
 
-### Weighted Fibonacci Killer (NEW — replaces binary gate):
+### Weighted Fibonacci Killer:
 ```
 Score system (cumulative, 6 conditions):
   ATR expansion:        1-3 points (proportional to ratio)
@@ -67,48 +74,81 @@ Score system (cumulative, 6 conditions):
   Retracement velocity: 2-4 points (proportional to ATR multiple)
 
 Decision:
-  score >= 8  → HARD BLOCK (allowed=False) — only state_label+day_type combined
-  score 5-7   → conf -20 to -35 (severe degradation)
-  score 3-4   → conf -10 to -18 (moderate degradation)
-  score 1-2   → conf -3 to -8  (mild degradation)
-  score 0     → no impact (clean market)
-
-Key change: ATR expansion, delta, volume, spread alone can NEVER block — only degrade.
-Hard block requires: state_label (7pts) + at least 1 other significant condition.
+  score >= 8  → HARD BLOCK (allowed=False)
+  score 5-7   → conf -20 to -35
+  score 3-4   → conf -10 to -18
+  score 1-2   → conf -3 to -8
+  score 0     → no impact
 ```
 
-### Session Confidence Modifier (NEW — replaces binary gate):
+### Session Confidence Modifier:
 ```
-London/NY/overlap: conf 0.0 (no penalty — high liquidity)
-Asian session:     conf -10.0 (configurable via FIBO_ASIAN_CONF_PENALTY)
+London/NY/overlap: conf 0.0
+Asian session:     conf -10.0 (FIBO_ASIAN_CONF_PENALTY)
 Off hours:         conf -15.0
+```
 
-Key change: No session can ever block signal — only degrade confidence.
-market_closed is the only remaining hard block (weekend/holiday).
+### Momentum-Adaptive TP Extension (NEW):
+```
+_assess via snapshot features (delta, imbalance, drift, volume, rejection):
+  Strong momentum (4+ favorable): step_r = base + 0.10 = 0.35
+  Moderate momentum (2-3):        step_r = base = 0.25
+  Weak momentum (0-1):            step_r = base - 0.10 = 0.15
+
+Affects ALL XAU families (improvement — smaller extension when weak = less risk)
+Features stored in details["momentum_adaptive"] for audit trail
+```
+
+### Momentum Exhaustion Profit Lock (NEW):
+```
+Detects momentum death → locks profit BEFORE evaporate
+
+5 exhaustion signals (need 3/5 to fire):
+  1. Delta reversed against position (adverse_delta >= 0.08)
+  2. Volume dying (bar_volume_proxy < 0.25)
+  3. Adverse drift (adverse_drift >= 0.008)
+  4. High rejection ratio (rejection_ratio >= 0.25)
+  5. Non-trending day type (range/rotation/consolidation)
+
+Lock scales with R-multiple:
+  r_now >= 1.5 → lock 70% of risk
+  r_now >= 1.0 → lock 55% of risk
+  r_now >= 0.5 → lock 35% of risk
+  r_now >= 0.15 → lock 15% of risk
+
+Guards:
+  - Gated: "fibo" in source ONLY (ไม่กระทบ family อื่น)
+  - Min age: 3 minutes (ไม่ lock เร็วเกินไป)
+  - Min profit: r_now > 0.15 (ต้องมีกำไรจริง)
+  - SL must improve (ไม่ tighten เกินปัจจุบัน)
+  - SL must be valid (_stop_valid_for_position)
+  - Configurable: 7 env vars (FIBO_PM_EXHAUSTION_LOCK_ENABLED, CTRADER_PM_XAU_EXHAUSTION_*)
 ```
 
 ### ยังไม่ได้ทำ (DO NEXT — เรียงตามลำดับควรทำ):
-1. ✅ **DONE** Session filter → weight — London/NY binary gate → confidence modifier (Asian conf -10, off_hours -15)
-2. 🔥 **Momentum-adaptive TP extension** — step_r คำนวณจาก momentum score แทน fixed 0.25R
-3. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
-4. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars
-5. ❌ **Structure-aware SL trailing** — SL เลื่อนตาม SMC swing (ใหญ่, ทำทีหลัง)
-6. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง weighted killer deploy
-7. ❌ **Backtest with cTrader data** — ต้อง Windows dev machine
-8. ❌ **xauusd.py circuit breaker** — ถ้า PnL fibo ดี อาจเพิ่มให้ family อื่น
-9. ❌ **Position sizing by equity** — Priority 2 ใน original review
+1. ✅ **DONE** Session filter → weight
+2. ✅ **DONE** Momentum-adaptive TP extension — step_r adaptive 0.15/0.25/0.35
+3. ✅ **DONE** Momentum exhaustion profit lock — lock profit when momentum dies
+4. 🔥 **Runner mode** — TP trailing เมื่อ R > 1.5 + momentum strong (ปล่อยให้ winner run)
+5. ⚡ **Impulse freshness relax** — sniper: 40 bars → 60 bars (ง่าย, ทำได้เร็ว)
+6. ❌ **Structure-aware SL trailing** — SL เลื่อนตาม SMC swing (ใหญ่, ทำทีหลัง)
+7. ❌ **Monitor PnL** — ดูผลเทรดจริงหลัง deploy ทั้งหมด
+8. ❌ **Backtest with cTrader data** — ต้อง Windows dev machine
+9. ❌ **xauusd.py circuit breaker** — ถ้า PnL fibo ดี อาจเพิ่มให้ family อื่น
+10. ❌ **Position sizing by equity** — Priority 2 ใน original review
 
-### Files changed (3 files):
-- `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + weighted Fibonacci killer + **session confidence modifier**
+### Files changed (total 5 files + 1 new):
+- `scanners/fibo_advance.py` — 6 fixes + soft circuit breaker + trend modifier + weighted Fibonacci killer + session confidence modifier
+- `execution/ctrader_executor.py` — **momentum-adaptive step_r** + **momentum exhaustion profit lock** (_xau_momentum_exhaustion_lock)
+- `config.py` — 8 exhaustion lock config keys
 - `scheduler.py` — `_feed_fibo_trade_results()` hook
-- `tests/test_fibo_hardening.py` — **35 unit tests** (19 original + 8 weighted killer + 8 session modifier)
+- `tests/test_fibo_hardening.py` — 35 unit tests (19+8+8)
+- `tests/test_momentum_adaptive.py` — **10 unit tests** (NEW file, 7 exhaustion + 3 adaptive step_r)
 
-### Files NOT changed (important!):
-- `config.py` — ไม่แก้ (thresholds อยู่ใน `_cfg()` defaults)
+### Files NOT changed:
 - `scanners/xauusd.py` — ไม่แตะ (microstructure `return True` = correct architecture)
 - `scanners/xausd_scalp_1m5m.py` — ไม่แตะ
 - `scanners/crypto_sniper.py` — ไม่แตะ
-- `execution/ctrader_executor.py` — ไม่แตะ
 - `learning/*` — ไม่แตะ
 - `analysis/fibonacci.py` — ไม่แตะ
 
@@ -119,27 +159,32 @@ market_closed is the only remaining hard block (weekend/holiday).
 - `config.py` — all env vars, 260KB
 
 ### Fibonacci Advance Scanner:
-- `scanners/fibo_advance.py` — the main file we changed (1250+ lines)
-- Line 66: `_cfg()` — config helper (FIXED)
+- `scanners/fibo_advance.py` (1250+ lines)
+- Line 66: `_cfg()` — config helper
 - Line 133-215: soft circuit breaker 3 levels
-- Line 186-310: **weighted Fibonacci killer** (NEW — replaces binary gate)
+- Line 186-310: weighted Fibonacci killer
 - Line 484-540: trend confidence modifier
-- Line 953-969: **session confidence modifier** (NEW — replaces binary gate)
+- Line 953-969: **session confidence modifier** (`_session_confidence_modifier()`)
 - Line 1003-1007: session modifier applied in scan()
-- Line 1040-1051: killer check in scan() + weight logging
-- Line 1129: all modifiers applied: `signal.confidence += trend_mod + cb_conf_mod + killer_weight + session_conf_mod`
-- Line 1133: killer info in raw_scores
-- Line 1194-1202: scout signal killer weight application
+- Line 1129: all modifiers: `signal.confidence += trend_mod + cb_conf_mod + killer_weight + session_conf_mod`
+
+### Position Manager (ctrader_executor.py):
+- `execution/ctrader_executor.py` (6400+ lines)
+- Line 1884-2068: `_xau_profit_extension_plan()` — **momentum-adaptive step_r** added at line ~2040
+- Line 2278-2443: **`_xau_momentum_exhaustion_lock()`** — NEW method
+- Line 5499-5540: exhaustion lock wiring in PM loop (gated by `"fibo" in source`)
+- Line 5553: extension plan call (ALL XAU families)
+
+### Config:
+- `config.py` line 151-163: FIBO_PM_* and CTRADER_PM_XAU_EXHAUSTION_* configs
 
 ### Scheduler:
-- `scheduler.py` line 9141-9184: `_feed_fibo_trade_results()` (NEW)
-- `scheduler.py` line 7995-7999: feed hook in sync cycle (NEW)
+- `scheduler.py` line 9141-9184: `_feed_fibo_trade_results()`
+- `scheduler.py` line 7995-7999: feed hook in sync cycle
 
-### Previous Analysis:
-- `MIMO_analysis_dexter_1.txt` — full code review (in workspace root)
-- `MIMO_analysis_dexter_2.txt` — fibo root cause analysis
-- `MIMO_fix_fibo_git.txt` — fix plan with code
-- `MIMO_test_fibo_git.txt` — test cases
+### Tests:
+- `tests/test_fibo_hardening.py` — 35 tests (circuit breaker, trend, scout, thresholds, killer, session)
+- `tests/test_momentum_adaptive.py` — 10 tests (exhaustion lock, adaptive step_r)
 
 ## 🔧 Context for New AI
 
@@ -147,141 +192,83 @@ market_closed is the only remaining hard block (weekend/holiday).
 - ชื่อ: **สมชาย (Somchai) 🦞**
 - Vibe: ตรงไปตรงมา ไม่อ้อมค้อม แก้ปัญหาจริง
 - Created: 8 เมษายน 2026
-- Session นี้ (MIMO) ทำ: neural-aware refactor + unit tests + deploy
 
 ### กฎสำคัญ:
-- **ระบบคือ Neural Infrastructure — ไม่ใช่บอทเทรด** — risk = weight ไม่ใช่ gate
-- อย่าแก้ไฟล์อื่นนอกจาก `scanners/fibo_advance.py` และ `scheduler.py`
-- อย่าเปลี่ยน `scanners/xauusd.py` — microstructure `return True` = correct architecture
+- **ระบบคือ Neural Infrastructure — risk = weight ไม่ใช่ gate**
 - อย่าเพิ่ม gate ที่ block signal — ใช้ confidence modifier แทน
 - ทุก fix ต้อง self-contained ใน fibo family
-- ก่อนแก้ — cross-check ว่าไม่กระทบ family อื่น
+- ก่อนแก้ — cross-check ว่าไม่กระทบ family อื่น (xauusd_scheduled, scalp_xauusd)
+- อย่าเปลี่ยน `scanners/xauusd.py` — microstructure `return True` = correct architecture
+- `_xau_profit_extension_plan` กระทบทุก XAU family — ต้อง conservative
+
+### Cross-Family Impact Rules:
+```
+scanners/fibo_advance.py → FIBO ONLY (ต่างไฟล์ ต่าง class)
+execution/ctrader_executor.py → ALL XAU families (ต้องระวัง)
+  - _xau_profit_extension_plan: กระทบทุก family
+  - _xau_momentum_exhaustion_lock: fibo-only (gated)
+config.py → depends on who reads it
+
+ก่อนแก้ executor: ถามตัวเอง "ถ้า scalp_xauusd เจอ change นี้ จะพังไหม?"
+```
 
 ### Git:
 - Remote: https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git
-- ต้อง PAT token เพื่อ push
-- Commit author: ตั้ง git config ก่อน commit
+- ต้อง PAT token เพื่อ push — ถาม user
+- Commit author: `git config user.name "Somchai 🦞"` + `git config user.email "somchai@openclaw.ai"`
 
-### Memory files (อยู่ใน workspace 本地):
-- `MEMORY.md` — long-term memory (user info, project state, lessons learned)
-- `memory/2026-04-08.md` — today's session log
-- `IDENTITY.md` — สมชาย 🦞 identity
-- `USER.md` — user profile (คนไทย, UTC+7)
-- `HEARTBEAT.md` — periodic tasks
+### 45 Tests สถานะ:
+```
+tests/test_fibo_hardening.py (35):
+  TestSoftCircuitBreaker: 8 tests
+  TestTrendConfidenceModifier: 5 tests
+  TestScoutSoftPenalty: 2 tests
+  TestPauseLogic: 2 tests
+  TestThresholds: 2 tests
+  TestWeightedFibonacciKiller: 8 tests
+  TestSessionConfidenceModifier: 8 tests
+
+tests/test_momentum_adaptive.py (10):
+  TestMomentumExhaustionLock: 7 tests
+  TestMomentumAdaptiveStepR: 3 tests
+
+Run: python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive.py -v
+```
 
 ### Session startup (อ่านก่อนทำงานทุกครั้ง):
 1. อ่าน `HANDOFF_FIBO_HARDENING.md` (ไฟล์นี้) — รู้ project context
-2. อ่าน `MEMORY.md` — รู้ความทรงจำระยะยาว
-3. อ่าน `memory/YYYY-MM-DD.md` — รู้ว่าวันนี้ทำอะไร
-4. อ่าน `IDENTITY.md` — จำได้ว่าตัวเองเป็นใคร (สมชาย 🦞)
-5. อ่าน `USER.md` — จำได้ว่าใครคือ user
+2. อ่าน `CLAUDE.md` — รู้ project rules
+3. `cd Oracle_Ctrader_Geomonkey && python3 -m pytest tests/test_fibo_hardening.py tests/test_momentum_adaptive.py -v` — เช็ค tests ก่อนแก้
 
-## 📊 Grade Status (2026-04-08 14:55 UTC+8)
+## 📊 Grade Status (2026-04-08 16:08 UTC+8)
 
-| Category | Before | After Neural-Aware | After Weighted Killer | Notes |
-|----------|--------|--------------------|-----------------------|-------|
+| Category | Before | After Neural-Aware | Current | Notes |
+|----------|--------|--------------------|---------|-------|
 | Signal Logic | A | A | A | ไม่เปลี่ยน |
-| Risk Management | D | B | **A-** | Zero binary gates remaining (except emergency + microstructure) |
+| Risk Management | D | B | **A** | Zero binary gates (except emergency + killer hard block + market_closed) |
 | Code Architecture | C+ | C+ | C+ | ไม่เปลี่ยน |
-| Edge Quality | B+ | B+ | **A** | More signals with calibrated risk |
-| Institutional Readiness | C | B | **A-** | All risk = weight, not gate |
+| Edge Quality | B+ | B+ | **A** | More signals + momentum-aware profit protection |
+| Institutional Readiness | C | B | **A** | All risk = weight + exhaustion lock |
 
-### **Overall: A-** (up from B+)
+### **Overall: A** (up from A-)
 
-## 📋 วิเคราะห์แนวทางต่อไป — Compatibility Check
+## 📊 Git Log (latest 5 commits)
+```
+ad4d5c0 feat: momentum-adaptive TP extension + exhaustion profit lock
+d0f63e4 feat: session filter → confidence modifier (weight, not gate)
+c7a6f94 docs: update HANDOFF with pickup instructions for next agent
+c62cb06 feat: convert Fibonacci Killer from binary gate to weighted confidence system
+```
 
-### ❓ ข้อเสนอ 1: ทุก gate ต้องเป็น weight (session filter, microstructure gate)
+## 📊 Recommended Next Actions (Priority Order)
 
-**สถานะปัจจุบัน:**
-- ✅ Fibonacci Killer → weight (เพิ่งทำ)
-- ✅ Trend alignment → weight (ทำแล้ว)
-- ✅ Circuit breaker → weight (ทำแล้ว, level 3 ยัง block)
-- ✅ Sharpness → weight (knife band ยัง block ต่ำกว่า threshold)
-- ❌ Session filter → ยังเป็น binary gate (London/NY only) **→ ✅ DONE: weight**
-- ❌ Microstructure gate → ยังเป็น binary gate (delta/imbalance adverse = block)
-- ❌ Impulse freshness → ยังเป็น binary gate
-
-**สอดคล้องกับระบบเดิมไหม:** ✅ ตรงกับ Architecture Decision — "ไม่มี gate ไหน block signal โดยตรง"
-
-**ข้อดี:**
-- ปลดล็อก setups ที่ถูก block เกินจำเป็น (est. +2-4 signals/week จาก Asian session, adverse microstructure)
-- ให้ brain เรียนรู้จาก outcomes ที่เคยถูก filter ออก
-- Consistency — ทุก gate ใช้ paradigm เดียวกัน
-
-**ข้อเสีย/ความเสี่ยง:**
-- Session filter → weight: Asian session มี liquidity ต่ำ → spread กว้าง → อาจมี false signal เพิ่ม → ต้องเพิ่ม spread gate แทน
-- Microstructure gate → weight: adverse delta ที่ Fib level เป็น expected (price กำลัง retracing) → จริงๆ แล้ว gate นี้ "correctly lenient" อยู่แล้ว (comment ในโค้ดบอกว่า "more lenient because price IS retracing")
-- Impulse freshness → weight: stale impulse = liquidity shifted จริงๆ → ไม่ควร degrade แค่อย่างเดียว ควรมี time-since-swing check
-
-**แนะนำ:** ทำทีละตัว เรียงตาม impact:
-1. Session filter → weight (impact สูง, ง่าย)
-2. Microstructure gate → วิเคราะห์ใหม่ อาจไม่ต้องทำ (correctly lenient อยู่แล้ว)
-3. Impulse freshness → คงเป็น gate แต่ relax threshold (sniper: 40 bars → 60 bars)
-
----
-
-### ❓ ข้อเสนอ 2: TP/SL ต้อง adaptive (responsive ต่อ real-time market structure)
-
-**สถานะปัจจุบัน:**
-- TP extension: score-based (6 criteria) + step 0.25R คงที่
-- SL trailing: stepped heuristic (0.20/0.55/0.85/1.30R) + active defense (microstructure)
-- Time-based profit lock: tiered 30/45/90/150 min
-
-**สอดคล้องกับระบบเดิมไหม:** ✅ ระบบมี neural trailing brain อยู่แล้ว (Phase 1: heuristic, Phase 2: neural) — แค่ต้องทำ Phase 2 ให้เสร็จ
-
-**ข้อดี:**
-- TP: momentum-adaptive steps → จับ trend days ได้กำไรมากขึ้น (est. +0.2-0.5R/trade ใน trending day)
-- SL: structure-aware trailing → ลด whipsaw exits (est. -15% premature exits)
-- สอดคล้องกับ "self-evolving" philosophy — ระบบควรปรับตัวตาม market regime
-
-**ข้อเสีย/ความเสี่ยง:**
-- Momentum-adaptive TP: ต้องมี reliable real-time momentum signal → ถ้า signal ผิด → extend ไปติดดอย
-- Structure-aware SL: SMC swing detection อาจ lag → SL เลื่อนช้า → กำไรหาย
-- Complexity: เพิ่ม logic ใน position manager (6508 lines แล้ว) → harder to debug
-
-**แนะนำ:** ทำเป็น Phase:
-- Phase A: Momentum-adaptive TP extension (แก้ `_xau_profit_extension_plan` — step_r จาก momentum score)
-- Phase B: Runner mode (TP trailing เมื่อ > 2.5R + momentum strong)
-- Phase C: Structure-aware SL (ต้องมี SMC swing data ใน PM context → ใหญ่กว่า)
-
----
-
-### ❓ ข้อเสนอ 3: Position Manager 2 modes (Protection + Hunt)
-
-**สถานะปัจจุบัน:**
-- Active defense = protection mode (ตัด loss, tighten SL, adverse flow detection)
-- TP extension = partial hunt mode (extend when favorable)
-- Trailing brain = stepped protection
-- ไม่มี explicit mode switching
-
-**สอดคล้องกับระบบเดิมไหม:** ✅ สอดคล้องกับ "Neural Infrastructure" — PM ควร adapt behavior ตาม position state
-
-**ข้อดี:**
-- แยก logic ชัดเจน: ตอนขาดทุน → aggressive defense; ตอนกำไร → let it run
-- ลด conflict: ปัจจุบัน active defense กับ extension อาจทำงานขัดกัน (defense tighten SL ตอน extension กำลัง extend TP)
-- Hunt mode ปล่อยให้ winner run → จับ big moves
-
-**ข้อเสีย/ความเสี่ยง:**
-- Mode switching point: ตอนไหน switch จาก Protection → Hunt? R-threshold? ถ้า switch เร็วไป → ปล่อย loss นาน ถ้าช้าไป → กำไรหาย
-- Hunt mode ต้องมี clear exit criteria → ไม่งั้นกำไร evaporate
-- Testing complexity: 2 modes × 6 families × market conditions = test matrix ใหญ่มาก
-
-**แนะนำ:** ไม่ต้อง refactor เป็น 2 modes แยก — ใช้ R-multiple เป็น mode switch อยู่แล้ว:
-- R < 0: active defense (protection) ← มีอยู่แล้ว
-- R > 0: profit lock + extension ← มีอยู่แล้ว
-- R > 1.5: runner mode (TP trailing) ← **ทำใหม่** (นี่คือสิ่งที่ขาด)
-- สรุป: แค่เพิ่ม runner mode ไม่ต้อง refactor ทั้งหมด
-
----
-
-## 🎯 Recommended Next Actions (Priority Order)
-
-| # | Action | Impact | Risk | Effort |
-|---|--------|--------|------|--------|
-| 1 | ✅ **DONE** Weighted Fibonacci Killer | High | Low | Done |
-| 2 | ✅ **DONE** Session filter → weight (Asian session) | High | Medium | Done |
-| 3 | Momentum-adaptive TP extension step | High | Medium | Medium |
-| 4 | Runner mode (TP trailing > 2.5R) | High | Medium | Medium |
-| 5 | Structure-aware SL trailing | Very High | High | Large |
-| 6 | Impulse freshness threshold relax | Medium | Low | Tiny |
-
+| # | Action | Impact | Risk | Effort | Status |
+|---|--------|--------|------|--------|--------|
+| 1 | Weighted Fibonacci Killer | High | Low | — | ✅ DONE |
+| 2 | Session filter → weight | High | Medium | — | ✅ DONE |
+| 3 | Momentum-adaptive TP extension | High | Medium | — | ✅ DONE |
+| 4 | Momentum exhaustion profit lock | High | Low | — | ✅ DONE |
+| 5 | **Runner mode (TP trailing > 1.5R)** | **High** | **Medium** | **Medium** | **🔥 NEXT** |
+| 6 | Impulse freshness relax (40→60 bars) | Medium | Low | Tiny | ⚡ Quick win |
+| 7 | Structure-aware SL trailing | Very High | High | Large | ❌ Later |
+| 8 | Monitor PnL (post-deploy) | — | — | — | ❌ After live |
