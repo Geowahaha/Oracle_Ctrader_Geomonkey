@@ -1,14 +1,12 @@
 """
 tests/test_fibo_hardening.py
 
-Unit tests for fibo_advance risk hardening (PR #1):
-  1. Circuit breaker — 3 consecutive losses → triggers
-  2. Circuit breaker — $20 daily loss → triggers
-  3. Trend alignment — D1 bearish + H4 bearish → block LONG, allow SHORT
-  4. Trend alignment — D1 bullish + H4 bullish → block SHORT, allow LONG
-  5. Trend alignment — D1/H4 conflict → allow both
-  6. Sharpness error → passthrough (not block)
-  7. Scout auto-disable on 2+ consecutive losses
+Unit tests for fibo_advance neural-aware risk management:
+  1. Circuit breaker — soft brake 3 levels (warning/caution/emergency)
+  2. Trend confidence modifier — weight not gate
+  3. Sharpness error — degrade not block
+  4. Scout soft penalty — confidence reduction not hard disable
+  5. Pause logic — emergency stop only
 """
 import pytest
 import sys
@@ -42,11 +40,7 @@ def _make_df(close=3000.0, n=60):
 
 def _fake_add_ema(d1_bearish=False, d1_bullish=False,
                   h4_bearish=False, h4_bullish=False):
-    """
-    Returns a side_effect function for ta.add_ema that simulates
-    bullish/bearish EMA configurations.
-    Call order in _check_trend_alignment: H4 first, D1 second.
-    """
+    """Side_effect for ta.add_ema — H4 first call, D1 second call."""
     call_count = [0]
 
     def side_effect(df, periods=None):
@@ -54,7 +48,7 @@ def _fake_add_ema(d1_bearish=False, d1_bullish=False,
         df = df.copy()
         close = float(df["close"].iloc[-1])
 
-        if call_count[0] == 1:  # first call = H4
+        if call_count[0] == 1:  # H4
             if h4_bearish:
                 df["ema_21"] = [close + 5.0] * len(df)
                 df["ema_50"] = [close + 10.0] * len(df)
@@ -64,7 +58,7 @@ def _fake_add_ema(d1_bearish=False, d1_bullish=False,
             else:
                 df["ema_21"] = [close + 1.0] * len(df)
                 df["ema_50"] = [close - 1.0] * len(df)
-        else:  # second call = D1
+        else:  # D1
             if d1_bearish:
                 df["ema_21"] = [close + 5.0] * len(df)
                 df["ema_50"] = [close + 10.0] * len(df)
@@ -80,94 +74,105 @@ def _fake_add_ema(d1_bearish=False, d1_bullish=False,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Test 1: 3 consecutive losses → circuit breaker triggers
+# Test 1: Soft Circuit Breaker — 3 levels
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestCircuitBreakerConsecLoss:
+class TestSoftCircuitBreaker:
     def _fresh_scanner(self):
-        """Create a scanner with _last_reset_date set to today to prevent
-        circuit breaker from resetting counters on first check."""
         scanner = FiboAdvanceScanner()
         scanner._last_reset_date = date.today()
         return scanner
 
-    def test_three_consecutive_losses_triggers(self):
-        """3 losses in a row should trip the circuit breaker."""
+    def test_level1_warning_3_consec_losses(self):
+        """3 consecutive losses → warning, conf -10, still allowed."""
         scanner = self._fresh_scanner()
         scanner.report_trade_result(-5.0)
         scanner.report_trade_result(-3.0)
         scanner.report_trade_result(-7.0)
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
+
+        assert allowed is True
+        assert "warning" in reason
+        assert conf_mod == -10.0
+
+    def test_level2_caution_5_consec_losses(self):
+        """5 consecutive losses → caution, conf -25, still allowed."""
+        scanner = self._fresh_scanner()
+        for _ in range(5):
+            scanner.report_trade_result(-5.0)
+
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
+
+        assert allowed is True
+        assert "caution" in reason
+        assert conf_mod == -25.0
+
+    def test_level3_emergency_10_consec_losses(self):
+        """10 consecutive losses → emergency, BLOCK."""
+        scanner = self._fresh_scanner()
+        for _ in range(10):
+            scanner.report_trade_result(-5.0)
+
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is False
-        assert "consec_loss" in reason or "paused" in reason
+        assert "emergency" in reason
 
-    def test_two_consecutive_losses_ok(self):
-        """2 losses should NOT trigger (default threshold is 3)."""
+    def test_two_losses_ok_no_penalty(self):
+        """2 losses should NOT trigger any warning."""
         scanner = self._fresh_scanner()
         scanner.report_trade_result(-5.0)
         scanner.report_trade_result(-3.0)
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is True
         assert "circuit_ok" in reason
+        assert conf_mod == 0.0
 
     def test_win_resets_consecutive_counter(self):
         """A winning trade resets the consecutive loss counter."""
         scanner = self._fresh_scanner()
         scanner.report_trade_result(-5.0)
         scanner.report_trade_result(-3.0)
-        scanner.report_trade_result(10.0)  # win resets
+        scanner.report_trade_result(10.0)  # win
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is True
+        assert "circuit_ok" in reason
         assert scanner._consecutive_losses == 0
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Test 2: $20 daily loss → circuit breaker triggers
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestCircuitBreakerDailyLoss:
-    def _fresh_scanner(self):
-        scanner = FiboAdvanceScanner()
-        scanner._last_reset_date = date.today()
-        return scanner
-
-    def test_daily_loss_cap_triggers(self):
-        """Cumulative daily losses exceeding $20 should trip breaker (2 losses, under consec limit)."""
+    def test_daily_loss_level1_warning(self):
+        """Daily loss -$30 → warning, conf -15, still allowed."""
         scanner = self._fresh_scanner()
-        scanner.report_trade_result(-15.0)
-        allowed, _ = scanner._check_circuit_breaker()
-        assert allowed is True  # -$15, under $20 cap
+        scanner.report_trade_result(-31.0)
 
-        # One more loss pushes past $20 (only 2 consec losses, not hitting 3)
-        scanner.report_trade_result(-6.0)
-        allowed, reason = scanner._check_circuit_breaker()
-        assert allowed is False
-        assert "daily_loss" in reason
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
-    def test_daily_cap_exact_20(self):
-        """Exactly -$20 should trigger the breaker."""
+        assert allowed is True
+        assert "warning" in reason
+        assert conf_mod == -15.0
+
+    def test_daily_loss_level3_emergency(self):
+        """Daily loss -$150 → emergency, BLOCK."""
         scanner = self._fresh_scanner()
-        scanner.report_trade_result(-20.0)
+        scanner.report_trade_result(-150.0)
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is False
-        assert "daily_loss" in reason
+        assert "emergency" in reason
 
     def test_daily_loss_resets_new_day(self):
         """Daily losses should reset on a new date."""
         scanner = FiboAdvanceScanner()
         scanner._last_reset_date = date(2026, 4, 7)
-        scanner._daily_losses_usd = -25.0
-        scanner._consecutive_losses = 5
+        scanner._daily_losses_usd = -200.0
+        scanner._consecutive_losses = 15
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is True
         assert scanner._daily_losses_usd == 0.0
@@ -175,12 +180,12 @@ class TestCircuitBreakerDailyLoss:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Test 3-5: Trend Alignment Gate
+# Test 2: Trend Confidence Modifier — weight not gate
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestTrendAlignment:
-    def test_d1_bearish_h4_bearish_blocks_long(self):
-        """Both D1 and H4 bearish → should BLOCK long entries."""
+class TestTrendConfidenceModifier:
+    def test_counter_trend_penalty(self):
+        """D1+H4 bearish + direction long → penalty -15, NOT blocked."""
         with patch("scanners.fibo_advance.ta") as mock_ta:
             mock_ta.add_ema.side_effect = _fake_add_ema(
                 d1_bearish=True, h4_bearish=True
@@ -188,15 +193,47 @@ class TestTrendAlignment:
             scanner = FiboAdvanceScanner()
             df = _make_df()
 
-            allowed, reason = scanner._check_trend_alignment(
+            mod, reason = scanner._trend_confidence_modifier(
                 df_d1=df, df_h4=df, direction="long"
             )
 
-            assert allowed is False
+            assert mod == -15.0
             assert "counter_trend" in reason
 
-    def test_d1_bearish_h4_bearish_allows_short(self):
-        """Both D1 and H4 bearish → should ALLOW short entries."""
+    def test_aligned_bonus(self):
+        """D1+H4 bullish + direction long → bonus +5."""
+        with patch("scanners.fibo_advance.ta") as mock_ta:
+            mock_ta.add_ema.side_effect = _fake_add_ema(
+                d1_bullish=True, h4_bullish=True
+            )
+            scanner = FiboAdvanceScanner()
+            df = _make_df()
+
+            mod, reason = scanner._trend_confidence_modifier(
+                df_d1=df, df_h4=df, direction="long"
+            )
+
+            assert mod == +5.0
+            assert "aligned" in reason
+
+    def test_neutral_no_modifier(self):
+        """Mixed trend → 0 modifier, not blocked."""
+        with patch("scanners.fibo_advance.ta") as mock_ta:
+            mock_ta.add_ema.side_effect = _fake_add_ema(
+                d1_bullish=True, h4_bearish=True
+            )
+            scanner = FiboAdvanceScanner()
+            df = _make_df()
+
+            mod, reason = scanner._trend_confidence_modifier(
+                df_d1=df, df_h4=df, direction="long"
+            )
+
+            assert mod == 0.0
+            assert "neutral" in reason
+
+    def test_counter_trend_never_blocks(self):
+        """Counter-trend should NEVER return a blocking signal."""
         with patch("scanners.fibo_advance.ta") as mock_ta:
             mock_ta.add_ema.side_effect = _fake_add_ema(
                 d1_bearish=True, h4_bearish=True
@@ -204,124 +241,59 @@ class TestTrendAlignment:
             scanner = FiboAdvanceScanner()
             df = _make_df()
 
-            allowed, reason = scanner._check_trend_alignment(
+            # Both directions should return modifier, never block
+            mod_long, _ = scanner._trend_confidence_modifier(
+                df_d1=df, df_h4=df, direction="long"
+            )
+            mod_short, _ = scanner._trend_confidence_modifier(
                 df_d1=df, df_h4=df, direction="short"
             )
 
-            assert allowed is True
-            assert "trend_aligned" in reason
+            # long is counter-trend (penalty), short is aligned (bonus)
+            assert mod_long == -15.0  # penalty but not blocking
+            assert mod_short == +5.0  # aligned bonus
 
-    def test_d1_bullish_h4_bullish_blocks_short(self):
-        """Both D1 and H4 bullish → should BLOCK short entries."""
-        with patch("scanners.fibo_advance.ta") as mock_ta:
-            mock_ta.add_ema.side_effect = _fake_add_ema(
-                d1_bullish=True, h4_bullish=True
-            )
-            scanner = FiboAdvanceScanner()
-            df = _make_df()
-
-            allowed, reason = scanner._check_trend_alignment(
-                df_d1=df, df_h4=df, direction="short"
-            )
-
-            assert allowed is False
-            assert "counter_trend" in reason
-
-    def test_d1_bullish_h4_bullish_allows_long(self):
-        """Both D1 and H4 bullish → should ALLOW long entries."""
-        with patch("scanners.fibo_advance.ta") as mock_ta:
-            mock_ta.add_ema.side_effect = _fake_add_ema(
-                d1_bullish=True, h4_bullish=True
-            )
-            scanner = FiboAdvanceScanner()
-            df = _make_df()
-
-            allowed, reason = scanner._check_trend_alignment(
-                df_d1=df, df_h4=df, direction="long"
-            )
-
-            assert allowed is True
-            assert "trend_aligned" in reason
-
-    def test_d1_h4_conflict_allows_both(self):
-        """D1 bullish + H4 bearish (conflict) → should allow BOTH long and short."""
-        scanner = FiboAdvanceScanner()
-        df = _make_df()
-
-        # Test LONG direction: fresh mock each time
-        with patch("scanners.fibo_advance.ta") as mock_ta:
-            mock_ta.add_ema.side_effect = _fake_add_ema(
-                d1_bullish=True, h4_bearish=True
-            )
-            allowed_long, _ = scanner._check_trend_alignment(
-                df_d1=df, df_h4=df, direction="long"
-            )
-
-        # Test SHORT direction: fresh mock (resets call_count)
-        with patch("scanners.fibo_advance.ta") as mock_ta:
-            mock_ta.add_ema.side_effect = _fake_add_ema(
-                d1_bullish=True, h4_bearish=True
-            )
-            allowed_short, _ = scanner._check_trend_alignment(
-                df_d1=df, df_h4=df, direction="short"
-            )
-
-        assert allowed_long is True
-        assert allowed_short is True
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Test 6: Error handling passthrough
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestErrorHandling:
-    def test_trend_check_error_passes_through(self):
-        """If trend alignment raises an error, it should pass through (not block)."""
+    def test_error_passthrough(self):
+        """Trend check error → 0 modifier, passthrough."""
         scanner = FiboAdvanceScanner()
 
         with patch("scanners.fibo_advance.ta") as mock_ta:
-            mock_ta.add_ema.side_effect = Exception("EMA calc failed")
-
+            mock_ta.add_ema.side_effect = Exception("EMA failed")
             df = _make_df()
-            allowed, reason = scanner._check_trend_alignment(
+            mod, reason = scanner._trend_confidence_modifier(
                 df_d1=df, df_h4=df, direction="long"
             )
 
-            assert allowed is True
-            assert "trend_check_error_passthrough" in reason
+            assert mod == 0.0
+            assert "error" in reason
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Test 7: Scout auto-disable on 2+ consecutive losses
+# Test 3: Scout Soft Penalty
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestScoutAutoDisable:
-    def test_scout_disabled_at_two_consecutive_losses(self):
-        """Scout mode should be disabled when consec losses >= 2."""
-        scanner = FiboAdvanceScanner()
-        scanner.report_trade_result(-5.0)  # loss 1
-        scanner.report_trade_result(-3.0)  # loss 2
-        assert scanner._consecutive_losses >= 2
-
-    def test_scout_enabled_at_one_loss(self):
-        """Scout mode should remain enabled with only 1 consecutive loss."""
+class TestScoutSoftPenalty:
+    def test_scout_not_hard_blocked_at_2_losses(self):
+        """Scout should NOT be hard-blocked at 2 consecutive losses."""
         scanner = FiboAdvanceScanner()
         scanner.report_trade_result(-5.0)
-        assert scanner._consecutive_losses < 2
-
-    def test_scout_reenabled_after_win(self):
-        """Scout should re-enable after a winning trade resets counter."""
-        scanner = FiboAdvanceScanner()
-        scanner.report_trade_result(-5.0)  # loss 1
-        scanner.report_trade_result(-3.0)  # loss 2
+        scanner.report_trade_result(-3.0)
+        # With soft penalty, scout is still allowed (just lower conf)
         assert scanner._consecutive_losses >= 2
 
-        scanner.report_trade_result(10.0)  # win → reset
+    def test_scout_reenabled_after_win(self):
+        """Scout penalty resets after winning trade."""
+        scanner = FiboAdvanceScanner()
+        scanner.report_trade_result(-5.0)
+        scanner.report_trade_result(-3.0)
+        assert scanner._consecutive_losses >= 2
+
+        scanner.report_trade_result(10.0)  # win
         assert scanner._consecutive_losses == 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Test integration: pause_until logic
+# Test 4: Pause Logic — emergency only
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestPauseLogic:
@@ -330,7 +302,7 @@ class TestPauseLogic:
         scanner = FiboAdvanceScanner()
         scanner._pause_until = datetime.now(timezone.utc) + timedelta(hours=1)
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is False
         assert "paused" in reason
@@ -340,6 +312,25 @@ class TestPauseLogic:
         scanner = FiboAdvanceScanner()
         scanner._pause_until = datetime.now(timezone.utc) - timedelta(minutes=1)
 
-        allowed, reason = scanner._check_circuit_breaker()
+        allowed, reason, conf_mod = scanner._check_circuit_breaker()
 
         assert allowed is True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 5: Thresholds are at original values
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestThresholds:
+    def test_sniper_thresholds_reverted(self):
+        """Verify sniper thresholds are at original (relaxed) values."""
+        from scanners.fibo_advance import _cfg
+        assert _cfg("FIBO_ADVANCE_MIN_RR", 1.2) == 1.2
+        assert _cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 62.0) == 62.0
+
+    def test_scout_thresholds_reverted(self):
+        """Verify scout thresholds are at original (relaxed) values."""
+        from scanners.fibo_advance import _cfg
+        assert _cfg("FIBO_SCOUT_MIN_FIBO_SCORE", 28.0) == 28.0
+        assert _cfg("FIBO_SCOUT_MIN_RR", 1.0) == 1.0
+        assert _cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0) == 55.0
