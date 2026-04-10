@@ -147,6 +147,38 @@ class Config:
     FIBO_SCOUT_CTRADER_RISK_USD: float = float(os.getenv("FIBO_SCOUT_CTRADER_RISK_USD", "0.5"))
     FIBO_SCOUT_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_SCOUT_SHARPNESS_KNIFE_THR", "25"))
     FIBO_SCOUT_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_SCOUT_MAX_IMPULSE_AGE_BARS", "30"))
+    # When True, entry sharpness / knife gate blocks if capture features are missing (no blind Fib entries).
+    FIBO_REQUIRE_CAPTURE_FEATURES: bool = os.getenv("FIBO_REQUIRE_CAPTURE_FEATURES", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    # Reject Fib setup when |entry−SL| exceeds cap (0 = disabled). Tightens fat structural stops.
+    FIBO_ADVANCE_MAX_RISK_ATR_MULT: float = float(os.getenv("FIBO_ADVANCE_MAX_RISK_ATR_MULT", "0") or 0)
+    FIBO_ADVANCE_MAX_RISK_ENTRY_PCT: float = float(os.getenv("FIBO_ADVANCE_MAX_RISK_ENTRY_PCT", "0") or 0)
+    FIBO_SCOUT_MAX_RISK_ATR_MULT: float = float(os.getenv("FIBO_SCOUT_MAX_RISK_ATR_MULT", "0") or 0)
+    FIBO_SCOUT_MAX_RISK_ENTRY_PCT: float = float(os.getenv("FIBO_SCOUT_MAX_RISK_ENTRY_PCT", "0") or 0)
+    # Cap first TP distance in R so PM can bank sooner (0 = no cap). Long: tp1 <= entry+risk*R; short: tp1 >= entry−risk*R
+    FIBO_ADVANCE_TP1_MAX_R: float = float(os.getenv("FIBO_ADVANCE_TP1_MAX_R", "0") or 0)
+    FIBO_SCOUT_TP1_MAX_R: float = float(os.getenv("FIBO_SCOUT_TP1_MAX_R", "0") or 0)
+    # Evidence gate: do not let Fib trade early 38.2/50% pullbacks as if they were GP entries.
+    FIBO_ADVANCE_REQUIRE_GOLDEN_POCKET: bool = os.getenv("FIBO_ADVANCE_REQUIRE_GOLDEN_POCKET", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_SCOUT_REQUIRE_GOLDEN_POCKET: bool = os.getenv("FIBO_SCOUT_REQUIRE_GOLDEN_POCKET", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_ADVANCE_MIN_ENTRY_LEVEL_RATIO: float = float(os.getenv("FIBO_ADVANCE_MIN_ENTRY_LEVEL_RATIO", "0.618") or 0.618)
+    FIBO_SCOUT_MIN_ENTRY_LEVEL_RATIO: float = float(os.getenv("FIBO_SCOUT_MIN_ENTRY_LEVEL_RATIO", "0.618") or 0.618)
+    FIBO_ADVANCE_MIN_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_ADVANCE_MIN_RETRACEMENT_DEPTH", "0.618") or 0.618)
+    FIBO_SCOUT_MIN_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_SCOUT_MIN_RETRACEMENT_DEPTH", "0.618") or 0.618)
+    FIBO_ADVANCE_MAX_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_ADVANCE_MAX_RETRACEMENT_DEPTH", "0.786") or 0.786)
+    FIBO_SCOUT_MAX_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_SCOUT_MAX_RETRACEMENT_DEPTH", "0.786") or 0.786)
+    FIBO_GOLDEN_GATE_TOLERANCE: float = float(os.getenv("FIBO_GOLDEN_GATE_TOLERANCE", "0.012") or 0.012)
+    FIBO_ADVANCE_MIN_IMPULSE_STRENGTH_SCORE: float = float(os.getenv("FIBO_ADVANCE_MIN_IMPULSE_STRENGTH_SCORE", "0.55") or 0.55)
+    FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE: float = float(os.getenv("FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE", "0.50") or 0.50)
+    FIBO_ADVANCE_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_ADVANCE_MIN_MOMENTUM_SCORE", "4") or 4)
+    FIBO_SCOUT_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_SCOUT_MIN_MOMENTUM_SCORE", "4") or 4)
+    FIBO_SCOUT_REQUIRE_MTF_STACKING: bool = os.getenv("FIBO_SCOUT_REQUIRE_MTF_STACKING", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Audit result: fibo_xauusd short is quarantined by default; long side remains available.
+    FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED: bool = os.getenv("FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     # Fibo Position Manager — time-based profit lock (progressive SL tightening)
     FIBO_PM_TIME_LOCK_ENABLED: bool = os.getenv("FIBO_PM_TIME_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_PM_BE_AFTER_MIN: float = float(os.getenv("FIBO_PM_BE_AFTER_MIN", "20"))
@@ -653,6 +685,13 @@ class Config:
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", "0.42"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", "0.05"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", "0.55"))
+    # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
+    CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
+        "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", "0.15"))
+    CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", "0.08"))
+    CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", "0.03"))
     CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN", "0.15"))
     # When trading manager xau_order_care is inactive, still allow TP extension using config defaults (capture snapshot required).
     CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE: bool = os.getenv(
@@ -688,6 +727,39 @@ class Config:
     CTRADER_MAX_PENDING_ORDERS_PER_DIRECTION: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_DIRECTION", "1"))
     CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_SYMBOL: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_SYMBOL", "1"))
     CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_DIRECTION: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_DIRECTION", "1"))
+    # Evidence governance: block bad source+direction lanes before worker execution.
+    # Format: source:direction, where source may itself contain colons. Direction can be long, short, or *.
+    CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED: bool = os.getenv(
+        "CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_QUARANTINED_SOURCE_DIRECTIONS: str = os.getenv(
+        "CTRADER_QUARANTINED_SOURCE_DIRECTIONS",
+        ",".join(
+            [
+                "fibo_xauusd:short",
+                "scalp_xauusd:canary:long",
+                "scalp_xauusd:canary:short",
+                "scalp_xauusd:bs:canary:long",
+                "scalp_xauusd:bs:canary:short",
+                "scalp_xauusd:pb:canary:long",
+                "scalp_xauusd:pb:canary:short",
+                "scalp_xauusd:td:canary:long",
+                "scalp_xauusd:td:canary:short",
+                "scalp_xauusd:short",
+            ]
+        ),
+    )
+    CTRADER_PROTECTED_SOURCE_DIRECTIONS: str = os.getenv(
+        "CTRADER_PROTECTED_SOURCE_DIRECTIONS",
+        ",".join(
+            [
+                "xauusd_scheduled:canary",
+                "xauusd_scheduled:winner",
+                "scalp_xauusd:fss:canary",
+                "scalp_btcusd:canary",
+            ]
+        ),
+    )
     TRADING_TEAM_ENABLED: bool = os.getenv("TRADING_TEAM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     TRADING_TEAM_XAU_PRIORITY_TOPK: int = int(os.getenv("TRADING_TEAM_XAU_PRIORITY_TOPK", "4"))
     TRADING_TEAM_XAU_REASON_SCORE_MULT: float = float(os.getenv("TRADING_TEAM_XAU_REASON_SCORE_MULT", "18"))
@@ -892,6 +964,9 @@ class Config:
     CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE: bool = os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_OPENAPI_CLIENT_ID: str = os.getenv("CTRADER_OPENAPI_CLIENT_ID", os.getenv("OpenAPI_ClientID", ""))
     CTRADER_OPENAPI_CLIENT_SECRET: str = os.getenv("CTRADER_OPENAPI_CLIENT_SECRET", os.getenv("OpenAPI_Secreat", os.getenv("OpenAPI_Secret", "")))
+    # Optional override for protobuf TCP host (default: demo.ctraderapi.com / live.ctraderapi.com). See Spotware proxy docs.
+    CTRADER_OPENAPI_PROTOBUF_HOST: str = os.getenv("CTRADER_OPENAPI_PROTOBUF_HOST", "").strip()
+    CTRADER_OPENAPI_PROTOBUF_PORT: int = int(os.getenv("CTRADER_OPENAPI_PROTOBUF_PORT", "5035") or "5035")
     CTRADER_OPENAPI_REDIRECT_URI: str = os.getenv("CTRADER_OPENAPI_REDIRECT_URI", "http://localhost")
     CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", os.getenv("OpenAPI_Access_token_API_key", ""))
     CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", os.getenv("OpenAPI_Refresh_token_API_key", ""))
@@ -2185,6 +2260,35 @@ class Config:
         return out
 
     @classmethod
+    def _parse_source_direction_set(cls, raw: str) -> set[tuple[str, str]]:
+        out: set[tuple[str, str]] = set()
+        for part in str(raw or "").split(","):
+            item = str(part or "").strip().lower().replace(" ", "_")
+            if not item:
+                continue
+            if item in {"*", "all"}:
+                out.add(("*", "*"))
+                continue
+            if ":" not in item:
+                out.add((item, "*"))
+                continue
+            source, direction = item.rsplit(":", 1)
+            source = source.strip()
+            direction = direction.strip()
+            if direction not in {"long", "short", "buy", "sell", "*", "all"}:
+                source = item
+                direction = "*"
+            if direction == "buy":
+                direction = "long"
+            elif direction == "sell":
+                direction = "short"
+            elif direction == "all":
+                direction = "*"
+            if source:
+                out.add((source, direction or "*"))
+        return out
+
+    @classmethod
     def _parse_signature_set(cls, raw: str) -> set[str]:
         out: set[str] = set()
         for chunk in str(raw or "").split("|"):
@@ -2297,6 +2401,14 @@ class Config:
     @classmethod
     def get_ctrader_allowed_sources(cls) -> set[str]:
         return cls._parse_lower_set(cls.CTRADER_ALLOWED_SOURCES)
+
+    @classmethod
+    def get_ctrader_quarantined_source_directions(cls) -> set[tuple[str, str]]:
+        return cls._parse_source_direction_set(cls.CTRADER_QUARANTINED_SOURCE_DIRECTIONS)
+
+    @classmethod
+    def get_ctrader_protected_source_directions(cls) -> set[tuple[str, str]]:
+        return cls._parse_source_direction_set(cls.CTRADER_PROTECTED_SOURCE_DIRECTIONS)
 
     @classmethod
     def get_ctrader_allowed_symbols(cls) -> set[str]:

@@ -404,6 +404,50 @@ class CTraderExecutor:
             return True
         return token in allowed
 
+    @staticmethod
+    def _source_direction_matches(specs: set[tuple[str, str]], *, source: str, direction: str) -> bool:
+        src = str(source or "").strip().lower()
+        side = str(direction or "").strip().lower()
+        if side == "buy":
+            side = "long"
+        elif side == "sell":
+            side = "short"
+        for spec_source, spec_direction in set(specs or set()):
+            s = str(spec_source or "").strip().lower()
+            d = str(spec_direction or "*").strip().lower() or "*"
+            if s not in {"*", "all"} and s != src:
+                continue
+            if d in {"*", "all"} or d == side:
+                return True
+        return False
+
+    def _source_direction_governance_guard(self, *, source: str, symbol: str, direction: str) -> tuple[bool, str, dict]:
+        src = str(source or "").strip().lower()
+        side = str(direction or "").strip().lower()
+        if side == "buy":
+            side = "long"
+        elif side == "sell":
+            side = "short"
+        if not src or side not in {"long", "short"}:
+            return True, "", {"source": src, "direction": side}
+        protected = set(getattr(config, "get_ctrader_protected_source_directions", lambda: set())() or set())
+        meta = {
+            "source": src,
+            "symbol": str(symbol or "").strip().upper(),
+            "direction": side,
+            "protected": self._source_direction_matches(protected, source=src, direction=side),
+        }
+        if bool(meta["protected"]):
+            return True, "", meta
+        if not bool(getattr(config, "CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED", True)):
+            return True, "", {**meta, "enabled": False}
+        quarantined = set(getattr(config, "get_ctrader_quarantined_source_directions", lambda: set())() or set())
+        blocked = self._source_direction_matches(quarantined, source=src, direction=side)
+        meta.update({"enabled": True, "quarantined": bool(blocked)})
+        if blocked:
+            return False, f"source_direction_quarantined:{src}:{side}", meta
+        return True, "", meta
+
     def _symbol_allowed(self, symbol: str) -> bool:
         allowed = set(getattr(config, "get_ctrader_allowed_symbols", lambda: set())() or set())
         token = str(symbol or "").strip().upper()
@@ -557,6 +601,8 @@ class CTraderExecutor:
             return "xau_scheduled_trend"
         if ":ff:" in token or "failed_fade_follow_stop" in token:
             return "xau_scalp_failed_fade_follow_stop"
+        if token.startswith("fibo_xauusd") or "xau_fibo_advance" in token:
+            return "xau_fibo_advance"
         if token.startswith("scalp_xauusd"):
             return "xau_scalp_microtrend"
         if token.startswith("scalp_btcusd"):
@@ -2199,8 +2245,52 @@ class CTraderExecutor:
         stop_keep_r = max(0.05, float(order_care_overrides.get("stop_keep_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", 0.42) or 0.42) or 0.42))
         profit_lock_r = max(0.0, float(order_care_overrides.get("profit_lock_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", 0.05) or 0.05) or 0.05))
         trim_tp_r = max(0.10, float(order_care_overrides.get("trim_tp_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", 0.55) or 0.55) or 0.55))
+        r_current = float(r_now) if r_now is not None else None
+        profit_seek_enabled = bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
+        profit_seek_min_r = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+        profit_seek_active = bool(profit_seek_enabled and r_current is not None and r_current >= profit_seek_min_r)
 
-        if (r_now is not None) and score >= close_score and float(r_now) <= close_max_r:
+        if (r_current is not None) and score >= close_score and r_current <= close_max_r:
+            if profit_seek_active:
+                base_lock_r = max(
+                    profit_lock_r,
+                    max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", 0.08) or 0.08)),
+                )
+                lock_buffer_r = max(
+                    0.0,
+                    float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", 0.03) or 0.03),
+                )
+                lock_r = min(base_lock_r, max(0.0, r_current - lock_buffer_r))
+                if lock_r > 0.0:
+                    new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+                    if direction == "long":
+                        new_sl = max(stop_loss, new_sl)
+                    else:
+                        new_sl = min(stop_loss, new_sl)
+                    improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                    if improves and self._stop_valid_for_position(direction, entry, new_sl):
+                        return {
+                            "active": True,
+                            "action": "tighten",
+                            "reason": "xau_active_defense_profit_protect",
+                            "new_stop_loss": round(new_sl, 4),
+                            "new_take_profit": round(target_tp, 4) if self._target_valid_for_position(direction, entry, target_tp) else 0.0,
+                            "details": {
+                                **details,
+                                "close_suppressed": True,
+                                "profit_seek_min_r": round(profit_seek_min_r, 4),
+                                "profit_lock_r": round(lock_r, 4),
+                            },
+                        }
+                return {
+                    "active": False,
+                    "reason": "profit_seek_close_suppressed_no_valid_lock",
+                    "details": {
+                        **details,
+                        "close_suppressed": True,
+                        "profit_seek_min_r": round(profit_seek_min_r, 4),
+                    },
+                }
             return {
                 "active": True,
                 "action": "close",
@@ -2221,9 +2311,11 @@ class CTraderExecutor:
         new_tp = target_tp
         if self._target_valid_for_position(direction, entry, target_tp):
             trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-            if self._target_valid_for_position(direction, entry, trimmed_tp):
+            if (not profit_seek_active) and self._target_valid_for_position(direction, entry, trimmed_tp):
                 if abs(trimmed_tp - entry) < abs(target_tp - entry):
                     new_tp = trimmed_tp
+            elif profit_seek_active:
+                details["tp_trim_suppressed_profit_seeking"] = True
 
         breached = (direction == "long" and current_price <= new_sl) or (direction == "short" and current_price >= new_sl)
         if breached:
@@ -3581,6 +3673,17 @@ class CTraderExecutor:
             return _early_exit("filtered", f"source_not_allowed:{source}")
         if not self._symbol_allowed(symbol):
             return _early_exit("filtered", f"symbol_not_allowed:{symbol}")
+        gov_ok, gov_reason, gov_meta = self._source_direction_governance_guard(
+            source=source,
+            symbol=symbol,
+            direction=str(getattr(signal, "direction", "") or ""),
+        )
+        if not gov_ok:
+            return _early_exit(
+                "filtered",
+                gov_reason,
+                execution_meta={"source_direction_governance": dict(gov_meta or {})},
+            )
         price_ok, price_reason, _price_meta = self._price_sanity_guard(signal, source=source)
         if not price_ok:
             return _early_exit("filtered", price_reason)
@@ -5068,6 +5171,12 @@ class CTraderExecutor:
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
             
             age_min = self._position_age_min(pos)
+            # TP for amend paths before `target_tp` is computed later (planned vs live).
+            _trail_take_profit = (
+                live_tp
+                if self._target_valid_for_position(direction, entry, live_tp)
+                else (planned_tp if self._target_valid_for_position(direction, entry, planned_tp) else 0.0)
+            )
             # --- NEURAL TRAILING BRAIN HOOK (Bridge Mode) ---
             if (r_now is not None) and risk > 0 and direction in {"long", "short"}:
                 try:
@@ -5104,7 +5213,7 @@ class CTraderExecutor:
                             res = self.amend_position_sltp(
                                 position_id=position_id,
                                 stop_loss=brain_sl,
-                                take_profit=target_tp,
+                                take_profit=_trail_take_profit,
                                 trailing_stop_loss=False,
                             )
                             if bool(res.ok):
@@ -5536,6 +5645,12 @@ class CTraderExecutor:
                     be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
                     trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
                     stop_tol = max(abs(entry) * 0.000001, 0.01)
+                    profit_seek_active_pm = (
+                        bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
+                        and self._is_xau_symbol(symbol)
+                        and (r_now is not None)
+                        and float(r_now) >= max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+                    )
                     if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
                         res = self.close_position(position_id=position_id, volume=volume)
                         if bool(res.ok):
@@ -5563,7 +5678,7 @@ class CTraderExecutor:
                         be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
                         improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                         trimmed_tp = target_tp
-                        if trim_tp_r > 0:
+                        if trim_tp_r > 0 and not profit_seek_active_pm:
                             candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
                             if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
                                 trimmed_tp = candidate_tp

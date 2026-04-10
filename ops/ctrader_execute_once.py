@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -157,7 +158,17 @@ def _account_id_from_payload(payload: dict) -> int:
 
 
 def _resolve_host() -> tuple[str, int, str]:
-    if bool(getattr(config, "CTRADER_USE_DEMO", False)):
+    override = str(getattr(config, "CTRADER_OPENAPI_PROTOBUF_HOST", "") or "").strip()
+    try:
+        port = int(getattr(config, "CTRADER_OPENAPI_PROTOBUF_PORT", EndPoints.PROTOBUF_PORT) or EndPoints.PROTOBUF_PORT)
+    except Exception:
+        port = int(EndPoints.PROTOBUF_PORT)
+    port = max(1, min(port, 65535))
+    use_demo = bool(getattr(config, "CTRADER_USE_DEMO", False))
+    env = "demo" if use_demo else "live"
+    if override:
+        return override, port, env
+    if use_demo:
         return EndPoints.PROTOBUF_DEMO_HOST, int(EndPoints.PROTOBUF_PORT), "demo"
     return EndPoints.PROTOBUF_LIVE_HOST, int(EndPoints.PROTOBUF_PORT), "live"
 
@@ -445,12 +456,33 @@ def _workflow(mode: str, payload: dict):
         app_payload = Protobuf.extract(app_msg)
         _debug("app_auth", type(app_payload).__name__)
         if _is_error(app_payload):
+            _ec = str(getattr(app_payload, "errorCode", "") or "")
+            _desc = str(getattr(app_payload, "description", "") or "")
+            _cred = (
+                "Protobuf application auth (clientId+clientSecret) failed — before access token. "
+                "Values must come from Dexter `.env.local` (CTRADER_OPENAPI_CLIENT_ID/SECRET or OpenAPI_ClientID/OpenAPI_Secreat): "
+                "Mempalac `CTRADER_*` in `trading_ai/.env` is not read by this worker subprocess. "
+                "Match https://openapi.ctrader.com exactly; no quotes or trailing spaces. "
+                "If the app or secret was rotated, update both and refresh OAuth tokens."
+            )
+            _route = ""
+            if _ec.upper() == "CANT_ROUTE_REQUEST" or "cannot route" in (_desc or "").lower():
+                _route = (
+                    " Routing: `CANT_ROUTE_REQUEST` here usually means the clientId/clientSecret pair is wrong for this app, "
+                    "or protobuf routing failed. Confirm `CTRADER_USE_DEMO` matches your account type (demo vs live uses different hosts). "
+                    "If you are on the correct credentials and still see this, try `CTRADER_OPENAPI_PROTOBUF_HOST` from "
+                    "https://help.ctrader.com/open-api/proxies-endpoints/ (protobuf port 5035)."
+                )
             defer.returnValue({
                 "ok": False,
                 "status": "app_auth_failed",
-                "message": str(getattr(app_payload, "description", "") or getattr(app_payload, "errorCode", "application auth failed")),
+                "message": _desc or _ec or "application auth failed",
+                "error_code": _ec,
                 "account_id": int(account_id),
                 "environment": environment,
+                "host": str(host),
+                "client_id_prefix": (client_id[:12] + "…") if len(client_id) > 12 else client_id,
+                "hint": (_cred + _route).strip(),
             })
             return
 
@@ -1278,6 +1310,12 @@ def _workflow(mode: str, payload: dict):
             order_type_proto = model.ProtoOAOrderType.STOP
         else:
             order_type_proto = model.ProtoOAOrderType.MARKET
+        _lbl = str(payload.get("label", "") or "").strip()[:64]
+        _cid_in = str(payload.get("client_order_id", "") or "").strip()[:64]
+        # API rejects empty clientOrderId; callers often set label only (e.g. Mempalac worker).
+        _client_oid = (_cid_in or _lbl or f"w_{uuid.uuid4().hex[:20]}")[:64]
+        if not _lbl:
+            _lbl = _client_oid[:64]
         req_kwargs = {
             "ctidTraderAccountId": int(account_id),
             "symbolId": int(symbol_id),
@@ -1285,8 +1323,8 @@ def _workflow(mode: str, payload: dict):
             "tradeSide": side,
             "volume": int(volume),
             "comment": str(payload.get("comment", "") or "")[:128],
-            "label": str(payload.get("label", "") or "")[:64],
-            "clientOrderId": str(payload.get("client_order_id", "") or "")[:64],
+            "label": _lbl,
+            "clientOrderId": _client_oid,
             "timeInForce": model.ProtoOATimeInForce.GOOD_TILL_CANCEL,
         }
         price_digits = _price_digits(symbol_meta, trader)
