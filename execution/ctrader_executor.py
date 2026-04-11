@@ -2086,8 +2086,39 @@ class CTraderExecutor:
             return {"active": False, "reason": "score_below_extend", "details": details}
 
         base_tp_r = max(0.25, float(order_care_overrides.get("extension_tp_r", 1.10) or 1.10))
-        step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
+        base_step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
         lock_r = max(0.01, float(order_care_overrides.get("extension_lock_r", 0.18) or 0.18))
+
+        # ── Momentum-adaptive step_r ──────────────────────────────────────
+        # Assess momentum strength from snapshot features
+        momentum_favorable = 0
+        if bar_volume_proxy >= 0.50:
+            momentum_favorable += 1
+        if supportive_delta >= 0.15:
+            momentum_favorable += 1
+        if supportive_imbalance >= 0.12:
+            momentum_favorable += 1
+        if supportive_drift >= 0.015:
+            momentum_favorable += 1
+        if rejection_ratio <= 0.12:
+            momentum_favorable += 1
+
+        if momentum_favorable >= 4:
+            step_r = base_step_r + 0.10  # strong momentum → bigger extension
+            momentum_label = "strong"
+        elif momentum_favorable >= 2:
+            step_r = base_step_r         # moderate → default
+            momentum_label = "moderate"
+        else:
+            step_r = max(0.10, base_step_r - 0.10)  # weak momentum → smaller extension
+            momentum_label = "weak"
+
+        details["momentum_adaptive"] = {
+            "favorable_count": momentum_favorable,
+            "momentum_label": momentum_label,
+            "step_r": round(step_r, 2),
+            "base_step_r": round(base_step_r, 2),
+        }
         target_r = max(base_tp_r, current_target_r + step_r)
         new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
         if not self._target_valid_for_position(direction, entry, new_tp):
@@ -2333,6 +2364,171 @@ class CTraderExecutor:
             "reason": "xau_active_defense_tighten",
             "new_stop_loss": round(new_sl, 4),
             "new_take_profit": round(new_tp, 4) if self._target_valid_for_position(direction, entry, new_tp) else 0.0,
+            "details": details,
+        }
+
+    def _xau_momentum_exhaustion_lock(
+        self,
+        *,
+        source: str,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_price: float,
+        confidence: float,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        """
+        Detect momentum exhaustion and lock profit BEFORE it evaporates.
+
+        Problem: trade reaches +R profit, momentum dies (delta reverses, volume dries,
+        drift goes adverse), but system waits for price to hit TP or SL — profit evaporates.
+
+        Solution: When all momentum signals are exhausted AND trade is profitable,
+        tighten SL to lock a portion of the profit immediately.
+
+        Triggers when:
+          - r_now > 0 (trade in profit)
+          - age_min > min_age (not too young)
+          - At least 3 of 5 adverse signals fire simultaneously:
+              1. Delta reversed against position
+              2. Volume dying (bar_volume_proxy < 0.25)
+              3. Adverse drift
+              4. High rejection ratio (rejections >= 0.25)
+              5. Day type switched to range/rotation (non-trending)
+        """
+        if not self._is_xau_symbol(symbol):
+            return {"active": False}
+        if r_now is None or r_now <= 0.15:
+            return {"active": False, "reason": "not_in_profit"}
+        order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
+        order_care_overrides = dict(order_care_state.get("overrides") or {}) if order_care_state else {}
+
+        min_age = float(order_care_overrides.get(
+            "exhaustion_min_age_min",
+            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN", 3.0) or 3.0,
+        ) or 3.0)
+        if age_min < min_age:
+            return {"active": False, "reason": "too_young"}
+
+        snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=confidence)
+        features = dict(snapshot.get("features") or {})
+        if not bool(snapshot.get("ok")) or not features:
+            return {"active": False, "reason": str(snapshot.get("status") or "no_capture")}
+
+        day_type = str(features.get("day_type") or "trend").strip().lower() or "trend"
+        delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
+        imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
+        drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
+        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
+        bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
+
+        if direction == "long":
+            adverse_delta = max(0.0, -1.0 * delta_proxy)
+            adverse_drift = max(0.0, -1.0 * drift_pct)
+        else:
+            adverse_delta = max(0.0, delta_proxy)
+            adverse_drift = max(0.0, drift_pct)
+
+        # Count exhaustion signals
+        exhaustion_signals = 0
+        reasons: list[str] = []
+
+        delta_threshold = float(order_care_overrides.get(
+            "exhaustion_adverse_delta", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA", 0.08) or 0.08,
+        ) or 0.08)
+        if adverse_delta >= delta_threshold:
+            exhaustion_signals += 1
+            reasons.append("delta_reversed")
+
+        vol_threshold = float(order_care_overrides.get(
+            "exhaustion_max_volume", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME", 0.25) or 0.25,
+        ) or 0.25)
+        if bar_volume_proxy < vol_threshold:
+            exhaustion_signals += 1
+            reasons.append("volume_dying")
+
+        drift_threshold = float(order_care_overrides.get(
+            "exhaustion_adverse_drift", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT", 0.008) or 0.008,
+        ) or 0.008)
+        if adverse_drift >= drift_threshold:
+            exhaustion_signals += 1
+            reasons.append("drift_adverse")
+
+        rejection_threshold = float(order_care_overrides.get(
+            "exhaustion_max_rejection", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION", 0.25) or 0.25,
+        ) or 0.25)
+        if rejection_ratio >= rejection_threshold:
+            exhaustion_signals += 1
+            reasons.append("high_rejection")
+
+        if day_type in {"range", "rotation", "consolidation"}:
+            exhaustion_signals += 1
+            reasons.append("day_type_non_trending")
+
+        required_signals = int(order_care_overrides.get(
+            "exhaustion_required_signals",
+            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", 3) or 3,
+        ) or 3)
+        if exhaustion_signals < required_signals:
+            return {"active": False, "reason": "exhaustion_not_confirmed", "details": {
+                "exhaustion_signals": exhaustion_signals,
+                "required": required_signals,
+                "reasons": reasons,
+            }}
+
+        # ── Lock profit: tighten SL based on current R-multiple ──────────
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+
+        # Lock percentage scales with R: higher R → lock more
+        if r_now >= 1.5:
+            lock_pct = 0.70   # 70% of risk locked at 1.5R+
+        elif r_now >= 1.0:
+            lock_pct = 0.55   # 55% at 1.0R+
+        elif r_now >= 0.5:
+            lock_pct = 0.35   # 35% at 0.5R+
+        else:
+            lock_pct = 0.15   # 15% at 0.15R+
+
+        keep_risk = risk * (1.0 - lock_pct)
+        if direction == "long":
+            new_sl = entry - keep_risk
+        else:
+            new_sl = entry + keep_risk
+
+        if not self._stop_valid_for_position(direction, entry, new_sl):
+            return {"active": False, "reason": "invalid_new_sl"}
+        improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+        if not improves:
+            return {"active": False, "reason": "sl_not_improving"}
+
+        details = {
+            "exhaustion_signals": exhaustion_signals,
+            "required": required_signals,
+            "reasons": reasons,
+            "r_now": round(r_now, 4),
+            "lock_pct": lock_pct,
+            "day_type": day_type,
+            "delta_proxy": round(delta_proxy, 4),
+            "bar_volume_proxy": round(bar_volume_proxy, 4),
+            "adverse_drift": round(adverse_drift, 5),
+            "rejection_ratio": round(rejection_ratio, 4),
+        }
+        logger.info(
+            "[PM:ExhaustionLock] %s %s | r_now=%.2f | signals=%d/%d | lock=%d%% | new_sl=%.2f | reasons=%s",
+            symbol, direction, r_now, exhaustion_signals, required_signals,
+            int(lock_pct * 100), new_sl, reasons,
+        )
+        return {
+            "active": True,
+            "action": "tighten",
+            "reason": "xau_momentum_exhaustion_lock",
+            "new_stop_loss": round(new_sl, 4),
+            "new_take_profit": 0.0,  # keep existing TP
             "details": details,
         }
 
@@ -5410,6 +5606,48 @@ class CTraderExecutor:
                 if bool(res.ok):
                     report["closed_profit_positions"] += 1
                 continue
+
+            # ── Momentum exhaustion profit lock (before extension) ────────
+            # If momentum is dead and trade is profitable, lock profit NOW
+            # instead of waiting for TP or letting it evaporate
+            if "fibo" in source and bool(getattr(config, "FIBO_PM_EXHAUSTION_LOCK_ENABLED", True)) and r_now is not None and r_now > 0.15:
+                try:
+                    exhaustion = self._xau_momentum_exhaustion_lock(
+                        source=source, symbol=symbol, direction=direction,
+                        entry=entry, stop_loss=stop_loss, current_price=ref,
+                        confidence=confidence, age_min=age_min, r_now=r_now,
+                    )
+                    if bool(exhaustion.get("active")):
+                        _exh_new_sl = _safe_float(exhaustion.get("new_stop_loss"), 0.0)
+                        if self._stop_valid_for_position(direction, entry, _exh_new_sl):
+                            _exh_improves = (_exh_new_sl > stop_loss) if direction == "long" else (_exh_new_sl < stop_loss)
+                            if _exh_improves:
+                                _exh_keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
+                                _exh_res = self.amend_position_sltp(
+                                    position_id=position_id, stop_loss=_exh_new_sl,
+                                    take_profit=_exh_keep_tp, trailing_stop_loss=False,
+                                )
+                                if bool(_exh_res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append({
+                                        "journal_id": (journal_id or None),
+                                        "position_id": position_id,
+                                        "source": source,
+                                        "symbol": symbol,
+                                        "action": "xau_momentum_exhaustion_lock",
+                                        "reference_price": round(ref, 4),
+                                        "new_stop_loss": round(_exh_new_sl, 4),
+                                        "r_now": round(float(r_now), 4),
+                                        "details": dict(exhaustion.get("details") or {}),
+                                    })
+                                    logger.info(
+                                        "[PM:ExhaustionLock] pos=%s %s %s | r_now=%.2f | new_sl=%.2f",
+                                        position_id, symbol, direction, r_now, _exh_new_sl,
+                                    )
+                                    continue
+                except Exception as _exh_exc:
+                    logger.debug("[PM] momentum_exhaustion_lock error for %s: %s", symbol, _exh_exc)
+
             planned_tp_valid = self._target_valid_for_position(direction, entry, planned_tp)
             live_tp_valid = self._target_valid_for_position(direction, entry, live_tp)
             live_target_more_favorable = planned_tp_valid and live_tp_valid and self._target_more_favorable(direction, entry, live_tp, planned_tp)

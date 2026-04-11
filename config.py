@@ -133,6 +133,12 @@ class Config:
     FIBO_ADVANCE_KILLER_VOL_SPIKE: float = float(os.getenv("FIBO_ADVANCE_KILLER_VOL_SPIKE", "2.5"))
     FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP: float = float(os.getenv("FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP", "1.25"))
     FIBO_ADVANCE_KILLER_RETRACE_VEL: float = float(os.getenv("FIBO_ADVANCE_KILLER_RETRACE_VEL", "2.0"))
+    # Trend awareness (prevent April 7 disaster — strong D1 trend filter)
+    FIBO_TREND_STRONG_EMA_SPREAD_PCT: float = float(os.getenv("FIBO_TREND_STRONG_EMA_SPREAD_PCT", "0.5"))
+    FIBO_SESSION_DIRECTION_BIAS_PENALTY: float = float(os.getenv("FIBO_SESSION_DIRECTION_BIAS_PENALTY", "-12.0"))
+    # Soft pause after consecutive losses (faster circuit breaker)
+    FIBO_ADVANCE_SOFT_PAUSE_CONSEC: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_CONSEC", "5"))
+    FIBO_ADVANCE_SOFT_PAUSE_MIN: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_MIN", "30"))
     FIBO_ADVANCE_SCAN_INTERVAL_SEC: int = int(os.getenv("FIBO_ADVANCE_SCAN_INTERVAL_SEC", "300"))
     # Institution-grade gates
     FIBO_ADVANCE_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_ADVANCE_SHARPNESS_KNIFE_THR", "30"))
@@ -185,6 +191,14 @@ class Config:
     FIBO_PM_LOCK_30_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_30_AFTER_MIN", "45"))
     FIBO_PM_LOCK_50_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_50_AFTER_MIN", "90"))
     FIBO_PM_LOCK_70_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_70_AFTER_MIN", "150"))
+    # Momentum exhaustion profit lock (lock profit when momentum dies)
+    FIBO_PM_EXHAUSTION_LOCK_ENABLED: bool = os.getenv("FIBO_PM_EXHAUSTION_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN", "3.0"))
+    CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA", "0.08"))
+    CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME", "0.25"))
+    CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT", "0.008"))
+    CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION", "0.25"))
+    CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS: int = int(os.getenv("CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", "3"))
     # Comma-separated families that ignore Strategy Lab blocked/shadow for persistent canary candidate loading.
     # Default: XAU flow sidecars (still require pattern + chart contexts / first_sample gates in builders).
     PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK: str = os.getenv(

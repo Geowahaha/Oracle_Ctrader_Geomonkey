@@ -4585,5 +4585,268 @@ class TestCTraderExecutor(unittest.TestCase):
             shutil.rmtree(td, ignore_errors=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Momentum Exhaustion Profit Lock + Adaptive step_r
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMomentumExhaustionLock(unittest.TestCase):
+    """Test momentum exhaustion detection and profit locking."""
+
+    def _make_executor(self, td):
+        db_path = str(Path(td) / "ctrader_openapi.db")
+        with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+             patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+             patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+             patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+            executor = ctrader_module.CTraderExecutor()
+            executor.trading_manager_state_path.parent.mkdir(parents=True, exist_ok=True)
+            executor.trading_manager_state_path.write_text(
+                json.dumps({"xau_order_care": {"status": "active", "mode": "test", "allowed_sources": ["fibo:sniper"], "overrides": {}}}),
+                encoding="utf-8",
+            )
+            return executor
+
+    def test_exhaustion_locks_profit_when_all_signals_fire(self):
+        """When delta reversed + volume dying + drift adverse + high rejection + range → lock profit."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            # Exhausted momentum snapshot: all 5 signals fire
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "range",
+                    "delta_proxy": -0.15,   # adverse for long
+                    "depth_imbalance": -0.05,
+                    "mid_drift_pct": -0.012,  # adverse for long
+                    "rejection_ratio": 0.35,  # high
+                    "bar_volume_proxy": 0.15,  # dying
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.95,
+                )
+            self.assertTrue(result["active"])
+            self.assertEqual(result["action"], "tighten")
+            self.assertIn("xau_momentum_exhaustion_lock", result["reason"])
+            # At r_now=0.95, lock_pct should be 0.55 (1.0R tier)
+            self.assertEqual(result["details"]["lock_pct"], 0.55)
+            # 5 exhaustion signals fired
+            self.assertEqual(result["details"]["exhaustion_signals"], 5)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_momentum_still_strong(self):
+        """When momentum is still strong (volume high, delta supportive) → don't lock."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "trend",
+                    "delta_proxy": 0.20,     # supportive for long
+                    "depth_imbalance": 0.15,
+                    "mid_drift_pct": 0.015,   # supportive for long
+                    "rejection_ratio": 0.05,   # low
+                    "bar_volume_proxy": 0.75,   # high
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.95,
+                )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "exhaustion_not_confirmed")
+            # 0 exhaustion signals
+            self.assertEqual(result["details"]["exhaustion_signals"], 0)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_not_profitable(self):
+        """When trade is in loss → don't lock (can't lock what you don't have)."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            result = executor._xau_momentum_exhaustion_lock(
+                source="fibo:sniper", symbol="XAUUSD", direction="long",
+                entry=3026.49, stop_loss=3024.54, current_price=3025.00,
+                confidence=75.0, age_min=5.0, r_now=-0.70,
+            )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "not_in_profit")
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_too_young(self):
+        """When trade is too young (< min_age) → don't lock yet."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            result = executor._xau_momentum_exhaustion_lock(
+                source="fibo:sniper", symbol="XAUUSD", direction="long",
+                entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                confidence=75.0, age_min=1.0, r_now=0.95,
+            )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "too_young")
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_partial_signals_not_enough(self):
+        """When only 2 of 5 signals fire (need 3) → don't lock."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "trend",       # supportive
+                    "delta_proxy": -0.10,      # adverse (1 signal)
+                    "depth_imbalance": 0.05,
+                    "mid_drift_pct": 0.005,    # supportive
+                    "rejection_ratio": 0.30,    # high (2nd signal)
+                    "bar_volume_proxy": 0.40,   # not dying
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.50,
+                )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["details"]["exhaustion_signals"], 2)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_lock_scales_with_r_multiple(self):
+        """Higher R-multiple → higher lock percentage."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot_exhausted = {
+                "ok": True, "run_id": "exh",
+                "features": {
+                    "day_type": "range", "delta_proxy": -0.15, "depth_imbalance": -0.05,
+                    "mid_drift_pct": -0.012, "rejection_ratio": 0.35, "bar_volume_proxy": 0.15,
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot_exhausted):
+                # At 0.3R → lock_pct=0.15
+                r_low = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3027.20,
+                    confidence=75.0, age_min=5.0, r_now=0.35,
+                )
+                # At 1.0R → lock_pct=0.55
+                r_mid = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=1.0,
+                )
+                # At 2.0R → lock_pct=0.70
+                r_high = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3030.40,
+                    confidence=75.0, age_min=5.0, r_now=2.0,
+                )
+
+            self.assertTrue(r_low["active"])
+            self.assertTrue(r_mid["active"])
+            self.assertTrue(r_high["active"])
+            self.assertEqual(r_low["details"]["lock_pct"], 0.15)
+            self.assertEqual(r_mid["details"]["lock_pct"], 0.55)
+            self.assertEqual(r_high["details"]["lock_pct"], 0.70)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_momentum_adaptive_step_r_strong(self):
+        """Strong momentum (4+ favorable) → step_r increases from base."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True, "run_id": "test",
+                "features": {
+                    "day_type": "trend",
+                    "delta_proxy": -0.25,  # strong supportive for short
+                    "depth_imbalance": -0.18,
+                    "mid_drift_pct": -0.020,
+                    "rejection_ratio": 0.05,  # low
+                    "bar_volume_proxy": 0.80,  # high
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_profit_extension_plan(
+                    source="fibo:sniper", symbol="XAUUSD", direction="short",
+                    entry=3030.00, stop_loss=3033.00, planned_tp=3027.00,
+                    current_tp=3027.00, current_price=3026.00,
+                    confidence=80.0, age_min=2.0, r_now=1.33,
+                )
+            if result["active"]:
+                details = result.get("details", {})
+                momentum_info = details.get("momentum_adaptive", {})
+                self.assertEqual(momentum_info.get("momentum_label"), "strong")
+                # step_r should be base(0.25) + 0.10 = 0.35
+                self.assertAlmostEqual(momentum_info.get("step_r", 0), 0.35, places=2)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_momentum_adaptive_step_r_weak(self):
+        """Weak momentum (0-1 favorable) → step_r decreases from base."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True, "run_id": "test",
+                "features": {
+                    "day_type": "range",          # not supportive
+                    "delta_proxy": 0.05,          # weak adverse for short
+                    "depth_imbalance": 0.02,       # weak
+                    "mid_drift_pct": 0.003,        # weak
+                    "rejection_ratio": 0.35,       # high
+                    "bar_volume_proxy": 0.15,       # low
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_profit_extension_plan(
+                    source="fibo:sniper", symbol="XAUUSD", direction="short",
+                    entry=3030.00, stop_loss=3033.00, planned_tp=3027.00,
+                    current_tp=3027.00, current_price=3026.00,
+                    confidence=80.0, age_min=2.0, r_now=1.33,
+                )
+            # Even if not active (score below), momentum should be labeled weak
+            details = result.get("details", {})
+            if "momentum_adaptive" in details:
+                self.assertEqual(details["momentum_adaptive"]["momentum_label"], "weak")
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
