@@ -34,6 +34,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from config import config  # noqa: E402
+from api.ctrader_token_manager import token_manager  # noqa: E402
 from market.tick_bar_engine import TickBarEngine
 
 logging.basicConfig(
@@ -372,14 +373,16 @@ class CTraderStreamService:
         self._reconnect_delay = _RECONNECT_BASE_SEC  # reset backoff
         self.db.update_status(error_message="authenticating...")
 
-        client_id = str(getattr(config, "CTRADER_OPENAPI_CLIENT_ID", "") or "").strip()
-        client_secret = str(getattr(config, "CTRADER_OPENAPI_CLIENT_SECRET", "") or "").strip()
-        self._access_token = str(getattr(config, "CTRADER_OPENAPI_ACCESS_TOKEN", "") or "").strip()
-        refresh_token = str(getattr(config, "CTRADER_OPENAPI_REFRESH_TOKEN", "") or "").strip()
+        creds = token_manager.get_credentials()
+        client_id = creds["client_id"]
+        client_secret = creds["client_secret"]
+        self._access_token = creds["access_token"]
+        refresh_token = creds["refresh_token"]
 
         if not client_id or not client_secret:
             logger.error("Missing CTRADER_OPENAPI_CLIENT_ID/CLIENT_SECRET")
             self.db.update_status(connected=0, error_message="credentials missing")
+            token_manager.on_token_failed("credentials missing")
             self._schedule_reconnect()
             return
 
@@ -404,10 +407,11 @@ class CTraderStreamService:
 
         # Token refresh if needed
         if not self._access_token and refresh_token:
-            self._access_token = self._try_refresh(refresh_token, client_id, client_secret)
+            self._access_token = token_manager.try_refresh()
         if not self._access_token:
             logger.error("No access token available")
             self.db.update_status(connected=0, error_message="no access token")
+            token_manager.on_token_failed("no access token at connect")
             self._schedule_reconnect()
             return
 
@@ -430,9 +434,9 @@ class CTraderStreamService:
             acc_payload = Protobuf.extract(acc_msg)
             if isinstance(acc_payload, pb.ProtoOAErrorRes):
                 err_code = str(getattr(acc_payload, "errorCode", "") or "")
-                # Try refresh on invalid token
+                # Try refresh on invalid token via centralized manager
                 if err_code == "CH_ACCESS_TOKEN_INVALID" and refresh_token:
-                    self._access_token = self._try_refresh(refresh_token, client_id, client_secret)
+                    self._access_token = token_manager.try_refresh()
                     if self._access_token:
                         acc_msg = yield self.client.send(
                             pb.ProtoOAAccountAuthReq(

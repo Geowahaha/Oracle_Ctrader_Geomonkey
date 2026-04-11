@@ -24,6 +24,7 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from config import config  # noqa: E402
+from api.ctrader_token_manager import token_manager  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ctrader_worker")
@@ -175,34 +176,16 @@ def _resolve_host() -> tuple[str, int, str]:
 
 def _access_token_candidates() -> tuple[str, str]:
     return (
-        str(getattr(config, "CTRADER_OPENAPI_ACCESS_TOKEN", "") or "").strip(),
-        str(getattr(config, "CTRADER_OPENAPI_REFRESH_TOKEN", "") or "").strip(),
+        token_manager.get_access_token(),
+        token_manager.get_refresh_token(),
     )
 
 
 def _try_refresh_tokens() -> tuple[str, dict]:
-    client_id = str(getattr(config, "CTRADER_OPENAPI_CLIENT_ID", "") or "").strip()
-    client_secret = str(getattr(config, "CTRADER_OPENAPI_CLIENT_SECRET", "") or "").strip()
-    redirect_uri = str(getattr(config, "CTRADER_OPENAPI_REDIRECT_URI", "http://localhost") or "http://localhost").strip()
-    refresh_token = str(getattr(config, "CTRADER_OPENAPI_REFRESH_TOKEN", "") or "").strip()
-    if not client_id or not client_secret or not refresh_token:
-        return "", {"ok": False, "status": "refresh_not_available", "message": "client/refresh token missing"}
-    try:
-        auth = Auth(client_id, client_secret, redirect_uri)
-        refreshed = auth.refreshToken(refresh_token)
-        if not isinstance(refreshed, dict):
-            return "", {"ok": False, "status": "refresh_failed", "message": "refresh returned non-dict"}
-        new_access = str(refreshed.get("accessToken") or "").strip()
-        if not new_access:
-            return "", {
-                "ok": False,
-                "status": "refresh_failed",
-                "message": str(refreshed.get("description") or refreshed.get("errorCode") or "refresh failed"),
-                "refresh": _scrub_tokens(refreshed),
-            }
-        return new_access, {"ok": True, "status": "refreshed", "refresh": _scrub_tokens(refreshed)}
-    except Exception as e:
-        return "", {"ok": False, "status": "refresh_failed", "message": str(e)}
+    new_token = token_manager.try_refresh()
+    if new_token:
+        return new_token, {"ok": True, "status": "refreshed_via_manager"}
+    return "", {"ok": False, "status": "refresh_failed", "message": "token_manager refresh failed"}
 
 
 def _symbol_candidates(payload: dict) -> list[str]:

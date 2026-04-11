@@ -987,14 +987,17 @@ class Config:
     CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_DELTA_MULT: float = float(os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_DELTA_MULT", "0.90"))
     CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_BAR_VOLUME_MULT: float = float(os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_BAR_VOLUME_MULT", "0.95"))
     CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE: bool = os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-    CTRADER_OPENAPI_CLIENT_ID: str = os.getenv("CTRADER_OPENAPI_CLIENT_ID", os.getenv("OpenAPI_ClientID", ""))
-    CTRADER_OPENAPI_CLIENT_SECRET: str = os.getenv("CTRADER_OPENAPI_CLIENT_SECRET", os.getenv("OpenAPI_Secreat", os.getenv("OpenAPI_Secret", "")))
+    CTRADER_OPENAPI_CLIENT_ID: str = os.getenv("CTRADER_OPENAPI_CLIENT_ID", os.getenv("OpenAPI_ClientID", "")).strip()
+    CTRADER_OPENAPI_CLIENT_SECRET: str = os.getenv("CTRADER_OPENAPI_CLIENT_SECRET", os.getenv("OpenAPI_Secreat", os.getenv("OpenAPI_Secret", ""))).strip()
     # Optional override for protobuf TCP host (default: demo.ctraderapi.com / live.ctraderapi.com). See Spotware proxy docs.
     CTRADER_OPENAPI_PROTOBUF_HOST: str = os.getenv("CTRADER_OPENAPI_PROTOBUF_HOST", "").strip()
     CTRADER_OPENAPI_PROTOBUF_PORT: int = int(os.getenv("CTRADER_OPENAPI_PROTOBUF_PORT", "5035") or "5035")
     CTRADER_OPENAPI_REDIRECT_URI: str = os.getenv("CTRADER_OPENAPI_REDIRECT_URI", "http://localhost")
-    CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", os.getenv("OpenAPI_Access_token_API_key", ""))
-    CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", os.getenv("OpenAPI_Refresh_token_API_key", ""))
+    # Token resolution: token_manager handles priority (persisted state > env).
+    # Legacy fallback keys (OpenAPI_Access_token_API_key) removed — they pointed
+    # to revoked tokens after key rotation. Use CTRADER_OPENAPI_* keys only.
+    CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", "").strip()
+    CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", "").strip()
     CTRADER_USER_ID_JSON: str = os.getenv("CTRADER_USER_ID_JSON", os.getenv("Ctrader_UserID", ""))
     CTRADER_ACCOUNTS_JSON: str = os.getenv("CTRADER_ACCOUNTS_JSON", os.getenv("Ctrader_accounts", ""))
     MT5_READINESS_CHECK_ON_START: bool = os.getenv("MT5_READINESS_CHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
