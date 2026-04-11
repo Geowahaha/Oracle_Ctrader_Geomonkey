@@ -268,6 +268,17 @@ class Config:
     BTC_RANGE_REPAIR_TP3_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP3_RR", "1.15"))
     BTC_RANGE_REPAIR_CTRADER_RISK_USD: float = float(os.getenv("BTC_RANGE_REPAIR_CTRADER_RISK_USD", "0.55"))
 
+    # ── XAU Toxic Hour Guard — block XAU scalp during historically losing hours ──
+    XAU_TOXIC_HOUR_GUARD_ENABLED: bool = os.getenv("XAU_TOXIC_HOUR_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_TOXIC_HOURS_UTC: str = os.getenv("XAU_TOXIC_HOURS_UTC", "1")  # comma-separated UTC hours, default 01 (=08 BKK)
+
+    # ── ADI — Adaptive Directional Intelligence ──
+    ADI_ENABLED: bool = os.getenv("ADI_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    ADI_LOOKBACK_DAYS: int = int(os.getenv("ADI_LOOKBACK_DAYS", "14"))
+    ADI_MAX_PENALTY: float = float(os.getenv("ADI_MAX_PENALTY", "-45.0"))
+    ADI_MAX_BOOST: float = float(os.getenv("ADI_MAX_BOOST", "15.0"))
+    ADI_COLD_START_PENALTY: float = float(os.getenv("ADI_COLD_START_PENALTY", "-6.0"))
+
     # ── XAU MRD — Microstructure Regime Detector (XAUUSD Scanner) ──
     MRD_DELTA_BIAS_THRESHOLD: float = float(os.getenv("MRD_DELTA_BIAS_THRESHOLD", "0.15"))
     MRD_DEPTH_IMBALANCE_THRESHOLD: float = float(os.getenv("MRD_DEPTH_IMBALANCE_THRESHOLD", "0.25"))

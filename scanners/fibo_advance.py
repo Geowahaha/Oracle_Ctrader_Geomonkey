@@ -193,7 +193,16 @@ class FiboAdvanceScanner:
         For Fibonacci entries we're more lenient because price IS retracing —
         delta may be slightly adverse before reversing.
         """
+        if not bool((snapshot or {}).get("ok")):
+            status = str((snapshot or {}).get("status") or "capture_unavailable").strip().lower() or "capture_unavailable"
+            return True, f"micro_capture_unavailable:{status}"
         features = snapshot.get("features", {}) if snapshot else {}
+        if not features:
+            return True, "micro_capture_unavailable:no_features"
+        spots_count = int(features.get("spots_count", 0) or 0)
+        depth_count = int(features.get("depth_count", 0) or 0)
+        if spots_count < 3 and depth_count < 3:
+            return True, f"micro_capture_insufficient:{spots_count}s_{depth_count}d"
         delta       = float(features.get("delta_proxy", 0.0))
         imbalance   = float(features.get("depth_imbalance", 0.0))
         tick_vel    = float(features.get("bar_volume_proxy", 0.0))

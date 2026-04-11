@@ -49,6 +49,7 @@ from learning.live_profile_autopilot import (
     _confidence_band as live_profile_confidence_band,
     _classify_chart_state as live_profile_classify_chart_state,
 )
+from learning.adaptive_directional_intelligence import adi as adaptive_di
 from learning.trading_manager_agent import trading_manager_agent
 from learning.strategy_lab_team import strategy_lab_team_agent
 from learning.trading_team import trading_team_agent
@@ -302,6 +303,129 @@ class DexterScheduler:
             return float(value)
         except Exception:
             return float(default)
+
+    def _apply_adi_modifier(self, signal, source: str) -> dict:
+        """Apply Adaptive Directional Intelligence confidence modifier.
+
+        Evaluates 5 dimensions (empirical, technical, flow, temporal, cross-family)
+        and adjusts signal.confidence.  Never blocks — only modifies confidence
+        so existing gates make the final decision.
+        """
+        if not bool(getattr(config, "ADI_ENABLED", True)):
+            return {}
+        if self._is_pytest_runtime():
+            return {}
+        try:
+            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if not sym or direction not in {"long", "short"}:
+                return {}
+
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+
+            # --- Build trend_context from signal's existing raw_scores ---
+            trend_context = {
+                "d1": self._signal_d1_trend_token(signal),
+                "h4": self._signal_h4_trend_token(signal),
+                "h1": self._signal_h1_trend_token(signal),
+            }
+
+            # --- Build flow_features from raw_scores or fresh snapshot ---
+            flow_features = None
+            # Check if features already present (from scalp pipeline / fibo)
+            for key in ("capture_features", "entry_sharpness_features", "micro_features"):
+                if isinstance(raw.get(key), dict) and raw[key].get("delta_proxy") is not None:
+                    flow_features = raw[key]
+                    break
+            # Check top-level raw_scores keys
+            if flow_features is None and raw.get("delta_proxy") is not None:
+                flow_features = {
+                    "delta_proxy": raw.get("delta_proxy", 0.0),
+                    "depth_imbalance": raw.get("depth_imbalance", 0.0),
+                    "bar_volume_proxy": raw.get("bar_volume_proxy", 0.0),
+                    "tick_up_ratio": raw.get("tick_up_ratio", 0.5),
+                    "spots_count": raw.get("spots_count", 0),
+                }
+            # Fallback: fetch fresh snapshot for XAU
+            if flow_features is None and "XAU" in sym:
+                try:
+                    snap = live_profile_autopilot.latest_capture_feature_snapshot(
+                        symbol="XAUUSD", lookback_sec=120,
+                        direction=direction,
+                        confidence=float(getattr(signal, "confidence", 70) or 70),
+                    )
+                    if isinstance(snap, dict) and snap.get("ok"):
+                        flow_features = dict(snap.get("features") or snap.get("gate", {}).get("features") or {})
+                except Exception:
+                    pass
+
+            # --- Session info ---
+            session_info = None
+            try:
+                sig_session = str(getattr(signal, "session", "") or "").strip().lower()
+                if sig_session:
+                    session_info = {"active_sessions": [sig_session]}
+            except Exception:
+                pass
+
+            # --- Evaluate ---
+            conf_before = float(getattr(signal, "confidence", 0.0) or 0.0)
+            result = adaptive_di.evaluate(
+                source=str(source or ""),
+                direction=direction,
+                symbol=sym,
+                confidence=conf_before,
+                trend_context=trend_context,
+                flow_features=flow_features,
+                session_info=session_info,
+            )
+
+            modifier = float(result.get("modifier", 0.0) or 0.0)
+            if modifier == 0.0:
+                # Record evaluation but don't touch confidence
+                raw["adi_modifier"] = 0.0
+                raw["adi_recommendation"] = str(result.get("recommendation", ""))
+                signal.raw_scores = raw
+                return result
+
+            # Apply modifier to confidence
+            new_conf = round(max(0.0, min(99.9, conf_before + modifier)), 1)
+            signal.confidence = new_conf
+
+            # Record full audit trail in raw_scores
+            raw["adi_modifier"] = round(modifier, 1)
+            raw["adi_conf_before"] = round(conf_before, 1)
+            raw["adi_conf_after"] = round(new_conf, 1)
+            raw["adi_recommendation"] = str(result.get("recommendation", ""))
+            raw["adi_divergence"] = bool(result.get("divergence_flag", False))
+            raw["adi_catastrophic"] = bool(result.get("catastrophic_flag", False))
+            raw["adi_dimensions"] = result.get("dimensions", {})
+            signal.raw_scores = raw
+
+            # Log for observability
+            tag = str(raw.get("signal_trace_tag", ""))
+            logger.info(
+                "[ADI] %s %s %s | conf:%.1f→%.1f (mod:%+.1f) | %s%s",
+                tag, sym, direction.upper(),
+                conf_before, new_conf, modifier,
+                result.get("recommendation", ""),
+                " ⚠DIVERGENCE" if result.get("divergence_flag") else "",
+            )
+
+            # Append to signal warnings/reasons for notification visibility
+            if modifier <= -10:
+                warn = f"ADI penalty {modifier:+.1f} ({result.get('recommendation', '')})"
+                if hasattr(signal, "warnings") and isinstance(signal.warnings, list) and warn not in signal.warnings:
+                    signal.warnings.append(warn)
+            elif modifier >= 5:
+                reason = f"ADI boost {modifier:+.1f} ({result.get('recommendation', '')})"
+                if hasattr(signal, "reasons") and isinstance(signal.reasons, list) and reason not in signal.reasons:
+                    signal.reasons.append(reason)
+
+            return result
+        except Exception as e:
+            logger.debug("[ADI] apply error: %s", e)
+            return {}
 
     @staticmethod
     def _trend_from_open_last(open_price: float, last_price: float, neutral_buffer_pct: float) -> str:
@@ -1023,6 +1147,14 @@ class DexterScheduler:
                 return False, "xauusd_market_holiday"
         if not session_manager.is_xauusd_market_open():
             return False, "xauusd_market_closed"
+        if bool(getattr(config, "XAU_TOXIC_HOUR_GUARD_ENABLED", True)):
+            try:
+                toxic_hours = {int(h.strip()) for h in str(getattr(config, "XAU_TOXIC_HOURS_UTC", "1") or "1").split(",") if h.strip().isdigit()}
+                utc_hour = datetime.now(timezone.utc).hour
+                if utc_hour in toxic_hours:
+                    return False, f"xau_toxic_hour_utc:{utc_hour}"
+            except Exception:
+                pass
         if bool(getattr(config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", False)):
             session_sig = self._signal_session_signature(signal)
             allowed_sessions = set(config.get_mt5_scalp_xau_live_sessions() or set())
@@ -7855,6 +7987,11 @@ class DexterScheduler:
         if not bool(getattr(config, "CTRADER_AUTOTRADE_ENABLED", False)):
             return None
         self._ensure_signal_trace(signal, source=str(source or ""))
+        # ── ADI: Adaptive Directional Intelligence confidence modifier ──
+        try:
+            self._apply_adi_modifier(signal, source=str(source or ""))
+        except Exception as e:
+            logger.debug("[ADI] _apply_adi_modifier failed (non-fatal): %s", e)
         dispatch_source, dispatch_meta = self._ctrader_pick_dispatch_source(signal, source)
         if not dispatch_source:
             skip_reason = str((dispatch_meta or {}).get("winner_reason", "source_not_allowed"))
@@ -9143,6 +9280,14 @@ class DexterScheduler:
         """
         if not bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
             return
+        if bool(getattr(config, "XAU_TOXIC_HOUR_GUARD_ENABLED", True)):
+            try:
+                toxic_hours = {int(h.strip()) for h in str(getattr(config, "XAU_TOXIC_HOURS_UTC", "1") or "1").split(",") if h.strip().isdigit()}
+                if datetime.now(timezone.utc).hour in toxic_hours:
+                    logger.debug("[FiboAdvance] Skipping — toxic hour UTC:%d", datetime.now(timezone.utc).hour)
+                    return
+            except Exception:
+                pass
         try:
             signal = fibo_advance_scanner.scan()
             if signal is None:
