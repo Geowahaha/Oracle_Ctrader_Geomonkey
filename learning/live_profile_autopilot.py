@@ -7132,14 +7132,17 @@ class LiveProfileAutopilot:
             if not use_tick_fallback:
                 try:
                     cconn2 = sqlite3.connect(str(candle_db_path), timeout=15)
-                    rows = cconn2.execute(
-                        "SELECT high, low FROM candles WHERE symbol='XAUUSD' AND tf='1m' AND ts >= ? AND ts <= ? ORDER BY ts ASC",
-                        (signal_utc_str, end_utc_str),
-                    ).fetchall()
-                    cconn2.close()
-                    return [(float(r[0] or 0), float(r[1] or 0)) for r in rows]
+                    try:
+                        rows = cconn2.execute(
+                            "SELECT high, low FROM candles WHERE symbol='XAUUSD' AND tf='1m' AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+                            (signal_utc_str, end_utc_str),
+                        ).fetchall()
+                    finally:
+                        cconn2.close()
+                    if rows:
+                        return [(float(r[0] or 0), float(r[1] or 0)) for r in rows]
                 except Exception:
-                    return []
+                    pass
             # Tick fallback: build 1m buckets from ctrader_spot_ticks mid prices
             try:
                 tick_rows = self._connect_ctrader().execute(

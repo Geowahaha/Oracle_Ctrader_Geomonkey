@@ -1019,7 +1019,8 @@ class FiboAdvanceScanner:
     def _scout_scan(self, df_h1: pd.DataFrame, df_m15: pd.DataFrame,
                     current_price: float, atr_h1: float, rsi: float,
                     session_info: dict, snapshot: dict,
-                    smc_context, h4_bias: str) -> Optional[TradeSignal]:
+                    smc_context, h4_bias: str,
+                    d1_bias: str = "neutral") -> Optional[TradeSignal]:
         """
         Scout mode: catch intermediate Fibonacci setups on M15 while waiting
         for the big Sniper setup. Only fires in H4 bias direction.
@@ -1082,10 +1083,21 @@ class FiboAdvanceScanner:
             fibo_ctx.nearest_level_price, df_h1, atr_h1, current_price, smc_context
         )
 
-        # ── Short quarantine (scout longs only for now) ──────────────────
-        if scout_direction == "short" and bool(getattr(config, "FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", True)):
-            logger.info("[FiboAdvance:Scout] blocked: fibo_xauusd short quarantine")
-            return None
+        # ── Trend Alignment Gate (replaces crude short quarantine) ─────
+        # Only trade WITH dominant trend: block counter-trend entries
+        # when D1+H4 agree on direction.  Enables smart shorts in bearish.
+        _ta_gate_enabled = bool(getattr(config, "FIBO_TREND_ALIGNMENT_GATE_ENABLED", True))
+        if _ta_gate_enabled:
+            if scout_direction == "long" and d1_bias == "short" and h4_bias == "short":
+                logger.info("[FiboAdvance:Scout] blocked: trend_alignment_gate long vs D1+H4 bearish")
+                return None
+            if scout_direction == "short" and d1_bias == "long" and h4_bias == "long":
+                logger.info("[FiboAdvance:Scout] blocked: trend_alignment_gate short vs D1+H4 bullish")
+                return None
+            # Mixed/neutral: require at least H4 alignment (existing guard above already checks this)
+            if scout_direction == "short" and h4_bias != "short":
+                logger.info("[FiboAdvance:Scout] blocked: short needs h4_bias=short (got %s)", h4_bias)
+                return None
 
         # ── MTF stacking required gate ────────────────────────────────────
         if bool(getattr(config, "FIBO_SCOUT_REQUIRE_MTF_STACKING", True)) and not mtf_stacking:
@@ -1438,10 +1450,21 @@ class FiboAdvanceScanner:
             score_ok       = fibo_ctx.fibo_confluence_score >= min_fibo_score
 
             if score_ok and smc_aligned and dist_ok:
-                # ── Gate: Short quarantine (fibo longs only for now) ───────
-                if direction == "short" and bool(getattr(config, "FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", True)):
-                    logger.info("[FiboAdvance:Sniper] blocked: fibo_xauusd short quarantine")
-                else:
+                # ── Trend Alignment Gate (replaces crude short quarantine) ─
+                # Block counter-trend entries when D1+H4 agree on direction.
+                _ta_gate = bool(getattr(config, "FIBO_TREND_ALIGNMENT_GATE_ENABLED", True))
+                _ta_blocked = False
+                if _ta_gate:
+                    if direction == "long" and d1_bias == "short" and h4_bias == "short":
+                        logger.info("[FiboAdvance:Sniper] blocked: trend_alignment_gate long vs D1+H4 bearish")
+                        _ta_blocked = True
+                    elif direction == "short" and d1_bias == "long" and h4_bias == "long":
+                        logger.info("[FiboAdvance:Sniper] blocked: trend_alignment_gate short vs D1+H4 bullish")
+                        _ta_blocked = True
+                    elif direction == "short" and h4_bias != "short":
+                        logger.info("[FiboAdvance:Sniper] blocked: short needs h4_bias=short (got %s)", h4_bias)
+                        _ta_blocked = True
+                if not _ta_blocked:
                     # ── Gate: Impulse freshness ────────────────────────────
                     fresh_ok, fresh_reason = self._check_impulse_freshness(fib, df_h1, mode="sniper")
                     if not fresh_ok:
@@ -1559,6 +1582,7 @@ class FiboAdvanceScanner:
                 snapshot=snapshot,
                 smc_context=smc_context,
                 h4_bias=h4_bias,
+                d1_bias=d1_bias,
             )
             if scout_signal is not None:
                 # Trend modifier for scout direction

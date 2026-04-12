@@ -184,7 +184,8 @@ class Config:
     FIBO_SCOUT_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_SCOUT_MIN_MOMENTUM_SCORE", "4") or 4)
     FIBO_SCOUT_REQUIRE_MTF_STACKING: bool = os.getenv("FIBO_SCOUT_REQUIRE_MTF_STACKING", "1").strip().lower() in ("1", "true", "yes", "on")
     # Audit result: fibo_xauusd short is quarantined by default; long side remains available.
-    FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED: bool = os.getenv("FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED: bool = os.getenv("FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")  # DEPRECATED: replaced by FIBO_TREND_ALIGNMENT_GATE
+    FIBO_TREND_ALIGNMENT_GATE_ENABLED: bool = os.getenv("FIBO_TREND_ALIGNMENT_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     # Fibo Position Manager — time-based profit lock (progressive SL tightening)
     FIBO_PM_TIME_LOCK_ENABLED: bool = os.getenv("FIBO_PM_TIME_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_PM_BE_AFTER_MIN: float = float(os.getenv("FIBO_PM_BE_AFTER_MIN", "20"))
@@ -288,10 +289,16 @@ class Config:
 
     # ── ADI — Adaptive Directional Intelligence ──
     ADI_ENABLED: bool = os.getenv("ADI_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    ADI_CATASTROPHIC_GATE_ENABLED: bool = os.getenv("ADI_CATASTROPHIC_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     ADI_LOOKBACK_DAYS: int = int(os.getenv("ADI_LOOKBACK_DAYS", "14"))
     ADI_MAX_PENALTY: float = float(os.getenv("ADI_MAX_PENALTY", "-45.0"))
     ADI_MAX_BOOST: float = float(os.getenv("ADI_MAX_BOOST", "15.0"))
     ADI_COLD_START_PENALTY: float = float(os.getenv("ADI_COLD_START_PENALTY", "-6.0"))
+
+    # ── Hermes — Self-Improving Trade Intelligence Loop ──
+    HERMES_TOXIC_GATE_ENABLED: bool = os.getenv("HERMES_TOXIC_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    HERMES_TOXIC_MODIFIER_THRESHOLD: float = float(os.getenv("HERMES_TOXIC_MODIFIER_THRESHOLD", "-10.0"))
+    HERMES_TOXIC_MIN_SAMPLES: int = int(os.getenv("HERMES_TOXIC_MIN_SAMPLES", "5"))
 
     # ── XAU MRD — Microstructure Regime Detector (XAUUSD Scanner) ──
     MRD_DELTA_BIAS_THRESHOLD: float = float(os.getenv("MRD_DELTA_BIAS_THRESHOLD", "0.15"))

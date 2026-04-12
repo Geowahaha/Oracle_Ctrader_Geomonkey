@@ -8025,6 +8025,74 @@ class DexterScheduler:
             self._apply_adi_modifier(signal, source=str(source or ""))
         except Exception as e:
             logger.debug("[ADI] _apply_adi_modifier failed (non-fatal): %s", e)
+
+        # ── ADI Catastrophic Gate: hard-block when any dimension is extreme ──
+        # catastrophic_flag fires when ANY of the 5 ADI dimensions ≤ -25
+        # (empirical collapse, all-TF counter-trend, extreme adverse flow, etc.)
+        try:
+            _adi_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            _adi_catastrophic = bool(_adi_raw.get("adi_catastrophic", False))
+            _adi_gate_enabled = bool(getattr(config, "ADI_CATASTROPHIC_GATE_ENABLED", True))
+            if _adi_catastrophic and _adi_gate_enabled:
+                _adi_rec = str(_adi_raw.get("adi_recommendation", ""))
+                _sig_dir = str(getattr(signal, "direction", "") or "")
+                _sig_sym = str(getattr(signal, "symbol", "") or "")
+                logger.info(
+                    "[ADI-GATE] CATASTROPHIC hard-block | %s %s %s | conf=%.1f | rec=%s | dims=%s",
+                    str(source or ""), _sig_sym, _sig_dir,
+                    float(getattr(signal, "confidence", 0)),
+                    _adi_rec,
+                    str(_adi_raw.get("adi_dimensions", {})),
+                )
+                self._audit_xau_pre_dispatch_skip(
+                    signal,
+                    requested_source=str(source or ""),
+                    dispatch_source="",
+                    gate="adi_catastrophic",
+                    reason=f"adi_catastrophic:{_adi_rec}",
+                    dispatch_meta={"adi_catastrophic": True, "adi_recommendation": _adi_rec},
+                )
+                return None
+        except Exception as e:
+            logger.debug("[ADI-GATE] catastrophic check error (non-fatal): %s", e)
+
+        # ── Hermes Toxic Pattern Gate: hard-block known losing patterns ──
+        # When Hermes skill modifier is severely negative AND enough samples exist,
+        # the pattern is proven toxic — don't trade it.
+        try:
+            _hermes_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            _hermes_mod = float(_hermes_raw.get("hermes_modifier", 0.0) or 0.0)
+            _hermes_detail = _hermes_raw.get("hermes_detail", {}) or {}
+            _hermes_samples = int(_hermes_detail.get("total_samples", 0) or 0)
+            _hermes_avg_wr = float(_hermes_detail.get("avg_wr", 1.0) or 1.0)
+            _hermes_gate_enabled = bool(getattr(config, "HERMES_TOXIC_GATE_ENABLED", True))
+            _hermes_toxic_threshold = float(getattr(config, "HERMES_TOXIC_MODIFIER_THRESHOLD", -10.0) or -10.0)
+            _hermes_toxic_min_samples = int(getattr(config, "HERMES_TOXIC_MIN_SAMPLES", 5) or 5)
+            if (_hermes_gate_enabled
+                    and _hermes_mod <= _hermes_toxic_threshold
+                    and _hermes_samples >= _hermes_toxic_min_samples):
+                _sig_dir = str(getattr(signal, "direction", "") or "")
+                _sig_sym = str(getattr(signal, "symbol", "") or "")
+                logger.info(
+                    "[HERMES-GATE] TOXIC hard-block | %s %s %s | hermes_mod=%.1f | "
+                    "samples=%d | avg_wr=%.3f | conf=%.1f",
+                    str(source or ""), _sig_sym, _sig_dir,
+                    _hermes_mod, _hermes_samples, _hermes_avg_wr,
+                    float(getattr(signal, "confidence", 0)),
+                )
+                self._audit_xau_pre_dispatch_skip(
+                    signal,
+                    requested_source=str(source or ""),
+                    dispatch_source="",
+                    gate="hermes_toxic",
+                    reason=f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}",
+                    dispatch_meta={"hermes_toxic": True, "hermes_modifier": _hermes_mod,
+                                   "hermes_avg_wr": _hermes_avg_wr, "hermes_samples": _hermes_samples},
+                )
+                return None
+        except Exception as e:
+            logger.debug("[HERMES-GATE] toxic check error (non-fatal): %s", e)
+
         dispatch_source, dispatch_meta = self._ctrader_pick_dispatch_source(signal, source)
         if not dispatch_source:
             skip_reason = str((dispatch_meta or {}).get("winner_reason", "source_not_allowed"))
