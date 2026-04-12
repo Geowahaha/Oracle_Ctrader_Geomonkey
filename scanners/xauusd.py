@@ -80,6 +80,8 @@ class XAUUSDScanner:
                     return False, f"positive_depth_imbalance:{imbalance:.3f}"
             
             if tick_velocity < vel_thr:
+                if tick_velocity == 0.0 and delta == 0.0 and imbalance == 0.0:
+                    return True, "micro_stale_data_passthrough:all_zero"
                 return False, f"low_tick_velocity:{tick_velocity:.3f}"
                 
             return True, "micro_aligned"

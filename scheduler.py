@@ -8169,7 +8169,20 @@ class DexterScheduler:
                 except Exception:
                     logger.debug("[Scheduler] fibo trade result feed failed", exc_info=True)
             else:
-                logger.warning("[CTRADER] sync failed: %s", rpt.get("error") or rpt.get("message"))
+                err_msg = str(rpt.get("error") or rpt.get("message") or "")
+                logger.warning("[CTRADER] sync failed: %s", err_msg)
+                # Auto-refresh token on auth failures
+                if any(k in err_msg for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID", "Unauthorized")):
+                    try:
+                        from api.ctrader_token_manager import token_manager as _tm
+                        logger.info("[CTRADER] Auth failure detected — attempting token refresh")
+                        new_token = _tm.try_refresh()
+                        if new_token:
+                            logger.info("[CTRADER] Token refreshed after sync auth failure")
+                        else:
+                            logger.error("[CTRADER] Token refresh failed — trading may be disrupted")
+                    except Exception as refresh_err:
+                        logger.debug("[CTRADER] Token refresh error: %s", refresh_err)
             if bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)):
                 try:
                     gate_loop = neural_gate_learning_loop.run_cycle()
@@ -11993,8 +12006,15 @@ class DexterScheduler:
                 or {}
             )
         except Exception as e:
-            logger.warning("[Scheduler] cTrader market capture failed: %s", e)
-            return {"ok": False, "status": "error", "message": str(e)}
+            err_str = str(e)
+            logger.warning("[Scheduler] cTrader market capture failed: %s", err_str)
+            if any(k in err_str for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID")):
+                try:
+                    from api.ctrader_token_manager import token_manager as _tm_cap
+                    _tm_cap.try_refresh()
+                except Exception:
+                    pass
+            return {"ok": False, "status": "error", "message": err_str}
         if bool(report.get("ok")):
             spots_count = int(report.get("spots_count", 0) or len(list(report.get("spots") or [])))
             depth_count = int(report.get("depth_count", 0) or len(list(report.get("depth") or [])))
@@ -12005,7 +12025,14 @@ class DexterScheduler:
                 str(report.get("run_id", "") or ""),
             )
         else:
-            logger.warning("[Scheduler] cTrader market capture failed: %s", report.get("message"))
+            cap_err = str(report.get("message") or "")
+            logger.warning("[Scheduler] cTrader market capture failed: %s", cap_err)
+            if any(k in cap_err for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID")):
+                try:
+                    from api.ctrader_token_manager import token_manager as _tm_cap2
+                    _tm_cap2.try_refresh()
+                except Exception:
+                    pass
         if bool(report.get("ok")) and (force or bool(getattr(config, "CTRADER_TICK_DEPTH_REPLAY_LAB_ENABLED", False))):
             try:
                 self._run_ctrader_tick_depth_replay_lab(force=False)

@@ -364,6 +364,8 @@ class FiboAdvanceScanner:
         vel_thr   = float(_cfg("FIBO_ADVANCE_MICRO_VEL_THR",   0.05))
 
         if tick_vel < vel_thr:
+            if tick_vel == 0.0 and delta == 0.0 and imbalance == 0.0:
+                return True, "micro_stale_data_passthrough:all_zero"
             return False, f"low_tick_velocity:{tick_vel:.3f}"
 
         if direction == "long":
