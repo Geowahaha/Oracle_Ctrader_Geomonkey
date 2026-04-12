@@ -382,15 +382,45 @@ class DexterScheduler:
 
             modifier = float(result.get("modifier", 0.0) or 0.0)
             if modifier == 0.0:
-                # Record evaluation but don't touch confidence
+                # ADI is neutral — still check Hermes skill modifier
+                hermes_mod_z = 0.0
+                hermes_detail_z = {}
+                try:
+                    from learning.hermes_loop import improvement_loop as _hermes_z
+                    sig_sess = str(getattr(signal, "session", "") or "").strip().lower()
+                    hermes_mod_z, hermes_detail_z = _hermes_z.get_skill_modifier(
+                        source=str(source or ""), direction=direction, session=sig_sess,
+                    )
+                    if hermes_mod_z != 0.0:
+                        new_c = round(max(0.0, min(99.9, conf_before + hermes_mod_z)), 1)
+                        signal.confidence = new_c
+                except Exception:
+                    pass
                 raw["adi_modifier"] = 0.0
                 raw["adi_recommendation"] = str(result.get("recommendation", ""))
+                raw["hermes_modifier"] = round(hermes_mod_z, 1)
+                raw["hermes_detail"] = hermes_detail_z
                 signal.raw_scores = raw
                 return result
 
             # Apply modifier to confidence
             new_conf = round(max(0.0, min(99.9, conf_before + modifier)), 1)
             signal.confidence = new_conf
+
+            # ── Hermes skill modifier (compounds on ADI) ──
+            hermes_mod = 0.0
+            hermes_detail = {}
+            try:
+                from learning.hermes_loop import improvement_loop as _hermes
+                sig_session = str(getattr(signal, "session", "") or "").strip().lower()
+                hermes_mod, hermes_detail = _hermes.get_skill_modifier(
+                    source=str(source or ""), direction=direction, session=sig_session,
+                )
+                if hermes_mod != 0.0:
+                    new_conf = round(max(0.0, min(99.9, new_conf + hermes_mod)), 1)
+                    signal.confidence = new_conf
+            except Exception:
+                pass
 
             # Record full audit trail in raw_scores
             raw["adi_modifier"] = round(modifier, 1)
@@ -400,14 +430,17 @@ class DexterScheduler:
             raw["adi_divergence"] = bool(result.get("divergence_flag", False))
             raw["adi_catastrophic"] = bool(result.get("catastrophic_flag", False))
             raw["adi_dimensions"] = result.get("dimensions", {})
+            raw["hermes_modifier"] = round(hermes_mod, 1)
+            raw["hermes_detail"] = hermes_detail
             signal.raw_scores = raw
 
             # Log for observability
             tag = str(raw.get("signal_trace_tag", ""))
+            hermes_tag = f" hermes:{hermes_mod:+.1f}" if hermes_mod else ""
             logger.info(
-                "[ADI] %s %s %s | conf:%.1f→%.1f (mod:%+.1f) | %s%s",
+                "[ADI] %s %s %s | conf:%.1f→%.1f (adi:%+.1f%s) | %s%s",
                 tag, sym, direction.upper(),
-                conf_before, new_conf, modifier,
+                conf_before, new_conf, modifier, hermes_tag,
                 result.get("recommendation", ""),
                 " ⚠DIVERGENCE" if result.get("divergence_flag") else "",
             )
