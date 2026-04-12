@@ -33,6 +33,54 @@ logger = logging.getLogger(__name__)
 
 # Symbols that use xauusd_provider
 _XAU_SYMBOLS = {"XAUUSD", "GOLD"}
+
+
+def _apply_adi_hermes_bt(signal_dict: dict, cursor_dt) -> float:
+    """Apply ADI + Hermes confidence modifiers in backtest mode.
+
+    Runs the same confidence adjustments as production but:
+    - Skips the _is_pytest_runtime() guard
+    - Uses cursor_dt session for Hermes lookup
+    - Non-blocking: any error returns original confidence
+    """
+    conf = float(signal_dict.get("confidence", 70) or 70)
+    source = str(signal_dict.get("source", "") or "")
+    direction = str(signal_dict.get("direction", "") or "").lower()
+    symbol = str(signal_dict.get("symbol", "XAUUSD") or "XAUUSD").upper()
+
+    if direction not in ("long", "short"):
+        return conf
+
+    # ── ADI ──
+    try:
+        from learning.adaptive_directional_intelligence import adi as _adi
+        from config import config as _cfg
+        if bool(getattr(_cfg, "ADI_ENABLED", True)):
+            result = _adi.evaluate(
+                source=source, direction=direction, symbol=symbol,
+                confidence=conf,
+                trend_context=None, flow_features=None, session_info=None,
+            )
+            conf = round(max(0.0, min(99.9, conf + float(result.get("modifier", 0) or 0))), 1)
+    except Exception:
+        pass
+
+    # ── Hermes skill modifier ──
+    try:
+        from learning.hermes_loop import improvement_loop as _hl
+        h = cursor_dt.hour if cursor_dt else -1
+        if 22 <= h or h < 7:
+            sess = "asian"
+        elif 7 <= h < 13:
+            sess = "london"
+        else:
+            sess = "new_york"
+        mod, _ = _hl.get_skill_modifier(source=source, direction=direction, session=sess)
+        conf = round(max(0.0, min(99.9, conf + mod)), 1)
+    except Exception:
+        pass
+
+    return conf
 # Symbols that use crypto_provider
 _CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD"}
 
@@ -244,6 +292,11 @@ def _run_single(
                     source = str(signal_dict.get("source", "")).lower()
                     if family.lower() not in source:
                         continue
+
+                # ── ADI + Hermes confidence modifier (BT mode) ──
+                signal_dict["confidence"] = _apply_adi_hermes_bt(
+                    signal_dict, cursor_dt,
+                )
 
                 signals_collected.append((ts, signal_dict))
 

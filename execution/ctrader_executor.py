@@ -2278,7 +2278,10 @@ class CTraderExecutor:
         trim_tp_r = max(0.10, float(order_care_overrides.get("trim_tp_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", 0.55) or 0.55) or 0.55))
         r_current = float(r_now) if r_now is not None else None
         profit_seek_enabled = bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
-        profit_seek_min_r = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+        profit_seek_min_r_base = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+        # Fibo trades target 1.272R+: don't lock profit until at least 0.8R (near TP1)
+        _is_fibo_src = str(source or "").strip().lower().startswith("fibo")
+        profit_seek_min_r = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R", 0.80) or 0.80)) if _is_fibo_src else profit_seek_min_r_base
         profit_seek_active = bool(profit_seek_enabled and r_current is not None and r_current >= profit_seek_min_r)
 
         if (r_current is not None) and score >= close_score and r_current <= close_max_r:
@@ -2340,13 +2343,18 @@ class CTraderExecutor:
         else:
             new_sl = min(stop_loss, new_sl)
         new_tp = target_tp
+        # Fibo trades must reach their Fibonacci extension target — never trim TP
+        _is_fibo_source = str(source or "").strip().lower().startswith("fibo")
         if self._target_valid_for_position(direction, entry, target_tp):
-            trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-            if (not profit_seek_active) and self._target_valid_for_position(direction, entry, trimmed_tp):
-                if abs(trimmed_tp - entry) < abs(target_tp - entry):
-                    new_tp = trimmed_tp
-            elif profit_seek_active:
-                details["tp_trim_suppressed_profit_seeking"] = True
+            if _is_fibo_source:
+                details["tp_trim_suppressed_fibo_source"] = True
+            else:
+                trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
+                if (not profit_seek_active) and self._target_valid_for_position(direction, entry, trimmed_tp):
+                    if abs(trimmed_tp - entry) < abs(target_tp - entry):
+                        new_tp = trimmed_tp
+                elif profit_seek_active:
+                    details["tp_trim_suppressed_profit_seeking"] = True
 
         breached = (direction == "long" and current_price <= new_sl) or (direction == "short" and current_price >= new_sl)
         if breached:

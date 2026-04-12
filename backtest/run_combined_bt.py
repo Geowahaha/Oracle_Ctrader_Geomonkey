@@ -673,7 +673,17 @@ def run_combined(
 
                 sig = result.signal
                 direction = str(getattr(sig, "direction", "") or "").lower()
-                confidence = float(getattr(sig, "confidence", 0.0) or 0.0)
+
+                # ── ADI + Hermes confidence modifier (BT mode) ──
+                from backtest.run_backtest import _apply_adi_hermes_bt
+                sig.confidence = _apply_adi_hermes_bt(
+                    {"source": FAMILY_META["behavioral_v2"]["source"],
+                     "direction": direction,
+                     "symbol": sym,
+                     "confidence": float(getattr(sig, "confidence", 0.0) or 0.0)},
+                    cursor_dt,
+                )
+                confidence = float(sig.confidence)
 
                 # Session label for this bar (used by session-gated families)
                 bar_session = _get_session_label(cursor_dt)
