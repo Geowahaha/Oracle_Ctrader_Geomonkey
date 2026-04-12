@@ -5187,6 +5187,17 @@ class CTraderExecutor:
                         "status": str(cancel_result.status or ""),
                     })
                     follow_signal, follow_source = self._follow_stop_signal_from_order(order, plan)
+                    # ── FFFS session block: skip overlap/off_hours ──
+                    _fffs_blocked_sessions = {s.strip().lower() for s in str(getattr(config, "FFFS_BLOCKED_SESSIONS", "overlap,off_hours") or "").split(",") if s.strip()}
+                    if _fffs_blocked_sessions:
+                        try:
+                            from market.session_manager import session_manager as _sm
+                            _active = set(s.lower() for s in (_sm.get_session_info() or {}).get("active_sessions", []) or [])
+                            if _active & _fffs_blocked_sessions:
+                                logger.info("[FFFS] blocked: active_sessions=%s overlap blocked_sessions=%s", _active, _fffs_blocked_sessions)
+                                continue
+                        except Exception:
+                            pass
                     follow_result = self.execute_signal(follow_signal, source=follow_source)
                     self._mark_order_follow_stop_launch(
                         conn,

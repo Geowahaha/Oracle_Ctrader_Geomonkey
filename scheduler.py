@@ -6300,6 +6300,18 @@ class DexterScheduler:
                     for s in list(_directive.get("blocked_sources") or [])
                     if str(s).strip()
                 }
+        # ── Global off_hours block for canary families ──────────────────
+        # WR is low across all families during off_hours. Block first, let Hermes re-enable.
+        _canary_off_hours_block = bool(getattr(config, "CANARY_BLOCK_OFF_HOURS", True))
+        if _canary_off_hours_block and symbol == "XAUUSD":
+            try:
+                _sess_info = session_manager.get_session_info()
+                _active_sessions = set(str(s).lower() for s in (_sess_info.get("active_sessions") or []))
+                if "off_hours" in _active_sessions and not _active_sessions.intersection({"london", "new_york"}):
+                    logger.info("[CANARY] global off_hours block — skipping all family variants")
+                    return report
+            except Exception:
+                pass
         family_candidates = self._load_strategy_family_candidates(symbol=symbol, base_source=base_source)
         for candidate in list(family_candidates or []):
             try:

@@ -300,6 +300,10 @@ class Config:
     HERMES_TOXIC_MODIFIER_THRESHOLD: float = float(os.getenv("HERMES_TOXIC_MODIFIER_THRESHOLD", "-10.0"))
     HERMES_TOXIC_MIN_SAMPLES: int = int(os.getenv("HERMES_TOXIC_MIN_SAMPLES", "5"))
 
+    # ── Session Block — proven losing sessions per family ──
+    FFFS_BLOCKED_SESSIONS: str = os.getenv("FFFS_BLOCKED_SESSIONS", "overlap,off_hours")
+    CANARY_BLOCK_OFF_HOURS: bool = os.getenv("CANARY_BLOCK_OFF_HOURS", "1").strip().lower() in ("1", "true", "yes", "on")
+
     # ── XAU MRD — Microstructure Regime Detector (XAUUSD Scanner) ──
     MRD_DELTA_BIAS_THRESHOLD: float = float(os.getenv("MRD_DELTA_BIAS_THRESHOLD", "0.15"))
     MRD_DEPTH_IMBALANCE_THRESHOLD: float = float(os.getenv("MRD_DEPTH_IMBALANCE_THRESHOLD", "0.25"))
@@ -393,6 +397,7 @@ class Config:
     XAU_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("XAU_RANGE_REPAIR_LOOKBACK_SEC", "300"))
     XAU_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("XAU_RANGE_REPAIR_ALLOWED_STATES", "range_probe")
     XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES", "fast_expansion,panic_spread")
+    XAU_RANGE_REPAIR_BLOCKED_SESSIONS: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_SESSIONS", "london,off_hours")
     XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS: float = float(os.getenv("XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS", "0.09"))
     XAU_RANGE_REPAIR_MIN_REJECTION_RATIO: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_REJECTION_RATIO", "0.16"))
     XAU_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY", "0.18"))
@@ -516,7 +521,7 @@ class Config:
     XAU_FLOW_SHORT_SIDECAR_MIN_RESOLVED: int = int(os.getenv("XAU_FLOW_SHORT_SIDECAR_MIN_RESOLVED", "3"))
     XAU_FLOW_SHORT_SIDECAR_MIN_STATE_SCORE: float = float(os.getenv("XAU_FLOW_SHORT_SIDECAR_MIN_STATE_SCORE", "20"))
     XAU_FLOW_SHORT_SIDECAR_MAX_ROWS: int = int(os.getenv("XAU_FLOW_SHORT_SIDECAR_MAX_ROWS", "6"))
-    XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS", "new_york,london,new_york,overlap")
+    XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS", "new_york,london")
     XAU_FLOW_SHORT_SIDECAR_ALLOWED_PATTERNS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_PATTERNS", "SCALP_FLOW_FORCE")
     XAU_FLOW_SHORT_SIDECAR_ALLOW_ADJACENT_CONFIDENCE: bool = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOW_ADJACENT_CONFIDENCE", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_FLOW_SHORT_SIDECAR_ALLOW_COMPATIBLE_DAY_TYPE: bool = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOW_COMPATIBLE_DAY_TYPE", "1").strip().lower() in ("1", "true", "yes", "on")
