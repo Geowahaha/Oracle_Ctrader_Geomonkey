@@ -15,6 +15,8 @@
    Exposes local test-server endpoints for status, memory search, wake-up context, and taxonomy.
 3. `trading_ai.integrations.ctrader_dexter_worker`
    Bridges into Dexter's worker as a subprocess. Dexter stays a separate repo and process boundary.
+4. `trading_ai.core.skillbook` + `trading_ai.core.self_improvement`
+   Hermes-inspired procedural memory loop: recall skills before decisions, distill new skills after closed trades.
 
 ## Memory design
 
@@ -43,8 +45,10 @@ The monitor API now also exposes a trading intelligence layer:
 - operator note halls (`facts`, `discoveries`, `advice`, `preferences`)
 - tunnel candidates across rooms
 - a daily analyst brief for asynchronous MiMo review
+- procedural skill documents and skill-context recall
 
 See [TRADING_MEMORY_V2.md](TRADING_MEMORY_V2.md) for the target full-power MemPalace design.
+See [HERMES_SELF_IMPROVEMENT.md](HERMES_SELF_IMPROVEMENT.md) for the new self-improving agent loop.
 
 ## Local test server
 

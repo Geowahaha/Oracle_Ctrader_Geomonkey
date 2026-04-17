@@ -36,6 +36,10 @@ class StrategyStats:
     active: bool = True
     lane_stage: str = "candidate"
     pending_recommendation: str = ""
+    shadow_trades: int = 0
+    shadow_wins: int = 0
+    shadow_losses: int = 0
+    shadow_total_profit: float = 0.0
 
 
 class StrategyRegistry:
@@ -78,6 +82,10 @@ class StrategyRegistry:
                     active=bool(blob.get("active", True)),
                     lane_stage=str(blob.get("lane_stage") or "candidate"),
                     pending_recommendation=str(blob.get("pending_recommendation") or ""),
+                    shadow_trades=int(blob.get("shadow_trades", 0)),
+                    shadow_wins=int(blob.get("shadow_wins", 0)),
+                    shadow_losses=int(blob.get("shadow_losses", 0)),
+                    shadow_total_profit=float(blob.get("shadow_total_profit", 0.0)),
                 )
             except (TypeError, ValueError):
                 continue
@@ -263,17 +271,80 @@ class StrategyRegistry:
             st = self._stats.get(strategy_key)
             if st is None:
                 return True
-            return bool(st.active)
+            if st.lane_stage == "retired":
+                return False
+            if st.pending_recommendation in {"quarantine", "quarantine_shadow"}:
+                return False
+            if st.active:
+                return True
+            if st.pending_recommendation in {"probation_boost", "promote_from_shadow"}:
+                return True
+            if st.shadow_trades >= 2 and st.shadow_total_profit > 0 and st.shadow_wins >= st.shadow_losses:
+                return True
+            return False
 
     def get_strategy_boost(self, strategy_key: str) -> float:
         with self._lock:
             st = self._stats.get(strategy_key)
-            if st is None or not st.active or st.trades <= 0:
+            if st is None:
+                return 0.0
+            if st.pending_recommendation in {"quarantine", "quarantine_shadow"} or st.lane_stage == "retired":
+                return 0.0
+            shadow_wr = (st.shadow_wins / float(st.shadow_trades)) if st.shadow_trades else 0.0
+            if st.pending_recommendation == "promote_from_shadow" and st.shadow_trades >= 2 and shadow_wr >= 0.6:
+                return 0.08
+            if st.pending_recommendation == "probation_boost" and (st.shadow_trades + st.trades) >= 2:
+                return 0.05
+            if not st.active or st.trades <= 0:
                 return 0.0
             wr = st.wins / float(st.trades)
             if wr > 0.6 and st.trades > 15:
                 return 0.15
             return 0.0
+
+    def record_shadow_probe(
+        self,
+        strategy_key: str,
+        *,
+        pnl: float,
+        score: int,
+    ) -> None:
+        with self._lock:
+            st = self._stats.setdefault(strategy_key, StrategyStats())
+            st.shadow_trades += 1
+            st.shadow_total_profit += float(pnl)
+            if score > 0:
+                st.shadow_wins += 1
+            elif score < 0:
+                st.shadow_losses += 1
+            if st.lane_stage == "candidate":
+                st.lane_stage = "shadow"
+            shadow_wr = (st.shadow_wins / float(st.shadow_trades)) if st.shadow_trades else 0.0
+            if st.shadow_trades >= 2 and shadow_wr >= 0.6 and st.shadow_total_profit > 0:
+                st.pending_recommendation = "promote_from_shadow"
+            elif st.shadow_trades >= 2 and st.shadow_losses >= st.shadow_wins + 1 and st.shadow_total_profit < 0:
+                st.pending_recommendation = "quarantine_shadow"
+            self._persist_unlocked()
+
+    def sync_skill_feedback(
+        self,
+        strategy_key: str,
+        *,
+        risk_adjusted_score: float,
+        trades_seen: int,
+        win_rate: float,
+    ) -> None:
+        with self._lock:
+            st = self._stats.setdefault(strategy_key, StrategyStats())
+            if trades_seen >= 2 and win_rate >= 0.6 and risk_adjusted_score > 0.15:
+                if st.lane_stage == "candidate":
+                    st.lane_stage = "shadow"
+                st.pending_recommendation = "probation_boost"
+            elif trades_seen >= 2 and win_rate <= 0.35 and risk_adjusted_score < -0.2:
+                st.pending_recommendation = "quarantine"
+                if trades_seen >= 4 or st.shadow_losses >= 2:
+                    st.lane_stage = "retired"
+            self._persist_unlocked()
 
     def hydrate_from_closed_trades(self, rows: list[Dict[str, Any]]) -> None:
         """Rebuild stats from structured memory rows (features, setup_tag, score, pnl)."""

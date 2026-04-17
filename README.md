@@ -51,6 +51,34 @@ cd D:\Mempalac_AI
 scripts\start-loop.ps1
 ```
 
+Historical backtest replay:
+
+```powershell
+cd D:\Mempalac_AI
+scripts\run-backtest.ps1 --start 2026-04-06 --end 2026-04-11 --timezone Asia/Bangkok
+```
+
+Real cTrader-only replay with isolated self-learning:
+
+```powershell
+cd D:\Mempalac_AI
+scripts\run-backtest.ps1 --start 2026-04-06 --end 2026-04-11 --timezone Asia/Bangkok --source-policy real_only --enable-learning
+```
+
+Four-week walk-forward preparation window with daily carryover reporting:
+
+```powershell
+cd D:\Mempalac_AI
+scripts\run-walkforward.ps1
+```
+
+Real-time position and entry monitoring are written to:
+
+- `data/position_monitor.json`
+- `data/position_monitor_history.ndjson`
+
+The loop now supports a guarded `loss_streak` override path: promoted shadow lanes can reopen at reduced size after repeated losses instead of staying permanently blocked.
+
 Start both in background:
 
 ```powershell
@@ -78,6 +106,9 @@ scripts\check-status.ps1
 - `GET /memory/analyst-packet`
 - `GET /memory/notes`
 - `POST /memory/notes`
+- `GET /skills`
+- `GET /skills/context`
+- `GET /positions/monitor`
 
 ## Operator tools
 
@@ -104,3 +135,4 @@ MIMO_MODEL=mimo-v2-pro
 - Keep separate repos, separate venvs, separate `DATA_DIR`, separate logs, and separate ports.
 
 See [docs/ARCHITECTURE.md](/D:/Mempalac_AI/docs/ARCHITECTURE.md) and [PARALLEL_WITH_DEXTER.md](/D:/Mempalac_AI/trading_ai/docs/PARALLEL_WITH_DEXTER.md).
+Hermes-inspired self-improvement notes: [docs/HERMES_SELF_IMPROVEMENT.md](/D:/Mempalac_AI/docs/HERMES_SELF_IMPROVEMENT.md).

@@ -304,6 +304,67 @@ class ExecutionService:
             )
         return ExecutionOutcome(trade=tr, close=close, closes=closes)
 
+    async def close_positions(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        dry_run: bool,
+        positions: Optional[list[OpenPosition]] = None,
+    ) -> list[CloseDetail]:
+        existing_positions = list(self._positions.get(symbol) or [])
+        if not existing_positions:
+            return []
+
+        targets = list(positions or existing_positions)
+        target_keys = {
+            (p.order_id, p.position_id, p.opened_ts, p.entry_price, p.volume, p.side)
+            for p in targets
+        }
+        closes: list[CloseDetail] = []
+        remaining: list[OpenPosition] = []
+
+        for prev in existing_positions:
+            key = (prev.order_id, prev.position_id, prev.opened_ts, prev.entry_price, prev.volume, prev.side)
+            if key not in target_keys:
+                remaining.append(prev)
+                continue
+            close_result = await self._broker.close_position(
+                symbol=prev.symbol,
+                position=prev,
+                reason=reason,
+                dry_run=dry_run,
+            )
+            if not close_result.closed and not dry_run:
+                log.error(
+                    "Position manager: failed to close %s %s position_id=%s reason=%s: %s",
+                    prev.side,
+                    prev.symbol,
+                    prev.position_id,
+                    reason,
+                    close_result.message,
+                )
+                remaining.append(prev)
+                continue
+            sign = 1.0 if prev.side == "BUY" else -1.0
+            realized = sign * (close_result.exit_price - prev.entry_price) * prev.volume
+            closes.append(
+                CloseDetail(
+                    symbol=prev.symbol,
+                    side=prev.side,
+                    volume=prev.volume,
+                    entry_price=prev.entry_price,
+                    exit_price=close_result.exit_price,
+                    pnl=realized,
+                    position_id=prev.position_id,
+                )
+            )
+        if remaining:
+            self._positions[symbol] = remaining
+        elif symbol in self._positions:
+            del self._positions[symbol]
+        return closes
+
     def force_flat(self) -> None:
         self._positions.clear()
 

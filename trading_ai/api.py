@@ -12,8 +12,9 @@ from pydantic import BaseModel, Field
 
 from trading_ai.config import load_settings, memory_persist_path
 from trading_ai.core.memory import MemoryEngine, MemoryNote, RecallHit
+from trading_ai.core.skillbook import build_team_brief
 from trading_ai.core.strategy_evolution import StrategyRegistry
-from trading_ai.main import build_broker
+from trading_ai.main import build_broker, build_skillbook
 
 app = FastAPI(title="Mempalac Trading AI", version="0.1.0")
 _ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +44,11 @@ def get_memory() -> MemoryEngine:
 @lru_cache(maxsize=1)
 def get_broker():
     return build_broker(get_settings())
+
+
+@lru_cache(maxsize=1)
+def get_skillbook():
+    return build_skillbook(get_settings())
 
 
 def get_registry() -> StrategyRegistry:
@@ -218,6 +224,18 @@ async def memory_tunnel(room: str) -> Dict[str, Any]:
     return {"items": matches}
 
 
+@app.get("/positions/monitor")
+async def positions_monitor() -> Dict[str, Any]:
+    settings = get_settings()
+    path = Path(settings.position_monitor_path)
+    if not path.is_file():
+        return {"ok": False, "status": "missing", "path": str(path)}
+    try:
+        return {"ok": True, "path": str(path), "snapshot": json.loads(path.read_text(encoding="utf-8"))}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/memory/notes")
 async def memory_notes(
     wing: Optional[str] = None,
@@ -274,12 +292,93 @@ async def memory_daily_brief() -> Dict[str, Any]:
 async def memory_analyst_packet() -> Dict[str, Any]:
     packet = get_memory().build_daily_analyst_packet()
     packet["strategy_promotions"] = get_registry().promotion_snapshot()
+    packet["skills"] = get_skillbook().list_skills(limit=20)
     return packet
 
 
 @app.get("/strategy/promotions")
 async def strategy_promotions() -> Dict[str, Any]:
     return {"items": get_registry().promotion_snapshot()}
+
+
+@app.get("/skills")
+async def skills(
+    symbol: Optional[str] = None,
+    session: Optional[str] = None,
+    strategy_key: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    return {
+        "items": get_skillbook().list_skills(
+            symbol=symbol,
+            session=session,
+            strategy_key=strategy_key,
+            limit=limit,
+        )
+    }
+
+
+@app.get("/skills/context")
+async def skills_context(
+    symbol: Optional[str] = None,
+    session: Optional[str] = None,
+    setup_tag: str = "trend_follow",
+    strategy_key: str = "",
+    room: str = "",
+    trend_direction: str = "RANGE",
+    volatility: str = "MEDIUM",
+    action: str = "HOLD",
+) -> Dict[str, Any]:
+    settings = get_settings()
+    effective_symbol = symbol or settings.symbol
+    matches = get_skillbook().recall(
+        symbol=effective_symbol,
+        session=session or "",
+        setup_tag=setup_tag,
+        strategy_key=strategy_key,
+        room=room or strategy_key,
+        trend_direction=trend_direction,
+        volatility=volatility,
+        action=action,
+        top_k=settings.skill_recall_top_k,
+    )
+    strategy_state = next(
+        (
+            row
+            for row in get_registry().promotion_snapshot()
+            if str(row.get("strategy_key") or "") == strategy_key
+        ),
+        None,
+    )
+    team_brief = build_team_brief(
+        features={
+            "session": session or "",
+            "trend_direction": trend_direction,
+            "volatility": volatility,
+            "structure": {},
+        },
+        risk_state={"can_trade": True},
+        pattern_analysis={},
+        matches=matches,
+        strategy_state=strategy_state,
+        room_guard=None,
+    )
+    return {
+        "items": [
+            {
+                "skill_key": item.skill_key,
+                "score": item.score,
+                "title": item.title,
+                "summary": item.summary,
+                "fit_reasons": item.fit_reasons,
+                "stats": item.stats,
+                "file_path": item.file_path,
+            }
+            for item in matches
+        ],
+        "prompt_context": get_skillbook().render_prompt_context(matches),
+        "team_brief": team_brief,
+    }
 
 
 @app.post("/strategy/promotions/stage")
@@ -354,6 +453,8 @@ async def dashboard() -> str:
     <a href="/memory/daily-brief" target="_blank">/memory/daily-brief</a>,
     <a href="/memory/analyst-packet" target="_blank">/memory/analyst-packet</a>,
     <a href="/memory/notes" target="_blank">/memory/notes</a>,
+    <a href="/skills" target="_blank">/skills</a>,
+    <a href="/skills/context" target="_blank">/skills/context</a>,
     <a href="/strategy/promotions" target="_blank">/strategy/promotions</a>
   </div>
   <div class="grid">

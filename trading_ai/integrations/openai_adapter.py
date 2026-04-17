@@ -58,6 +58,7 @@ class OpenAIProvider:
         system: str,
         user: str,
         temperature: float = 0.2,
+        json_schema: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Request JSON object response. Retries on rate limits / transient API errors.
@@ -70,7 +71,17 @@ class OpenAIProvider:
                     model=self._model,
                     temperature=temperature,
                     max_tokens=self._max_tokens,
-                    response_format={"type": "json_object"},
+                    response_format=(
+                        {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "structured_response",
+                                "schema": json_schema,
+                            },
+                        }
+                        if json_schema
+                        else {"type": "json_object"}
+                    ),
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},

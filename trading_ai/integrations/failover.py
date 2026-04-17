@@ -21,6 +21,7 @@ class FailoverProvider:
         system: str,
         user: str,
         temperature: float = 0.2,
+        json_schema: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         errors: List[str] = []
         for label, provider in self._providers:
@@ -29,6 +30,7 @@ class FailoverProvider:
                     system=system,
                     user=user,
                     temperature=temperature,
+                    json_schema=json_schema,
                 )
                 if errors:
                     log.info("LLM failover recovered via %s after %s prior errors", label, len(errors))

@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 import unittest
 
+from trading_ai.integrations.ctrader_dexter_worker import _compact_broker_comment
 from trading_ai.main import _reconcile_open_positions_from_broker
 
 
@@ -18,6 +19,10 @@ class _StubBroker:
 
 
 class ReconcileOpenPositionsTests(unittest.TestCase):
+    def test_compact_broker_comment_keeps_short_safe_tag(self):
+        text = "entry_override:opp=0.701:risk=0.484:edge=0.216|The market structure and trend direction are clearly downward"
+        self.assertEqual(_compact_broker_comment(text), "entry_override")
+
     def test_converts_ctrader_raw_volume_back_to_lots(self):
         broker = _StubBroker(
             {
@@ -40,8 +45,9 @@ class ReconcileOpenPositionsTests(unittest.TestCase):
             ctrader_worker_volume_scale=100,
         )
 
-        positions = asyncio.run(_reconcile_open_positions_from_broker(broker, settings))
+        positions, ok = asyncio.run(_reconcile_open_positions_from_broker(broker, settings))
 
+        self.assertTrue(ok)
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].symbol, "XAUUSD")
         self.assertEqual(positions[0].side, "BUY")
@@ -70,8 +76,9 @@ class ReconcileOpenPositionsTests(unittest.TestCase):
             ctrader_worker_volume_scale=100,
         )
 
-        positions = asyncio.run(_reconcile_open_positions_from_broker(broker, settings))
+        positions, ok = asyncio.run(_reconcile_open_positions_from_broker(broker, settings))
 
+        self.assertTrue(ok)
         self.assertEqual(positions, [])
 
 

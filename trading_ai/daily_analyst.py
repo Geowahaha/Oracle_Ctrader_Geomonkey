@@ -10,6 +10,7 @@ from trading_ai.config import load_settings, memory_persist_path
 from trading_ai.core.memory import MemoryEngine, MemoryNote
 from trading_ai.core.strategy_evolution import StrategyRegistry
 from trading_ai.integrations.mimo import MiMoProvider
+from trading_ai.main import build_skillbook
 from trading_ai.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -44,6 +45,7 @@ async def run_daily_analyst(*, dry_run: bool = False) -> Dict[str, Any]:
     packet = memory.build_daily_analyst_packet()
     registry = StrategyRegistry(Path(settings.strategy_registry_path))
     packet["strategy_promotions"] = registry.promotion_snapshot()
+    packet["skills"] = build_skillbook(settings).list_skills(limit=20)
 
     provider = MiMoProvider(
         api_key=settings.mimo_api_key,

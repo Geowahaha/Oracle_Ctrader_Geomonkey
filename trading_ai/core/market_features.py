@@ -38,6 +38,14 @@ def _pct_returns(closes: List[float]) -> List[float]:
     return out
 
 
+def _stdev(xs: List[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    mean = sum(xs) / float(len(xs))
+    var = sum((x - mean) ** 2 for x in xs) / float(len(xs))
+    return math.sqrt(max(0.0, var))
+
+
 def _trend_from_closes(closes: List[float], *, sensitivity: float = 0.00025) -> TrendName:
     if len(closes) < 5:
         return "RANGE"
@@ -81,6 +89,15 @@ def _range_width(xs: List[float]) -> float:
     if len(xs) < 2:
         return 0.0
     return max(xs) - min(xs)
+
+
+def _momentum_pct(closes: List[float], lookback: int) -> float:
+    if len(closes) <= lookback:
+        return 0.0
+    base = closes[-(lookback + 1)]
+    if abs(base) <= 1e-12:
+        return 0.0
+    return (closes[-1] - base) / abs(base)
 
 
 def _structure_flags(closes: List[float]) -> Dict[str, bool]:
@@ -132,6 +149,15 @@ def extract_features(market_data: Dict[str, Any]) -> Dict[str, Any]:
     trend = _trend_from_closes(closes)
     vol = _volatility_from_closes_and_spread(closes, mid=mid, spread=spread)
     structure = _structure_flags(closes)
+    recent_window = closes[-20:] if len(closes) >= 20 else closes
+    recent_rets = _pct_returns(closes[-32:] if len(closes) > 32 else closes)
+    realized_vol = _stdev(recent_rets)
+    momentum_5 = _momentum_pct(closes, 5)
+    momentum_20 = _momentum_pct(closes, 20)
+    range_width_pct = (_range_width(recent_window) / max(abs(mid), 1e-12)) if mid else 0.0
+    trend_strength = abs(momentum_20) / max(realized_vol, 1e-9)
+    recent_high = max(recent_window) if recent_window else mid
+    recent_low = min(recent_window) if recent_window else mid
 
     return {
         "symbol": symbol,
@@ -141,6 +167,13 @@ def extract_features(market_data: Dict[str, Any]) -> Dict[str, Any]:
         "structure": structure,
         "sample_closes_len": len(closes),
         "spread_pct": (spread / mid) if mid else 0.0,
+        "momentum_5": momentum_5,
+        "momentum_20": momentum_20,
+        "realized_volatility": realized_vol,
+        "range_width_pct": range_width_pct,
+        "trend_strength": trend_strength,
+        "distance_from_recent_high_pct": ((recent_high - mid) / max(abs(mid), 1e-12)) if mid else 0.0,
+        "distance_from_recent_low_pct": ((mid - recent_low) / max(abs(mid), 1e-12)) if mid else 0.0,
     }
 
 

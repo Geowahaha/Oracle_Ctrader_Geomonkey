@@ -450,21 +450,23 @@ class MemoryEngine:
         trend = str(features.get("trend_direction") or "")
         query = f"{symbol} | {sess} | {vol} | {trend} | {json.dumps(features, sort_keys=True)}"
 
+        trade_cond = {"memory_type": {"$eq": "trade_journal"}}
         sym_cond = {"symbol": {"$eq": symbol}}
         strategies: List[Optional[Dict[str, Any]]] = [
             {
                 "$and": [
+                    trade_cond,
                     sym_cond,
                     {"session": {"$eq": sess}},
                     {"volatility": {"$eq": vol}},
                     {"trend_direction": {"$eq": trend}},
                 ]
             },
-            {"$and": [sym_cond, {"session": {"$eq": sess}}, {"volatility": {"$eq": vol}}]},
-            {"$and": [sym_cond, {"session": {"$eq": sess}}, {"trend_direction": {"$eq": trend}}]},
-            {"$and": [sym_cond, {"session": {"$eq": sess}}]},
-            sym_cond,
-            None,
+            {"$and": [trade_cond, sym_cond, {"session": {"$eq": sess}}, {"volatility": {"$eq": vol}}]},
+            {"$and": [trade_cond, sym_cond, {"session": {"$eq": sess}}, {"trend_direction": {"$eq": trend}}]},
+            {"$and": [trade_cond, sym_cond, {"session": {"$eq": sess}}]},
+            {"$and": [trade_cond, sym_cond]},
+            trade_cond,
         ]
 
         seen_ids: set[str] = set()
@@ -645,6 +647,7 @@ class MemoryEngine:
             row
             for row in self._normalized_rows()
             if row["memory_type"] != "trade_journal"
+            and not str(row["memory_type"] or "").startswith("execution_")
             and (not str(row["symbol"]) or str(row["symbol"]) == symbol)
             and (session is None or not str(row["session"]) or str(row["session"]) == session)
         ]

@@ -31,6 +31,24 @@ If both systems trade the **same** cTrader account, orders and risk are **not** 
 Relevant Mempalac env keys (see `config.py`):
 `CTRADER_DEXTER_WORKER`, `CTRADER_ACCOUNT_ID`, `CTRADER_WORKER_SCRIPT`, `CTRADER_WORKER_PYTHON`, `CTRADER_WORKER_TIMEOUT_SEC`, `CTRADER_WORKER_VOLUME_SCALE`.
 
+### Optional: Mempalac as Dexter family-lane signal source
+
+If you want **Dexter** to own trade execution while Mempalac provides direction/confidence as a lane:
+
+- In Mempalac `.env`:
+  - `DEXTER_FAMILY_EXPORT_ENABLED=1`
+  - `DEXTER_FAMILY_EXPORT_PATH=D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json`
+  - `DEXTER_FAMILY_EXPORT_BASE_SOURCE=scalp_xauusd`
+- In Dexter `.env.local`:
+  - `MEMPALACE_FAMILY_ENABLED=1`
+  - `MEMPALACE_FAMILY_SIGNAL_PATH=D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json`
+  - `PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED=1`
+
+Notes:
+- Existing Dexter families stay untouched; this lane is **off by default**.
+- Mempalac writes BUY/SELL/HOLD payloads every loop; Dexter only takes fresh payloads (`MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC`).
+- HOLD payload means no mempalace family execution on Dexter.
+
 ## 4. Resource and port isolation
 
 - **CPU / RAM:** Two loops plus Chroma can stress a small VM. Watch Dexter scan latency if Mempalac runs heavy backtests on the same host.

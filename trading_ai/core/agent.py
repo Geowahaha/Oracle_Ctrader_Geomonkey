@@ -63,7 +63,12 @@ class Decision:
 @runtime_checkable
 class LLMClient(Protocol):
     async def complete_json(
-        self, *, system: str, user: str, temperature: float = 0.2
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        json_schema: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]: ...
 
 
@@ -112,26 +117,33 @@ class TradingAgent:
         risk_state: Dict[str, Any],
         pattern_analysis: Dict[str, Any],
         wake_up_context: str,
+        skill_context: str,
+        team_brief: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "instruction": (
                 "Act as a professional day trader with strict risk management. "
                 "Only trade when high-probability conditions exist: clear directional bias, "
                 "favorable session/volatility context, supportive similar past outcomes, "
-                "and pattern_analysis that does not contradict the trade. "
-                "If pattern win_rate is weak or sample_size is thin for the contemplated setup, prefer HOLD. "
+                "pattern_analysis that does not contradict the trade, and procedural skills that support the setup. "
+                "If pattern win_rate is weak or sample_size is thin for the contemplated setup, lower confidence first "
+                "instead of defaulting to HOLD when trend, volatility, and structure are otherwise unusually clear. "
                 "If memory is sparse or no close-matching trades exist yet, you may still take a small bootstrap trade "
                 "when market structure, trend, and session alignment are unusually clear. "
+                "Do not choose HOLD only because procedural_skill_context is sparse. "
                 "Output a single JSON object only."
             ),
             "decision_rules": [
                 "Rule priority is risk block, hard market block, directional opportunity, memory/pattern modifier.",
                 "If risk_state.can_trade is false, action must be HOLD.",
+                "If team_brief.risk_guardian reports blocked=true or can_trade=false, action must be HOLD.",
                 "If trend_direction is RANGE, volatility is LOW, or structure.consolidation is true, action must be HOLD.",
                 "If trend_direction is UP, volatility is MEDIUM or HIGH, and structure.consolidation is false, BUY may be valid when memory and pattern data do not contradict it.",
                 "If trend_direction is DOWN, volatility is MEDIUM or HIGH, and structure.consolidation is false, SELL may be valid when memory and pattern data do not contradict it.",
                 "Never choose BUY against a DOWN trend. Never choose SELL against an UP trend.",
-                "Lower confidence when memory is sparse, pattern sample_size is thin, or top_similar_trades are mixed.",
+                "Sparse skills, sparse memory, or thin pattern sample alone are not contradictions; they should usually reduce confidence instead of forcing HOLD.",
+                "Lower confidence when memory is sparse, pattern sample_size is thin, top_similar_trades are mixed, or skill_context contains avoid_when / guardrails that match the current market.",
+                "Treat team_brief as a four-seat council: strategist, memory_librarian, risk_guardian, evolution_coach. If they materially disagree, prefer HOLD.",
             ],
             "output_contract": (
                 "Return exactly one JSON object. "
@@ -145,9 +157,23 @@ class TradingAgent:
             "current_market": market.as_prompt_dict(),
             "structured_features": features,
             "memory_wakeup_context": wake_up_context,
+            "procedural_skill_context": skill_context,
+            "team_brief": team_brief,
             "top_similar_trades": self._render_top_similar(similar_trades, limit=5),
             "risk_state": risk_state,
             "pattern_analysis": pattern_analysis,
+        }
+
+    def _decision_json_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                "confidence": {"type": "number"},
+                "reason": {"type": "string"},
+            },
+            "required": ["action", "confidence", "reason"],
+            "additionalProperties": True,
         }
 
     def _heuristic_fallback_decision(
@@ -288,12 +314,14 @@ class TradingAgent:
         risk_state: Dict[str, Any],
         pattern_analysis: Dict[str, Any],
         wake_up_context: str,
+        skill_context: str,
+        team_brief: Dict[str, Any],
     ) -> Decision:
         system = (
             "You are a deterministic trading classifier and policy head for a data-driven execution system. "
             "Apply the decision_rules exactly, then use memory_wakeup_context, top_similar_trades, "
-            "risk_state, and pattern_analysis as confidence modifiers. "
-            "Cold start is allowed only for unusually clear directional structure with controlled risk. "
+            "procedural_skill_context, team_brief, risk_state, and pattern_analysis as confidence modifiers. "
+            "Cold start is allowed for unusually clear directional structure with controlled risk; sparse memory alone is not a HOLD signal. "
             "Return JSON only with keys action, confidence, reason. "
             "Valid actions are exactly BUY, SELL, or HOLD. "
             "Never output 'BUY|SELL|HOLD' as a literal action."
@@ -306,12 +334,19 @@ class TradingAgent:
                 risk_state=risk_state,
                 pattern_analysis=pattern_analysis,
                 wake_up_context=wake_up_context,
+                skill_context=skill_context,
+                team_brief=team_brief,
             ),
             ensure_ascii=False,
             indent=2,
         )
         try:
-            raw = await self._llm.complete_json(system=system, user=user, temperature=0.15)
+            raw = await self._llm.complete_json(
+                system=system,
+                user=user,
+                temperature=0.15,
+                json_schema=self._decision_json_schema(),
+            )
             decision = Decision.from_llm_payload(raw)
             if decision.raw.get("_invalid_action"):
                 raise ValueError(f"llm_invalid_action:{decision.raw.get('_invalid_action')}")

@@ -7,6 +7,20 @@ from typing import Literal, Optional
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+_ROOT_ENV_PATH = _PROJECT_ROOT / ".env"
+_PACKAGE_ENV_PATH = _PACKAGE_ROOT / ".env"
+
+
+def config_env_paths() -> tuple[Path, ...]:
+    """
+    Legacy root `.env` is kept as a fallback, but `trading_ai/.env` is the active
+    source of truth for local operator workflows and token refresh updates.
+    """
+
+    return (_ROOT_ENV_PATH, _PACKAGE_ENV_PATH)
+
 
 class LLMProviderName(str, Enum):
     OPENAI = "openai"
@@ -15,13 +29,10 @@ class LLMProviderName(str, Enum):
 
 
 class Settings(BaseSettings):
-    """Environment-driven configuration. Use `.env` in project root or export vars."""
+    """Environment-driven configuration. Prefer `trading_ai/.env` or exported vars."""
 
     model_config = SettingsConfigDict(
-        env_file=(
-            str(Path(__file__).resolve().parents[1] / ".env"),
-            ".env",
-        ),
+        env_file=tuple(str(path) for path in config_env_paths()),
         env_file_encoding="utf-8",
         env_ignore_empty=True,
         extra="ignore",
@@ -42,6 +53,31 @@ class Settings(BaseSettings):
         default=Path("./data/runtime_state.json"),
         validation_alias="RUNTIME_STATE_PATH",
         description="Crash-recovery state for the active Mempalac process.",
+    )
+    dexter_family_export_enabled: bool = Field(
+        default=False,
+        validation_alias="DEXTER_FAMILY_EXPORT_ENABLED",
+        description="Publish latest Mempalac BUY/SELL/HOLD decision into Dexter runtime for family-lane execution.",
+    )
+    dexter_family_export_path: Path = Field(
+        default=Path("../dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json"),
+        validation_alias="DEXTER_FAMILY_EXPORT_PATH",
+        description="JSON handoff file consumed by Dexter mempalace family adapter.",
+    )
+    dexter_family_export_base_source: str = Field(
+        default="scalp_xauusd",
+        validation_alias="DEXTER_FAMILY_EXPORT_BASE_SOURCE",
+        description="Dexter base source token for mempalace family handoff (ex: scalp_xauusd).",
+    )
+    dexter_family_export_family: str = Field(
+        default="xau_scalp_mempalace_lane",
+        validation_alias="DEXTER_FAMILY_EXPORT_FAMILY",
+        description="Dexter family token mapped to mempalace lane.",
+    )
+    dexter_family_export_strategy_id: str = Field(
+        default="xau_scalp_mempalace_lane_v1",
+        validation_alias="DEXTER_FAMILY_EXPORT_STRATEGY_ID",
+        description="Strategy id tag exported for Dexter journal/report attribution.",
     )
     strategy_registry_path: Path = Field(
         default=Path("./data/strategy_registry.json"),
@@ -77,6 +113,13 @@ class Settings(BaseSettings):
     )
     local_model: str = Field(default="qwen2.5", validation_alias="LOCAL_MODEL_NAME")
     local_api_key: str = Field(default="ollama", validation_alias="LOCAL_API_KEY")
+    local_keep_alive: str = Field(default="5m", validation_alias="LOCAL_KEEP_ALIVE")
+    local_num_ctx: Optional[int] = Field(default=None, validation_alias="LOCAL_NUM_CTX")
+    local_think: bool = Field(
+        default=False,
+        validation_alias="LOCAL_THINK",
+        description="Enable Ollama thinking traces for local models when supported.",
+    )
     local_fallback_models: str = Field(
         default="",
         validation_alias="LOCAL_FALLBACK_MODELS",
@@ -133,6 +176,329 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="MEMORY_ROOM_GUARD_BLOCK_ANTI",
         description="Force HOLD when the current room is classified as an anti-pattern.",
+    )
+    self_improvement_enabled: bool = Field(
+        default=True,
+        validation_alias="SELF_IMPROVEMENT_ENABLED",
+        description="After each closed trade, distill a reusable procedural skill document.",
+    )
+    self_improvement_store_notes: bool = Field(
+        default=True,
+        validation_alias="SELF_IMPROVEMENT_STORE_NOTES",
+        description="Mirror distilled skills into MemPalace notes for wake-up context and inspection.",
+    )
+    self_improvement_model_name: Optional[str] = Field(
+        default=None,
+        validation_alias="SELF_IMPROVEMENT_MODEL_NAME",
+        description="Optional dedicated model for the Hermes-style self-improvement loop.",
+    )
+    self_improvement_timeout_sec: Optional[float] = Field(
+        default=None,
+        validation_alias="SELF_IMPROVEMENT_TIMEOUT_SEC",
+        description="Optional timeout override for post-trade self-improvement reviews.",
+    )
+    self_improvement_max_tokens: Optional[int] = Field(
+        default=None,
+        validation_alias="SELF_IMPROVEMENT_MAX_TOKENS",
+        description="Optional max-token override for post-trade skill distillation.",
+    )
+    self_improvement_local_num_ctx: Optional[int] = Field(
+        default=512,
+        validation_alias="SELF_IMPROVEMENT_LOCAL_NUM_CTX",
+        description="Optional Ollama num_ctx override for the self-improvement model.",
+    )
+    self_improvement_local_keep_alive: str = Field(
+        default="0s",
+        validation_alias="SELF_IMPROVEMENT_LOCAL_KEEP_ALIVE",
+        description="How long the self-improvement model should stay loaded after a review.",
+    )
+    self_improvement_local_think: bool = Field(
+        default=False,
+        validation_alias="SELF_IMPROVEMENT_LOCAL_THINK",
+        description="Enable Ollama thinking traces for the self-improvement model.",
+    )
+    agent_team_enabled: bool = Field(
+        default=True,
+        validation_alias="AGENT_TEAM_ENABLED",
+        description="Inject a strategist / memory / risk / evolution team brief into the decision prompt.",
+    )
+    skillbook_dir: Path = Field(
+        default=Path("./data/skills"),
+        validation_alias="SKILLBOOK_DIR",
+        description="Markdown skill documents written by the self-improvement loop.",
+    )
+    skillbook_index_path: Path = Field(
+        default=Path("./data/skillbook_index.json"),
+        validation_alias="SKILLBOOK_INDEX_PATH",
+        description="Fast index for procedural skill recall.",
+    )
+    skill_recall_top_k: int = Field(
+        default=3,
+        validation_alias="SKILL_RECALL_TOP_K",
+        ge=1,
+        le=12,
+        description="Top-K skill documents injected back into the prompt each cycle.",
+    )
+    skillbook_max_evidence: int = Field(
+        default=8,
+        validation_alias="SKILLBOOK_MAX_EVIDENCE",
+        ge=2,
+        le=40,
+        description="Recent evidence rows retained per skill document.",
+    )
+    shadow_probe_enabled: bool = Field(
+        default=True,
+        validation_alias="SHADOW_PROBE_ENABLED",
+        description="In backtest/paper, keep learning with dry-run shadow probes when real entry is blocked.",
+    )
+    shadow_probe_volume_fraction: float = Field(
+        default=0.25,
+        validation_alias="SHADOW_PROBE_VOLUME_FRACTION",
+        ge=0.05,
+        le=1.0,
+        description="Fraction of DEFAULT_VOLUME used by dry-run shadow probes.",
+    )
+    shadow_probe_min_confidence: float = Field(
+        default=0.58,
+        validation_alias="SHADOW_PROBE_MIN_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence required before a blocked signal can open a shadow probe.",
+    )
+    soft_gate_new_lane_enabled: bool = Field(
+        default=True,
+        validation_alias="SOFT_GATE_NEW_LANE_ENABLED",
+        description="Downgrade some new-lane blockers from hard HOLD to confidence penalty.",
+    )
+    soft_gate_new_lane_max_trades: int = Field(
+        default=3,
+        validation_alias="SOFT_GATE_NEW_LANE_MAX_TRADES",
+        ge=1,
+        le=20,
+        description="Treat lanes below this trade count as immature and eligible for soft-gate handling.",
+    )
+    soft_gate_confidence_penalty: float = Field(
+        default=0.08,
+        validation_alias="SOFT_GATE_CONFIDENCE_PENALTY",
+        ge=0.0,
+        le=0.5,
+        description="Confidence penalty applied when a blocker is softened instead of forcing HOLD.",
+    )
+    soft_gate_min_confidence: float = Field(
+        default=0.58,
+        validation_alias="SOFT_GATE_MIN_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description="Lower confidence floor used for probationary new-lane trades.",
+    )
+    probation_trade_volume_fraction: float = Field(
+        default=0.35,
+        validation_alias="PROBATION_TRADE_VOLUME_FRACTION",
+        ge=0.05,
+        le=1.0,
+        description="Actual trade size fraction used for probationary soft-gated lanes to conserve risk budget.",
+    )
+    loss_streak_override_enabled: bool = Field(
+        default=True,
+        validation_alias="LOSS_STREAK_OVERRIDE_ENABLED",
+        description="Allow promoted shadow/skill lanes to re-open real entries after an entry loss-streak block.",
+    )
+    loss_streak_override_min_shadow_trades: int = Field(
+        default=3,
+        validation_alias="LOSS_STREAK_OVERRIDE_MIN_SHADOW_TRADES",
+        ge=1,
+        le=20,
+        description="Minimum closed shadow probes required before a lane can soften the entry loss-streak block.",
+    )
+    loss_streak_override_min_shadow_win_rate: float = Field(
+        default=0.54,
+        validation_alias="LOSS_STREAK_OVERRIDE_MIN_SHADOW_WIN_RATE",
+        ge=0.0,
+        le=1.0,
+        description="Minimum shadow win-rate required before a promoted lane can soften the loss-streak block.",
+    )
+    loss_streak_override_min_skill_trades: int = Field(
+        default=3,
+        validation_alias="LOSS_STREAK_OVERRIDE_MIN_SKILL_TRADES",
+        ge=1,
+        le=20,
+        description="Minimum skill evidence count before skill-only loss-streak overrides are allowed.",
+    )
+    loss_streak_override_min_skill_edge: float = Field(
+        default=0.1,
+        validation_alias="LOSS_STREAK_OVERRIDE_MIN_SKILL_EDGE",
+        ge=-1.0,
+        le=2.0,
+        description="Minimum risk-adjusted skill edge required for skill-only loss-streak overrides.",
+    )
+    loss_streak_override_confidence_penalty: float = Field(
+        default=0.06,
+        validation_alias="LOSS_STREAK_OVERRIDE_CONFIDENCE_PENALTY",
+        ge=0.0,
+        le=0.5,
+        description="Confidence penalty applied when re-opening a lane through loss-streak override.",
+    )
+    position_manager_enabled: bool = Field(
+        default=True,
+        validation_alias="POSITION_MANAGER_ENABLED",
+        description="Continuously assess open positions with momentum/statistical signals and close when risk dominates opportunity.",
+    )
+    position_monitor_path: Path = Field(
+        default=Path("./data/position_monitor.json"),
+        validation_alias="POSITION_MONITOR_PATH",
+        description="Latest real-time monitoring snapshot for entry assessment and open-position management.",
+    )
+    position_monitor_history_path: Path = Field(
+        default=Path("./data/position_monitor_history.ndjson"),
+        validation_alias="POSITION_MONITOR_HISTORY_PATH",
+        description="Append-only monitoring history for post-trade analysis and operator review.",
+    )
+    weekly_lane_learning_enabled: bool = Field(
+        default=True,
+        validation_alias="WEEKLY_LANE_LEARNING_ENABLED",
+        description="Learn from this week's good/bad lanes and blocked opportunities, then adapt live decisions conservatively.",
+    )
+    weekly_lane_refresh_sec: int = Field(
+        default=300,
+        validation_alias="WEEKLY_LANE_REFRESH_SEC",
+        ge=30,
+        le=86_400,
+        description="How often to refresh weekly lane profile from memory + monitor + Dexter deal history.",
+    )
+    weekly_lane_profile_path: Path = Field(
+        default=Path("./data/weekly_lane_profile.json"),
+        validation_alias="WEEKLY_LANE_PROFILE_PATH",
+        description="Latest weekly lane-learning profile persisted for audit and troubleshooting.",
+    )
+    weekly_lane_dexter_db_path: Optional[Path] = Field(
+        default=Path("../dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/ctrader_openapi.db"),
+        validation_alias="WEEKLY_LANE_DEXTER_DB_PATH",
+        description="Optional Dexter ctrader_openapi.db source for this-week family-lane deal history.",
+    )
+    weekly_lane_min_trades: int = Field(
+        default=3,
+        validation_alias="WEEKLY_LANE_MIN_TRADES",
+        ge=1,
+        le=100,
+        description="Minimum weekly closed trades before a lane is classified as good/bad.",
+    )
+    weekly_lane_good_win_rate: float = Field(
+        default=0.58,
+        validation_alias="WEEKLY_LANE_GOOD_WIN_RATE",
+        ge=0.0,
+        le=1.0,
+    )
+    weekly_lane_bad_loss_rate: float = Field(
+        default=0.6,
+        validation_alias="WEEKLY_LANE_BAD_LOSS_RATE",
+        ge=0.0,
+        le=1.0,
+    )
+    weekly_lane_bad_pnl_threshold: float = Field(
+        default=0.0,
+        validation_alias="WEEKLY_LANE_BAD_PNL_THRESHOLD",
+        description="Treat lane as bad when weekly pnl_sum falls below this threshold.",
+    )
+    weekly_lane_monitor_lookahead_steps: int = Field(
+        default=8,
+        validation_alias="WEEKLY_LANE_MONITOR_LOOKAHEAD_STEPS",
+        ge=2,
+        le=120,
+        description="Forward monitor steps used to estimate missed opportunities vs prevented bad blocks.",
+    )
+    weekly_lane_monitor_move_threshold_pct: float = Field(
+        default=0.0008,
+        validation_alias="WEEKLY_LANE_MONITOR_MOVE_THRESHOLD_PCT",
+        ge=0.00005,
+        le=0.05,
+        description="Minimum favorable/adverse move (pct) to classify a blocked signal outcome.",
+    )
+    weekly_lane_block_bad_lanes: bool = Field(
+        default=True,
+        validation_alias="WEEKLY_LANE_BLOCK_BAD_LANES",
+        description="Force HOLD on lanes classified as bad this week.",
+    )
+    weekly_lane_confidence_boost: float = Field(
+        default=0.04,
+        validation_alias="WEEKLY_LANE_CONFIDENCE_BOOST",
+        ge=0.0,
+        le=0.4,
+        description="Confidence bonus for lanes classified as good this week.",
+    )
+    weekly_lane_confidence_penalty: float = Field(
+        default=0.1,
+        validation_alias="WEEKLY_LANE_CONFIDENCE_PENALTY",
+        ge=0.0,
+        le=0.5,
+        description="Confidence penalty for lanes classified as bad when hard block is disabled.",
+    )
+    weekly_lane_probe_override_enabled: bool = Field(
+        default=True,
+        validation_alias="WEEKLY_LANE_PROBE_OVERRIDE_ENABLED",
+        description="Allow low-size probe entry when blocker evidence missed profitable moves this week.",
+    )
+    weekly_lane_probe_min_support: int = Field(
+        default=2,
+        validation_alias="WEEKLY_LANE_PROBE_MIN_SUPPORT",
+        ge=1,
+        le=20,
+        description="Minimum weekly opportunity support required before blocker-to-probe override can trigger.",
+    )
+    weekly_lane_probe_override_confidence: float = Field(
+        default=0.67,
+        validation_alias="WEEKLY_LANE_PROBE_OVERRIDE_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description="Confidence assigned when a weekly lane probe override converts HOLD into entry.",
+    )
+    weekly_lane_probe_volume_fraction: float = Field(
+        default=0.35,
+        validation_alias="WEEKLY_LANE_PROBE_VOLUME_FRACTION",
+        ge=0.05,
+        le=1.0,
+        description="Fraction of DEFAULT_VOLUME used for weekly lane probe overrides.",
+    )
+    position_manager_max_hold_minutes: int = Field(
+        default=240,
+        validation_alias="POSITION_MANAGER_MAX_HOLD_MINUTES",
+        ge=15,
+        le=1440,
+        description="Maximum preferred holding window before opportunity decay begins to force exits.",
+    )
+    position_manager_min_expected_move_pct: float = Field(
+        default=0.00035,
+        validation_alias="POSITION_MANAGER_MIN_EXPECTED_MOVE_PCT",
+        ge=0.00001,
+        le=0.02,
+        description="Minimum expected move percent used to avoid TP/SL collapsing in low-noise conditions.",
+    )
+    position_manager_tp_vol_multiplier: float = Field(
+        default=1.35,
+        validation_alias="POSITION_MANAGER_TP_VOL_MULTIPLIER",
+        ge=0.4,
+        le=5.0,
+        description="Base take-profit distance multiplier over realized move expectation.",
+    )
+    position_manager_sl_vol_multiplier: float = Field(
+        default=0.95,
+        validation_alias="POSITION_MANAGER_SL_VOL_MULTIPLIER",
+        ge=0.2,
+        le=3.0,
+        description="Base stop-loss distance multiplier over realized move expectation.",
+    )
+    position_manager_trail_trigger_fraction: float = Field(
+        default=0.55,
+        validation_alias="POSITION_MANAGER_TRAIL_TRIGGER_FRACTION",
+        ge=0.1,
+        le=1.0,
+        description="When unrealized progress reaches this fraction of TP distance, activate a trailing protect level.",
+    )
+    position_manager_risk_close_threshold: float = Field(
+        default=0.64,
+        validation_alias="POSITION_MANAGER_RISK_CLOSE_THRESHOLD",
+        ge=0.4,
+        le=1.0,
+        description="Close the position early when estimated live risk exceeds this threshold and opportunity fades.",
     )
 
     # --- Risk ---
@@ -392,6 +758,37 @@ class Settings(BaseSettings):
         gt=0.0,
         validation_alias="RISK_MIN_ORDER_LOT",
     )
+    entry_override_enabled: bool = Field(
+        default=True,
+        validation_alias="ENTRY_OVERRIDE_ENABLED",
+        description="Allow a reduced-size entry when the LLM freezes on HOLD but objective setup quality is strong.",
+    )
+    entry_override_min_opportunity: float = Field(
+        default=0.67,
+        ge=0.0,
+        le=1.0,
+        validation_alias="ENTRY_OVERRIDE_MIN_OPPORTUNITY",
+    )
+    entry_override_max_risk: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        validation_alias="ENTRY_OVERRIDE_MAX_RISK",
+    )
+    entry_override_min_edge: float = Field(
+        default=0.16,
+        ge=-1.0,
+        le=1.0,
+        validation_alias="ENTRY_OVERRIDE_MIN_EDGE",
+        description="Minimum opportunity minus risk required before a HOLD can be promoted into a probationary entry.",
+    )
+    entry_override_confidence: float = Field(
+        default=0.67,
+        ge=0.0,
+        le=1.0,
+        validation_alias="ENTRY_OVERRIDE_CONFIDENCE",
+        description="Confidence assigned to probationary entry overrides before normal exposure caps apply.",
+    )
 
     # --- Strategy evolution v2 (GPT-style; off by default — cuts frequency & adds gates) ---
     strategy_evolution_v2_enabled: bool = Field(
@@ -587,13 +984,19 @@ class Settings(BaseSettings):
             base = base.resolve()
         self.data_dir = base
         self.runtime_state_path = _resolve_path(self.runtime_state_path, base)
+        self.dexter_family_export_path = _resolve_external_path(self.dexter_family_export_path)
         self.strategy_registry_path = _resolve_path(self.strategy_registry_path, base)
         self.strategy_correlation_path = _resolve_path(self.strategy_correlation_path, base)
         self.chroma_path = _resolve_path(self.chroma_path, base)
+        self.weekly_lane_profile_path = _resolve_path(self.weekly_lane_profile_path, base)
+        self.skillbook_dir = _resolve_path(self.skillbook_dir, base)
+        self.skillbook_index_path = _resolve_path(self.skillbook_index_path, base)
         if self.mempalace_chroma_path is not None:
             self.mempalace_chroma_path = _resolve_external_path(self.mempalace_chroma_path)
         if self.ctrader_worker_script is not None:
             self.ctrader_worker_script = _resolve_external_path(self.ctrader_worker_script)
+        if self.weekly_lane_dexter_db_path is not None:
+            self.weekly_lane_dexter_db_path = _resolve_external_path(self.weekly_lane_dexter_db_path)
         return self
 
 
@@ -613,7 +1016,7 @@ def _resolve_path(path: Path, data_dir: Path) -> Path:
 
 
 def load_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=tuple(str(path) for path in config_env_paths()))
 
 
 def memory_persist_path(settings: Settings) -> Path:
