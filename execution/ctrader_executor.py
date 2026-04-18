@@ -1471,6 +1471,17 @@ class CTraderExecutor:
         return sl > entry
 
     @staticmethod
+    def _stop_valid_for_management(direction: str, current_price: float, stop_loss: float) -> bool:
+        px = _safe_float(current_price, 0.0)
+        sl = _safe_float(stop_loss, 0.0)
+        side = str(direction or "").strip().lower()
+        if px <= 0 or sl <= 0 or side not in {"long", "short"}:
+            return False
+        if side == "long":
+            return sl < px
+        return sl > px
+
+    @staticmethod
     def _price_crossed_target(direction: str, price: float, target: float) -> bool:
         px = _safe_float(price, 0.0)
         tp = _safe_float(target, 0.0)
@@ -1554,6 +1565,8 @@ class CTraderExecutor:
         bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
         mid_drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
         delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
+        depth_imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
+        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
         max_weak_volume = max(
             0.01,
             float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY", 0.22) or 0.22),
@@ -1566,6 +1579,39 @@ class CTraderExecutor:
             bar_volume_proxy <= max_weak_volume
             and abs(mid_drift_pct) <= max_weak_abs_drift
         ) or (day_type in {"range", "rotation", "consolidation"})
+        sweep_recovery_enabled = bool(
+            getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", True)
+        )
+        sweep_min_rejection = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", 0.28) or 0.28),
+        )
+        sweep_min_volume = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", 0.30) or 0.30),
+        )
+        sweep_min_delta = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", 0.08) or 0.08),
+        )
+        sweep_min_imbalance = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", 0.06) or 0.06),
+        )
+        supportive_delta = (
+            (direction == "long" and delta_proxy >= sweep_min_delta)
+            or (direction == "short" and delta_proxy <= (-1.0 * sweep_min_delta))
+        )
+        supportive_depth = (
+            (direction == "long" and depth_imbalance >= sweep_min_imbalance)
+            or (direction == "short" and depth_imbalance <= (-1.0 * sweep_min_imbalance))
+        )
+        sweep_recovery = bool(
+            sweep_recovery_enabled
+            and rejection_ratio >= sweep_min_rejection
+            and bar_volume_proxy >= sweep_min_volume
+            and (supportive_delta or supportive_depth)
+        )
         family_mode = self._family_trade_mode(source)
         details = {
             "family_mode": family_mode,
@@ -1576,6 +1622,9 @@ class CTraderExecutor:
             "bar_volume_proxy": round(bar_volume_proxy, 4),
             "mid_drift_pct": round(mid_drift_pct, 6),
             "delta_proxy": round(delta_proxy, 4),
+            "depth_imbalance": round(depth_imbalance, 4),
+            "rejection_ratio": round(rejection_ratio, 4),
+            "sweep_recovery": bool(sweep_recovery),
             "day_type": day_type,
         }
         if family_mode == "impulse":
@@ -1602,7 +1651,7 @@ class CTraderExecutor:
                 float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", 0.08) or 0.08),
             )
             new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
-            if not self._stop_valid_for_position(direction, entry, new_sl):
+            if not self._stop_valid_for_management(direction, current_price, new_sl):
                 return {"active": False, "reason": "invalid_impulse_lock_stop", "details": details}
             improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
             if not improves:
@@ -1615,7 +1664,43 @@ class CTraderExecutor:
                 "details": details,
             }
 
-        if family_mode == "corrective" or weak_market:
+        if family_mode == "corrective":
+            risk = abs(entry - stop_loss)
+            if risk <= 0:
+                return {"active": False, "reason": "invalid_risk", "details": details}
+            lock_r = max(
+                0.0,
+                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", 0.05) or 0.05),
+            )
+            new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+            if sweep_recovery and self._stop_valid_for_management(direction, current_price, new_sl):
+                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                if improves:
+                    return {
+                        "active": True,
+                        "action": "tighten",
+                        "reason": "profit_retrace_guard_corrective_sweep_tighten",
+                        "new_stop_loss": round(new_sl, 4),
+                        "details": details,
+                    }
+            if weak_market:
+                return {
+                    "active": True,
+                    "action": "close",
+                    "reason": "profit_retrace_guard_close",
+                    "details": details,
+                }
+            if self._stop_valid_for_management(direction, current_price, new_sl):
+                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                if improves:
+                    return {
+                        "active": True,
+                        "action": "tighten",
+                        "reason": "profit_retrace_guard_corrective_tighten",
+                        "new_stop_loss": round(new_sl, 4),
+                        "details": details,
+                    }
+        if weak_market:
             return {
                 "active": True,
                 "action": "close",
@@ -6072,7 +6157,7 @@ class CTraderExecutor:
                     guard_sl = _safe_float(retrace_guard.get("new_stop_loss"), 0.0)
                     guard_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else target_tp
                     stop_tol = max(abs(entry) * 0.000001, 0.01)
-                    if self._stop_valid_for_position(direction, entry, guard_sl) and abs(guard_sl - stop_loss) > stop_tol:
+                    if self._stop_valid_for_management(direction, ref, guard_sl) and abs(guard_sl - stop_loss) > stop_tol:
                         res = self.amend_position_sltp(
                             position_id=position_id,
                             stop_loss=guard_sl,

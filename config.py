@@ -740,6 +740,25 @@ class Config:
     CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY", "0.12"))
     CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY", "0.30"))
     CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", "0.08"))
+    # Sweep-recovery detector: avoid premature close when move likely is liquidity sweep + continuation.
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED: bool = os.getenv(
+        "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", "0.28")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", "0.30")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", "0.08")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", "0.06")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", "0.05")
+    )
     CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN", "0.15"))
     # When trading manager xau_order_care is inactive, still allow TP extension using config defaults (capture snapshot required).
     CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE: bool = os.getenv(
