@@ -386,6 +386,9 @@ class Config:
     CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD", "0.20"))
 
     CTRADER_XAU_ACTIVE_FAMILIES: str = os.getenv("CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit,xau_scalp_breakout_stop")
+    DEXTER_MEMPALACE_FAMILY_LANE_ENABLED: bool = os.getenv("DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    DEXTER_MEMPALACE_FAMILY_NAME: str = os.getenv("DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane")
+    DEXTER_MEMPALACE_SOURCE_TOKENS: str = os.getenv("DEXTER_MEMPALACE_SOURCE_TOKENS", "mempalace,mempalac")
     CTRADER_XAU_PRIMARY_FAMILY: str = os.getenv("CTRADER_XAU_PRIMARY_FAMILY", "")
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES: str = os.getenv(
@@ -744,6 +747,45 @@ class Config:
     CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R", "0.80"))
     CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", "0.08"))
     CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", "0.03"))
+    # Profit retrace guard: bank profit in weak/corrective phases, but keep impulse continuation alive.
+    CTRADER_PM_IMPULSE_FAMILIES: str = os.getenv(
+        "CTRADER_PM_IMPULSE_FAMILIES",
+        "xau_scalp_breakout_stop,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scheduled_trend,xau_scalp_mempalace_lane",
+    )
+    CTRADER_PM_CORRECTIVE_FAMILIES: str = os.getenv(
+        "CTRADER_PM_CORRECTIVE_FAMILIES",
+        "xau_scalp_pullback_limit,xau_scalp_range_repair,xau_scalp_flow_short_sidecar,xau_scalp_tick_depth_filter",
+    )
+    CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED: bool = os.getenv(
+        "CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN", "4.0"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R", "0.30"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R", "0.22"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY", "0.22"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT", "0.004"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY", "0.12"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY", "0.30"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", "0.08"))
+    # Sweep-recovery detector: avoid premature close when move likely is liquidity sweep + continuation.
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED: bool = os.getenv(
+        "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", "0.28")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", "0.30")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", "0.08")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", "0.06")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", "0.05")
+    )
     CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN", "0.15"))
     # When trading manager xau_order_care is inactive, still allow TP extension using config defaults (capture snapshot required).
     CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE: bool = os.getenv(
@@ -944,6 +986,12 @@ class Config:
     # ── Copy Trade System ──
     COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     COPY_TRADE_WORKER_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_WORKER_TIMEOUT_SEC", "25"))
+    COPY_TRADE_CLOSE_FOLLOW_ENABLED: bool = os.getenv("COPY_TRADE_CLOSE_FOLLOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    COPY_TRADE_PROTECTION_FOLLOW_ENABLED: bool = os.getenv("COPY_TRADE_PROTECTION_FOLLOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    COPY_TRADE_LATENCY_WARN_MS: int = int(os.getenv("COPY_TRADE_LATENCY_WARN_MS", "5000"))
+    COPY_TRADE_CLOSE_FOLLOW_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_CLOSE_FOLLOW_TIMEOUT_SEC", "18"))
+    COPY_TRADE_PROTECTION_FOLLOW_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_PROTECTION_FOLLOW_TIMEOUT_SEC", "18"))
+    COPY_TRADE_CLOSE_EVENT_DEDUPE_SEC: int = int(os.getenv("COPY_TRADE_CLOSE_EVENT_DEDUPE_SEC", "90"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC", "6"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS", "240"))
     CTRADER_PENDING_ORDER_SWEEP_ENABLED: bool = os.getenv("CTRADER_PENDING_ORDER_SWEEP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -2573,7 +2621,24 @@ class Config:
 
     @classmethod
     def get_ctrader_xau_active_families(cls) -> set[str]:
-        return cls._parse_lower_set(cls.CTRADER_XAU_ACTIVE_FAMILIES)
+        families = cls._parse_lower_set(cls.CTRADER_XAU_ACTIVE_FAMILIES)
+        if bool(getattr(cls, "DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", False)):
+            fam = str(getattr(cls, "DEXTER_MEMPALACE_FAMILY_NAME", "") or "").strip().lower()
+            if fam:
+                families.add(fam)
+        return families
+
+    @classmethod
+    def get_dexter_mempalace_source_tokens(cls) -> set[str]:
+        return cls._parse_lower_set(cls.DEXTER_MEMPALACE_SOURCE_TOKENS)
+
+    @classmethod
+    def get_ctrader_pm_impulse_families(cls) -> set[str]:
+        return cls._parse_lower_set(cls.CTRADER_PM_IMPULSE_FAMILIES)
+
+    @classmethod
+    def get_ctrader_pm_corrective_families(cls) -> set[str]:
+        return cls._parse_lower_set(cls.CTRADER_PM_CORRECTIVE_FAMILIES)
 
     @classmethod
     def get_ctrader_market_capture_symbols(cls) -> set[str]:

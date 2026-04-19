@@ -129,7 +129,6 @@ class CTraderExecutor:
         self.trading_manager_state_path = self.db_path.parent / "runtime" / "trading_manager_state.json"
         self.trading_team_state_path = self.db_path.parent / "runtime" / "trading_team_state.json"
         self._autopilot = None
-        self._position_peak_r: dict[int, float] = {}
         self._init_db()
 
     @property
@@ -405,50 +404,6 @@ class CTraderExecutor:
             return True
         return token in allowed
 
-    @staticmethod
-    def _source_direction_matches(specs: set[tuple[str, str]], *, source: str, direction: str) -> bool:
-        src = str(source or "").strip().lower()
-        side = str(direction or "").strip().lower()
-        if side == "buy":
-            side = "long"
-        elif side == "sell":
-            side = "short"
-        for spec_source, spec_direction in set(specs or set()):
-            s = str(spec_source or "").strip().lower()
-            d = str(spec_direction or "*").strip().lower() or "*"
-            if s not in {"*", "all"} and s != src:
-                continue
-            if d in {"*", "all"} or d == side:
-                return True
-        return False
-
-    def _source_direction_governance_guard(self, *, source: str, symbol: str, direction: str) -> tuple[bool, str, dict]:
-        src = str(source or "").strip().lower()
-        side = str(direction or "").strip().lower()
-        if side == "buy":
-            side = "long"
-        elif side == "sell":
-            side = "short"
-        if not src or side not in {"long", "short"}:
-            return True, "", {"source": src, "direction": side}
-        protected = set(getattr(config, "get_ctrader_protected_source_directions", lambda: set())() or set())
-        meta = {
-            "source": src,
-            "symbol": str(symbol or "").strip().upper(),
-            "direction": side,
-            "protected": self._source_direction_matches(protected, source=src, direction=side),
-        }
-        if bool(meta["protected"]):
-            return True, "", meta
-        if not bool(getattr(config, "CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED", True)):
-            return True, "", {**meta, "enabled": False}
-        quarantined = set(getattr(config, "get_ctrader_quarantined_source_directions", lambda: set())() or set())
-        blocked = self._source_direction_matches(quarantined, source=src, direction=side)
-        meta.update({"enabled": True, "quarantined": bool(blocked)})
-        if blocked:
-            return False, f"source_direction_quarantined:{src}:{side}", meta
-        return True, "", meta
-
     def _symbol_allowed(self, symbol: str) -> bool:
         allowed = set(getattr(config, "get_ctrader_allowed_symbols", lambda: set())() or set())
         token = str(symbol or "").strip().upper()
@@ -586,12 +541,6 @@ class CTraderExecutor:
         token = str(source or "").strip().lower()
         if not token:
             return ""
-        if bool(getattr(config, "DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", False)):
-            mem_tokens = set(getattr(config, "get_dexter_mempalace_source_tokens", lambda: set())() or set())
-            if mem_tokens and any(mt in token for mt in mem_tokens):
-                fam = str(getattr(config, "DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane") or "").strip().lower()
-                if fam:
-                    return fam
         if ":rr:" in token or "range_repair" in token:
             return "xau_scalp_range_repair"
         if ":td:" in token or "tick_depth_filter" in token:
@@ -608,8 +557,6 @@ class CTraderExecutor:
             return "xau_scheduled_trend"
         if ":ff:" in token or "failed_fade_follow_stop" in token:
             return "xau_scalp_failed_fade_follow_stop"
-        if token.startswith("fibo_xauusd") or "xau_fibo_advance" in token:
-            return "xau_fibo_advance"
         if token.startswith("scalp_xauusd"):
             return "xau_scalp_microtrend"
         if token.startswith("scalp_btcusd"):
@@ -1471,17 +1418,6 @@ class CTraderExecutor:
         return sl > entry
 
     @staticmethod
-    def _stop_valid_for_management(direction: str, current_price: float, stop_loss: float) -> bool:
-        px = _safe_float(current_price, 0.0)
-        sl = _safe_float(stop_loss, 0.0)
-        side = str(direction or "").strip().lower()
-        if px <= 0 or sl <= 0 or side not in {"long", "short"}:
-            return False
-        if side == "long":
-            return sl < px
-        return sl > px
-
-    @staticmethod
     def _price_crossed_target(direction: str, price: float, target: float) -> bool:
         px = _safe_float(price, 0.0)
         tp = _safe_float(target, 0.0)
@@ -1504,210 +1440,6 @@ class CTraderExecutor:
         if side == "long":
             return (px - entry) / risk
         return (entry - px) / risk
-
-    def _family_trade_mode(self, source: str) -> str:
-        family = self._source_family(source)
-        if not family:
-            return "neutral"
-        impulse = set(getattr(config, "get_ctrader_pm_impulse_families", lambda: set())() or set())
-        corrective = set(getattr(config, "get_ctrader_pm_corrective_families", lambda: set())() or set())
-        if family in impulse:
-            return "impulse"
-        if family in corrective:
-            return "corrective"
-        return "neutral"
-
-    def _profit_retrace_guard_plan(
-        self,
-        *,
-        source: str,
-        symbol: str,
-        direction: str,
-        position_id: int,
-        entry: float,
-        stop_loss: float,
-        current_price: float,
-        confidence: float,
-        age_min: float,
-        r_now: Optional[float],
-    ) -> dict:
-        if not bool(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED", True)):
-            return {"active": False, "reason": "disabled"}
-        if r_now is None:
-            return {"active": False, "reason": "missing_r"}
-        if int(position_id or 0) <= 0:
-            return {"active": False, "reason": "position_missing"}
-        min_age = max(0.0, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN", 4.0) or 4.0))
-        if float(age_min) < min_age:
-            return {"active": False, "reason": "too_young"}
-        min_peak_r = max(0.0, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R", 0.30) or 0.30))
-        retrace_trigger = max(0.01, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R", 0.22) or 0.22))
-        peak_prev = float(self._position_peak_r.get(int(position_id), float(r_now)) or float(r_now))
-        peak_now = max(peak_prev, float(r_now))
-        self._position_peak_r[int(position_id)] = peak_now
-        if peak_now < min_peak_r:
-            return {
-                "active": False,
-                "reason": "peak_below_min",
-                "details": {"peak_r": round(peak_now, 4), "min_peak_r": round(min_peak_r, 4)},
-            }
-        retrace_r = peak_now - float(r_now)
-        if retrace_r < retrace_trigger:
-            return {
-                "active": False,
-                "reason": "retrace_small",
-                "details": {"peak_r": round(peak_now, 4), "r_now": round(float(r_now), 4), "retrace_r": round(retrace_r, 4)},
-            }
-
-        snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=confidence)
-        features = dict(snapshot.get("features") or {}) if isinstance(snapshot, dict) else {}
-        day_type = str(features.get("day_type") or "").strip().lower()
-        bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
-        mid_drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
-        delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
-        depth_imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
-        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
-        max_weak_volume = max(
-            0.01,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY", 0.22) or 0.22),
-        )
-        max_weak_abs_drift = max(
-            0.0001,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT", 0.004) or 0.004),
-        )
-        weak_market = (
-            bar_volume_proxy <= max_weak_volume
-            and abs(mid_drift_pct) <= max_weak_abs_drift
-        ) or (day_type in {"range", "rotation", "consolidation"})
-        sweep_recovery_enabled = bool(
-            getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", True)
-        )
-        sweep_min_rejection = max(
-            0.0,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", 0.28) or 0.28),
-        )
-        sweep_min_volume = max(
-            0.0,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", 0.30) or 0.30),
-        )
-        sweep_min_delta = max(
-            0.0,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", 0.08) or 0.08),
-        )
-        sweep_min_imbalance = max(
-            0.0,
-            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", 0.06) or 0.06),
-        )
-        supportive_delta = (
-            (direction == "long" and delta_proxy >= sweep_min_delta)
-            or (direction == "short" and delta_proxy <= (-1.0 * sweep_min_delta))
-        )
-        supportive_depth = (
-            (direction == "long" and depth_imbalance >= sweep_min_imbalance)
-            or (direction == "short" and depth_imbalance <= (-1.0 * sweep_min_imbalance))
-        )
-        sweep_recovery = bool(
-            sweep_recovery_enabled
-            and rejection_ratio >= sweep_min_rejection
-            and bar_volume_proxy >= sweep_min_volume
-            and (supportive_delta or supportive_depth)
-        )
-        family_mode = self._family_trade_mode(source)
-        details = {
-            "family_mode": family_mode,
-            "peak_r": round(peak_now, 4),
-            "r_now": round(float(r_now), 4),
-            "retrace_r": round(retrace_r, 4),
-            "weak_market": bool(weak_market),
-            "bar_volume_proxy": round(bar_volume_proxy, 4),
-            "mid_drift_pct": round(mid_drift_pct, 6),
-            "delta_proxy": round(delta_proxy, 4),
-            "depth_imbalance": round(depth_imbalance, 4),
-            "rejection_ratio": round(rejection_ratio, 4),
-            "sweep_recovery": bool(sweep_recovery),
-            "day_type": day_type,
-        }
-        if family_mode == "impulse":
-            impulse_delta = max(
-                0.0,
-                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY", 0.12) or 0.12),
-            )
-            impulse_volume = max(
-                0.01,
-                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY", 0.30) or 0.30),
-            )
-            continuation_alive = (
-                (direction == "long" and delta_proxy >= impulse_delta)
-                or (direction == "short" and delta_proxy <= (-1.0 * impulse_delta))
-            ) and bar_volume_proxy >= impulse_volume
-            details["continuation_alive"] = bool(continuation_alive)
-            if continuation_alive:
-                return {"active": False, "reason": "impulse_continuation_alive", "details": details}
-            risk = abs(entry - stop_loss)
-            if risk <= 0:
-                return {"active": False, "reason": "invalid_risk", "details": details}
-            lock_r = max(
-                0.0,
-                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", 0.08) or 0.08),
-            )
-            new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
-            if not self._stop_valid_for_management(direction, current_price, new_sl):
-                return {"active": False, "reason": "invalid_impulse_lock_stop", "details": details}
-            improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
-            if not improves:
-                return {"active": False, "reason": "impulse_lock_not_improving", "details": details}
-            return {
-                "active": True,
-                "action": "tighten",
-                "reason": "profit_retrace_guard_impulse_tighten",
-                "new_stop_loss": round(new_sl, 4),
-                "details": details,
-            }
-
-        if family_mode == "corrective":
-            risk = abs(entry - stop_loss)
-            if risk <= 0:
-                return {"active": False, "reason": "invalid_risk", "details": details}
-            lock_r = max(
-                0.0,
-                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", 0.05) or 0.05),
-            )
-            new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
-            if sweep_recovery and self._stop_valid_for_management(direction, current_price, new_sl):
-                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
-                if improves:
-                    return {
-                        "active": True,
-                        "action": "tighten",
-                        "reason": "profit_retrace_guard_corrective_sweep_tighten",
-                        "new_stop_loss": round(new_sl, 4),
-                        "details": details,
-                    }
-            if weak_market:
-                return {
-                    "active": True,
-                    "action": "close",
-                    "reason": "profit_retrace_guard_close",
-                    "details": details,
-                }
-            if self._stop_valid_for_management(direction, current_price, new_sl):
-                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
-                if improves:
-                    return {
-                        "active": True,
-                        "action": "tighten",
-                        "reason": "profit_retrace_guard_corrective_tighten",
-                        "new_stop_loss": round(new_sl, 4),
-                        "details": details,
-                    }
-        if weak_market:
-            return {
-                "active": True,
-                "action": "close",
-                "reason": "profit_retrace_guard_close",
-                "details": details,
-            }
-        return {"active": False, "reason": "market_not_weak", "details": details}
 
     @staticmethod
     def _planned_rr(journal_row: Optional[sqlite3.Row]) -> float:
@@ -2308,39 +2040,8 @@ class CTraderExecutor:
             return {"active": False, "reason": "score_below_extend", "details": details}
 
         base_tp_r = max(0.25, float(order_care_overrides.get("extension_tp_r", 1.10) or 1.10))
-        base_step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
+        step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
         lock_r = max(0.01, float(order_care_overrides.get("extension_lock_r", 0.18) or 0.18))
-
-        # ── Momentum-adaptive step_r ──────────────────────────────────────
-        # Assess momentum strength from snapshot features
-        momentum_favorable = 0
-        if bar_volume_proxy >= 0.50:
-            momentum_favorable += 1
-        if supportive_delta >= 0.15:
-            momentum_favorable += 1
-        if supportive_imbalance >= 0.12:
-            momentum_favorable += 1
-        if supportive_drift >= 0.015:
-            momentum_favorable += 1
-        if rejection_ratio <= 0.12:
-            momentum_favorable += 1
-
-        if momentum_favorable >= 4:
-            step_r = base_step_r + 0.10  # strong momentum → bigger extension
-            momentum_label = "strong"
-        elif momentum_favorable >= 2:
-            step_r = base_step_r         # moderate → default
-            momentum_label = "moderate"
-        else:
-            step_r = max(0.10, base_step_r - 0.10)  # weak momentum → smaller extension
-            momentum_label = "weak"
-
-        details["momentum_adaptive"] = {
-            "favorable_count": momentum_favorable,
-            "momentum_label": momentum_label,
-            "step_r": round(step_r, 2),
-            "base_step_r": round(base_step_r, 2),
-        }
         target_r = max(base_tp_r, current_target_r + step_r)
         new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
         if not self._target_valid_for_position(direction, entry, new_tp):
@@ -2498,55 +2199,8 @@ class CTraderExecutor:
         stop_keep_r = max(0.05, float(order_care_overrides.get("stop_keep_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", 0.42) or 0.42) or 0.42))
         profit_lock_r = max(0.0, float(order_care_overrides.get("profit_lock_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", 0.05) or 0.05) or 0.05))
         trim_tp_r = max(0.10, float(order_care_overrides.get("trim_tp_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", 0.55) or 0.55) or 0.55))
-        r_current = float(r_now) if r_now is not None else None
-        profit_seek_enabled = bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
-        profit_seek_min_r_base = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
-        # Fibo trades target 1.272R+: don't lock profit until at least 0.8R (near TP1)
-        _is_fibo_src = str(source or "").strip().lower().startswith("fibo")
-        profit_seek_min_r = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R", 0.80) or 0.80)) if _is_fibo_src else profit_seek_min_r_base
-        profit_seek_active = bool(profit_seek_enabled and r_current is not None and r_current >= profit_seek_min_r)
 
-        if (r_current is not None) and score >= close_score and r_current <= close_max_r:
-            if profit_seek_active:
-                base_lock_r = max(
-                    profit_lock_r,
-                    max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", 0.08) or 0.08)),
-                )
-                lock_buffer_r = max(
-                    0.0,
-                    float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", 0.03) or 0.03),
-                )
-                lock_r = min(base_lock_r, max(0.0, r_current - lock_buffer_r))
-                if lock_r > 0.0:
-                    new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
-                    if direction == "long":
-                        new_sl = max(stop_loss, new_sl)
-                    else:
-                        new_sl = min(stop_loss, new_sl)
-                    improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
-                    if improves and self._stop_valid_for_position(direction, entry, new_sl):
-                        return {
-                            "active": True,
-                            "action": "tighten",
-                            "reason": "xau_active_defense_profit_protect",
-                            "new_stop_loss": round(new_sl, 4),
-                            "new_take_profit": round(target_tp, 4) if self._target_valid_for_position(direction, entry, target_tp) else 0.0,
-                            "details": {
-                                **details,
-                                "close_suppressed": True,
-                                "profit_seek_min_r": round(profit_seek_min_r, 4),
-                                "profit_lock_r": round(lock_r, 4),
-                            },
-                        }
-                return {
-                    "active": False,
-                    "reason": "profit_seek_close_suppressed_no_valid_lock",
-                    "details": {
-                        **details,
-                        "close_suppressed": True,
-                        "profit_seek_min_r": round(profit_seek_min_r, 4),
-                    },
-                }
+        if (r_now is not None) and score >= close_score and float(r_now) <= close_max_r:
             return {
                 "active": True,
                 "action": "close",
@@ -2565,18 +2219,11 @@ class CTraderExecutor:
         else:
             new_sl = min(stop_loss, new_sl)
         new_tp = target_tp
-        # Fibo trades must reach their Fibonacci extension target — never trim TP
-        _is_fibo_source = str(source or "").strip().lower().startswith("fibo")
         if self._target_valid_for_position(direction, entry, target_tp):
-            if _is_fibo_source:
-                details["tp_trim_suppressed_fibo_source"] = True
-            else:
-                trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-                if (not profit_seek_active) and self._target_valid_for_position(direction, entry, trimmed_tp):
-                    if abs(trimmed_tp - entry) < abs(target_tp - entry):
-                        new_tp = trimmed_tp
-                elif profit_seek_active:
-                    details["tp_trim_suppressed_profit_seeking"] = True
+            trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
+            if self._target_valid_for_position(direction, entry, trimmed_tp):
+                if abs(trimmed_tp - entry) < abs(target_tp - entry):
+                    new_tp = trimmed_tp
 
         breached = (direction == "long" and current_price <= new_sl) or (direction == "short" and current_price >= new_sl)
         if breached:
@@ -2594,345 +2241,6 @@ class CTraderExecutor:
             "reason": "xau_active_defense_tighten",
             "new_stop_loss": round(new_sl, 4),
             "new_take_profit": round(new_tp, 4) if self._target_valid_for_position(direction, entry, new_tp) else 0.0,
-            "details": details,
-        }
-
-    def _policy_defense_plan(
-        self,
-        *,
-        position_id: int,
-        source: str,
-        symbol: str,
-        direction: str,
-        entry: float,
-        stop_loss: float,
-        target_tp: float,
-        current_price: float,
-        confidence: float,
-        age_min: float,
-        r_now: Optional[float],
-    ) -> dict:
-        """
-        V4 policy-layer wrapper around _xau_active_defense_plan.
-
-        When CTRADER_PM_POLICY_LAYER_ENABLED is False (default), delegates to
-        the legacy evaluator unchanged — zero behavior change.
-
-        When enabled, evaluates the WinnerProtection state machine first:
-          - EMERGENCY        → force close (proven winner giving back too much)
-          - TRAILING_STRUCT  → active defense disabled; existing profit-extension
-                               / structural trail paths own the position
-          - LOCKED           → legacy evaluator runs, but a "close" action is
-                               suppressed unless score >= close_score + bonus
-          - ARMED / RUNNING  → legacy evaluator runs unchanged
-        """
-        legacy_call = lambda: self._xau_active_defense_plan(
-            source=source,
-            symbol=symbol,
-            direction=direction,
-            entry=entry,
-            stop_loss=stop_loss,
-            target_tp=target_tp,
-            current_price=current_price,
-            confidence=confidence,
-            age_min=age_min,
-            r_now=r_now,
-        )
-
-        if not bool(getattr(config, "CTRADER_PM_POLICY_LAYER_ENABLED", False)):
-            return legacy_call()
-
-        if r_now is None:
-            return legacy_call()
-        if not self._is_xau_active_defense_source(symbol=symbol, source=source):
-            return legacy_call()
-
-        try:
-            from execution.policy import (
-                ActiveDefenseInput,
-                WinnerProtectionConfig,
-                WinnerProtectionInput,
-                WinnerProtectionPolicy,
-                WinnerState,
-                configure_default_resolver,
-                default_resolver,
-            )
-        except Exception:
-            return legacy_call()
-
-        try:
-            r_now_f = float(r_now)
-        except (TypeError, ValueError):
-            return legacy_call()
-
-        if not hasattr(self, "_policy_r_peak_cache"):
-            self._policy_r_peak_cache: dict = {}
-        cache = self._policy_r_peak_cache
-        prior_peak = float(cache.get(position_id, r_now_f) or r_now_f)
-        r_peak = max(prior_peak, r_now_f)
-        cache[position_id] = r_peak
-        if len(cache) > 4096:
-            # Guard against leaks. Keep the 2048 largest r_peak entries.
-            try:
-                retained = dict(sorted(cache.items(), key=lambda kv: kv[1], reverse=True)[:2048])
-                self._policy_r_peak_cache = retained
-            except Exception:
-                self._policy_r_peak_cache = {position_id: r_peak}
-
-        try:
-            cfg = WinnerProtectionConfig(
-                arm_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_ARM_R", 2.0) or 2.0),
-                lock_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_R", 3.0) or 3.0),
-                trail_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_TRAIL_R", 5.0) or 5.0),
-                lock_floor_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", 1.5) or 1.5),
-                giveback_emergency_ratio=float(getattr(config, "CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", 0.33) or 0.33),
-                locked_active_defense_score_bonus=int(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", 3) or 3),
-            )
-            resolver = configure_default_resolver(winner_config=cfg)
-        except ValueError:
-            resolver = default_resolver()
-        except Exception:
-            return legacy_call()
-
-        snap = resolver.snapshot()
-        winner_decision = resolver.winner().decide(
-            WinnerProtectionInput(
-                r_now=r_now_f,
-                r_peak=r_peak,
-                regime_label=str(snap.label or ""),
-                regime_confidence=float(snap.confidence or 0.0),
-            )
-        )
-
-        winner_envelope = {
-            "winner_state": winner_decision.state.value,
-            "r_now": round(r_now_f, 4),
-            "r_peak": round(r_peak, 4),
-            "regime_label": str(snap.label or ""),
-            "regime_confidence": round(float(snap.confidence or 0.0), 3),
-        }
-
-        if winner_decision.force_close:
-            return {
-                "active": True,
-                "action": "close",
-                "reason": "winner_protection_emergency",
-                "details": {
-                    **winner_envelope,
-                    "winner_reason": winner_decision.reason,
-                },
-            }
-
-        if winner_decision.state == WinnerState.TRAILING_STRUCT:
-            cache.pop(position_id, None)  # trailing path owns the trade; drop peak cache
-            return {
-                "active": False,
-                "reason": "winner_protection_trailing_struct",
-                "details": {
-                    **winner_envelope,
-                    "sl_floor_r": winner_decision.structural_sl_floor_r,
-                    "winner_reason": winner_decision.reason,
-                },
-            }
-
-        base = legacy_call()
-
-        if winner_decision.state == WinnerState.LOCKED and bool(base.get("active")):
-            action = str(base.get("action") or "").strip().lower()
-            if action == "close":
-                details = dict(base.get("details") or {})
-                score = int(details.get("score") or 0)
-                thresholds = resolver.defense().thresholds(
-                    ActiveDefenseInput(
-                        r_now=r_now_f,
-                        regime_label=str(snap.label or ""),
-                        regime_confidence=float(snap.confidence or 0.0),
-                        winner_state=winner_decision.state.value,
-                    )
-                )
-                bonus = resolver.winner().locked_close_score_bonus()
-                effective_threshold = int(thresholds.close_score) + int(bonus)
-                if score < effective_threshold:
-                    return {
-                        "active": False,
-                        "reason": "winner_protection_locked_suppressed_close",
-                        "details": {
-                            **details,
-                            **winner_envelope,
-                            "effective_close_threshold": effective_threshold,
-                            "base_close_score": int(thresholds.close_score),
-                            "locked_bonus": int(bonus),
-                        },
-                    }
-
-        if isinstance(base, dict):
-            merged_details = dict(base.get("details") or {})
-            merged_details.update(winner_envelope)
-            base = {**base, "details": merged_details}
-        return base
-
-    def _xau_momentum_exhaustion_lock(
-        self,
-        *,
-        source: str,
-        symbol: str,
-        direction: str,
-        entry: float,
-        stop_loss: float,
-        current_price: float,
-        confidence: float,
-        age_min: float,
-        r_now: Optional[float],
-    ) -> dict:
-        """
-        Detect momentum exhaustion and lock profit BEFORE it evaporates.
-
-        Problem: trade reaches +R profit, momentum dies (delta reverses, volume dries,
-        drift goes adverse), but system waits for price to hit TP or SL — profit evaporates.
-
-        Solution: When all momentum signals are exhausted AND trade is profitable,
-        tighten SL to lock a portion of the profit immediately.
-
-        Triggers when:
-          - r_now > 0 (trade in profit)
-          - age_min > min_age (not too young)
-          - At least 3 of 5 adverse signals fire simultaneously:
-              1. Delta reversed against position
-              2. Volume dying (bar_volume_proxy < 0.25)
-              3. Adverse drift
-              4. High rejection ratio (rejections >= 0.25)
-              5. Day type switched to range/rotation (non-trending)
-        """
-        if not self._is_xau_symbol(symbol):
-            return {"active": False}
-        if r_now is None or r_now <= 0.15:
-            return {"active": False, "reason": "not_in_profit"}
-        order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
-        order_care_overrides = dict(order_care_state.get("overrides") or {}) if order_care_state else {}
-
-        min_age = float(order_care_overrides.get(
-            "exhaustion_min_age_min",
-            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN", 3.0) or 3.0,
-        ) or 3.0)
-        if age_min < min_age:
-            return {"active": False, "reason": "too_young"}
-
-        snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=confidence)
-        features = dict(snapshot.get("features") or {})
-        if not bool(snapshot.get("ok")) or not features:
-            return {"active": False, "reason": str(snapshot.get("status") or "no_capture")}
-
-        day_type = str(features.get("day_type") or "trend").strip().lower() or "trend"
-        delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
-        imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
-        drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
-        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
-        bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
-
-        if direction == "long":
-            adverse_delta = max(0.0, -1.0 * delta_proxy)
-            adverse_drift = max(0.0, -1.0 * drift_pct)
-        else:
-            adverse_delta = max(0.0, delta_proxy)
-            adverse_drift = max(0.0, drift_pct)
-
-        # Count exhaustion signals
-        exhaustion_signals = 0
-        reasons: list[str] = []
-
-        delta_threshold = float(order_care_overrides.get(
-            "exhaustion_adverse_delta", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA", 0.08) or 0.08,
-        ) or 0.08)
-        if adverse_delta >= delta_threshold:
-            exhaustion_signals += 1
-            reasons.append("delta_reversed")
-
-        vol_threshold = float(order_care_overrides.get(
-            "exhaustion_max_volume", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME", 0.25) or 0.25,
-        ) or 0.25)
-        if bar_volume_proxy < vol_threshold:
-            exhaustion_signals += 1
-            reasons.append("volume_dying")
-
-        drift_threshold = float(order_care_overrides.get(
-            "exhaustion_adverse_drift", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT", 0.008) or 0.008,
-        ) or 0.008)
-        if adverse_drift >= drift_threshold:
-            exhaustion_signals += 1
-            reasons.append("drift_adverse")
-
-        rejection_threshold = float(order_care_overrides.get(
-            "exhaustion_max_rejection", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION", 0.25) or 0.25,
-        ) or 0.25)
-        if rejection_ratio >= rejection_threshold:
-            exhaustion_signals += 1
-            reasons.append("high_rejection")
-
-        if day_type in {"range", "rotation", "consolidation"}:
-            exhaustion_signals += 1
-            reasons.append("day_type_non_trending")
-
-        required_signals = int(order_care_overrides.get(
-            "exhaustion_required_signals",
-            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", 3) or 3,
-        ) or 3)
-        if exhaustion_signals < required_signals:
-            return {"active": False, "reason": "exhaustion_not_confirmed", "details": {
-                "exhaustion_signals": exhaustion_signals,
-                "required": required_signals,
-                "reasons": reasons,
-            }}
-
-        # ── Lock profit: tighten SL based on current R-multiple ──────────
-        risk = abs(entry - stop_loss)
-        if risk <= 0:
-            return {"active": False, "reason": "invalid_risk"}
-
-        # Lock percentage scales with R: higher R → lock more
-        if r_now >= 1.5:
-            lock_pct = 0.70   # 70% of risk locked at 1.5R+
-        elif r_now >= 1.0:
-            lock_pct = 0.55   # 55% at 1.0R+
-        elif r_now >= 0.5:
-            lock_pct = 0.35   # 35% at 0.5R+
-        else:
-            lock_pct = 0.15   # 15% at 0.15R+
-
-        keep_risk = risk * (1.0 - lock_pct)
-        if direction == "long":
-            new_sl = entry - keep_risk
-        else:
-            new_sl = entry + keep_risk
-
-        if not self._stop_valid_for_position(direction, entry, new_sl):
-            return {"active": False, "reason": "invalid_new_sl"}
-        improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
-        if not improves:
-            return {"active": False, "reason": "sl_not_improving"}
-
-        details = {
-            "exhaustion_signals": exhaustion_signals,
-            "required": required_signals,
-            "reasons": reasons,
-            "r_now": round(r_now, 4),
-            "lock_pct": lock_pct,
-            "day_type": day_type,
-            "delta_proxy": round(delta_proxy, 4),
-            "bar_volume_proxy": round(bar_volume_proxy, 4),
-            "adverse_drift": round(adverse_drift, 5),
-            "rejection_ratio": round(rejection_ratio, 4),
-        }
-        logger.info(
-            "[PM:ExhaustionLock] %s %s | r_now=%.2f | signals=%d/%d | lock=%d%% | new_sl=%.2f | reasons=%s",
-            symbol, direction, r_now, exhaustion_signals, required_signals,
-            int(lock_pct * 100), new_sl, reasons,
-        )
-        return {
-            "active": True,
-            "action": "tighten",
-            "reason": "xau_momentum_exhaustion_lock",
-            "new_stop_loss": round(new_sl, 4),
-            "new_take_profit": 0.0,  # keep existing TP
             "details": details,
         }
 
@@ -4273,17 +3581,6 @@ class CTraderExecutor:
             return _early_exit("filtered", f"source_not_allowed:{source}")
         if not self._symbol_allowed(symbol):
             return _early_exit("filtered", f"symbol_not_allowed:{symbol}")
-        gov_ok, gov_reason, gov_meta = self._source_direction_governance_guard(
-            source=source,
-            symbol=symbol,
-            direction=str(getattr(signal, "direction", "") or ""),
-        )
-        if not gov_ok:
-            return _early_exit(
-                "filtered",
-                gov_reason,
-                execution_meta={"source_direction_governance": dict(gov_meta or {})},
-            )
         price_ok, price_reason, _price_meta = self._price_sanity_guard(signal, source=source)
         if not price_ok:
             return _early_exit("filtered", price_reason)
@@ -4513,20 +3810,7 @@ class CTraderExecutor:
             payload={"account_id": self._configured_account_id()[0], "position_id": int(position_id or 0), "volume": resolved_volume},
             timeout_sec=max(5, int(getattr(config, "CTRADER_EXECUTOR_TIMEOUT_SEC", 25) or 25)),
         )
-        result = self._result_from_dict(raw)
-        if bool(result.ok) and int(position_id or 0) > 0:
-            try:
-                from copy_trade.manager import copy_trade_manager
-
-                copy_trade_manager.enforce_close_follow_async(
-                    master_position_id=int(position_id or 0),
-                    master_order_id=int(result.order_id or 0),
-                    reason="master_close_api",
-                    master_close_utc=_utc_now_iso(),
-                )
-            except Exception as ct_err:
-                logger.debug("[CopyTrade] close-follow skipped: %s", ct_err)
-        return result
+        return self._result_from_dict(raw)
 
     def amend_position_sltp(
         self,
@@ -4547,20 +3831,7 @@ class CTraderExecutor:
             },
             timeout_sec=max(5, int(getattr(config, "CTRADER_EXECUTOR_TIMEOUT_SEC", 25) or 25)),
         )
-        result = self._result_from_dict(raw)
-        if bool(result.ok) and int(position_id or 0) > 0:
-            try:
-                from copy_trade.manager import copy_trade_manager
-
-                copy_trade_manager.sync_protection_follow_async(
-                    master_position_id=int(position_id or 0),
-                    stop_loss=_safe_float(stop_loss, 0.0),
-                    take_profit=_safe_float(take_profit, 0.0),
-                    reason="master_amend_sltp",
-                )
-            except Exception as ct_err:
-                logger.debug("[CopyTrade] protection-follow skipped: %s", ct_err)
-        return result
+        return self._result_from_dict(raw)
 
     def cancel_order(self, *, order_id: int) -> CTraderExecutionResult:
         raw = self._run_worker(
@@ -5609,17 +4880,6 @@ class CTraderExecutor:
                         "status": str(cancel_result.status or ""),
                     })
                     follow_signal, follow_source = self._follow_stop_signal_from_order(order, plan)
-                    # ── FFFS session block: skip overlap/off_hours ──
-                    _fffs_blocked_sessions = {s.strip().lower() for s in str(getattr(config, "FFFS_BLOCKED_SESSIONS", "overlap,off_hours") or "").split(",") if s.strip()}
-                    if _fffs_blocked_sessions:
-                        try:
-                            from market.session_manager import session_manager as _sm
-                            _active = set(s.lower() for s in (_sm.get_session_info() or {}).get("active_sessions", []) or [])
-                            if _active & _fffs_blocked_sessions:
-                                logger.info("[FFFS] blocked: active_sessions=%s overlap blocked_sessions=%s", _active, _fffs_blocked_sessions)
-                                continue
-                        except Exception:
-                            pass
                     follow_result = self.execute_signal(follow_signal, source=follow_source)
                     self._mark_order_follow_stop_launch(
                         conn,
@@ -5806,7 +5066,7 @@ class CTraderExecutor:
             planned_risk = self._planned_risk(journal_row, entry_price=entry, stop_loss=planned_sl or stop_loss)
             r_now = self._r_multiple(direction, entry, stop_loss, ref)
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
-            
+
             age_min = self._position_age_min(pos)
             # TP for amend paths before `target_tp` is computed later (planned vs live).
             _trail_take_profit = (
@@ -5822,10 +5082,10 @@ class CTraderExecutor:
                     _cls_func = getattr(self, "_classify_symbol", lambda x: "other")
                     now_ts = datetime.now(timezone.utc)
                     curr_session_overlap = float(_sf(now_ts.hour).get("session_overlap", 0.0)) if _sf else 0.0
-                    
+
                     snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=0.0)
                     feat = snapshot.get("features", {}) if snapshot else {}
-                    
+
                     state = {
                         "position_id": position_id,
                         "symbol": symbol,
@@ -5841,7 +5101,7 @@ class CTraderExecutor:
                         "active_sl": stop_loss,
                     }
                     decision = trailing_brain.get_trailing_decision(state)
-                    
+
                     if decision and decision.should_move and decision.trail_lock_r > 0:
                         brain_sl = entry + (risk * decision.trail_lock_r) if direction == "long" else entry - (risk * decision.trail_lock_r)
                         brain_improves = (brain_sl > stop_loss) if direction == "long" else (brain_sl < stop_loss)
@@ -6047,48 +5307,6 @@ class CTraderExecutor:
                 if bool(res.ok):
                     report["closed_profit_positions"] += 1
                 continue
-
-            # ── Momentum exhaustion profit lock (before extension) ────────
-            # If momentum is dead and trade is profitable, lock profit NOW
-            # instead of waiting for TP or letting it evaporate
-            if "fibo" in source and bool(getattr(config, "FIBO_PM_EXHAUSTION_LOCK_ENABLED", True)) and r_now is not None and r_now > 0.15:
-                try:
-                    exhaustion = self._xau_momentum_exhaustion_lock(
-                        source=source, symbol=symbol, direction=direction,
-                        entry=entry, stop_loss=stop_loss, current_price=ref,
-                        confidence=confidence, age_min=age_min, r_now=r_now,
-                    )
-                    if bool(exhaustion.get("active")):
-                        _exh_new_sl = _safe_float(exhaustion.get("new_stop_loss"), 0.0)
-                        if self._stop_valid_for_position(direction, entry, _exh_new_sl):
-                            _exh_improves = (_exh_new_sl > stop_loss) if direction == "long" else (_exh_new_sl < stop_loss)
-                            if _exh_improves:
-                                _exh_keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
-                                _exh_res = self.amend_position_sltp(
-                                    position_id=position_id, stop_loss=_exh_new_sl,
-                                    take_profit=_exh_keep_tp, trailing_stop_loss=False,
-                                )
-                                if bool(_exh_res.ok):
-                                    report["amended_positions"] += 1
-                                    report["pm_actions"].append({
-                                        "journal_id": (journal_id or None),
-                                        "position_id": position_id,
-                                        "source": source,
-                                        "symbol": symbol,
-                                        "action": "xau_momentum_exhaustion_lock",
-                                        "reference_price": round(ref, 4),
-                                        "new_stop_loss": round(_exh_new_sl, 4),
-                                        "r_now": round(float(r_now), 4),
-                                        "details": dict(exhaustion.get("details") or {}),
-                                    })
-                                    logger.info(
-                                        "[PM:ExhaustionLock] pos=%s %s %s | r_now=%.2f | new_sl=%.2f",
-                                        position_id, symbol, direction, r_now, _exh_new_sl,
-                                    )
-                                    continue
-                except Exception as _exh_exc:
-                    logger.debug("[PM] momentum_exhaustion_lock error for %s: %s", symbol, _exh_exc)
-
             planned_tp_valid = self._target_valid_for_position(direction, entry, planned_tp)
             live_tp_valid = self._target_valid_for_position(direction, entry, live_tp)
             live_target_more_favorable = planned_tp_valid and live_tp_valid and self._target_more_favorable(direction, entry, live_tp, planned_tp)
@@ -6238,8 +5456,7 @@ class CTraderExecutor:
                             "live_tp": round(live_tp, 4),
                         })
                     continue
-            active_defense = self._policy_defense_plan(
-                position_id=position_id,
+            active_defense = self._xau_active_defense_plan(
                 source=source,
                 symbol=symbol,
                 direction=direction,
@@ -6317,61 +5534,6 @@ class CTraderExecutor:
                             continue
                 except Exception:
                     logger.debug("[PM] crypto_dom_defense error for %s", symbol, exc_info=True)
-            retrace_guard = self._profit_retrace_guard_plan(
-                source=source,
-                symbol=symbol,
-                direction=direction,
-                position_id=position_id,
-                entry=entry,
-                stop_loss=stop_loss,
-                current_price=ref,
-                confidence=confidence,
-                age_min=age_min,
-                r_now=r_now,
-            )
-            if bool(retrace_guard.get("active")):
-                guard_action = str(retrace_guard.get("action") or "").strip().lower()
-                guard_reason = str(retrace_guard.get("reason") or "profit_retrace_guard")
-                guard_details = dict(retrace_guard.get("details") or {})
-                if guard_action == "close":
-                    res = self.close_position(position_id=position_id, volume=volume)
-                    if bool(res.ok):
-                        report["closed_profit_positions"] += 1
-                        report["pm_actions"].append({
-                            "position_id": position_id,
-                            "source": source,
-                            "symbol": symbol,
-                            "action": guard_reason,
-                            "reference_price": round(ref, 4),
-                            "r_now": (None if r_now is None else round(float(r_now), 4)),
-                            "details": guard_details,
-                        })
-                    continue
-                if guard_action == "tighten":
-                    guard_sl = _safe_float(retrace_guard.get("new_stop_loss"), 0.0)
-                    guard_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else target_tp
-                    stop_tol = max(abs(entry) * 0.000001, 0.01)
-                    if self._stop_valid_for_management(direction, ref, guard_sl) and abs(guard_sl - stop_loss) > stop_tol:
-                        res = self.amend_position_sltp(
-                            position_id=position_id,
-                            stop_loss=guard_sl,
-                            take_profit=guard_tp if self._target_valid_for_position(direction, entry, guard_tp) else 0.0,
-                            trailing_stop_loss=False,
-                        )
-                        if bool(res.ok):
-                            report["amended_positions"] += 1
-                            report["pm_actions"].append({
-                                "position_id": position_id,
-                                "source": source,
-                                "symbol": symbol,
-                                "action": guard_reason,
-                                "reference_price": round(ref, 4),
-                                "new_stop_loss": round(guard_sl, 4),
-                                "new_take_profit": round(guard_tp, 4) if self._target_valid_for_position(direction, entry, guard_tp) else 0.0,
-                                "r_now": (None if r_now is None else round(float(r_now), 4)),
-                                "details": guard_details,
-                            })
-                        continue
             if not self._is_scheduled_canary_source(source):
                 if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
                     no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)
@@ -6380,12 +5542,6 @@ class CTraderExecutor:
                     be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
                     trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
                     stop_tol = max(abs(entry) * 0.000001, 0.01)
-                    profit_seek_active_pm = (
-                        bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
-                        and self._is_xau_symbol(symbol)
-                        and (r_now is not None)
-                        and float(r_now) >= max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
-                    )
                     if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
                         res = self.close_position(position_id=position_id, volume=volume)
                         if bool(res.ok):
@@ -6413,7 +5569,7 @@ class CTraderExecutor:
                         be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
                         improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
                         trimmed_tp = target_tp
-                        if trim_tp_r > 0 and not profit_seek_active_pm:
+                        if trim_tp_r > 0:
                             candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
                             if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
                                 trimmed_tp = candidate_tp
@@ -7049,13 +6205,6 @@ class CTraderExecutor:
                     "UPDATE ctrader_orders SET is_open=0, last_seen_utc=? WHERE account_id=?",
                     (now_iso, account_id),
                 )
-            if self._position_peak_r:
-                alive = set(int(pid) for pid in seen_positions)
-                self._position_peak_r = {
-                    int(pid): float(peak)
-                    for pid, peak in self._position_peak_r.items()
-                    if int(pid) in alive
-                }
             for deal in deals:
                 position_id = int(_safe_float(deal.get("position_id"), 0))
                 source = ""
@@ -7122,18 +6271,6 @@ class CTraderExecutor:
                             closed_at=str(deal.get("execution_utc") or now_iso),
                             extra={"kind": "ctrader_close", "deal": deal, "journal_id": journal_id},
                         )
-                    try:
-                        from copy_trade.manager import copy_trade_manager
-
-                        copy_trade_manager.enforce_close_follow_async(
-                            master_position_id=position_id,
-                            master_order_id=int(deal.get("order_id") or 0),
-                            master_deal_id=int(deal.get("deal_id") or 0),
-                            reason="master_close_reconcile",
-                            master_close_utc=str(deal.get("execution_utc") or now_iso),
-                        )
-                    except Exception as ct_err:
-                        logger.debug("[CopyTrade] reconcile close-follow skipped: %s", ct_err)
                 conn.execute(
                     """
                     INSERT INTO ctrader_deals(
