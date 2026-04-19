@@ -2375,6 +2375,180 @@ class CTraderExecutor:
             "details": details,
         }
 
+    def _policy_defense_plan(
+        self,
+        *,
+        position_id: int,
+        source: str,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        target_tp: float,
+        current_price: float,
+        confidence: float,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        """
+        V4 policy-layer wrapper around _xau_active_defense_plan.
+
+        When CTRADER_PM_POLICY_LAYER_ENABLED is False (default), delegates to
+        the legacy evaluator unchanged — zero behavior change.
+
+        When enabled, evaluates the WinnerProtection state machine first:
+          - EMERGENCY        → force close (proven winner giving back too much)
+          - TRAILING_STRUCT  → active defense disabled; existing profit-extension
+                               / structural trail paths own the position
+          - LOCKED           → legacy evaluator runs, but a "close" action is
+                               suppressed unless score >= close_score + bonus
+          - ARMED / RUNNING  → legacy evaluator runs unchanged
+        """
+        legacy_call = lambda: self._xau_active_defense_plan(
+            source=source,
+            symbol=symbol,
+            direction=direction,
+            entry=entry,
+            stop_loss=stop_loss,
+            target_tp=target_tp,
+            current_price=current_price,
+            confidence=confidence,
+            age_min=age_min,
+            r_now=r_now,
+        )
+
+        if not bool(getattr(config, "CTRADER_PM_POLICY_LAYER_ENABLED", False)):
+            return legacy_call()
+
+        if r_now is None:
+            return legacy_call()
+        if not self._is_xau_active_defense_source(symbol=symbol, source=source):
+            return legacy_call()
+
+        try:
+            from execution.policy import (
+                ActiveDefenseInput,
+                WinnerProtectionConfig,
+                WinnerProtectionInput,
+                WinnerProtectionPolicy,
+                WinnerState,
+                configure_default_resolver,
+                default_resolver,
+            )
+        except Exception:
+            return legacy_call()
+
+        try:
+            r_now_f = float(r_now)
+        except (TypeError, ValueError):
+            return legacy_call()
+
+        if not hasattr(self, "_policy_r_peak_cache"):
+            self._policy_r_peak_cache: dict = {}
+        cache = self._policy_r_peak_cache
+        prior_peak = float(cache.get(position_id, r_now_f) or r_now_f)
+        r_peak = max(prior_peak, r_now_f)
+        cache[position_id] = r_peak
+        if len(cache) > 4096:
+            # Guard against leaks. Keep the 2048 largest r_peak entries.
+            try:
+                retained = dict(sorted(cache.items(), key=lambda kv: kv[1], reverse=True)[:2048])
+                self._policy_r_peak_cache = retained
+            except Exception:
+                self._policy_r_peak_cache = {position_id: r_peak}
+
+        try:
+            cfg = WinnerProtectionConfig(
+                arm_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_ARM_R", 2.0) or 2.0),
+                lock_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_R", 3.0) or 3.0),
+                trail_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_TRAIL_R", 5.0) or 5.0),
+                lock_floor_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", 1.5) or 1.5),
+                giveback_emergency_ratio=float(getattr(config, "CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", 0.33) or 0.33),
+                locked_active_defense_score_bonus=int(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", 3) or 3),
+            )
+            resolver = configure_default_resolver(winner_config=cfg)
+        except ValueError:
+            resolver = default_resolver()
+        except Exception:
+            return legacy_call()
+
+        snap = resolver.snapshot()
+        winner_decision = resolver.winner().decide(
+            WinnerProtectionInput(
+                r_now=r_now_f,
+                r_peak=r_peak,
+                regime_label=str(snap.label or ""),
+                regime_confidence=float(snap.confidence or 0.0),
+            )
+        )
+
+        winner_envelope = {
+            "winner_state": winner_decision.state.value,
+            "r_now": round(r_now_f, 4),
+            "r_peak": round(r_peak, 4),
+            "regime_label": str(snap.label or ""),
+            "regime_confidence": round(float(snap.confidence or 0.0), 3),
+        }
+
+        if winner_decision.force_close:
+            return {
+                "active": True,
+                "action": "close",
+                "reason": "winner_protection_emergency",
+                "details": {
+                    **winner_envelope,
+                    "winner_reason": winner_decision.reason,
+                },
+            }
+
+        if winner_decision.state == WinnerState.TRAILING_STRUCT:
+            cache.pop(position_id, None)  # trailing path owns the trade; drop peak cache
+            return {
+                "active": False,
+                "reason": "winner_protection_trailing_struct",
+                "details": {
+                    **winner_envelope,
+                    "sl_floor_r": winner_decision.structural_sl_floor_r,
+                    "winner_reason": winner_decision.reason,
+                },
+            }
+
+        base = legacy_call()
+
+        if winner_decision.state == WinnerState.LOCKED and bool(base.get("active")):
+            action = str(base.get("action") or "").strip().lower()
+            if action == "close":
+                details = dict(base.get("details") or {})
+                score = int(details.get("score") or 0)
+                thresholds = resolver.defense().thresholds(
+                    ActiveDefenseInput(
+                        r_now=r_now_f,
+                        regime_label=str(snap.label or ""),
+                        regime_confidence=float(snap.confidence or 0.0),
+                        winner_state=winner_decision.state.value,
+                    )
+                )
+                bonus = resolver.winner().locked_close_score_bonus()
+                effective_threshold = int(thresholds.close_score) + int(bonus)
+                if score < effective_threshold:
+                    return {
+                        "active": False,
+                        "reason": "winner_protection_locked_suppressed_close",
+                        "details": {
+                            **details,
+                            **winner_envelope,
+                            "effective_close_threshold": effective_threshold,
+                            "base_close_score": int(thresholds.close_score),
+                            "locked_bonus": int(bonus),
+                        },
+                    }
+
+        if isinstance(base, dict):
+            merged_details = dict(base.get("details") or {})
+            merged_details.update(winner_envelope)
+            base = {**base, "details": merged_details}
+        return base
+
     def _xau_momentum_exhaustion_lock(
         self,
         *,
@@ -5816,7 +5990,8 @@ class CTraderExecutor:
                             "live_tp": round(live_tp, 4),
                         })
                     continue
-            active_defense = self._xau_active_defense_plan(
+            active_defense = self._policy_defense_plan(
+                position_id=position_id,
                 source=source,
                 symbol=symbol,
                 direction=direction,
