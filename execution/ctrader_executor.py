@@ -6294,6 +6294,63 @@ class CTraderExecutor:
                                 "details": details,
                         })
                     continue
+            elif str(active_defense.get("reason") or "") == "winner_protection_trailing_struct":
+                # V4 TRAILING_STRUCT: legacy active defense is disabled; the
+                # structural SL floor (peak-relative) must still be ratcheted
+                # or the state is a silent no-op.
+                trailing_details = dict(active_defense.get("details") or {})
+                floor_r_raw = trailing_details.get("sl_floor_r")
+                r_now_tf = floor_r_tf = entry_tf = ref_tf = sl_cur_tf = None
+                if floor_r_raw is not None and r_now is not None:
+                    try:
+                        r_now_tf = float(r_now)
+                        floor_r_tf = float(floor_r_raw)
+                        entry_tf = float(entry)
+                        ref_tf = float(ref)
+                        sl_cur_tf = float(stop_loss)
+                    except (TypeError, ValueError):
+                        r_now_tf = floor_r_tf = entry_tf = ref_tf = sl_cur_tf = None
+                if (
+                    r_now_tf is not None
+                    and abs(r_now_tf) > 1e-6
+                    and entry_tf is not None
+                    and entry_tf > 0
+                ):
+                    initial_risk_tf = abs(ref_tf - entry_tf) / abs(r_now_tf)
+                    if initial_risk_tf > 0:
+                        side_tf = str(direction or "").strip().lower()
+                        sl_target_tf = None
+                        if side_tf == "long":
+                            candidate_tf = entry_tf + floor_r_tf * initial_risk_tf
+                            if candidate_tf > sl_cur_tf:
+                                sl_target_tf = candidate_tf
+                        elif side_tf == "short":
+                            candidate_tf = entry_tf - floor_r_tf * initial_risk_tf
+                            if candidate_tf < sl_cur_tf:
+                                sl_target_tf = candidate_tf
+                        if sl_target_tf is not None:
+                            stop_tol_tf = max(abs(entry_tf) * 0.000001, 0.01)
+                            if abs(sl_target_tf - sl_cur_tf) > stop_tol_tf and self._stop_valid_for_management(direction, ref_tf, sl_target_tf):
+                                tp_for_amend_tf = target_tp if self._target_valid_for_position(direction, entry, target_tp) else 0.0
+                                res = self.amend_position_sltp(
+                                    position_id=position_id,
+                                    stop_loss=sl_target_tf,
+                                    take_profit=tp_for_amend_tf,
+                                    trailing_stop_loss=False,
+                                )
+                                if bool(res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append({
+                                        "position_id": position_id,
+                                        "source": source,
+                                        "symbol": symbol,
+                                        "action": "winner_protection_trailing_ratchet",
+                                        "reference_price": round(ref_tf, 4),
+                                        "new_stop_loss": round(sl_target_tf, 4),
+                                        "r_now": round(r_now_tf, 4),
+                                        "details": {**trailing_details, "sl_floor_r": round(floor_r_tf, 4)},
+                                    })
+                continue  # TRAILING_STRUCT owns the trade; skip lower-state defenses
             # DOM-only defense for non-XAU symbols (BTC/ETH)
             if not self._is_xau_symbol(symbol) and symbol.upper() in {"BTCUSD", "ETHUSD"}:
                 try:
