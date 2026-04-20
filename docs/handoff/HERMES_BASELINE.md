@@ -1,209 +1,200 @@
-# Hermes Baseline
+# Hermes — Baseline & Ownership
 
-**Last updated:** 2026-04-20
-**Role:** Senior software architect, maintainability reviewer, systems-hardening engineer, production-operations planner
-**Branch:** `deploy-xau-family-canary`
+> **Last updated:** 2026-04-20
+> **Role:** Architecture, infrastructure, observability, production reliability.
+> **Mode:** Delta — complement Opus without overlapping.
 
 ---
 
 ## Hermes Ownership Areas
 
-| Area | Scope | Does NOT include |
-|------|-------|-----------------|
-| Refactor map | How to restructure code without breaking live trading | Deciding what to remove (that's Opus) |
-| Config hardening | Preventing silent misconfiguration | Changing trading thresholds |
-| Logging / monitoring / observability | Making problems visible | Interpreting what the logs mean for trading |
-| Scheduler split | Decomposing the 13.7K-line god class | Changing scan logic or routing behavior |
-| DB archival / retention / backup safety | Keeping databases healthy | Deciding what data is trading-relevant |
-| Thread model cleanup | Preventing race conditions | Changing execution logic |
-| Production maintainability | Safe deployment, rollback, health checks | Trading strategy decisions |
+```
+HERMES OWNS:                          OPUS OWNS (do not touch):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Refactor map                           Execution truth
+Config hardening                       Confidence logic
+Logging / monitoring                   Fake-smart detection
+Scheduler split                        Opportunity capture
+DB archival / backup                   Winner protection
+Thread model cleanup                   Live policy behavior
+Production maintainability             TRAILING_STRUCT enforcement
+                                       Per-gate ROI evaluation
+```
+
+**Core rule:** Opus identifies the problem. Hermes builds the instrumentation to make it visible. Opus proposes the fix. Hermes builds the infrastructure to deploy it safely.
 
 ---
 
 ## Architectural Hardening Priorities
 
-### Codebase metrics (measured)
-- **Total Python:** ~285K lines across 200+ files
-- **scheduler.py:** 13,679 lines, 1 class, 120+ methods — the critical bottleneck
-- **config.py:** 1,903 attributes, 1,864 unique env vars, validate() checks only 3
-- **learning/:** 29,675 lines across 26 modules
-- **execution/:** 13,153 lines across 7 modules
-- **ctrader_executor.py:** 7,378 lines mixing DB access (221 lines), order management (1,700 refs), subprocess execution, and source gating
-- **live_profile_autopilot.py:** 7,642 lines — largest single module, mixed causal and potentially decorative logic
-- **Tests:** 29,499 lines across 60 files
-- **ctrader_openapi.db:** 5.4 GB — returning I/O errors, no archival policy
+### Current state (quantified):
 
-### Config access patterns (measured)
-- `getattr(config, "X")` in scheduler.py: **923 calls**
-- `config.X` direct access in scheduler.py: **88 calls**
-- Ratio: **10:1 defensive to direct** — the codebase has learned to distrust config
+| Metric | Value | Risk |
+|--------|-------|------|
+| scheduler.py | 13,679 lines, 1 class, 120+ methods | Single point of failure |
+| config.py | 1,903 attributes, 1,864 unique env vars | validate() checks only 3 |
+| getattr(config) ratio | 923 calls vs 88 direct refs (10:1) | Typo = silent fallback |
+| Boolean config flags | 401 | Dangerous combos undetected |
+| Locks in scheduler | 3 locks for 13.7K lines | Race conditions possible |
+| ctrader_openapi.db | 5.4 GB, I/O errors observed | May be failing silently |
+| Total Python | ~285K lines (excluding .claude worktree) | Large surface area |
 
-### Thread model (measured)
-- **3 locks** for 13.7K lines of code with 35+ scheduled jobs + async threads
-- **40+ self._* instance variables** written by multiple methods without synchronization
-- **1 async thread** spawned (`_run_neural_mission_cycle_async`)
-- **Main loop:** daemon thread, no heartbeat monitoring
+### Hardening sequence:
+
+1. **Immediate:** DB health, atomic writes, r_peak verification, trailing visibility
+2. **This week:** Structured logging, config assertions, opportunity tracker
+3. **Weeks 2-4:** Scheduler extraction (reports → families → guards)
+4. **Weeks 5+:** Execution module decomposition, config migration
 
 ---
 
 ## Scheduler Split Direction
 
-### Current state
-`scheduler.py` is a 13,679-line God Class containing:
-- Signal helpers (~2,000 lines)
-- Family canary builders (~4,000 lines)
-- Guard methods (~2,500 lines)
-- Report generators (~3,000 lines)
-- Scan loop methods (~1,000 lines)
-- Execution dispatchers (~1,000 lines)
-- Setup, start, stop (~200 lines)
+### Current structure:
+```
+scheduler.py (13,679 lines)
+  ├── Signal helpers (~2,000 lines)
+  ├── Family canary builders (~4,000 lines)
+  ├── Guard methods (~2,500 lines)
+  ├── Report generators (~3,000 lines)
+  ├── Scan loops (~1,000 lines)
+  ├── Execution dispatchers (~1,000 lines)
+  └── Core loop + setup (~500 lines)
+```
 
-### Target structure
+### Target structure:
 ```
 scheduler/
-  __init__.py        ← Core class (2,000 lines): start/stop/loop/scan orchestration
-  state.py           ← Shared state management with locks
-  routing.py         ← Signal dispatch engine
-  guards/            ← All guard/check logic
-  families/          ← All family canary builders
-  reports/           ← All report generators
-  scan_loops.py      ← Scan orchestration methods
+  __init__.py          ← Core loop, setup, scan loops (~2,000 lines)
+  state.py             ← Shared state management (~500 lines)
+  routing.py           ← Signal dispatch engine (~3,000 lines)
+  guards/              ← All guard logic (~2,500 lines across modules)
+  families/            ← All family builders (~4,000 lines across modules)
+  reports/             ← All report generators (~3,000 lines across modules)
 ```
 
-### Sequence (constrained by Opus findings)
-1. **Phase 1:** Extract report generators (LOWEST risk — read-only, don't affect trading)
-2. **Phase 2:** Extract family builders (MEDIUM risk — modify signals but don't execute)
-3. **Phase 3:** Extract guards (MEDIUM risk — but WAIT for Opus to validate which guards are causal)
-4. **Phase 4:** Extract routing (HIGH risk — execution hot path, needs full test coverage first)
-5. **Phase 5:** Decompose ctrader_executor.py (WAIT — Opus still evaluating execution wiring)
-6. **Phase 6:** Decompose live_profile_autopilot.py (HOLD — pending Opus verdict on causal status)
+### Migration sequence:
+1. **Phase 1 (Week 2):** Extract report generators — lowest risk, read-only operations
+2. **Phase 2 (Week 3):** Extract family builders — medium risk, modify signal objects
+3. **Phase 3 (Week 3-4):** Extract guard logic — medium risk, called in hot path
+4. **Phase 4 (Week 5):** Extract routing logic — highest risk, execution hot path
+5. **Phase 5 (Week 6):** Extract scan loops — medium risk
 
-### Constraint
-> Do NOT decompose any module Opus identifies as non-causal. Flag for removal instead of investing in refactoring.
+### Constraints:
+- Do NOT extract methods that route through modules Opus hasn't validated as causal
+- Every extraction must have a "behavior snapshot" test before and after
+- Never refactor during market hours — weekends or feature flags only
+- The scheduler singleton (`scheduler = DexterScheduler()`) must remain importable from `scheduler`
 
 ---
 
 ## Config Hardening Direction
 
-### Current state
-- 1,903 flat attributes from `os.getenv()`
-- No type checking, no range validation, no cross-field validation
+### Current state:
+- 1,903 attributes set via `os.getenv()` with no type checking
 - `validate()` checks only 3 keys (AI key, Telegram token, Telegram chat ID)
-- Dangerous combinations (autotrade+dry_run) go undetected
+- No range validation, no cross-field validation, no startup assertions
+- 923 `getattr(config, "X")` calls in scheduler.py alone — defensive coding because config is untrusted
 
-### Target architecture
+### Target architecture:
 ```
 config/
-  __init__.py        ← Config class (backward-compatible facade)
-  schema.py          ← Pydantic model for validation
-  validators.py      ← Cross-field assertions + startup checks
-  groups/            ← Organized by subsystem (ctrader, mt5, scanning, etc.)
+  __init__.py       ← Config class (backward-compatible facade)
+  schema.py         ← Pydantic model for all config groups
+  validators.py     ← Cross-field validation + startup assertions
+  groups/           ← Organized by subsystem (~15 group files)
 ```
 
-### Key additions (Opus-informed)
-- r_peak persistence verification at startup
-- TRAILING_STRUCT + position manager consistency check
-- Token/auth timeout ordering check
-- Opportunity suppression risk detection (high confidence + high sharpness thresholds)
-- Neural brain model staleness check
+### Migration sequence:
+1. **Week 1:** Add `schema.py` as shadow validator (no code changes)
+2. **Week 2:** Add startup validation pass (log warnings, don't fail)
+3. **Week 3:** Add startup assertions for dangerous combinations
+4. **Week 4-6:** Migrate `getattr()` calls to direct `config.X` access
+5. **Week 6-8:** Optional: grouped access (`cfg.ctrader.risk_usd`)
 
-### Migration approach
-1. Add Pydantic schema as "shadow validator" alongside existing config (no behavior change)
-2. Add startup assertions that log warnings (no failures)
-3. Migrate `getattr()` calls to direct access one module at a time
-4. Only then consider grouped access (`cfg.ctrader.risk_usd_per_trade`)
+### Dangerous combinations to assert:
+- `AUTOTRADE_ENABLED=1` + `DRY_RUN=0` → log WARNING with account ID
+- Both MT5 + cTrader enabled + combined risk > daily limit → block startup
+- `SCALPING_ENABLED=1` + no execution backend → log WARNING
+- `TRAILING_STRUCT_ENABLED=1` + `POSITION_MANAGER_DISABLED` → log WARNING (Opus finding)
+- AI provider missing + `SIGNAL_FEEDBACK_ENABLED=1` → log WARNING
 
 ---
 
 ## Observability Direction
 
-### What to build (priority order)
+### Structured logging:
+- Adopt structlog with JSON output
+- Signal correlation IDs propagated through entire lifecycle
+- Consistent event taxonomy: `signal.received`, `gate.rejected`, `execution.order_placed`, etc.
 
-**P0 — Opus-critical visibility:**
-1. **r_peak health check** — verify at startup, alert if missing
-2. **TRAILING_STRUCT enforcement visibility** — log gap between intended and actual trailing
-3. **Token/auth health monitoring** — alert on refresh failure, approaching expiry
-4. **Atomic JSON writes** — prevent state corruption on crash
+### Opus-specific telemetry (highest priority):
+1. **Opportunity suppression tracker** — per-gate rejection rates + replay of "would rejected signals have won?"
+2. **TRAILING_STRUCT enforcement visibility** — log gap between intended and actual trailing stops
+3. **r_peak persistence verification** — startup check + reconstruction from history
+4. **Token/auth health monitoring** — refresh failures, expiry countdown
+5. **Gate ROI attribution** — per-gate outcome tracking for live ROI measurement
 
-**P1 — Production reliability:**
-5. **Structured logging** (structlog with JSON output)
-6. **Signal correlation IDs** — trace every signal from scanner to execution
-7. **Per-gate rejection telemetry** — who blocks what and why
-8. **Scheduler heartbeat** — detect hung main loop
-9. **Gate ROI attribution** — prove which gates add value (Opus's "per-gate live ROI proof")
-
-**P2 — Operational insight:**
-10. **Rejection funnel dashboard** — visual gate-by-gate pass/fail rates
-11. **Opportunity suppression tracker** — "would rejected signals have been profitable?"
-12. **DB health monitoring** — size, I/O errors, WAL mode status
-13. **Config drift report** — diff current .env.local against .env.example
-
-### Event taxonomy
-```
-signal.received / signal.rejected / signal.routed / signal.executed / signal.failed
-gate.decision / gate.outcome / gate.rejected (with reason)
-execution.order_placed / order_filled / order_rejected / order_cancelled
-position.opened / position.closed / position.defended / position.breakeven
-learning.outcome_recorded / model_updated / profile_adjusted
-scheduler.heartbeat / job_start / job_end / job_error
-config.warning / config.assertion_failed
-auth.token_state / auth.token_expiring_soon / auth.refresh_failure
-trailing.gap_detected
-r_peak.missing_at_startup / r_peak.loaded
-```
+### Alerts (P0):
+- `r_peak.missing_at_startup` → Telegram URGENT
+- `trailing.gap_detected` → Telegram URGENT
+- `auth.refresh_failure` → Telegram URGENT
+- `scheduler.hung` → Telegram
+- `db.io_error` → Telegram
+- `opportunity_suppression.extreme` → Telegram + "verify gate ROI"
 
 ---
 
 ## DB Archival Direction
 
-### Current state
-- `ctrader_openapi.db`: 5.4 GB, returning I/O errors
-- No archival policy, no retention, no VACUUM schedule
+### Current state:
+- `ctrader_openapi.db`: 5.4 GB, I/O errors observed
+- No archival, no retention, no VACUUM strategy
 - All trade records since inception in one file
 
-### Target policy
-- **HOT (0-30 days):** Active queries, <50ms response
-- **WARM (30-180 days):** Historical learning, <500ms response
-- **COLD (>180 days):** Archive file, rarely accessed
+### Target:
+- **Hot:** Last 30 days — fast queries, <50ms
+- **Warm:** 30-180 days — slower queries, <500ms
+- **Cold:** >180 days — archive DB, rarely accessed
 
-### Technical approach
-1. Enable WAL mode + separate read/write connections
-2. Weekly archival: copy records >30 days to archive DB, then delete from main
-3. VACUUM after archival, only during Sunday 00:00-06:00 UTC
-4. Daily backup to `data/backups/`
-5. Alert at 4 GB, archive at 3 GB
-
-### Immediate action
-Run health check before any archival. The I/O error observed during review may indicate corruption, not just growth.
+### Sequence:
+1. **Immediate:** Health check — verify reads AND writes work
+2. **Week 1:** Enable WAL mode, separate read/write connections, daily backup
+3. **Week 2:** Implement archival of records > 30 days
+4. **Ongoing:** Monitor size, alert at 4 GB, VACUUM after archival
 
 ---
 
 ## Thread Model Cleanup Direction
 
-### Current state
-- 3 locks for 13.7K lines
-- 40+ unprotected self._* variables
-- 1 async thread (neural mission)
-- No heartbeat, no atomic writes, no queue-based patterns
+### Current state:
+- 3 locks (`_neural_mission_cycle_lock`, `_mt5_repeat_guard_lock`, `_signal_trace_lock`)
+- 40+ `self._*` state variables written by multiple methods
+- 1 async thread (neural mission) spawned from main loop
+- Daemon thread main loop — no watchdog
 
-### Target state
-1. Centralized `SchedulerState` class with RLock
-2. Neural mission: queue-based instead of thread-spawned
-3. All JSON state writes: atomic (write-to-temp-then-rename)
-4. SQLite: WAL mode + separate read/write connections
-5. Notifications: queue-based to prevent Telegram I/O blocking
-6. Main loop: heartbeat monitoring with watchdog
+### Key risks:
+- `self._neural_mission_thread` written without lock
+- `self._mt5_repeat_guard_state` persisted to JSON without atomic writes
+- `neural_brain.npz` written by async thread, read by main thread — no file lock
+- `self.running` flag read/written without synchronization
 
-### Where locks are necessary
-| State | Current | Needed |
-|-------|---------|--------|
-| `_neural_mission_thread` | None | Lock or atomic flag |
-| `_mt5_repeat_guard_state` | Protected ✓ | Keep |
-| `_signal_trace_seq` | Protected ✓ | Keep |
-| `neural_brain.npz` | None | File lock or atomic write |
-| All `data/runtime/*.json` | None | Atomic write pattern |
+### Sequence:
+1. **Week 1:** Document concurrency contract, add `state.py` with centralized access
+2. **Week 2:** Replace neural mission thread with queue-based approach, atomic JSON writes
+3. **Week 3:** Separate read/write SQLite connections, WAL mode on all databases
+4. **Week 4:** Add notification queue, heartbeat monitoring
+5. **Week 5:** Audit all `self._*` access, add locks where needed
 
-### Where queue-based design is better
-1. Neural mission training
-2. Telegram notifications
-3. DB writes for reports (batch writer thread)
+---
+
+## What Hermes Needs From Opus
+
+| Need | Why |
+|------|-----|
+| Causal audit of learning/ modules | To know what to refactor vs. flag for removal |
+| r_peak persistence verification | To know if startup verification needs reconstruction logic |
+| TRAILING_STRUCT enforcement status | To know if enforcement gap is at caller or callee level |
+| Per-gate ROI evaluation | To know which guards to keep vs. simplify |
+| Confidence calibration verdict | To know if confidence logic needs hardening or replacement |

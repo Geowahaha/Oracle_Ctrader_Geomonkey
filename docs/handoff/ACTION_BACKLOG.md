@@ -1,128 +1,121 @@
 # Action Backlog
 
-**Last updated:** 2026-04-20
-**Branch:** `deploy-xau-family-canary`
+> **Sequenced for safe execution.** Owner per item. Dependencies noted.
+> Do not skip ahead — dependencies are real.
 
 ---
 
-## How to Read This Backlog
+## P0 — Immediate (before any refactoring)
 
-- **Owner:** Opus | Hermes | Reviewer | Opus+Hermes
-- **Status:** TODO | IN_PROGRESS | BLOCKED | DONE | CANCELLED
-- **Safe to do live?** YES | NO | WEEKEND_ONLY | DRY_RUN_ONLY
-- Sequenced for minimal risk. Do not skip ahead.
+| # | Action | Owner | Status | Depends On | Safe Sequencing |
+|---|--------|-------|--------|------------|-----------------|
+| 0 | Run `ctrader_openapi.db` health check (reads + writes) | Hermes | TODO | Nothing | Do first — if DB is broken, everything else is compromised |
+| 1 | Add `atomic_json_write()` utility | Hermes | TODO | Nothing | Independent — can do in parallel with #0 |
+| 2 | Apply atomic writes to `trading_manager_state.json` | Hermes | TODO | #1 | After utility exists |
+| 3 | Verify r_peak persistence across restart | Opus | TODO | #2 | After atomic writes — test with restart simulation |
+| 4 | Add r_peak startup verification + alert | Hermes | TODO | #3 | After Opus confirms current mechanism |
+| 5 | Verify TRAILING_STRUCT enforcement at execution level | Opus | TODO | Nothing | Independent — can start now |
+| 6 | Add TRAILING_STRUCT enforcement visibility logging | Hermes | TODO | #5 | After Opus confirms where the gap is |
+| 7 | Add token/auth refresh health monitoring | Hermes | TODO | Nothing | Independent — can start now |
+| 8 | Add startup config assertions (r_peak, trailing, suppression risk) | Hermes | TODO | #3, #5 | After Opus findings on r_peak and trailing |
 
----
+## P1 — This week
 
-## P0 — Immediate (this week)
+| # | Action | Owner | Status | Depends On | Safe Sequencing |
+|---|--------|-------|--------|------------|-----------------|
+| 9 | Causal audit: classify all learning/ modules (real vs decorative) | Opus | TODO | Nothing | Start now — blocks Phase 6 refactor |
+| 10 | Add opportunity suppression tracker (per-gate rejection logging) | Hermes | TODO | Nothing | Independent |
+| 11 | Add gate ROI attribution data collection | Hermes | TODO | #10 | After tracker exists |
+| 12 | Enable WAL mode on `ctrader_openapi.db` | Hermes | TODO | #0 (health check) | After confirming DB is healthy |
+| 13 | Set up structured logging (structlog + JSON) | Hermes | TODO | Nothing | Independent — but do before adding more logging |
+| 14 | Add scheduler heartbeat monitoring | Hermes | TODO | #13 | After structured logging |
+| 15 | Apply atomic writes to all runtime state files | Hermes | TODO | #1 | After utility exists |
 
-| # | Task | Owner | Status | Safe? | Depends | File(s) |
-|---|------|-------|--------|-------|---------|---------|
-| 1 | Run `ctrader_openapi.db` health check — verify reads, writes, WAL mode, table counts | Hermes | TODO | YES | — | `data/ctrader_openapi.db` |
-| 2 | Implement `atomic_json_write()` utility | Hermes | TODO | YES | — | new: `utils/atomic_write.py` |
-| 3 | Apply atomic writes to `trading_manager_state.json` | Hermes | TODO | YES | #2 | `data/runtime/trading_manager_state.json` |
-| 4 | Add r_peak persistence verification at startup | Hermes | TODO | YES | #3 | `scheduler.py` (startup) |
-| 5 | Add TRAILING_STRUCT enforcement visibility logging | Hermes | TODO | YES | — | `learning/position_trailing_brain.py`, `scheduler.py` |
-| 6 | Add token/auth refresh health monitoring | Hermes | TODO | YES | — | `api/ctrader_token_manager.py` |
-| 7 | Verify r_peak — is it persisted? What breaks after restart? | Opus | TODO | YES | — | `learning/trading_manager_agent.py`, `data/runtime/trading_manager_state.json` |
-| 8 | Verify TRAILING_STRUCT — is enforcement missing at caller level? | Opus | TODO | YES | — | `learning/position_trailing_brain.py`, execution callers |
-| 9 | Audit confidence construction — which paths are synthetic? | Opus | TODO | YES | — | `learning/live_profile_autopilot.py`, `learning/neural_brain.py` |
-| 10 | Check cTrader auth status on VM — is broker-synced? | Reviewer | TODO | YES | — | VM `/opt/dexter_pro` |
+## P2 — Weeks 2-4
 
----
+| # | Action | Owner | Status | Depends On | Safe Sequencing |
+|---|--------|-------|--------|------------|-----------------|
+| 16 | Extract report generators from scheduler.py (Phase 1) | Hermes | TODO | #13, #14 | After logging + heartbeat in place |
+| 17 | Implement DB daily backup | Hermes | TODO | #12 | After WAL mode enabled |
+| 18 | Build rejection funnel dashboard report | Hermes | TODO | #10, #11 | After tracker + attribution |
+| 19 | Fix confidence logic gaps (per Opus findings) | Opus | TODO | #9, #11 | After causal audit + gate attribution data |
+| 20 | Extract family builders from scheduler.py (Phase 2) | Hermes | TODO | #16 | After Phase 1 extraction proven safe |
+| 21 | Extract guard logic from scheduler.py (Phase 3) | Hermes | TODO | #9, #20 | After Opus validates which guards are causal |
+| 22 | Implement DB archival (records > 30 days) | Hermes | TODO | #17 | After backups are running |
+| 23 | Identify and remove/deprioritize fake-smart modules | Opus | TODO | #9 | After causal audit |
+| 24 | Add per-gate live ROI reporting | Hermes | TODO | #11 | After attribution data collection |
 
-## P1 — Short-term (next 2 weeks)
+## P3 — Weeks 5+ (after Opus completes live-trading audit)
 
-| # | Task | Owner | Status | Safe? | Depends | File(s) |
-|---|------|-------|--------|-------|---------|---------|
-| 11 | Add startup config assertions (r_peak, trailing, suppression risk) | Hermes | TODO | YES | #4 | `config.py` (new: `config/validators.py`) |
-| 12 | Enable WAL mode on `ctrader_openapi.db` if not already | Hermes | TODO | WEEKEND_ONLY | #1 | `data/ctrader_openapi.db` |
-| 13 | Add per-gate rejection telemetry (structured logging) | Hermes | TODO | YES | — | `scheduler.py` (all gate methods) |
-| 14 | Add gate ROI attribution data collection | Hermes | TODO | YES | #13 | new: `telemetry/gate_roi.py` |
-| 15 | Add opportunity suppression tracker | Hermes | TODO | YES | #13 | new: `telemetry/opportunity_suppression.py` |
-| 16 | Add scheduler heartbeat monitoring | Hermes | TODO | YES | — | `scheduler.py` (_run_loop) |
-| 17 | Identify which gates are validated by outcome attribution | Opus | TODO | YES | #14 | `scheduler.py` (gate methods) |
-| 18 | Identify which "smart" modules are non-causal | Opus | TODO | YES | — | `learning/*.py` |
-| 19 | Validate opportunity suppression — which gates block good trades? | Opus | TODO | YES | #15 | gate data + trade outcomes |
-| 20 | Run full test suite, record baseline | Reviewer | TODO | YES | — | `tests/` |
-
----
-
-## P2 — Medium-term (weeks 3-6)
-
-| # | Task | Owner | Status | Safe? | Depends | File(s) |
-|---|------|-------|--------|-------|---------|---------|
-| 21 | Set up structured logging (structlog) | Hermes | TODO | YES | — | new: `logging_setup.py` |
-| 22 | Extract report generators from scheduler.py → `scheduler/reports/` | Hermes | TODO | WEEKEND_ONLY | #20 | `scheduler.py` |
-| 23 | Apply atomic writes to all `data/runtime/*.json` files | Hermes | TODO | YES | #2 | `data/runtime/*.json` |
-| 24 | Implement DB archival — first pass (backup only, no deletion) | Hermes | TODO | WEEKEND_ONLY | #1, #12 | `ops/db_archive.py` |
-| 25 | Extract family builders from scheduler.py → `scheduler/families/` | Hermes | TODO | WEEKEND_ONLY | #22 | `scheduler.py` |
-| 26 | Fix confidence construction in paths Opus flagged | Opus | TODO | DRY_RUN_ONLY | #9 | `learning/*.py` |
-| 27 | Remove or deprioritize non-causal modules | Opus+Hermes | TODO | WEEKEND_ONLY | #18 | `learning/*.py`, `scheduler.py` |
-| 28 | Add rejection funnel dashboard report | Hermes | TODO | YES | #13 | `scheduler/reports/` |
-
----
-
-## P3 — Long-term (weeks 6+, after Opus completes live audit)
-
-| # | Task | Owner | Status | Safe? | Depends | File(s) |
-|---|------|-------|--------|-------|---------|---------|
-| 29 | Extract guard logic from scheduler.py → `scheduler/guards/` | Hermes | TODO | WEEKEND_ONLY | #17, #20 | `scheduler.py` |
-| 30 | Extract routing logic from scheduler.py → `scheduler/routing.py` | Hermes | TODO | WEEKEND_ONLY | #29, #20 | `scheduler.py` |
-| 31 | Decompose ctrader_executor.py (DB, source gating, execution) | Hermes | TODO | WEEKEND_ONLY | Opus sign-off | `execution/ctrader_executor.py` |
-| 32 | Evaluate live_profile_autopilot.py decomposition | Hermes | TODO | YES | #18 | `learning/live_profile_autopilot.py` |
-| 33 | Migrate config to Pydantic validation | Hermes | TODO | YES | — | `config.py` |
-| 34 | Separate read/write DB connections in ctrader_executor | Hermes | TODO | WEEKEND_ONLY | #12, #24 | `execution/ctrader_executor.py` |
-| 35 | Fix confidence magic numbers → statistically derived values | Opus | TODO | DRY_RUN_ONLY | #9 | `learning/live_profile_autopilot.py` |
-| 36 | Add notification queue (prevent Telegram I/O blocking) | Hermes | TODO | YES | #21 | `notifier/telegram_bot.py` |
-
----
-
-## Completed
-
-| # | Task | Owner | Date | Notes |
-|---|------|-------|------|-------|
-| — | Multi-expert handoff structure created | Hermes | 2026-04-20 | This file + 4 sibling docs |
-
----
-
-## Blocked / Waiting
-
-| # | Task | Blocked By | Notes |
-|---|------|-----------|-------|
-| 29-31 | Guard/routing/executor extraction | Opus: must validate causal status first | Do not decompose non-causal modules |
-| 32 | autopilot.py decomposition | Opus: must identify causal sub-modules first | Flag non-causal parts for removal, not refactoring |
-| 35 | Confidence magic number fix | Opus: must map which paths are synthetic first | Statistical calibration requires knowing which adjustments are real |
+| # | Action | Owner | Status | Depends On | Safe Sequencing |
+|---|--------|-------|--------|------------|-----------------|
+| 25 | Extract routing logic from scheduler.py (Phase 4) | Hermes | TODO | #21 | After guards extracted |
+| 26 | Decompose live_profile_autopilot.py (if causal per Opus) | Hermes | TODO | #9 | After causal audit — skip if decorative |
+| 27 | Decompose ctrader_executor.py (separate DB from execution) | Hermes | TODO | #25 | After routing extracted |
+| 28 | Migrate config to Pydantic validation | Hermes | TODO | #8 | After startup assertions stable |
+| 29 | Separate read/write SQLite connections in ctrader_executor | Hermes | TODO | #27 | After executor decomposition |
+| 30 | Replace neural mission thread with queue-based approach | Hermes | TODO | #14 | After heartbeat monitoring |
+| 31 | Add notification queue (Telegram I/O non-blocking) | Hermes | TODO | #13 | After structured logging |
+| 32 | VACUUM strategy (weekly during low-activity windows) | Hermes | TODO | #22 | After archival running |
 
 ---
 
 ## Dependency Graph (simplified)
 
 ```
-#1 (DB health check)
- ├→ #12 (WAL mode)
- │   └→ #24 (DB archival)
- │       └→ #34 (separate R/W connections)
- └→ #27 (remove non-causal — needs Opus audit first)
+#0 (DB health)
+ └─ #12 (WAL mode)
+    └─ #17 (daily backup)
+       └─ #22 (archival)
+          └─ #32 (VACUUM)
 
-#2 (atomic write utility)
- ├→ #3 (apply to trading_manager_state)
- │   └→ #4 (r_peak verification)
- │       └→ #11 (config assertions)
- └→ #23 (apply to all runtime JSON)
+#1 (atomic write utility)
+ ├─ #2 (trading_manager_state)
+ │  └─ #3 (r_peak verification — Opus)
+ │     └─ #4 (r_peak startup alert)
+ │        └─ #8 (config assertions)
+ └─ #15 (all runtime state files)
 
-#13 (gate rejection telemetry)
- ├→ #14 (gate ROI attribution)
- │   └→ #17 (Opus validates gates)
- │       └→ #29 (extract guards — only causal ones)
- └→ #15 (opportunity suppression)
-     └→ #19 (Opus validates suppression)
-         └→ #26 (fix confidence in flagged paths)
+#9 (causal audit — Opus)
+ ├─ #19 (confidence fix — Opus)
+ ├─ #21 (guard extraction — Hermes, depends on Opus verdict)
+ ├─ #23 (remove fake-smart — Opus)
+ └─ #26 (autopilot decomposition — Hermes)
 
-#20 (test suite baseline)
- ├→ #22 (extract reports)
- │   └→ #25 (extract families)
- │       └→ #29 (extract guards)
- │           └→ #30 (extract routing)
- └→ #27 (remove non-causal)
+#10 (opportunity tracker)
+ └─ #11 (gate attribution)
+    ├─ #18 (rejection funnel dashboard)
+    └─ #24 (per-gate ROI reporting)
+
+#13 (structured logging)
+ ├─ #14 (heartbeat monitoring)
+ │  └─ #16 (report extraction)
+ │     └─ #20 (family extraction)
+ │        └─ #21 (guard extraction)
+ │           └─ #25 (routing extraction)
+ └─ #31 (notification queue)
+
+#5 (trailing verification — Opus)
+ └─ #6 (trailing visibility logging)
 ```
+
+---
+
+## Blocked Items (waiting on Opus)
+
+| Item | Blocked By | What Opus Needs to Provide |
+|------|------------|---------------------------|
+| #3 r_peak verification | Opus audit | Does r_peak persist? Where? What format? |
+| #5 TRAILING_STRUCT verification | Opus audit | Where is the enforcement gap? Caller or callee? |
+| #9 Causal audit | Opus analysis | Classification of each learning/ module |
+| #19 Confidence fix | Opus analysis + #11 | Which confidence paths are synthetic? |
+| #23 Remove fake-smart | Opus analysis | Which modules to remove? |
+
+## Blocked Items (waiting on Hermes)
+
+| Item | Blocked By | What Hermes Needs to Provide |
+|------|------------|------------------------------|
+| #10 opportunity tracker | Hermes implementation | Structured logging + signal correlation IDs |
+| #11 gate attribution | #10 | Tracker infrastructure in place |
+| #16 report extraction | #13, #14 | Logging + heartbeat before splitting |
+| #28 config migration | #8 | Startup assertions stable first |

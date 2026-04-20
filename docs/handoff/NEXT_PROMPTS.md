@@ -1,46 +1,48 @@
 # Next Prompts
 
-**Last updated:** 2026-04-20
-**Purpose:** Ready-to-use prompts for the next session with each expert.
+> Ready-to-use prompts for continuing multi-expert work.
+> Copy-paste into a new session. Adjust as needed.
 
 ---
 
 ## Next Prompt for Opus
 
 ```
-You are Opus 4.7, continuing the Dexter Pro multi-expert review.
+You are Opus 4.7, continuing your review of Dexter Pro.
 
-Read these files first:
-1. docs/handoff/HANDOFF_MULTI_EXPERT.md (project context + ownership)
-2. docs/handoff/OPUS_BASELINE.md (your previous findings — do NOT repeat this work)
-3. docs/handoff/ACTION_BACKLOG.md (what's been queued, what's blocked on you)
+You have a full baseline in docs/handoff/OPUS_BASELINE.md.
+Read it before starting. Do not re-audit what you've already covered.
 
-Your current task — verify the P0 items:
+YOUR CURRENT TASKS (in priority order):
 
-1. r_peak persistence: Open data/runtime/trading_manager_state.json.
-   Does it contain xau_r_peak or r_peak?
-   If not, trace through learning/trading_manager_agent.py to find where r_peak
-   is set and whether it's written to the state file.
-   Report: persisted / not persisted / partially persisted.
+1. r_peak PERSISTENCE VERIFICATION
+   - Search the codebase for where r_peak is defined, updated, and read
+   - Does it write to trading_manager_state.json?
+   - Does it read back at startup?
+   - If not persisted, what happens after restart?
+   - Report: mechanism, gap, and fix recommendation
 
-2. TRAILING_STRUCT enforcement: Open learning/position_trailing_brain.py.
-   Trace the trailing logic from definition to execution caller.
-   Is it actually invoked at the execution level, or is it dead code / decorative?
-   Report: enforced / not enforced / partially enforced.
+2. TRAILING_STRUCT ENFORCEMENT VERIFICATION
+   - Search for TRAILING_STRUCT, position_trailing_brain, trailing logic
+   - Is trailing stop logic actually invoked by execution callers?
+   - Where is the gap between intent and enforcement?
+   - Report: exact location of gap and fix recommendation
 
-3. Confidence construction audit: In learning/live_profile_autopilot.py,
-   find all places where confidence is adjusted. Classify each as:
-   - REAL: outcome-linked, statistically derived
-   - SYNTHETIC: magic number, hardcoded bonus/penalty
-   - DECORATIVE: calculated but never used in live decision path
-   Report: file:line for each, with classification.
+3. CAUSAL AUDIT OF LEARNING/ MODULES
+   - For each file in learning/, determine: is it on the live signal→execution path?
+   - Classify: REAL / DECORATIVE / MIXED / UNCERTAIN
+   - Focus on: strategy_evolution, strategy_lab_team, adaptive_directional_intelligence,
+     signal_simulator, entry_template_catalog, scalping_runtime
+   - Report: table of module → status → evidence
 
-4. Non-causal module identification: In learning/, list every module and
-   classify as CAUSAL / NON-CAUSAL / UNCERTAIN based on whether it's on
-   the live trading decision path.
+4. CONFIDENCE PATH VERIFICATION
+   - Trace confidence from signal generation → _apply_neural_soft_adjustment → gate → execution
+   - Is the final confidence value that gates use actually calibrated?
+   - Or is it synthetic (magic numbers, no outcome linkage)?
+   - Report: which paths are calibrated, which are synthetic
 
-Do NOT propose fixes. Just report findings. Hermes will build infrastructure
-to support fixes after you confirm what's real and what's not.
+Output format: structured findings with file:line references.
+Do NOT modify any code. Read-only review.
 ```
 
 ---
@@ -48,117 +50,92 @@ to support fixes after you confirm what's real and what's not.
 ## Next Prompt for Hermes
 
 ```
-You are Hermes, continuing the Dexter Pro architectural hardening.
+You are Hermes, continuing architectural hardening of Dexter Pro.
 
-Read these files first:
-1. docs/handoff/HANDOFF_MULTI_EXPERT.md (project context + ownership)
-2. docs/handoff/HERMES_BASELINE.md (your areas and direction)
-3. docs/handoff/ACTION_BACKLOG.md (current task list)
-4. docs/handoff/OPUS_BASELINE.md (Opus findings — treat as constraints)
+You have a full baseline in docs/handoff/HERMES_BASELINE.md.
+Read it before starting. Do not repeat analysis already done.
 
-Your current task — execute the P0 items:
+YOUR CURRENT TASKS (in priority order):
 
-1. Run the ctrader_openapi.db health check:
-   - Check file size
-   - Open with sqlite3, read table names and row counts
-   - Test a read query
-   - Test a write (create temp table, insert, drop)
-   - Check journal_mode (WAL vs rollback)
-   - Report: PASS / DEGRADED / CORRUPTED
+1. DB HEALTH CHECK
+   - Run diagnostic on data/ctrader_openapi.db
+   - Check: size, journal mode, table counts, read test, write test
+   - If I/O errors: assess severity and recommend immediate action
+   - Report: health status + recommended immediate actions
 
-2. Create utils/atomic_write.py with atomic_json_write() and
-   atomic_json_read() functions. Test them. Do NOT apply to any
-   production files yet — just create the utility.
+2. ATOMIC WRITE UTILITY
+   - Create utils/atomic_write.py (or similar location)
+   - Implement atomic_json_write() and atomic_json_read()
+   - Apply to data/runtime/trading_manager_state.json
+   - Verify the write is actually atomic (write to .tmp, then rename)
+   - Report: utility created, files migrated
 
-3. Add startup r_peak verification to scheduler.py:
-   - At the start of _run_loop, before any scanning
-   - Read trading_manager_state.json
-   - Check for xau_r_peak or r_peak
-   - Log structured result (info if present, error if missing)
-   - Do NOT add reconstruction logic yet — just detection
+3. STRUCTURED LOGGING SETUP
+   - Add structlog to requirements
+   - Create logging_setup.py with JSON processor configuration
+   - Add signal correlation ID propagation (bind to structlog contextvar)
+   - Convert 3-5 key methods in scheduler.py to use structured logging
+   - Report: setup complete, sample log output
 
-4. Add TRAILING_STRUCT enforcement visibility logging:
-   - In position_trailing_brain.py, add a log line every time
-     trailing logic fires, with intended vs actual values
-   - Do NOT change trailing logic — just add logging
+4. STARTUP CONFIG ASSERTIONS
+   - Create config/validators.py (or add to existing config.py)
+   - Implement assertions for:
+     * r_peak presence in trading_manager_state.json
+     * TRAILING_STRUCT + POSITION_MANAGER consistency
+     * Token timeout vs healthcheck timeout
+     * Opportunity suppression risk (high confidence + high sharpness thresholds)
+   - Run at startup, log warnings (do not block startup)
+   - Report: assertions created, sample output
 
-5. Add token/auth health monitoring:
-   - In ctrader_token_manager.py (or wherever tokens are managed)
-   - Log token state (expiry, refresh count, last error)
-   - Alert if <5 minutes to expiry
-   - Alert on refresh failure
-
-Do NOT change any trading logic, thresholds, or risk parameters.
-Do NOT decompose any modules yet.
+Output format: files created/modified, test results, any issues found.
+Do NOT modify trading logic, execution logic, or risk logic.
 ```
 
 ---
 
-## Next Prompt for Reviewer / Integrator
+## Reminder: No-Overlap Rules
 
 ```
-You are the Reviewer/Integrator for the Dexter Pro multi-expert team.
+IF Opus is asked about:     → Refuse. That's Hermes's domain:
+  - Refactoring
+  - Config architecture
+  - Logging infrastructure
+  - Scheduler decomposition
+  - DB archival
+  - Thread model
 
-Read these files first:
-1. docs/handoff/HANDOFF_MULTI_EXPERT.md
-2. docs/handoff/ACTION_BACKLOG.md
+IF Hermes is asked about:   → Refuse. That's Opus's domain:
+  - Whether a confidence adjustment is "real"
+  - Which modules are fake-smart
+  - Execution wiring correctness
+  - Per-gate ROI evaluation
+  - Winner protection logic
+  - TRAILING_STRUCT enforcement correctness
 
-Your current task:
-
-1. Check the VM status:
-   - SSH to the Oracle VM
-   - Check if dexter-monitor service is running: systemctl status dexter-monitor
-   - Check the last 50 lines of logs
-   - Check if cTrader auth is valid (any recent auth errors?)
-   - Report: RUNNING+SYNCED / RUNNING+BROKEN / STOPPED
-
-2. Run the full test suite locally:
-   - cd to the project root
-   - python -m pytest tests/ -x --tb=short -q
-   - Record results: pass count, fail count, any errors
-   - Compare against last known baseline (31 passed, 1 warning)
-
-3. Review the 5 handoff files for completeness:
-   - docs/handoff/HANDOFF_MULTI_EXPERT.md
-   - docs/handoff/OPUS_BASELINE.md
-   - docs/handoff/HERMES_BASELINE.md
-   - docs/handoff/ACTION_BACKLOG.md
-   - docs/handoff/NEXT_PROMPTS.md
-   - Check: any contradictions between Opus and Hermes baselines?
-   - Check: any tasks that are sequenced unsafely?
-   - Check: anything missing from the backlog?
-
-4. Verify git status:
-   - Are there uncommitted changes that shouldn't be committed?
-   - Is the branch correct (deploy-xau-family-canary)?
-   - Any conflicts with remote?
-```
-
----
-
-## Reminder: Avoid Overlap
-
-```
-OPUS evaluates truth. HERMES builds infrastructure.
-OPUS asks "is this confidence adjustment real?" HERMES asks "can we SEE whether it's real in the logs?"
-OPUS proposes a fix. HERMES designs the deployment path.
-HERMES never evaluates trading logic. OPUS never designs config schemas.
-
-If both experts want to touch the same file:
-  → Reviewer decides who goes first
-  → The other expert waits and works on a different P0 item
-  → No two experts modify the same file in the same session
+OVERLAP ZONE (coordinate via reviewer):
+  - Runtime state persistence (Opus identifies need, Hermes implements)
+  - Startup verification (Opus defines what to check, Hermes implements)
+  - Observability for live-trading issues (Opus identifies issue, Hermes instruments)
 ```
 
 ---
 
 ## Delta Mode Guidance
 
-When continuing a session:
+Both experts should work in **delta mode** — only analyze what's new or changed since last review.
 
-1. **Read the backlog first.** Check what's IN_PROGRESS or TODO with the highest priority.
-2. **Check for new findings.** If Opus completed an audit, read OPUS_BASELINE.md for updates before starting Hermes work.
-3. **Don't repeat.** If a task is marked DONE in the backlog, don't re-do it. Check git history for the commit.
-4. **Update the backlog.** After completing a task, mark it DONE and add the commit hash.
-5. **Update the baselines.** If you discovered something new about the architecture, update HERMES_BASELINE.md or OPUS_BASELINE.md.
-6. **Stay in your lane.** If a task says "WAIT for Opus sign-off," don't start it. Move to the next item you can do.
+**For Opus:**
+- Start from `OPUS_BASELINE.md`. Only re-examine code that has changed since 2026-04-20.
+- Focus on the 4 tasks above. Do not broaden the review.
+- If you find something that contradicts the baseline, note it as a DELTA.
+
+**For Hermes:**
+- Start from `HERMES_BASELINE.md`. Only re-examine code that has changed since 2026-04-20.
+- Focus on the 4 tasks above. Do not broaden the infrastructure work.
+- If you discover a new architectural risk not in the baseline, note it as a DELTA.
+
+**After completing tasks:**
+1. Update the relevant baseline file (OPUS_BASELINE.md or HERMES_BASELINE.md)
+2. Update ACTION_BACKLOG.md status field
+3. Commit with message format: `[Opus|Hermes] <scope>: <description>`
+4. Push to `deploy-xau-family-canary` branch

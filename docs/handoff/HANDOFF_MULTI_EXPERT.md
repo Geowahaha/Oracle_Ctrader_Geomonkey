@@ -1,216 +1,219 @@
-# Multi-Expert Handoff & Coordination
+# Multi-Expert Handoff & Coordination System
 
-**Created:** 2026-04-20
-**Branch:** `deploy-xau-family-canary`
-**Remote:** `dexter` → `https://github.com/Geowahaha/Oracle_Ctrader_Geomonkey.git`
-**Owner:** mrgeo | Bangkok (UTC+7)
+> **Purpose:** Enable Opus, Hermes, and reviewer/integrator to work continuously
+> without losing context, overlapping, or drifting from the live-trading mission.
 
 ---
 
 ## Project Mission
 
-Dexter Pro is a fully autonomous multi-strategy AI trading system executing real money on cTrader and MT5. Trading XAUUSD (primary), BTCUSD, ETHUSD.
+Dexter Pro is a fully autonomous multi-strategy AI trading system.
+It trades XAUUSD (primary), BTCUSD, ETHUSD via cTrader OpenAPI and MT5.
 
-**Core directive:**
+**Core trading mission:**
 - Let profits run in trend
 - Secure profit efficiently in sideways/chop
 - Do not over-block good trades
-- Architecture is mostly sound, but execution/live wiring and reliability have important gaps
+- Minimize losses, maximize compounded returns
 
 ---
 
 ## Current Live Status
 
-- **Branch:** `deploy-xau-family-canary` — active development, deployed to Oracle VM
-- **VM path:** `/opt/dexter_pro`, service: `dexter-monitor` via systemd
-- **Local PC:** safety-only mode (`CTRADER_DRY_RUN=1`, `MT5_DRY_RUN=1`), local monitor stopped
-- **cTrader auth:** last known issue — invalid/revoked token behavior. Must recheck with fresh tokens before assuming broker-synced.
-- **DB health:** `ctrader_openapi.db` is 5.4 GB, returning I/O errors on read during last review session. Needs immediate triage.
-- **Test suite:** 60 test files, ~29,500 lines. Last known passing: `31 passed, 1 warning` (pre-deploy local).
+| Area | Status |
+|------|--------|
+| Architecture | Mostly sound. Execution wiring and reliability have gaps. |
+| Live trading | Active on `deploy-xau-family-canary` branch. |
+| DB health | `ctrader_openapi.db` is 5.4 GB. I/O errors observed during review (2026-04-20). |
+| Scheduler | 13,679-line god class. Functional but unmaintainable. |
+| Config | 1,903 attributes, 1,864 unique env vars. validate() checks only 3. |
+| Thread model | 3 locks for 13.7K lines with 35+ scheduled jobs. |
+| r_peak persistence | **UNVERIFIED** — must survive restart or winner-protection is unreliable. |
+| TRAILING_STRUCT | **WIRING GAP** — intent exists, enforcement not fully realized at caller level. |
+| Confidence logic | Partially fixed. Still synthetic/weakly calibrated in some paths. |
+| Fake-smart risk | Several modules may be decorative/non-causal. Opus verdict pending. |
 
 ---
 
-## Confirmed Truths
+## Confirmed Truths (Baseline)
 
-### Strong parts (real intelligence, protect these)
-- NeuralBrain — genuine outcome-linked learning via SQLite-backed online model
-- HermesLoop — real reinforcement-style modifier loop
-- V4 WinnerProtection — directionally correct architecture
-- Entry Sharpness Score — 8 microstructure features, substantial feature engineering
-- Active position defense — real-time adverse flow detection, dynamic stop tightening
-- Canary system — low-risk probing before family promotion
-- Multi-agent conductor — Risk/Perf/Regime agents that debate and ensemble
+These are established facts. Do not re-audit unless contradicted by new code evidence.
 
-### Weak / fake-smart parts (identified, pending full validation)
-- Decorative AI/library prior logic — looks sophisticated, not on live decision path
-- LLM/research paths — not on live trading decision path
-- Auto-calibration paths — may not persist or materially affect live outcomes
-- Gate stacks — look sophisticated but not validated by per-gate outcome attribution
+### Strong parts (real intelligence on the trading path)
+- NeuralBrain: genuine outcome-linked learning component
+- HermesLoop: real reinforcement-style modifier loop
+- V4 WinnerProtection: directionally correct architecture
+- Entry sharpness: substantial feature engineering (8 microstructure features)
+- Active position defense: real-time adverse flow detection
+- Multi-agent conductor: genuine multi-agent orchestration
 
-### Critical wiring gaps
-- TRAILING_STRUCT: structural trailing intent exists, enforcement not fully realized at caller level
-- r_peak persistence: must survive restart or winner-protection becomes unreliable
-- Entry confidence: partially fixed, still synthetic/weakly calibrated in some paths
-- High-confidence blocking: still exists in important paths, may suppress opportunity
+### Weak parts (need verification or cleanup)
+- Decorative AI/library prior logic — not on live decision path
+- LLM/research paths not on live trading decision path
+- Auto-calibration paths that may not persist or materially affect live outcomes
+- Gate stacks that look sophisticated but lack per-gate live ROI proof
+- Confidence construction still synthetic in some paths
+- High-confidence blocking still exists in important paths
 
 ---
 
 ## Ownership Split
 
-### Opus 4.7 — Execution Truth & Live Behavior
+### Opus — Execution Truth & Live Trading Behavior
 
 **Owns:**
-- Execution truth — does the system actually place trades correctly?
-- Confidence logic — are confidence adjustments real or synthetic?
-- Fake-smart detection — which modules add no causal value?
-- Opportunity capture vs over-blocking — are strong trades being suppressed?
-- Live policy behavior — does V4 policy actually affect live trades?
-- Winner protection / active defense — is r_peak real? Is trailing enforced?
-- Per-gate ROI proof — which gates add value, which just block?
+- Execution wiring: does the system actually place trades correctly?
+- Confidence logic: are confidence adjustments real and calibrated?
+- Fake-smart detection: which modules add no causal value?
+- Opportunity capture vs over-blocking: are strong trades being suppressed?
+- Winner protection / active defense / r_peak persistence
+- Live policy behavior: does V4 policy layer actually affect live outcomes?
+- TRAILING_STRUCT enforcement verification
 
 **Does NOT own:**
-- Scheduler decomposition
-- Config restructuring
-- Logging infrastructure
-- DB archival strategy
-- Thread safety refactors
+- Refactoring decisions (Hermes)
+- Config architecture (Hermes)
+- Logging infrastructure (Hermes)
+- Scheduler decomposition (Hermes)
+- DB archival (Hermes)
+- Thread model (Hermes)
 
 ### Hermes — Architecture, Infrastructure & Observability
 
 **Owns:**
-- Refactor map — how to restructure without breaking live trading
-- Config hardening — preventing silent misconfiguration
-- Logging / monitoring / observability — making problems visible
-- Scheduler split — decomposing the 13.7K-line god class
+- Refactor map: how to restructure without breaking live trading
+- Config hardening: prevent silent misconfiguration
+- Logging / monitoring / observability: make everything visible
+- Scheduler split: decompose the 13.7K-line god class
 - DB archival / retention / backup safety
 - Thread model cleanup / shared-state safety
 - Production maintainability
 
 **Does NOT own:**
-- Evaluating whether confidence logic is "real"
-- Deciding which modules are fake-smart
-- Modifying execution wiring
-- Changing trading thresholds or risk parameters
-- Any live-trading behavior changes (unless explicitly approved)
+- Evaluating whether a confidence adjustment is "real" (Opus)
+- Deciding which gates add value (Opus)
+- Fixing execution wiring gaps (Opus)
+- Modifying trading logic (Opus)
+- Fake-smart module evaluation (Opus)
 
-### Reviewer / Integrator — Coordination & Verification
+### Reviewer / Integrator — Coordination & Quality
 
 **Owns:**
 - Verifying no-overlap between Opus and Hermes work
-- Sequencing changes so live trading is never destabilized
-- Running test suites after each change
-- Committing and deploying approved changes
-- Maintaining the action backlog
-- Flagging when two experts' work conflicts
+- Sequencing: ensuring Opus fixes land before Hermes refactors depend on them
+- Quality gate: all changes must pass before merging to live branch
+- Conflict resolution when Opus and Hermes recommendations intersect
+- Final sign-off on any change that touches live execution paths
 
 ---
 
 ## No-Overlap Rules
 
-1. **Opus finds the problem. Hermes builds the dashboard that shows the problem is still happening.**
-2. **Opus proposes a fix. Hermes designs the infrastructure to support that fix safely.**
-3. **Hermes never evaluates whether a confidence adjustment is "real" — that's Opus.**
-4. **Opus never proposes scheduler decomposition or config restructuring — that's Hermes.**
-5. **If both experts want to touch the same file, Reviewer decides who goes first.**
-6. **No expert modifies live trading logic without explicit owner approval.**
+```
+RULE 1: Opus identifies the problem. Hermes builds the instrumentation.
+        Opus proposes the fix. Hermes builds the infrastructure to deploy it.
 
-### Weekly Sync Protocol
-1. Opus identifies a live-trading issue
-2. Hermes adds logging/metrics/alerts to make that issue continuously visible
-3. Opus proposes a fix
-4. Hermes designs the refactor/infrastructure to support that fix
-5. Reviewer sequences the work, runs tests, approves deployment
-6. Both verify via the observability infrastructure Hermes built
+RULE 2: Hermes never evaluates whether a module is "real" or "fake-smart."
+        That is Opus's domain. Hermes acts on Opus's verdict.
+
+RULE 3: Opus never proposes refactoring or restructuring.
+        That is Hermes's domain. Opus flags modules for Hermes to act on.
+
+RULE 4: If either expert's work touches the same file, the reviewer/integrator
+        must sequence: Opus fix first, Hermes refactor second.
+
+RULE 5: Both experts preserve the trading mission:
+        - let profits run in trend
+        - secure profit efficiently in sideways/chop
+        - do not over-block good trades
+```
 
 ---
 
 ## Current Priorities
 
-### P0 — Immediate (this week)
+### P0 — Immediate (before any refactoring)
 
-| # | Task | Owner | Status | Depends On |
-|---|------|-------|--------|------------|
-| 1 | Triage `ctrader_openapi.db` — health check reads+writes | Hermes | TODO | — |
-| 2 | Add atomic JSON write to `trading_manager_state.json` | Hermes | TODO | — |
-| 3 | Add r_peak persistence verification at startup | Hermes | TODO | #2 |
-| 4 | Add TRAILING_STRUCT enforcement visibility logging | Hermes | TODO | — |
-| 5 | Add token/auth refresh health monitoring | Hermes | TODO | — |
-| 6 | Verify TRAILING_STRUCT wiring — is enforcement actually missing? | Opus | TODO | — |
-| 7 | Verify r_peak — is it persisted? What happens after restart? | Opus | TODO | — |
-| 8 | Audit confidence construction — which paths are synthetic? | Opus | TODO | — |
+| # | Item | Owner | Status |
+|---|------|-------|--------|
+| 1 | Verify `ctrader_openapi.db` health (reads AND writes) | Hermes | TODO |
+| 2 | Add atomic_json_write to `trading_manager_state.json` | Hermes | TODO |
+| 3 | Verify r_peak persistence across restart | Opus | TODO |
+| 4 | Add r_peak startup verification + alert | Hermes | TODO |
+| 5 | Verify TRAILING_STRUCT enforcement at caller level | Opus | TODO |
+| 6 | Add TRAILING_STRUCT enforcement visibility logging | Hermes | TODO |
+| 7 | Add token/auth refresh health monitoring | Hermes | TODO |
 
-### P1 — Short-term (next 2 weeks)
+### P1 — This week
 
-| # | Task | Owner | Status | Depends On |
-|---|------|-------|--------|------------|
-| 9 | Add opportunity suppression tracker (per-gate rejection logging) | Hermes | TODO | — |
-| 10 | Add gate ROI attribution data collection | Hermes | TODO | — |
-| 11 | Add startup config assertions (r_peak, trailing, suppression risk) | Hermes | TODO | #3 |
-| 12 | Enable WAL mode on ctrader_openapi.db | Hermes | TODO | #1 |
-| 13 | Identify which gates are validated by outcome attribution | Opus | TODO | #10 |
-| 14 | Identify which "smart" modules are non-causal | Opus | TODO | — |
-| 15 | Validate opportunity suppression — which gates block good trades? | Opus | TODO | #9 |
+| # | Item | Owner | Status |
+|---|------|-------|--------|
+| 8 | Identify fake-smart modules (causal audit) | Opus | TODO |
+| 9 | Add opportunity suppression tracker | Hermes | TODO |
+| 10 | Add gate ROI attribution data collection | Hermes | TODO |
+| 11 | Add startup config assertions (Opus-specific) | Hermes | TODO |
+| 12 | Enable WAL mode on ctrader_openapi.db | Hermes | TODO |
+| 13 | Add structured logging (structlog) | Hermes | TODO |
 
-### P2 — Medium-term (weeks 3-6)
+### P2 — Weeks 2-4
 
-| # | Task | Owner | Status | Depends On |
-|---|------|-------|--------|------------|
-| 16 | Extract report generators from scheduler.py | Hermes | TODO | — |
-| 17 | Set up structured logging (structlog) | Hermes | TODO | — |
-| 18 | Add scheduler heartbeat monitoring | Hermes | TODO | — |
-| 19 | Implement DB archival (backup first, retention later) | Hermes | TODO | #1, #12 |
-| 20 | Extract family builders from scheduler.py | Hermes | TODO | #16 |
-| 21 | Remove or deprioritize non-causal modules | Opus+Hermes | TODO | #14 |
-| 22 | Fix confidence construction in flagged paths | Opus | TODO | #8 |
+| # | Item | Owner | Status |
+|---|------|-------|--------|
+| 14 | Extract report generators from scheduler.py | Hermes | TODO |
+| 15 | Implement DB archival (backup first, retention later) | Hermes | TODO |
+| 16 | Add rejection funnel dashboard | Hermes | TODO |
+| 17 | Fix confidence logic gaps (per Opus findings) | Opus | TODO |
+| 18 | Extract family builders from scheduler.py | Hermes | TODO |
+| 19 | Extract guard logic from scheduler.py | Hermes | TODO |
 
-### P3 — Long-term (weeks 6+, after Opus completes live audit)
+### P3 — Weeks 5+ (after Opus completes live-trading audit)
 
-| # | Task | Owner | Status | Depends On |
-|---|------|-------|--------|------------|
-| 23 | Extract guard logic from scheduler.py | Hermes | TODO | #13 |
-| 24 | Extract routing logic from scheduler.py | Hermes | TODO | #23 |
-| 25 | Decompose ctrader_executor.py | Hermes | TODO | Opus sign-off |
-| 26 | Evaluate live_profile_autopilot.py decomposition | Hermes | TODO | #14 |
-| 27 | Migrate config to Pydantic validation | Hermes | TODO | — |
-| 28 | Separate read/write DB connections | Hermes | TODO | #19 |
+| # | Item | Owner | Status |
+|---|------|-------|--------|
+| 20 | Extract routing logic from scheduler.py | Hermes | TODO |
+| 21 | Decompose live_profile_autopilot.py (if causal) | Hermes | TODO |
+| 22 | Decompose ctrader_executor.py (separate DB from execution) | Hermes | TODO |
+| 23 | Migrate config to Pydantic validation | Hermes | TODO |
+| 24 | Remove fake-smart modules (per Opus verdict) | Opus | TODO |
 
 ---
 
 ## Open Risks
 
-| Risk | Severity | Owner | Notes |
-|------|----------|-------|-------|
-| `ctrader_openapi.db` I/O errors — may already be failing silently | P0 | Hermes | 5.4 GB, observed I/O error during review |
-| r_peak not verified as persisted — winner-protection unreliable after restart | P0 | Opus | Must confirm before trusting emergency logic |
-| TRAILING_STRUCT not verified as enforced — structural trailing may be decorative | P0 | Opus | Intent exists, caller-level enforcement uncertain |
-| cTrader auth may be revoked — VM broker sync status unknown | P0 | Reviewer | Last known: invalid token errors |
-| Confidence construction synthetic in some paths — blocks may be false positives | P1 | Opus | Partially fixed, some paths still weak |
-| Opportunity suppression from over-layered gates — no per-gate ROI proof | P1 | Opus | Gate stacks not validated by outcome attribution |
-| Scheduler god class — single point of failure for all subsystems | P1 | Hermes | 13,779 lines, 1 class, 3 locks |
-| Thread model — atomic writes missing, state corruption risk | P1 | Hermes | JSON state files, no atomic writes |
-| Fake-smart modules consuming resources but not affecting live outcomes | P2 | Opus | Decorative AI, LLM paths, auto-calibration |
-| DB growth — no archival policy, will hit performance wall | P2 | Hermes | Currently 5.4 GB |
+| Risk | Severity | Owner |
+|------|----------|-------|
+| `ctrader_openapi.db` I/O errors may indicate corruption | P0 | Hermes |
+| r_peak may not survive restart — winner-protection unreliable | P0 | Opus |
+| TRAILING_STRUCT intent not enforced at execution level | P0 | Opus |
+| Scheduler single-thread failure cascades to all families | P1 | Hermes |
+| Config typos silently fall back to defaults (923 getattr calls) | P1 | Hermes |
+| No per-gate ROI proof — gates may be over-blocking | P1 | Opus |
+| Token/auth refresh failure can silently stop all trading | P1 | Hermes |
+| Confidence construction still synthetic in some paths | P2 | Opus |
+| 5.4 GB DB approaching SQLite practical limits | P2 | Hermes |
+| Thread model has insufficient synchronization | P2 | Hermes |
 
 ---
 
 ## Next Questions to Each Expert
 
-### To Opus
-1. Is r_peak actually persisted in `data/runtime/trading_manager_state.json`? If not, what breaks after restart?
-2. Is TRAILING_STRUCT actually enforced at the execution caller level, or is it decorative intent?
-3. Which specific confidence paths are still synthetic? Give file:line references.
+### To Opus:
+1. Which modules are confirmed fake-smart vs real? (causal audit)
+2. Does r_peak actually persist across restart? What's the current mechanism?
+3. Is TRAILING_STRUCT enforced at the MT5/cTrader execution level, or only in intent?
 4. Which gates in the signal routing pipeline have proven ROI? Which don't?
-5. Which modules in `learning/` are non-causal (decorative AI, LLM paths, auto-calibration that doesn't persist)?
+5. Is the confidence construction in `_apply_neural_soft_adjustment` calibrated or synthetic?
+6. Does the V4 policy layer actually change live behavior, or is it aspirational?
 
-### To Hermes
-1. Is `ctrader_openapi.db` actually corrupted, or just slow? Run the health check.
-2. Can atomic JSON writes be applied to all `data/runtime/*.json` files without changing behavior?
-3. What's the smallest useful first extraction from scheduler.py?
-4. Is WAL mode already enabled on any of the SQLite databases?
-5. What's the estimated time for each phase of the scheduler split?
+### To Hermes:
+1. Is `ctrader_openapi.db` healthy? Can it read AND write?
+2. Are all runtime state files written atomically?
+3. What's the current scheduler heartbeat status?
+4. Which scheduled jobs actually contribute to live trading vs. are decorative?
+5. What's the current DB growth rate? When will it hit 10 GB?
 
-### To Reviewer
-1. Is the VM currently running and broker-synced? When was last successful auth?
-2. Are the current test suites passing on the deployed branch?
-3. What's the deployment process for rolling back if a refactor breaks something?
-4. Is there a staging environment, or is `deploy-xau-family-canary` the only path to production?
+### To Reviewer/Integrator:
+1. Are Opus and Hermes workstreams properly sequenced?
+2. Has any change accidentally overlapped between the two?
+3. Are all changes tested before merging to the live branch?
+4. Is the trading mission preserved in all proposed changes?
