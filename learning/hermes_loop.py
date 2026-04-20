@@ -32,6 +32,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
+from utils.atomic_write import atomic_json_write
+
 logger = logging.getLogger(__name__)
 
 _SKILLS_DIR = "data/runtime/skills"
@@ -630,16 +632,15 @@ class ImprovementLoop:
                 pass
 
     def _save_state(self):
-        """Persist loop state."""
+        """Persist loop state (atomic)."""
         try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "last_processed_utc": self._last_processed_utc,
                 "last_evolution_utc": self._last_evolution_utc,
                 "cycle_count": self._cycle_count,
                 "saved_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             }
-            self._state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            atomic_json_write(self._state_path, state)
         except Exception:
             pass
 

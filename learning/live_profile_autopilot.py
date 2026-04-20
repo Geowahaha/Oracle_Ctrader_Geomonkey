@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import config
+from utils.atomic_write import atomic_json_write
 
 
 def _utc_now() -> datetime:
@@ -1426,7 +1427,7 @@ class LiveProfileAutopilot:
     def _save_named_state(path: Path, state: dict) -> None:
         payload = dict(state or {})
         payload["updated_at"] = _iso(_utc_now())
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json_write(path, payload)
 
     def _save_report_snapshot(self, name: str, payload: dict) -> None:
         try:
@@ -4185,7 +4186,7 @@ class LiveProfileAutopilot:
     def _save_state(self, state: dict) -> None:
         payload = dict(state or {})
         payload["updated_at"] = _iso(_utc_now())
-        self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json_write(self.state_path, payload)
 
     @staticmethod
     def _lower_csv(values: set[str]) -> str:
@@ -4255,6 +4256,107 @@ class LiveProfileAutopilot:
 
     def _managed_ctrader_sources(self) -> set[str]:
         return {"scalp_btcusd", "scalp_btcusd:winner", "scalp_ethusd", "scalp_ethusd:winner", "scalp_xauusd", "xauusd_scheduled", "xauusd_scheduled:winner"}
+
+    def _loosen_regime_break_guard(self, symbol: str, cumulative_wr: float) -> tuple[bool, dict]:
+        """Block autopilot `loosen_*` canary-tuning proposals when the short
+        recent sample has deteriorated vs the cumulative baseline.
+
+        Returns ``(blocked, telemetry)``. ``blocked=True`` means the caller
+        must suppress the loosen proposal. On insufficient sample, connection
+        failure, or disabled flag the guard returns ``(False, telemetry)`` —
+        behavior matches the pre-guard pipeline (backward-compatible).
+        """
+        telemetry: dict = {"enabled": bool(getattr(config, "AUTOPILOT_REGIME_BREAK_GUARD_ENABLED", True))}
+        if not telemetry["enabled"]:
+            return False, telemetry
+        sym = _norm_symbol(symbol)
+        if not sym:
+            telemetry["skipped"] = "no_symbol"
+            return False, telemetry
+        recent_n = max(5, int(getattr(config, "AUTOPILOT_REGIME_BREAK_RECENT_N", 20) or 20))
+        wr_drop_trigger = float(getattr(config, "AUTOPILOT_REGIME_BREAK_WR_DROP", 0.10) or 0.10)
+        min_baseline_wr = float(getattr(config, "AUTOPILOT_REGIME_BREAK_MIN_BASELINE_WR", 0.45) or 0.45)
+        max_lookback_days = max(1, int(getattr(config, "AUTOPILOT_REGIME_BREAK_MAX_LOOKBACK_DAYS", 14) or 14))
+        lookback_iso = _iso(_utc_now() - timedelta(days=max_lookback_days))
+
+        outcomes: list[tuple[str, int]] = []
+        try:
+            if self.ctrader_db_path.exists():
+                with closing(self._connect_ctrader()) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT execution_utc, outcome
+                          FROM ctrader_deals
+                         WHERE execution_utc >= ?
+                           AND symbol = ?
+                           AND has_close_detail = 1
+                           AND journal_id IS NOT NULL
+                           AND outcome IN (0, 1)
+                         ORDER BY execution_utc DESC
+                         LIMIT ?
+                        """,
+                        (lookback_iso, sym, recent_n * 2),
+                    ).fetchall()
+                    for row in list(rows or []):
+                        ts = str(row["execution_utc"] or "")
+                        outcome = _safe_int(row["outcome"], -1)
+                        if ts and outcome in (0, 1):
+                            outcomes.append((ts, int(outcome)))
+        except Exception:
+            telemetry["ctrader_query_failed"] = True
+        try:
+            if self.mt5_db_path.exists():
+                with closing(self._connect_mt5()) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT created_at, outcome
+                          FROM mt5_execution_journal
+                         WHERE created_at >= ?
+                           AND (signal_symbol = ? OR broker_symbol = ?)
+                           AND resolved = 1
+                           AND outcome IN (0, 1)
+                         ORDER BY created_at DESC
+                         LIMIT ?
+                        """,
+                        (lookback_iso, sym, sym, recent_n * 2),
+                    ).fetchall()
+                    for row in list(rows or []):
+                        ts = str(row["created_at"] or "")
+                        outcome = _safe_int(row["outcome"], -1)
+                        if ts and outcome in (0, 1):
+                            outcomes.append((ts, int(outcome)))
+        except Exception:
+            telemetry["mt5_query_failed"] = True
+
+        outcomes.sort(key=lambda item: item[0], reverse=True)
+        recent = outcomes[:recent_n]
+        telemetry["recent_resolved"] = len(recent)
+        telemetry["required"] = recent_n
+        if len(recent) < recent_n:
+            telemetry["sample_ok"] = False
+            telemetry["blocked"] = False
+            return False, telemetry
+
+        wins = sum(1 for _, o in recent if o == 1)
+        recent_wr = round(wins / float(len(recent)), 4)
+        baseline_wr = round(float(cumulative_wr or 0.0), 4)
+        telemetry.update(
+            {
+                "sample_ok": True,
+                "recent_wr": recent_wr,
+                "cumulative_wr": baseline_wr,
+                "drop_trigger": wr_drop_trigger,
+                "min_baseline_wr": min_baseline_wr,
+            }
+        )
+        wr_dropped = (baseline_wr - recent_wr) >= wr_drop_trigger
+        recent_below_min = recent_wr < min_baseline_wr
+        if wr_dropped or recent_below_min:
+            telemetry["blocked"] = True
+            telemetry["reason"] = "wr_regime_break" if wr_dropped else "recent_wr_below_min"
+            return True, telemetry
+        telemetry["blocked"] = False
+        return False, telemetry
 
     def _build_canary_tuning_recommendations(self, symbols: list[dict]) -> list[dict]:
         min_sample = max(2, int(getattr(config, "AUTO_APPLY_LIVE_PROFILE_MIN_SAMPLE", 6) or 6))
@@ -4353,22 +4455,28 @@ class LiveProfileAutopilot:
                 continue
             if round(float(proposed), 4) == round(float(current), 4):
                 continue
-            out.append(
-                {
-                    "symbol": sym,
-                    "key": key,
-                    "current": round(float(current), 4),
-                    "proposed": round(float(proposed), 4),
-                    "action": action,
-                    "reason": reason,
-                    "resolved": resolved,
-                    "win_rate": round(wr, 4),
-                    "pnl_usd": round(pnl, 4),
-                    "control_resolved": control_resolved,
-                    "control_win_rate": round(control_wr, 4),
-                    "control_pnl_usd": round(control_pnl, 4),
-                }
-            )
+            regime_break_telemetry: dict = {}
+            if str(action or "").startswith("loosen_"):
+                blocked, regime_break_telemetry = self._loosen_regime_break_guard(sym, wr)
+                if blocked:
+                    continue
+            entry = {
+                "symbol": sym,
+                "key": key,
+                "current": round(float(current), 4),
+                "proposed": round(float(proposed), 4),
+                "action": action,
+                "reason": reason,
+                "resolved": resolved,
+                "win_rate": round(wr, 4),
+                "pnl_usd": round(pnl, 4),
+                "control_resolved": control_resolved,
+                "control_win_rate": round(control_wr, 4),
+                "control_pnl_usd": round(control_pnl, 4),
+            }
+            if regime_break_telemetry:
+                entry["regime_break_guard"] = regime_break_telemetry
+            out.append(entry)
         out.sort(key=lambda item: (abs(float(item.get("pnl_usd", 0.0) or 0.0)), int(item.get("resolved", 0) or 0)), reverse=True)
         return out
 
@@ -4411,6 +4519,7 @@ class LiveProfileAutopilot:
             "mfu": "xau_scalp_microtrend_follow_up",
             "fss": "xau_scalp_flow_short_sidecar",
             "rr": "xau_scalp_range_repair",
+            "mmp": "xau_scalp_mempalace_lane",
             "bwl": "btc_weekday_lob_momentum",
             "ewp": "eth_weekday_overlap_probe",
             "xau_scalp_pullback_limit": "xau_scalp_pullback_limit",
@@ -4420,6 +4529,7 @@ class LiveProfileAutopilot:
             "xau_scalp_microtrend_follow_up": "xau_scalp_microtrend_follow_up",
             "xau_scalp_flow_short_sidecar": "xau_scalp_flow_short_sidecar",
             "xau_scalp_range_repair": "xau_scalp_range_repair",
+            "xau_scalp_mempalace_lane": "xau_scalp_mempalace_lane",
             "btc_weekday_lob_momentum": "btc_weekday_lob_momentum",
             "eth_weekday_overlap_probe": "eth_weekday_overlap_probe",
         }

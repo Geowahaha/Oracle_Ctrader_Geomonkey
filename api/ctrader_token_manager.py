@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from utils.atomic_write import atomic_json_write
+
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "data/runtime/ctrader_token_state.json"
@@ -97,10 +99,9 @@ class CTraderTokenManager:
             return {}
 
     def _save_state(self):
-        """Persist current tokens to disk."""
+        """Persist current tokens to disk (atomic)."""
         path = self._state_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "access_token": self._access_token,
                 "refresh_token": self._refresh_token,
@@ -109,8 +110,7 @@ class CTraderTokenManager:
                 "consecutive_failures": self._consecutive_failures,
                 "saved_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
+            atomic_json_write(path, state)
             logger.debug("[TokenManager] state saved to %s", path)
         except Exception as e:
             logger.warning("[TokenManager] state save error: %s", e)

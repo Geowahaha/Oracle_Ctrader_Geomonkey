@@ -12,6 +12,7 @@ from config import config
 from market.economic_calendar import economic_calendar
 from market.macro_impact_tracker import macro_impact_tracker
 from market.macro_news import macro_news
+from utils.atomic_write import atomic_json_write
 from learning.live_profile_autopilot import (
     _actual_entry_from_deal,
     _classify_chart_state,
@@ -85,7 +86,7 @@ class TradingManagerAgent:
         return {}
 
     def _save_state(self, payload: dict) -> None:
-        self.state_path.write_text(json.dumps(dict(payload or {}), ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json_write(self.state_path, dict(payload or {}))
 
     @staticmethod
     def _load_json(path: Path) -> dict:
