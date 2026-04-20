@@ -733,12 +733,12 @@ class Config:
     CTRADER_PM_POLICY_LAYER_ENABLED: bool = os.getenv(
         "CTRADER_PM_POLICY_LAYER_ENABLED", "0"
     ).strip().lower() in ("1", "true", "yes", "on")
-    CTRADER_PM_POLICY_LAYER_ARM_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_ARM_R", "2.0"))
-    CTRADER_PM_POLICY_LAYER_LOCK_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_R", "3.0"))
-    CTRADER_PM_POLICY_LAYER_TRAIL_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_TRAIL_R", "5.0"))
-    CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", "1.5"))
-    CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", "0.33"))
-    CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS: int = int(os.getenv("CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", "3"))
+    CTRADER_PM_POLICY_LAYER_ARM_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_ARM_R", "0.8"))
+    CTRADER_PM_POLICY_LAYER_LOCK_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_R", "1.5"))
+    CTRADER_PM_POLICY_LAYER_TRAIL_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_TRAIL_R", "3.0"))
+    CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", "0.4"))
+    CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", "0.45"))
+    CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS: int = int(os.getenv("CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", "2"))
     # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
     CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
         "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"

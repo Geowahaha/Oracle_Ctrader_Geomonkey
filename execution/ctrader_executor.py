@@ -2681,12 +2681,12 @@ class CTraderExecutor:
 
         try:
             cfg = WinnerProtectionConfig(
-                arm_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_ARM_R", 2.0) or 2.0),
-                lock_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_R", 3.0) or 3.0),
-                trail_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_TRAIL_R", 5.0) or 5.0),
-                lock_floor_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", 1.5) or 1.5),
-                giveback_emergency_ratio=float(getattr(config, "CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", 0.33) or 0.33),
-                locked_active_defense_score_bonus=int(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", 3) or 3),
+                arm_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_ARM_R", 0.8) or 0.8),
+                lock_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_R", 1.5) or 1.5),
+                trail_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_TRAIL_R", 3.0) or 3.0),
+                lock_floor_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", 0.4) or 0.4),
+                giveback_emergency_ratio=float(getattr(config, "CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", 0.45) or 0.45),
+                locked_active_defense_score_bonus=int(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", 2) or 2),
             )
             resolver = configure_default_resolver(winner_config=cfg)
         except ValueError:

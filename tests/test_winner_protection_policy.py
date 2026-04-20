@@ -95,9 +95,13 @@ class StateTransitionTests(unittest.TestCase):
         self.assertFalse(d.force_close)
 
     def test_trailing_persists_when_pulling_back(self) -> None:
-        peak = self.cfg.trail_r + 2.0
-        # Still above lock_r, and peak was above trail_r → stays in TRAILING.
-        d = _decide(self.policy, r_now=self.cfg.lock_r + 0.5, r_peak=peak)
+        # Peak above trail_r, current safely above giveback emergency
+        # threshold (peak * giveback_ratio) so we test TRAILING, not
+        # EMERGENCY. r_now also still above lock_r so the persistence
+        # branch fires.
+        peak = self.cfg.trail_r + 1.0
+        r_now = peak * 0.6
+        d = _decide(self.policy, r_now=r_now, r_peak=peak)
         self.assertEqual(d.state, WinnerState.TRAILING_STRUCT)
         self.assertGreaterEqual(d.structural_sl_floor_r, peak * 0.5)
 
