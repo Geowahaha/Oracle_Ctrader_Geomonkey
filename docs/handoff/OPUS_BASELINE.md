@@ -1,67 +1,54 @@
 # Opus 4.7 — Baseline Findings
 
-> **Last updated:** 2026-04-20
-> **Status:** Active baseline. Do not re-audit unless contradicted by new evidence.
+> Last updated: 2026-04-20
+> Source: Opus 4.7 deep live-trading audit
+> Purpose: Compact reference for Opus's confirmed findings. Do not re-state as opinions.
 
 ---
 
 ## Execution Truth
 
-**The system has real execution infrastructure** — cTrader OpenAPI subprocess, MT5 RPyC bridge, dual-broker support. But wiring gaps exist between design intent and actual live behavior.
+**What works:**
+- cTrader OpenAPI order placement is wired correctly for primary paths
+- MT5 execution via RPyC bridge functions (when connection is healthy)
+- Risk guards (max positions, max USD at risk) fire before order submission
+- Source profile gating prevents unauthorized family/symbol combinations
 
-### Confirmed strong:
-- cTrader execution subprocess is properly isolated (Twisted lifecycle separate from main process)
-- MT5 executor has broker-aware symbol resolution and position limits
-- Price sanity guards exist (deviation checks per symbol class)
-- Market entry drift guard exists
-
-### Confirmed gaps:
-- TRAILING_STRUCT: structural trailing intent exists but enforcement is not fully realized at the caller level. The position manager has trailing logic, but callers don't consistently invoke it.
-- Execution journal writes to a 5.4 GB database that is returning I/O errors — live trade records may be failing silently.
-- Token/auth refresh failure handling is too weak — a refresh failure can silently stop all trading.
+**What has gaps:**
+- TRAILING_STRUCT: structural trailing intent exists in code but enforcement is not fully realized at the caller level. Positions may not receive trailing updates that the design intended.
+- Token/auth refresh: failure handling is too weak. A refresh failure can interrupt trading with no automatic recovery.
+- Some execution paths have silent failure modes — orders fail but no alert fires.
 
 ---
 
-## Confidence Logic Status
+## Confidence Logic
 
-**Partially fixed.** Historical bugs were addressed, but confidence construction remains synthetic/weakly calibrated in important paths.
+**Status: Partially fixed, still weak.**
 
-### Confirmed:
-- NeuralBrain is a genuine outcome-linked learning component — it records trade outcomes and retrains
-- `_apply_neural_soft_adjustment` applies neural gate adjustments to signal confidence
-- Winner logic applies bonuses (+2.0) and penalties (-2.0/-4.5) based on historical session/band/side/symbol performance
+- Historical bugs in confidence calculation were fixed in prior sessions
+- Confidence construction is still synthetic — not calibrated to actual win rates
+- Some confidence adjustments are statistically grounded (winner logic bonuses/penalties)
+- Some confidence adjustments are hardcoded magic numbers (+2.0, -2.0, -4.5) without statistical justification
+- High-confidence blocking exists in important paths — signals with confidence below threshold are rejected even when they might be profitable
+- The neural gate learning loop adjusts confidence policy, but it's unclear if the adjustments materially affect live outcomes
 
-### Concerns:
-- Confidence adjustments use hardcoded magic numbers, not statistically derived values
-- High-confidence blocking still exists in important paths — signals that might be profitable are rejected
-- Confidence construction is synthetic: the composite score doesn't map to a calibrated probability of profit
-- The neural gate policy may not be persisting correctly across restarts
+**Bottom line:** Confidence is a number that looks meaningful but may not correlate with actual probability of profit. It gates real money decisions.
 
 ---
 
 ## Fake-Smart Findings
 
-Several modules appear sophisticated but may not add causal value to live trading decisions.
+Modules/features that appear sophisticated but may not add causal value on the live trading path:
 
-### Likely decorative / non-causal:
-- **Decorative AI/library prior logic** — modules that use LLM or library priors but aren't on the live signal→execution decision path
-- **LLM/research paths** — AI research or analysis that feeds reports but doesn't change which trades fire
-- **Auto-calibration paths** — calibration loops that don't persist their adjustments or don't materially affect live outcomes
-- **Gate stacks without ROI proof** — multiple gating layers that look sophisticated but aren't validated by outcome attribution per gate
+| Module/Feature | Assessment |
+|---|---|
+| Decorative AI/library prior logic | Not on live decision path. Looks smart, does nothing. |
+| LLM/research paths | Not on live trading decision path. Informational only. |
+| Auto-calibration paths | May not persist or may not materially affect live outcomes. Needs verification. |
+| Gate stacks (some) | Not validated by per-gate live ROI attribution. May block more than they help. |
+| Some confidence adjustments | Synthetic — not derived from outcome data. |
 
-### Likely real / causal:
-- NeuralBrain (outcome-linked learning)
-- HermesLoop (reinforcement-style modifier)
-- V4 WinnerProtection (directionally correct)
-- Entry sharpness scoring (8 microstructure features — substantial engineering)
-- Active position defense (real-time adverse flow detection)
-- TradingManagerAgent (xau_execution_directive, xau_cluster_loss_guard)
-
-### Needs verification:
-- `position_trailing_brain.py` — small (250 lines) but critical if TRAILING_STRUCT wiring gap originates here
-- `strategy_evolution.py` — family promotion/demotion: is it actually wired to live family selection?
-- `strategy_lab_team.py` — experimental family management: does it affect which families trade live?
-- `adaptive_directional_intelligence.py` — ADI modifier: does it actually change signal direction?
+**Important:** "Fake-smart" does not mean "bad code." It means the code exists, runs, looks complex, but does not causally affect whether trades win or lose. These modules should be flagged for removal or deprioritization, not refactored into cleaner versions.
 
 ---
 
@@ -69,75 +56,83 @@ Several modules appear sophisticated but may not add causal value to live tradin
 
 ### 1. r_peak Persistence (CRITICAL)
 
-**Problem:** `r_peak` (peak R-multiple for winner protection) may not survive system restart.
+- `r_peak` is used by winner-protection and emergency logic
+- If r_peak is not persisted to `trading_manager_state.json`, it is lost on restart
+- After restart, winner-protection and emergency logic use cold-start defaults
+- This makes the system unreliable after every restart until new trade data arrives
 
-**Impact:** Winner-protection and emergency logic become unreliable after restart. The system loses its memory of recent performance, which can cause:
-- Over-trading after restart (no loss-streak awareness)
-- Under-trading after restart (no win-streak awareness)
-- Emergency guards not triggering when they should
-
-**Fix required:** Verify r_peak is written to `trading_manager_state.json` and read back at startup. If not persisted, reconstruct from trade history.
+**Required:** Verify r_peak is written to trading_manager_state.json. Verify it is read at startup. Verify it can be reconstructed from trade history if missing.
 
 ### 2. TRAILING_STRUCT Enforcement Gap (CRITICAL)
 
-**Problem:** Structural trailing stop intent exists in the design but is not fully enforced at the execution caller level.
+- Structural trailing stop logic exists in the codebase
+- The intent is to dynamically adjust stops based on market structure
+- At the caller level, this trailing is not fully enforced
+- Result: positions may not be defended as the design intended
 
-**Impact:** Positions that should have trailing stops may not get them, or trailing stops may not move as intended. This means:
-- Winners may not run as intended
-- Profits may not be secured efficiently in trend
-- The system's trailing behavior doesn't match its design
+**Required:** Trace the trailing intent from definition to execution. Find where the chain breaks. Close the gap.
 
-**Fix required:** Verify every position manager trailing call is actually invoked by its callers. Add enforcement checks.
+### 3. Confidence Blocking on Strong Trades (HIGH)
 
-### 3. Confidence Over-Blocking (HIGH)
+- High-confidence thresholds block signals that might be profitable
+- Confidence is not calibrated to actual win rates
+- The system may be suppressing opportunity in trending markets
 
-**Problem:** High-confidence thresholds + multiple gate layers suppress potentially profitable trades.
-
-**Impact:** The system may be blocking strong trades in trend conditions because:
-- Confidence is synthetic (not calibrated to actual win probability)
-- Gates compound: each gate rejects N% and they stack
-- No per-gate ROI proof: we don't know which gates add value vs. just block
-
-**Fix required:** Build per-gate outcome attribution. Identify which gates have positive ROI. Relax or remove gates with negative ROI.
+**Required:** Build per-gate ROI attribution. Prove which gates add value. Reduce or remove gates that don't.
 
 ### 4. Silent Failure Modes (HIGH)
 
-**Problem:** Multiple failure modes produce no alert and no log:
-- Token/auth refresh failures
-- DB write failures (5.4 GB database returning I/O errors)
-- r_peak loss after restart
-- TRAILING_STRUCT non-enforcement
-- Scheduler loop hangs (daemon thread, no watchdog)
+- Order failures may not trigger alerts
+- Token refresh failures may not trigger recovery
+- DB write failures may not be detected
+- Scheduler hangs may not be detected
 
-**Fix required:** Instrumentation for all failure modes. Heartbeat monitoring. Startup state verification.
+**Required:** Every failure path needs an alert. Every critical operation needs a heartbeat.
 
 ---
 
 ## Top Priority Fixes
 
-| Priority | Fix | Depends On |
-|----------|-----|------------|
-| P0 | Verify and fix r_peak persistence across restart | Nothing — do now |
-| P0 | Verify and fix TRAILING_STRUCT enforcement at execution level | Nothing — do now |
-| P0 | Add token/auth refresh failure alerts | Nothing — do now |
-| P1 | Build per-gate outcome attribution (which gates add value?) | Instrumentation (Hermes) |
-| P1 | Identify and remove/deprioritize fake-smart modules | Causal audit |
-| P1 | Fix confidence calibration in key paths | Gate attribution data |
-| P2 | Reduce over-blocking in trend conditions | Gate attribution + confidence fix |
-| P2 | Add startup state verification for all critical runtime data | Atomic writes (Hermes) |
-| P2 | Verify V4 policy layer actually changes live behavior | Code trace + live log analysis |
+Ordered by live-trading impact:
+
+```
+FIX #1: Verify and fix r_peak persistence
+  WHY: Winner-protection is unreliable without it
+  HOW: Check trading_manager_state.json writes. Add startup verification.
+  OWNER: Opus verifies. Hermes builds infrastructure.
+
+FIX #2: Close TRAILING_STRUCT wiring gap
+  WHY: Positions not defended as designed
+  HOW: Trace trailing intent to execution. Add missing caller-level enforcement.
+  OWNER: Opus identifies gap. Hermes adds enforcement telemetry.
+
+FIX #3: Add per-gate ROI attribution
+  WHY: Can't validate gates without outcome data
+  HOW: Log every gate decision. Correlate with trade outcomes. Report per-gate win rate.
+  OWNER: Hermes builds data collection. Opus interprets results.
+
+FIX #4: Harden token/auth refresh
+  WHY: Trading interruption risk
+  HOW: Add retry logic, expiry alerts, refresh failure recovery.
+  OWNER: Hermes builds monitoring. Opus verifies execution path.
+
+FIX #5: Add atomic state writes
+  WHY: Crash = corrupted state = unreliable restart
+  HOW: Write to .tmp, rename atomically. Verify on read.
+  OWNER: Hermes.
+
+FIX #6: Add scheduler heartbeat
+  WHY: Hung scheduler = no scans = missed trades
+  HOW: Heartbeat counter in main loop. Alert if no heartbeat in 60s.
+  OWNER: Hermes.
+```
 
 ---
 
-## What Opus Needs From Hermes
+## Notes for Hermes
 
-| Need | Why |
-|------|-----|
-| Structured logging with signal correlation IDs | To trace a signal from scanner → gate → execution → outcome |
-| Opportunity suppression tracker | To prove which gates are over-blocking |
-| Gate ROI attribution data collection | To measure per-gate value |
-| Atomic state writes | To prevent r_peak and other state loss on crash |
-| Startup state verification | To alert when r_peak or execution directive is missing |
-| TRAILING_STRUCT enforcement visibility | To see the gap between intended and actual trailing |
-| Token/auth health monitoring | To catch refresh failures before they stop trading |
-| Scheduler heartbeat | To detect when the main loop hangs |
+- Do not refactor modules Opus identifies as fake-smart — flag them for removal
+- Do not adjust confidence thresholds — that's Opus's domain
+- Build observability for every issue Opus identifies
+- Prefer making problems visible over fixing them directly
+- Every Opus finding should have a corresponding Hermes telemetry/alert
