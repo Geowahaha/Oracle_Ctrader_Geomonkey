@@ -1,6 +1,6 @@
 # Action Backlog
 
-> Last updated: 2026-04-20 (delta: TRAILING_STRUCT fixed, DB emergency elevated, r_peak confirmed absent)
+> Last updated: 2026-04-20 (delta: TRAILING_STRUCT fixed, DB emergency elevated, r_peak confirmed absent, Hermes infra modules created: atomic_write, db_health, auth_health)
 > Format: Prioritized, owner-assigned, dependency-tracked
 > Update this file after every session. Move items between P-levels as needed.
 
@@ -10,10 +10,10 @@
 
 | ID | Item | Owner | Status | Depends On | Safe Sequencing |
 |----|------|-------|--------|------------|-----------------|
-| P0-0 | DB verification — read-only diagnostic + backup-first (see DB_VERIFICATION_PLAN.md) | Hermes | IN PROGRESS | — | Read-only diagnostics. No mutation. Must complete before P1-4/P1-9/P2-4. |
-| P0-1 | Add atomic_json_write utility + apply to trading_manager_state.json | Hermes | TODO | — | No behavior change. Drop-in replacement. |
+| P0-0 | DB verification — read-only diagnostic + backup-first (see DB_VERIFICATION_PLAN.md) | Hermes | **DONE** — health check module created, first diagnostic run | — | Read-only diagnostics. No mutation. Must complete before P1-4/P1-9/P2-4. |
+| P0-1 | Add atomic_json_write utility + apply to trading_manager_state.json | Hermes | **DONE** — utils/atomic_write.py created and tested | — | No behavior change. Drop-in replacement. |
 | P0-2 | Add r_peak persistence verification at startup | Hermes | TODO | P0-1 | Reads state file. Logs warning if missing. No trading logic change. r_peak confirmed ABSENT from trading_manager_state.json. |
-| P0-3 | Add token/auth refresh health monitoring | Hermes | TODO | — | Additive logging only. No auth logic change. |
+| P0-3 | Add token/auth refresh health monitoring | Hermes | **DONE** — infra/auth_health.py created, first check shows CRITICAL (142h since last refresh) | — | Additive logging only. No auth logic change. |
 | P0-4 | TRAILING_STRUCT enforcement | — | **DONE** | — | Fixed in commit 720b8f0. Verified in code: elif branch reading sl_floor_r + amend_position_sltp in ctrader_executor.py. |
 | P0-5 | Verify r_peak is actually written during trade recording | Opus | TODO | — | Code review only. Trace r_peak through trade lifecycle. |
 | P0-6 | Trace TRAILING_STRUCT from definition to execution caller | Opus | **DONE** | — | Fixed in 720b8f0. Opus should verify fix completeness. |
@@ -76,6 +76,9 @@
 | P0-4 | TRAILING_STRUCT enforcement wiring gap | Repo Owner | 2026-04-20 | Fixed in commit 720b8f0. elif branch reading sl_floor_r + amend_position_sltp. |
 | P0-7 | TRAILING_STRUCT wiring trace | Opus | 2026-04-20 | Confirmed fixed in 720b8f0. |
 | P0-0a | DB read-only diagnostic (first pass) | Hermes | 2026-04-20 | Read-only open works. 14 tables, 8.9M rows. No WAL companion files. Extreme latency. Full plan in DB_VERIFICATION_PLAN.md. |
+| P0-0b | DB health check module + second diagnostic | Hermes | 2026-04-20 | infra/db_health.py created. DB openable (warning: 5.4 GB, depth_quotes 8M rows). WAL files appear/disappear (live system checkpointing). |
+| P0-1 | Atomic write utility | Hermes | 2026-04-20 | utils/atomic_write.py created. atomic_json_write, atomic_json_read, atomic_json_update. 14 runtime JSON files registered. Functional test passed. |
+| P0-3 | Token/auth health monitoring | Hermes | 2026-04-20 | infra/auth_health.py created. First check: CRITICAL — token last refreshed 142h ago. |
 
 ---
 
