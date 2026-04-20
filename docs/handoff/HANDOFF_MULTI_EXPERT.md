@@ -31,7 +31,7 @@ Build and operate a self-improving, multi-strategy AI day-trading system that:
 - **Mode:** swarm_support_all — all XAU families active for broader data collection
 - **Brokers:** cTrader OpenAPI (primary) + MT5 (secondary, via RPyC)
 - **Symbols:** XAUUSD (primary), BTCUSD, ETHUSD
-- **Database:** ctrader_openapi.db at 5.4 GB — I/O errors observed during review (P0)
+- **Database:** ctrader_openapi.db at 5.4 GB — slow I/O (300s timeouts on queries), no WAL companion files despite WAL mode reported, read-only open confirmed working (2026-04-20 diagnostic)
 - **Config:** 1,864 unique env vars in .env.local, 401 boolean flags
 - **Scheduler:** 13,679-line god class, 35+ scheduled jobs, daemon thread
 - **Tests:** 60 test files, 29,500 lines
@@ -57,16 +57,19 @@ These are accepted as baseline. Do not re-audit unless contradicted by new code 
 - Auto-calibration paths may not persist or materially affect live outcomes
 - Gate stacks may not be validated by per-gate live ROI attribution
 - Confidence construction is synthetic / weakly calibrated
-- TRAILING_STRUCT enforcement has a wiring gap (intent exists, execution incomplete)
-- r_peak persistence across restarts is not verified
+- r_peak persistence across restarts is not verified (confirmed absent from trading_manager_state.json)
+
+### Resolved (fixed, verified in code)
+- TRAILING_STRUCT enforcement wiring gap — FIXED in commit 720b8f0. The `elif` branch reading `sl_floor_r` and calling `amend_position_sltp` is present in ctrader_executor.py.
 
 ### Known Issues (confirmed)
-- ctrader_openapi.db returning I/O errors — may be corrupted
+- ctrader_openapi.db: 5.4 GB, extreme query latency (300s timeouts), no WAL companion files, read-only open works but RW operations may hang. Full diagnostic in docs/handoff/DB_VERIFICATION_PLAN.md.
 - No atomic state writes — crash can corrupt runtime JSON
 - Token/auth refresh failure handling too weak
 - Scheduler has only 3 locks for 40+ shared state variables
 - No structured logging, no correlation IDs, no heartbeat monitoring
 - 923 getattr(config) calls vs 88 direct config.X — config system is distrusted
+- r_peak absent from trading_manager_state.json — winner-protection unreliable after restart
 
 ---
 
@@ -81,7 +84,6 @@ These are accepted as baseline. Do not re-audit unless contradicted by new code 
 - Opportunity capture vs over-blocking — are strong trades being suppressed?
 - Winner protection / active defense — is it wired correctly end-to-end?
 - Per-gate ROI attribution — which gates actually add value?
-- TRAILING_STRUCT enforcement — close the wiring gap
 - r_peak persistence — ensure it survives restarts
 
 **Does NOT own:**
@@ -148,15 +150,15 @@ RULE 4: When in doubt, ask the reviewer/integrator before acting.
 
 ## Current Priorities
 
-### P0 — Immediate (this session or next)
+### P0 — Immediate (before next trading session)
 
 | # | Item | Owner | Status | Notes |
 |---|------|-------|--------|-------|
-| 0 | Run ctrader_openapi.db health check | Hermes | TODO | I/O errors observed — may already be broken |
+| 0 | DB verification — ctrader_openapi.db (read-only diagnostic, backup-first) | Hermes | IN PROGRESS | 5.4 GB, slow I/O, no WAL files. See DB_VERIFICATION_PLAN.md. |
 | 1 | Add atomic_json_write to trading_manager_state.json | Hermes | TODO | r_peak corruption risk |
 | 2 | Verify r_peak persistence at startup | Hermes | TODO | Winner-protection unreliable without it |
-| 3 | Add TRAILING_STRUCT enforcement visibility | Hermes | TODO | Opus identified wiring gap |
-| 4 | Add token/auth refresh health monitoring | Hermes | TODO | Opus: failure handling too weak |
+| 3 | Add token/auth refresh health monitoring | Hermes | TODO | Opus: failure handling too weak |
+| 4 | TRAILING_STRUCT enforcement | — | **DONE** | Fixed in commit 720b8f0. Verified in code. |
 
 ### P1 — This Week
 
@@ -165,10 +167,10 @@ RULE 4: When in doubt, ask the reviewer/integrator before acting.
 | 5 | Add opportunity suppression tracker | Hermes | TODO | Per-gate rejection logging |
 | 6 | Add gate ROI attribution data collection | Hermes | TODO | Opus needs this to validate gates |
 | 7 | Add startup config assertions | Hermes | TODO | Dangerous combo detection |
-| 8 | Enable WAL mode on ctrader_openapi.db | Hermes | TODO | Concurrent read/write safety |
+| 8 | Enable WAL mode on ctrader_openapi.db | Hermes | TODO | Only after DB health verified |
 | 9 | Causal audit of all learning/ modules | Opus | TODO | Classify real vs fake-smart |
-| 10 | Verify TRAILING_STRUCT wiring end-to-end | Opus | TODO | Close the enforcement gap |
-| 11 | Verify r_peak reconstruction from history | Opus | TODO | Fallback if persistence fails |
+| 10 | Verify r_peak reconstruction from history | Opus | TODO | Fallback if persistence fails |
+| 11 | Add scheduler heartbeat monitoring | Hermes | TODO | Detect hung scheduler |
 
 ### P2 — Week 2-4
 
@@ -195,17 +197,17 @@ RULE 4: When in doubt, ask the reviewer/integrator before acting.
 
 ## Open Risks
 
-1. **ctrader_openapi.db may already be corrupted.** I/O errors observed. Every trade journal write may be failing silently. Verify before anything else.
+1. **ctrader_openapi.db has extreme latency.** 5.4 GB, queries time out at 300s, no WAL companion files despite WAL mode being reported. Read-only open confirmed working but RW operations may hang. This is the #1 production risk. Full diagnostic plan in DB_VERIFICATION_PLAN.md.
 
-2. **r_peak may not survive restart.** If true, winner-protection and emergency logic are unreliable after every restart until a new trade provides data.
+2. **r_peak does not survive restart.** Confirmed absent from trading_manager_state.json. Winner-protection and emergency logic are unreliable after every restart until new trade data arrives.
 
-3. **TRAILING_STRUCT is not fully enforced.** Structural trailing intent exists in code but is not wired to execution at the caller level. Positions may not be defended as designed.
+3. **No atomic writes.** A crash or power loss during state persistence corrupts JSON files. No recovery mechanism exists. 17 runtime JSON files are vulnerable.
 
 4. **Confidence is synthetic.** High-confidence blocking exists in important paths, but confidence construction may not be calibrated to actual win rates.
 
-5. **No atomic writes.** A crash or power loss during state persistence corrupts JSON files. No recovery mechanism exists.
+5. **Scheduler has no heartbeat.** If the main loop hangs (e.g., blocked on DB I/O), the system appears "running" but is not scanning.
 
-6. **Scheduler has no heartbeat.** If the main loop hangs (e.g., blocked on DB I/O), the system appears "running" but is not scanning.
+6. **TRAILING_STRUCT — RESOLVED.** Fixed in commit 720b8f0. The wiring gap is closed. Hermes should add enforcement telemetry for ongoing verification.
 
 ---
 
@@ -213,13 +215,13 @@ RULE 4: When in doubt, ask the reviewer/integrator before acting.
 
 ### To Opus
 1. Which learning/ modules are confirmed causal vs decorative? Need a definitive list.
-2. Is r_peak actually persisted? If not, can it be reconstructed from ctrader_openapi.db?
-3. Is TRAILING_STRUCT enforcement a single missing call, or a systemic wiring issue?
-4. What is the actual confidence construction formula? Is it calibrated to outcomes?
-5. Which gates in the signal routing pipeline have proven ROI? Which don't?
+2. Is r_peak actually persisted anywhere during trade lifecycle? If not, can it be reconstructed from ctrader_openapi.db?
+3. What is the actual confidence construction formula? Is it calibrated to outcomes?
+4. Which gates in the signal routing pipeline have proven ROI? Which don't?
+5. TRAILING_STRUCT is fixed (commit 720b8f0). Verify the fix is complete from your perspective.
 
 ### To Hermes
-1. Is the ctrader_openapi.db health check clean? If not, what's the recovery plan?
+1. Is ctrader_openapi.db recoverable? What is causing the extreme latency? See DB_VERIFICATION_PLAN.md.
 2. Are atomic writes in place for all runtime JSON state files?
 3. Is the scheduler heartbeat monitoring active?
 4. Has the DB archival plan been executed? What's the current backup status?

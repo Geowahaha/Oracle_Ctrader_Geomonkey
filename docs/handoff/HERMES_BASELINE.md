@@ -31,15 +31,13 @@ PRODUCTION OPS        → Make the system safe to operate and debug
 
 ### P0 — Before anything else
 
-1. **ctrader_openapi.db health check** — 5.4 GB, I/O errors observed. Verify reads AND writes work. If corrupted, recover before any other work.
+1. **ctrader_openapi.db verification** — 5.4 GB, extreme query latency (300s timeouts), no WAL companion files. Read-only open works but RW may hang. See DB_VERIFICATION_PLAN.md for safe diagnostic sequence. DO NOT run repair or archival until health is confirmed.
 
 2. **Atomic state writes** — All runtime JSON files (trading_manager_state.json, etc.) must use write-to-.tmp-then-rename pattern. Prevents corruption on crash.
 
-3. **r_peak persistence verification** — Startup check that r_peak exists in trading_manager_state.json. If missing, reconstruct from trade history.
+3. **r_peak persistence verification** — Startup check that r_peak exists in trading_manager_state.json. Confirmed ABSENT as of 2026-04-20. If missing, reconstruct from trade history.
 
-4. **TRAILING_STRUCT enforcement telemetry** — Log trailing state for every open position. Alert when intended trailing differs from actual.
-
-5. **Token/auth health monitoring** — Log token expiry, refresh success/failure. Alert on refresh failure or <5min to expiry.
+4. **Token/auth health monitoring** — Log token expiry, refresh success/failure. Alert on refresh failure or <5min to expiry.
 
 ### P1 — This week
 
@@ -125,7 +123,7 @@ STRUCTURED LOGGING:
 KEY TELEMETRY (Opus-specific):
   - Opportunity suppression tracker (per-gate rejection rates + replay)
   - Gate ROI attribution (per-gate win rate + PnL)
-  - TRAILING_STRUCT enforcement gap detection
+  - TRAILING_STRUCT enforcement verification (confirm fix from 720b8f0 works in live)
   - r_peak persistence verification at startup
   - Token/auth refresh health
 
@@ -149,10 +147,19 @@ ALERTS:
 ## DB Archival Direction
 
 ```
-CURRENT:  ctrader_openapi.db — 5.4 GB, I/O errors observed
-          No archival, no retention, no VACUUM strategy
+CURRENT:  ctrader_openapi.db — 5.4 GB
+          Extreme query latency (300s timeouts on Python sqlite3)
+          No WAL companion files (-wal, -shm) despite journal_mode=wal reported
+          Read-only open confirmed working (2026-04-20 diagnostic)
+          RW operations may hang — DO NOT test without backup first
+          14 tables, ~8.9M rows total
+          Largest: ctrader_depth_quotes (8M rows) — likely growth driver
+          11 other DB files in data/ (total ~142 MB, healthy)
 
-STRATEGY:
+BLOCKING ISSUE: Must verify DB health before any archival work.
+                See DB_VERIFICATION_PLAN.md for safe diagnostic sequence.
+
+STRATEGY (after health verified):
   HOT:   Last 30 days — fast queries, in main DB
   WARM:  30-180 days — slower queries, in main DB
   COLD:  >180 days — separate archive DB
@@ -165,6 +172,7 @@ APPROACH:
   5. Alert at 4 GB, archive at 3 GB
 
 RULES:
+  - NEVER run repair, VACUUM, or archival without verified backup
   - Never archive during market hours (Sunday 00:00-06:00 UTC only)
   - Verify before delete
   - Archive DBs have identical schema (no transformations)
@@ -207,7 +215,7 @@ OPUS FINDS:                         HERMES BUILDS:
 
 "r_peak doesn't persist"       →   atomic writes + startup verification + alert
 
-"TRAILING_STRUCT not enforced" →   enforcement telemetry + gap detection alert
+"TRAILING_STRUCT fixed"        →   enforcement verification telemetry (confirm live)
 
 "Confidence is synthetic"      →   gate_roi attribution + rejection funnel
 
@@ -220,4 +228,6 @@ OPUS FINDS:                         HERMES BUILDS:
 "Opportunity suppressed"       →   suppression tracker + replay analysis
 
 "Runtime state unreliable"     →   atomic writes + recovery + reconstruction
+
+"DB health degraded"           →   verification plan + safe diagnostic + backup-first
 ```
