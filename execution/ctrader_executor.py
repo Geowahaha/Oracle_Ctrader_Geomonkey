@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import config
+from utils.atomic_write import atomic_json_read, atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +129,14 @@ class CTraderExecutor:
         self.worker_path = Path(__file__).resolve().parent.parent / "ops" / "ctrader_execute_once.py"
         self.trading_manager_state_path = self.db_path.parent / "runtime" / "trading_manager_state.json"
         self.trading_team_state_path = self.db_path.parent / "runtime" / "trading_team_state.json"
+        self._rpeak_state_path = self.db_path.parent / "runtime" / "winner_protection_rpeak.json"
         self._autopilot = None
         self._position_peak_r: dict[int, float] = {}
+        self._policy_r_peak_cache: dict[int, float] = {}
+        self._policy_r_peak_meta: dict[int, dict] = {}
+        self._rpeak_hydrated: bool = False
         self._init_db()
+        self._hydrate_policy_rpeak_cache()
 
     @property
     def enabled(self) -> bool:
@@ -2597,6 +2603,135 @@ class CTraderExecutor:
             "details": details,
         }
 
+    def _hydrate_policy_rpeak_cache(self) -> None:
+        """Load persisted r_peak state into the in-memory cache.
+
+        Must run before the first `_policy_defense_plan` call. Safe on missing
+        or corrupt JSON — returns an empty cache without raising. DB-backed
+        reconstruction is a deliberate future extension, gated on DB health;
+        at v1 we do NOT query ctrader_openapi.db at startup because the 5.4 GB
+        table latency would block scheduler startup.
+        """
+        if self._rpeak_hydrated:
+            return
+        self._rpeak_hydrated = True
+        try:
+            raw = atomic_json_read(self._rpeak_state_path, default=None)
+        except Exception:
+            logger.warning("[rpeak] hydrate: atomic_json_read raised — starting with empty cache", exc_info=True)
+            return
+        if not isinstance(raw, dict):
+            logger.info("[rpeak] hydrate: no prior state at %s — cold start", self._rpeak_state_path)
+            return
+        positions = raw.get("positions") or {}
+        if not isinstance(positions, dict):
+            logger.warning("[rpeak] hydrate: state missing 'positions' — ignoring")
+            return
+        loaded = 0
+        for pid_raw, entry in positions.items():
+            try:
+                pid = int(pid_raw)
+                peak = float((entry or {}).get("r_peak"))
+            except (TypeError, ValueError):
+                continue
+            if peak <= 0.0:
+                continue
+            self._policy_r_peak_cache[pid] = peak
+            meta = {
+                "symbol": str((entry or {}).get("symbol") or "").upper(),
+                "direction": str((entry or {}).get("direction") or "").lower(),
+                "entry_price": float((entry or {}).get("entry_price") or 0.0),
+                "updated_utc": str((entry or {}).get("updated_utc") or ""),
+            }
+            self._policy_r_peak_meta[pid] = meta
+            loaded += 1
+        if loaded:
+            logger.info("[rpeak] hydrate: restored %d r_peak entries from %s", loaded, self._rpeak_state_path)
+
+    def _persist_policy_rpeak_entry(
+        self,
+        *,
+        position_id: int,
+        r_peak: float,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+    ) -> None:
+        """Atomically merge a single r_peak entry into the persisted state.
+
+        Only called when r_peak has strictly increased. Unaffected entries are
+        preserved. On write failure we log and continue — the in-memory cache
+        remains authoritative for the current process lifetime.
+        """
+        try:
+            try:
+                current = atomic_json_read(self._rpeak_state_path, default=None)
+            except Exception:
+                current = None
+            if not isinstance(current, dict):
+                current = {"version": 1, "positions": {}}
+            positions = current.get("positions")
+            if not isinstance(positions, dict):
+                positions = {}
+            pid_key = str(int(position_id))
+            now_iso = datetime.now(timezone.utc).isoformat()
+            positions[pid_key] = {
+                "r_peak": round(float(r_peak), 6),
+                "symbol": str(symbol or "").upper(),
+                "direction": str(direction or "").lower(),
+                "entry_price": round(float(entry_price or 0.0), 6),
+                "updated_utc": now_iso,
+            }
+            current["positions"] = positions
+            current["version"] = int(current.get("version") or 1)
+            current["updated_utc"] = now_iso
+            atomic_json_write(self._rpeak_state_path, current)
+        except Exception:
+            logger.warning("[rpeak] persist failed for position %s", position_id, exc_info=True)
+
+    def _prune_policy_rpeak(self, alive_position_ids: set) -> None:
+        """Drop r_peak cache + persisted entries for positions cTrader no
+        longer reports as open. Called from the account reconcile path.
+        """
+        try:
+            alive = {int(pid) for pid in (alive_position_ids or set())}
+        except Exception:
+            alive = set()
+        if self._policy_r_peak_cache:
+            self._policy_r_peak_cache = {
+                int(pid): float(peak)
+                for pid, peak in self._policy_r_peak_cache.items()
+                if int(pid) in alive
+            }
+        if self._policy_r_peak_meta:
+            self._policy_r_peak_meta = {
+                int(pid): dict(meta)
+                for pid, meta in self._policy_r_peak_meta.items()
+                if int(pid) in alive
+            }
+        try:
+            current = atomic_json_read(self._rpeak_state_path, default=None)
+        except Exception:
+            return
+        if not isinstance(current, dict):
+            return
+        positions = current.get("positions")
+        if not isinstance(positions, dict) or not positions:
+            return
+        pruned = {
+            pid_key: entry
+            for pid_key, entry in positions.items()
+            if (int(pid_key) if str(pid_key).lstrip("-").isdigit() else -1) in alive
+        }
+        if len(pruned) == len(positions):
+            return
+        current["positions"] = pruned
+        current["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        try:
+            atomic_json_write(self._rpeak_state_path, current)
+        except Exception:
+            logger.warning("[rpeak] prune write failed", exc_info=True)
+
     def _policy_defense_plan(
         self,
         *,
@@ -2665,19 +2800,47 @@ class CTraderExecutor:
         except (TypeError, ValueError):
             return legacy_call()
 
-        if not hasattr(self, "_policy_r_peak_cache"):
-            self._policy_r_peak_cache: dict = {}
+        if not hasattr(self, "_policy_r_peak_cache") or self._policy_r_peak_cache is None:
+            self._policy_r_peak_cache = {}
+        if not hasattr(self, "_policy_r_peak_meta") or self._policy_r_peak_meta is None:
+            self._policy_r_peak_meta = {}
+        # Defensive hydrate — no-op after first success.
+        self._hydrate_policy_rpeak_cache()
         cache = self._policy_r_peak_cache
-        prior_peak = float(cache.get(position_id, r_now_f) or r_now_f)
+        pid_int = int(position_id)
+        prior_peak = float(cache.get(pid_int, r_now_f) or r_now_f)
         r_peak = max(prior_peak, r_now_f)
-        cache[position_id] = r_peak
+        cache[pid_int] = r_peak
         if len(cache) > 4096:
             # Guard against leaks. Keep the 2048 largest r_peak entries.
             try:
                 retained = dict(sorted(cache.items(), key=lambda kv: kv[1], reverse=True)[:2048])
                 self._policy_r_peak_cache = retained
+                cache = self._policy_r_peak_cache
+                self._policy_r_peak_meta = {
+                    pid: meta for pid, meta in self._policy_r_peak_meta.items() if pid in retained
+                }
             except Exception:
-                self._policy_r_peak_cache = {position_id: r_peak}
+                self._policy_r_peak_cache = {pid_int: r_peak}
+                cache = self._policy_r_peak_cache
+                self._policy_r_peak_meta = {}
+        if bool(getattr(config, "CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED", True)) and r_peak > prior_peak + 1e-9:
+            try:
+                self._policy_r_peak_meta[pid_int] = {
+                    "symbol": str(symbol or "").upper(),
+                    "direction": str(direction or "").lower(),
+                    "entry_price": float(entry or 0.0),
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception:
+                pass
+            self._persist_policy_rpeak_entry(
+                position_id=pid_int,
+                r_peak=r_peak,
+                symbol=symbol,
+                direction=direction,
+                entry_price=float(entry or 0.0),
+            )
 
         try:
             cfg = WinnerProtectionConfig(
@@ -7106,13 +7269,19 @@ class CTraderExecutor:
                     "UPDATE ctrader_orders SET is_open=0, last_seen_utc=? WHERE account_id=?",
                     (now_iso, account_id),
                 )
+            alive = set(int(pid) for pid in seen_positions)
             if self._position_peak_r:
-                alive = set(int(pid) for pid in seen_positions)
                 self._position_peak_r = {
                     int(pid): float(peak)
                     for pid, peak in self._position_peak_r.items()
                     if int(pid) in alive
                 }
+            # V4 WinnerProtection r_peak cache + persisted state — mirror prune.
+            if self._policy_r_peak_cache or self._policy_r_peak_meta:
+                try:
+                    self._prune_policy_rpeak(alive)
+                except Exception:
+                    logger.warning("[rpeak] prune raised during reconcile", exc_info=True)
             for deal in deals:
                 position_id = int(_safe_float(deal.get("position_id"), 0))
                 source = ""

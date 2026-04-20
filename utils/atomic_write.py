@@ -133,4 +133,5 @@ ATOMIC_WRITE_TARGETS = [
     "data/runtime/parameter_trials.json",
     "data/runtime/token_budget.json",
     "data/runtime/neural_gate_loop_latest.json",
+    "data/runtime/winner_protection_rpeak.json",
 ]

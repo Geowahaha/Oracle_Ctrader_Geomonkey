@@ -235,6 +235,16 @@ class Config:
     ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER: bool = os.getenv("ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
     ETH_WEEKDAY_PROBE_CTRADER_RISK_USD: float = float(os.getenv("ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", "0.35"))
 
+    # ── Autopilot regime-break circuit breaker (Section 12 Verdict #6) ──
+    # Blocks loosen_* canary-tuning proposals when the short recent sample has
+    # deteriorated vs the cumulative baseline, so a lucky streak in long-window
+    # stats cannot self-reinforce a loosening decision across a regime break.
+    AUTOPILOT_REGIME_BREAK_GUARD_ENABLED: bool = os.getenv("AUTOPILOT_REGIME_BREAK_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    AUTOPILOT_REGIME_BREAK_RECENT_N: int = int(os.getenv("AUTOPILOT_REGIME_BREAK_RECENT_N", "20"))
+    AUTOPILOT_REGIME_BREAK_WR_DROP: float = float(os.getenv("AUTOPILOT_REGIME_BREAK_WR_DROP", "0.10"))
+    AUTOPILOT_REGIME_BREAK_MIN_BASELINE_WR: float = float(os.getenv("AUTOPILOT_REGIME_BREAK_MIN_BASELINE_WR", "0.45"))
+    AUTOPILOT_REGIME_BREAK_MAX_LOOKBACK_DAYS: int = int(os.getenv("AUTOPILOT_REGIME_BREAK_MAX_LOOKBACK_DAYS", "14"))
+
     # ── Crypto Cluster Loss Guard + Daily Cap (Phase 1 — isolated from XAU) ──
     CRYPTO_CLUSTER_LOSS_GUARD_ENABLED: bool = os.getenv("CRYPTO_CLUSTER_LOSS_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     BTC_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("BTC_CLUSTER_LOSS_WINDOW_HOURS", "3.0"))
@@ -739,6 +749,13 @@ class Config:
     CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", "0.4"))
     CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", "0.45"))
     CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS: int = int(os.getenv("CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", "2"))
+    # Persist WinnerProtection r_peak across process restarts via
+    # data/runtime/winner_protection_rpeak.json. When disabled, the cache is
+    # in-memory only and each restart warm-starts with r_peak=r_now (pre-fix
+    # behavior). Default ON — the atomic-write primitive is in place.
+    CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED: bool = os.getenv(
+        "CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
     # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
     CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
         "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"
