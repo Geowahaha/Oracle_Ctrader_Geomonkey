@@ -1182,9 +1182,9 @@ class FiboAdvanceScanner:
             fibo_ctx.nearest_level_price, df_h1, atr_h1, current_price, smc_context
         )
 
-        # ── Trend Alignment Gate (replaces crude short quarantine) ─────
-        # Only trade WITH dominant trend: block counter-trend entries
-        # when D1+H4 agree on direction.  Enables smart shorts in bearish.
+        # ── Trend Alignment Gate — SYMMETRIC ────────────────────────────
+        # Block counter-trend entries only when D1+H4 BOTH agree against us.
+        # Neutral/mixed H4 allows both sides (opportunity-first).
         _ta_gate_enabled = bool(getattr(config, "FIBO_TREND_ALIGNMENT_GATE_ENABLED", True))
         if _ta_gate_enabled:
             if scout_direction == "long" and d1_bias == "short" and h4_bias == "short":
@@ -1192,10 +1192,6 @@ class FiboAdvanceScanner:
                 return None
             if scout_direction == "short" and d1_bias == "long" and h4_bias == "long":
                 logger.info("[FiboAdvance:Scout] blocked: trend_alignment_gate short vs D1+H4 bullish")
-                return None
-            # Mixed/neutral: require at least H4 alignment (existing guard above already checks this)
-            if scout_direction == "short" and h4_bias != "short":
-                logger.info("[FiboAdvance:Scout] blocked: short needs h4_bias=short (got %s)", h4_bias)
                 return None
 
         # ── MTF stacking required gate ────────────────────────────────────
@@ -1582,14 +1578,13 @@ class FiboAdvanceScanner:
                 _ta_gate = bool(getattr(config, "FIBO_TREND_ALIGNMENT_GATE_ENABLED", True))
                 _ta_blocked = False
                 if _ta_gate:
+                    # Symmetric: block only when D1+H4 BOTH agree against direction.
+                    # Neutral/mixed H4 allows both sides (opportunity-first).
                     if direction == "long" and d1_bias == "short" and h4_bias == "short":
                         logger.info("[FiboAdvance:Sniper] blocked: trend_alignment_gate long vs D1+H4 bearish")
                         _ta_blocked = True
                     elif direction == "short" and d1_bias == "long" and h4_bias == "long":
                         logger.info("[FiboAdvance:Sniper] blocked: trend_alignment_gate short vs D1+H4 bullish")
-                        _ta_blocked = True
-                    elif direction == "short" and h4_bias != "short":
-                        logger.info("[FiboAdvance:Sniper] blocked: short needs h4_bias=short (got %s)", h4_bias)
                         _ta_blocked = True
                 if not _ta_blocked:
                     # ── Gate: Impulse freshness ────────────────────────────
