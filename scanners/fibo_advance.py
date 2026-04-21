@@ -1049,7 +1049,10 @@ class FiboAdvanceScanner:
         elif direction == "short" and rsi > 60:
             rsi_boost = 6.0
 
-        confidence = round(min(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus, 96.0), 1)
+        # Uncapped base — cap is applied post-modifier in scan() so that
+        # high-confluence signals retain their headroom to absorb downstream
+        # trend/killer/session penalties. (FIBO_ADVANCE_MAX_CONFIDENCE=96.)
+        confidence = round(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus, 1)
         min_conf   = float(_cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 62.0))
         # Pre-mod budget: trend/killer/session/cb modifiers are applied AFTER this
         # build. A borderline base that would pass with +5 aligned trend bonus
@@ -1306,10 +1309,13 @@ class FiboAdvanceScanner:
         tp1, tp2, tp3, rr = _ladder_sc
 
         smc_boost  = min(smc_context.confidence * 0.20, 10.0) if smc_context else 0.0
-        confidence = round(min(
+        # Uncapped base — cap is applied post-modifier in scan() so that
+        # high-confluence scout setups retain headroom to absorb penalties.
+        # (FIBO_SCOUT_MAX_CONFIDENCE=88.)
+        confidence = round(
             fibo_ctx.fibo_confluence_score + smc_boost + 5.0 + vp_adj + mtf_bonus,
-            88.0,
-        ), 1)
+            1,
+        )
         min_conf   = float(_cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0))
         # Pre-mod budget: scout_trend_mod/killer/session modifiers are applied
         # by the caller AFTER this returns. Let borderline signals survive so
@@ -1664,7 +1670,19 @@ class FiboAdvanceScanner:
                                     if signal is not None:
                                         sess_dir_bias, sess_dir_reason = self._session_direction_bias(
                                             direction, d1_bias, active_sessions)
-                                        signal.confidence = round(max(signal.confidence + trend_mod + cb_conf_mod + killer_weight + session_conf_mod + sess_dir_bias, 10.0), 1)
+                                        # Post-modifier: floor at 10 (display safety),
+                                        # cap at FIBO_ADVANCE_MAX_CONFIDENCE (design ceiling).
+                                        _sniper_max_conf = float(_cfg("FIBO_ADVANCE_MAX_CONFIDENCE", 96.0))
+                                        signal.confidence = round(
+                                            min(
+                                                max(
+                                                    signal.confidence + trend_mod + cb_conf_mod + killer_weight + session_conf_mod + sess_dir_bias,
+                                                    10.0,
+                                                ),
+                                                _sniper_max_conf,
+                                            ),
+                                            1,
+                                        )
                                         signal.pattern = signal.pattern.replace("FIBO_", "FIBO_SNIPER_")
                                         signal.raw_scores["mode"] = "sniper"
                                         signal.raw_scores["trend_mod"] = trend_mod
@@ -1746,6 +1764,8 @@ class FiboAdvanceScanner:
                 # Apply scout conf penalty + trend + killer weight + session + direction bias (all weight)
                 total_scout_mod = (scout_conf_penalty + scout_trend_mod + killer_weight
                                    + session_conf_mod + scout_sess_bias + cb_conf_mod)
+                # Scout design: apply penalties only (positive mods discarded to
+                # prevent inflating a lower-conviction class).
                 if total_scout_mod < 0:
                     scout_signal.confidence = round(max(scout_signal.confidence + total_scout_mod, 10.0), 1)
                     if scout_conf_penalty < 0:
@@ -1760,6 +1780,11 @@ class FiboAdvanceScanner:
                         scout_signal.reasons.append(f"session_dir_bias:{scout_sess_bias:.0f}")
                     if cb_conf_mod < 0:
                         scout_signal.reasons.append(f"circuit_breaker:{cb_conf_mod:.0f}")
+                # Apply scout ceiling regardless — the base may exceed 88 since
+                # the internal cap was removed to preserve penalty-absorption
+                # headroom (fix: move cap to post-modifier stage).
+                _scout_max_conf = float(_cfg("FIBO_SCOUT_MAX_CONFIDENCE", 88.0))
+                scout_signal.confidence = round(min(scout_signal.confidence, _scout_max_conf), 1)
                 # Add all modifiers to scout raw_scores
                 scout_signal.raw_scores["trend_mod"] = scout_trend_mod
                 scout_signal.raw_scores["trend_reason"] = scout_trend_reason
