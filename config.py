@@ -756,6 +756,18 @@ class Config:
     CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED: bool = os.getenv(
         "CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED", "1"
     ).strip().lower() in ("1", "true", "yes", "on")
+    # Graded degrade gate — consumes the persisted health state from
+    # infra/db_health + infra/auth_health to decide whether new entries
+    # should be allowed / warned / blocked. Observability default ON,
+    # blocking default OFF so the first rollout is log-only. Never gates
+    # position management, closes, or TP/SL repair paths.
+    CTRADER_HEALTH_GATE_ENABLED: bool = os.getenv(
+        "CTRADER_HEALTH_GATE_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL: bool = os.getenv(
+        "CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN: float = float(os.getenv("CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN", "120"))
     # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
     CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
         "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"

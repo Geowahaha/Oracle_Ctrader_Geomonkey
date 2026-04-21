@@ -4428,6 +4428,38 @@ class CTraderExecutor:
             return _early_exit("disabled", "ctrader autotrade disabled")
         if not self.sdk_available:
             return _early_exit("unavailable", "ctrader-open-api not installed")
+
+        # Graded health gate (DB + auth). Fail-open on missing/stale state.
+        try:
+            from execution.health_gate import health_gate_decision
+            gate = health_gate_decision(
+                enabled=bool(getattr(config, "CTRADER_HEALTH_GATE_ENABLED", False)),
+                block_on_critical=bool(getattr(config, "CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL", False)),
+                max_state_age_min=float(getattr(config, "CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN", 120.0)),
+            )
+        except Exception:
+            gate = None
+        if gate is not None and gate.status == "block":
+            logger.error(
+                "[health_gate] BLOCK new entry — reason=%s db=%s auth=%s (symbol=%s source=%s)",
+                gate.reason, gate.db_status, gate.auth_status, symbol, source,
+            )
+            return _early_exit(
+                "filtered",
+                f"health_gate_blocked:{gate.reason}",
+                execution_meta={
+                    "health_gate_status": gate.status,
+                    "health_gate_reason": gate.reason,
+                    "health_gate_db_status": gate.db_status,
+                    "health_gate_auth_status": gate.auth_status,
+                },
+            )
+        if gate is not None and gate.status == "warn":
+            logger.warning(
+                "[health_gate] WARN new entry — reason=%s db=%s auth=%s (symbol=%s source=%s)",
+                gate.reason, gate.db_status, gate.auth_status, symbol, source,
+            )
+
         if _looks_like_test_pattern(pattern):
             return _early_exit("filtered", f"test_pattern_filtered:{pattern}")
         if _looks_like_fixture_signal(symbol, entry, stop_loss, take_profit):
