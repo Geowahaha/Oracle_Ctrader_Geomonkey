@@ -234,8 +234,18 @@ class FiboAdvanceScanner:
         # ── 1. ATR expansion (1-3 points) ─────────────────────────────────────
         atr_ratio = 0.0
         if len(df_entry) >= 20 and atr > 0:
-            recent_atr = float(df_entry["atr_14"].iloc[-1]) if "atr_14" in df_entry.columns else atr
-            avg_atr    = float(df_entry["atr_14"].rolling(20).mean().iloc[-1]) if "atr_14" in df_entry.columns else atr
+            # NaN guard: rolling(20).mean() produces NaN when any of the last
+            # 20 atr_14 values is NaN; iloc[-1] can also be NaN. Silent NaN
+            # would make all downstream comparisons False and the killer would
+            # miss ATR expansion. Fall back to the passed-in atr (current).
+            if "atr_14" in df_entry.columns:
+                _r = df_entry["atr_14"].iloc[-1]
+                _a = df_entry["atr_14"].rolling(20).mean().iloc[-1]
+                recent_atr = float(_r) if pd.notna(_r) else atr
+                avg_atr    = float(_a) if pd.notna(_a) else atr
+            else:
+                recent_atr = atr
+                avg_atr    = atr
             if avg_atr > 0:
                 atr_ratio = recent_atr / avg_atr
                 atr_kill_mult = float(_cfg("FIBO_ADVANCE_KILLER_ATR_MULT", 1.8))
@@ -574,6 +584,15 @@ class FiboAdvanceScanner:
             if (d1_bullish and h4_bullish and direction == "long") or \
                (d1_bearish and h4_bearish and direction == "short"):
                 return +5.0, "trend_aligned_bonus"
+
+            # ══ MIXED: D1 weakly opposes, H4 agrees — small penalty ═════════
+            # D1 directionality opposes but is not strong enough to trip the
+            # -25 gate. Do NOT reward H4-only alignment with a bonus; the
+            # higher-timeframe is still against us.
+            if direction == "long" and d1_bearish and h4_bullish:
+                return -3.0, "d1_weak_bearish_h4_bullish_mixed_long"
+            if direction == "short" and d1_bullish and h4_bearish:
+                return -3.0, "d1_weak_bullish_h4_bearish_mixed_short"
 
             # ══ H4-ONLY ALIGNED (H4 supports, D1 neutral) ═══════════════════
             if (h4_bullish and direction == "long") or (h4_bearish and direction == "short"):
@@ -1032,7 +1051,12 @@ class FiboAdvanceScanner:
 
         confidence = round(min(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus, 96.0), 1)
         min_conf   = float(_cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 62.0))
-        if confidence < min_conf:
+        # Pre-mod budget: trend/killer/session/cb modifiers are applied AFTER this
+        # build. A borderline base that would pass with +5 aligned trend bonus
+        # should survive the internal gate. Caller enforces the final threshold
+        # implicitly via the same min_conf after modifiers.
+        _pre_mod_budget = float(_cfg("FIBO_ADVANCE_PRE_MOD_BUDGET", 5.0))
+        if confidence < (min_conf - _pre_mod_budget):
             return None
 
         # ── Sharpness-based risk adjustment ───────────────────────────────
@@ -1287,7 +1311,12 @@ class FiboAdvanceScanner:
             88.0,
         ), 1)
         min_conf   = float(_cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0))
-        if confidence < min_conf:
+        # Pre-mod budget: scout_trend_mod/killer/session modifiers are applied
+        # by the caller AFTER this returns. Let borderline signals survive so
+        # positive modifiers can rescue them; penalties remain non-blocking
+        # by design (see _trend_confidence_modifier docstring).
+        _scout_pre_mod_budget = float(_cfg("FIBO_SCOUT_PRE_MOD_BUDGET", 5.0))
+        if confidence < (min_conf - _scout_pre_mod_budget):
             return None
 
         zone = "GP" if fibo_ctx.in_golden_pocket else f"F{fibo_ctx.nearest_level_ratio:.3f}"
