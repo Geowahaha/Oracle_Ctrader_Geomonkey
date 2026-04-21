@@ -879,6 +879,68 @@ class FiboAdvanceScanner:
             return None
         return round(tp1, 2), round(tp2, 2), round(tp3, 2), rr
 
+    # ── Birth-anchor override for early_origin SL/TP ─────────────────────────
+
+    def _resolve_birth_override(self, fibo_ctx, direction: str,
+                                current_price: float) -> Optional[dict]:
+        """Return a dict of (fib, entry, sl_anchor, confidence) to use in
+        place of the completed-swing fib when entry_mode=="early_origin"
+        and the birth fib is valid; otherwise None (caller keeps the
+        default late-retrace path).
+
+        Gated by FIBO_IMPULSE_BIRTH_SLTP_ENABLED. Never raises.
+        """
+        try:
+            if not bool(getattr(config, "FIBO_IMPULSE_BIRTH_SLTP_ENABLED", False)):
+                return None
+            if getattr(fibo_ctx, "entry_mode", "") != "early_origin":
+                return None
+            birth_fib = getattr(fibo_ctx, "impulse_birth_fib_levels", None)
+            if birth_fib is None:
+                return None
+            conf = float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0)
+            min_conf = float(getattr(config, "FIBO_IMPULSE_BIRTH_SLTP_MIN_CONFIDENCE", 0.60))
+            if conf < min_conf:
+                return None
+            birth_dir = str(getattr(fibo_ctx, "impulse_birth_direction", "") or "")
+            dir_ok = (
+                (direction == "long" and birth_dir == "bullish")
+                or (direction == "short" and birth_dir == "bearish")
+            )
+            if not dir_ok:
+                return None
+
+            anchor_price = float(getattr(fibo_ctx, "impulse_birth_anchor_price", 0.0) or 0.0)
+            if anchor_price <= 0:
+                return None
+
+            # Entry: a limit at the chosen birth-fib retracement level
+            # (default 0.618 — golden pocket of the birth impulse). This
+            # keeps the "enter the origin on a shallow pullback" logic
+            # consistent with the rest of the fibo lane.
+            entry_ratio = float(getattr(config, "FIBO_IMPULSE_BIRTH_ENTRY_RATIO", 0.618))
+            entry_price = birth_fib.levels.get(entry_ratio, 0.0) or 0.0
+            # Degenerate birth fib (range 0) → skip override.
+            if entry_price <= 0 or birth_fib.swing_range <= 0:
+                return None
+            # If current_price has already blown past the entry ratio
+            # (pullback never came) we still prefer market at current to
+            # not miss the move; downstream RR check guards the trade.
+            if direction == "long" and current_price < entry_price:
+                entry_price = current_price
+            if direction == "short" and current_price > entry_price:
+                entry_price = current_price
+
+            return {
+                "fib": birth_fib,
+                "entry": float(entry_price),
+                "sl_anchor": float(anchor_price),
+                "confidence": conf,
+            }
+        except Exception as exc:
+            logger.debug("[FiboAdvance] birth override error: %s", exc)
+            return None
+
     # ── Entry / SL / TP Construction ──────────────────────────────────────────
 
     def _build_signal(self, direction: str, fibo_ctx, current_price: float,
@@ -902,14 +964,24 @@ class FiboAdvanceScanner:
         if entry <= 0:
             return None
 
-        # SL: place beyond swing start (the 100% level) with ATR buffer
-        sl_buffer  = atr * float(_cfg("FIBO_ADVANCE_SL_ATR_BUFFER", 0.25))
-        fib_100    = fib.levels.get(1.0, fib.swing_start)
+        # ── Early-origin override: swap fib + SL anchor when birth is fresh ──
+        birth_override = self._resolve_birth_override(fibo_ctx, direction, current_price)
+        anchor_mode = "late_retrace"
+        if birth_override is not None:
+            fib = birth_override["fib"]
+            entry = birth_override["entry"]
+            sl_anchor = birth_override["sl_anchor"]
+            sl_buffer = atr * float(_cfg("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", 0.25))
+            anchor_mode = "early_origin"
+        else:
+            # SL: place beyond swing start (the 100% level) with ATR buffer
+            sl_buffer = atr * float(_cfg("FIBO_ADVANCE_SL_ATR_BUFFER", 0.25))
+            sl_anchor = fib.levels.get(1.0, fib.swing_start)
 
         if direction == "long":
-            stop_loss = fib_100 - sl_buffer
+            stop_loss = sl_anchor - sl_buffer
         else:
-            stop_loss = fib_100 + sl_buffer
+            stop_loss = sl_anchor + sl_buffer
 
         risk = abs(entry - stop_loss)
         if risk < atr * 0.1:
@@ -1015,12 +1087,28 @@ class FiboAdvanceScanner:
                 "elliott_wave": fibo_ctx.elliott_wave_count,
                 "sharpness_score": int(sharpness_info.get("sharpness_score", 0) or 0),
                 "sharpness_band": sharpness_band,
+                "fibo_entry_mode": anchor_mode,
+                "impulse_birth_confidence": round(
+                    float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
+                ),
+                "impulse_birth_direction": str(
+                    getattr(fibo_ctx, "impulse_birth_direction", "") or ""
+                ),
+                "impulse_age_bars": int(getattr(fibo_ctx, "impulse_age_bars", 0) or 0),
             },
             entry_type="limit",
             sl_type="structure",
-            sl_reason=f"beyond_fib_100pct_swing_origin atr_buf:{sl_buffer:.1f}",
+            sl_reason=(
+                f"early_origin:base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
+                if anchor_mode == "early_origin"
+                else f"beyond_fib_100pct_swing_origin atr_buf:{sl_buffer:.1f}"
+            ),
             tp_type="structure",
-            tp_reason=f"fibo_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}",
+            tp_reason=(
+                f"birth_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
+                if anchor_mode == "early_origin"
+                else f"fibo_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
+            ),
             sl_liquidity_mapped=False,
             liquidity_pools_count=len(smc_context.liquidity_pools) if smc_context else 0,
         )
@@ -1144,13 +1232,25 @@ class FiboAdvanceScanner:
 
         # Build signal with scout-specific targets (shorter, quicker)
         entry     = fibo_ctx.nearest_level_price
-        sl_buffer = atr_m15 * float(_cfg("FIBO_SCOUT_SL_ATR_BUFFER", 0.20))
-        fib_100   = fib.levels.get(1.0, fib.swing_start)
+        # ── Early-origin override: swap fib + SL anchor when birth is fresh ──
+        scout_birth_override = self._resolve_birth_override(
+            fibo_ctx, scout_direction, current_price
+        )
+        scout_anchor_mode = "late_retrace"
+        if scout_birth_override is not None:
+            fib = scout_birth_override["fib"]
+            entry = scout_birth_override["entry"]
+            sl_anchor = scout_birth_override["sl_anchor"]
+            sl_buffer = atr_m15 * float(_cfg("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", 0.25))
+            scout_anchor_mode = "early_origin"
+        else:
+            sl_buffer = atr_m15 * float(_cfg("FIBO_SCOUT_SL_ATR_BUFFER", 0.20))
+            sl_anchor = fib.levels.get(1.0, fib.swing_start)
 
         if scout_direction == "long":
-            stop_loss = fib_100 - sl_buffer
+            stop_loss = sl_anchor - sl_buffer
         else:
-            stop_loss = fib_100 + sl_buffer
+            stop_loss = sl_anchor + sl_buffer
 
         risk = abs(entry - stop_loss)
         if risk < atr_m15 * 0.08:
@@ -1254,12 +1354,28 @@ class FiboAdvanceScanner:
                 "mtf_reason": mtf_reason,
                 "sharpness_score": sharpness_score,
                 "sharpness_band": sharpness_band,
+                "fibo_entry_mode": scout_anchor_mode,
+                "impulse_birth_confidence": round(
+                    float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
+                ),
+                "impulse_birth_direction": str(
+                    getattr(fibo_ctx, "impulse_birth_direction", "") or ""
+                ),
+                "impulse_age_bars": int(getattr(fibo_ctx, "impulse_age_bars", 0) or 0),
             },
             entry_type="limit",
             sl_type="structure",
-            sl_reason=f"scout_fib100_origin atr_buf:{sl_buffer:.1f}",
+            sl_reason=(
+                f"scout_early_origin_base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
+                if scout_anchor_mode == "early_origin"
+                else f"scout_fib100_origin atr_buf:{sl_buffer:.1f}"
+            ),
             tp_type="structure",
-            tp_reason=f"scout_ext_1272:{tp2:.1f}",
+            tp_reason=(
+                f"scout_birth_ext_1272:{tp2:.1f}"
+                if scout_anchor_mode == "early_origin"
+                else f"scout_ext_1272:{tp2:.1f}"
+            ),
             sl_liquidity_mapped=False,
             liquidity_pools_count=len(smc_context.liquidity_pools) if smc_context else 0,
         )

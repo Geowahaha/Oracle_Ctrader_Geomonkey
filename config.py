@@ -166,6 +166,13 @@ class Config:
     FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE", "0.55"))
     FIBO_IMPULSE_BIRTH_SCORE_BONUS: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SCORE_BONUS", "10.0"))
     FIBO_IMPULSE_BIRTH_STALE_AGE_BARS: int = int(os.getenv("FIBO_IMPULSE_BIRTH_STALE_AGE_BARS", "25"))
+    # Birth-anchor-based SL/TP for entry_mode == "early_origin" (scanner-local).
+    # When enabled, the scanner swaps the late-retrace fib for the birth fib
+    # when constructing entry / SL / TP, and uses the base as the stop anchor.
+    FIBO_IMPULSE_BIRTH_SLTP_ENABLED: bool = os.getenv("FIBO_IMPULSE_BIRTH_SLTP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_IMPULSE_BIRTH_SLTP_MIN_CONFIDENCE: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SLTP_MIN_CONFIDENCE", "0.60"))
+    FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", "0.25"))
+    FIBO_IMPULSE_BIRTH_ENTRY_RATIO: float = float(os.getenv("FIBO_IMPULSE_BIRTH_ENTRY_RATIO", "0.618"))
     # Scout mode (H1→M15 intermediate setups — fires while waiting for Sniper)
     FIBO_SCOUT_ENABLED: bool = os.getenv("FIBO_SCOUT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_SCOUT_MIN_CONFIDENCE: float = float(os.getenv("FIBO_SCOUT_MIN_CONFIDENCE", "55.0"))
