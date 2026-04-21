@@ -4391,6 +4391,38 @@ class CTraderExecutor:
                 "raw_scores": self._safe_json_load(json.dumps(getattr(signal, "raw_scores", {}) or {}, ensure_ascii=True, default=str)),
             }
 
+        def _xau_shadow_log(decision: str, reason: str = "", extra: Optional[dict] = None) -> None:
+            """Shadow-audit hook for XAU high-conf suppression analysis.
+
+            Observability only — never influences a live decision. All
+            failures swallowed inside the logger module.
+            """
+            try:
+                if not bool(getattr(config, "XAU_CONF_SUPPRESSION_SHADOW_ENABLED", False)):
+                    return
+                from execution.xau_suppression_shadow import log_signal_event
+                log_signal_event(
+                    enabled=True,
+                    symbol=symbol,
+                    direction=str(getattr(signal, "direction", "") or ""),
+                    source=str(source or ""),
+                    confidence=_safe_float(getattr(signal, "confidence", 0.0), 0.0),
+                    entry=entry,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    raw_scores=getattr(signal, "raw_scores", {}) or {},
+                    decision=decision,
+                    reason=reason,
+                    signal_run_id=str(trace.get("run_id", "") or ""),
+                    signal_run_no=int(trace.get("run_no", 0) or 0),
+                    pattern=str(getattr(signal, "pattern", "") or ""),
+                    session=str(getattr(signal, "session", "") or ""),
+                    max_file_mb=float(getattr(config, "XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB", 10.0)),
+                    extra=extra,
+                )
+            except Exception:
+                pass
+
         def _early_exit(
             status: str,
             message: str,
@@ -4420,7 +4452,10 @@ class CTraderExecutor:
                 )
             except Exception:
                 pass
+            _xau_shadow_log("rejected", reason=f"{status}:{message}")
             return result
+
+        _xau_shadow_log("arrived")
 
         if not self.enabled:
             return _early_exit("disabled", "ctrader disabled")
@@ -4539,6 +4574,7 @@ class CTraderExecutor:
                 },
             )
             self._journal(signal, result, source=source, request_payload=payload, response_payload={"mode": "dry_run"})
+            _xau_shadow_log("executed", reason="dry_run")
             return result
 
         raw = self._run_worker(
@@ -4587,6 +4623,15 @@ class CTraderExecutor:
                 )
             except Exception as ct_err:
                 logger.debug("[CopyTrade] dispatch skipped: %s", ct_err)
+        try:
+            _exec_status = str(getattr(result, "status", "") or "")
+            _exec_ok = bool(getattr(result, "ok", False))
+            _xau_shadow_log(
+                "executed" if (_exec_ok and _exec_status in {"accepted", "filled"}) else "rejected",
+                reason=f"live:{_exec_status or 'unknown'}",
+            )
+        except Exception:
+            pass
         return result
 
     def health_check(self, *, live: bool = True) -> dict:

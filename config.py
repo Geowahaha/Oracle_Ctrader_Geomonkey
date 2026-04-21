@@ -768,6 +768,15 @@ class Config:
         "CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL", "0"
     ).strip().lower() in ("1", "true", "yes", "on")
     CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN: float = float(os.getenv("CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN", "120"))
+    # XAU high-confidence suppression shadow audit. Pure append-only JSONL
+    # logger that captures every XAU signal reaching the executor (arrived,
+    # executed, rejected) for post-hoc analysis of whether the winner-logic
+    # confidence penalty is suppressing profitable opportunity. Never
+    # influences a live decision; never modifies the XAU direct lane.
+    XAU_CONF_SUPPRESSION_SHADOW_ENABLED: bool = os.getenv(
+        "XAU_CONF_SUPPRESSION_SHADOW_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB: float = float(os.getenv("XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB", "10"))
     # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
     CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
         "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"
