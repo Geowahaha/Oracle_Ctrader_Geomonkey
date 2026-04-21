@@ -69,6 +69,16 @@ class FiboSignalContext:
     fibo_confluence_score: float = 0.0   # 0-100 composite Fibonacci confidence
     reasons: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    # Impulse-birth fields (additive; older consumers ignore these freely).
+    entry_mode: str = "none"                           # "none"|"late_retrace"|"early_origin"
+    impulse_age_bars: int = 0                          # bars since late-retrace swing_end
+    impulse_birth_detected: bool = False
+    impulse_birth_direction: str = ""                  # "bullish"|"bearish"
+    impulse_birth_anchor_price: float = 0.0            # base low (bullish) / base high (bearish)
+    impulse_birth_base_start_idx: int = 0
+    impulse_birth_breakout_idx: int = 0
+    impulse_birth_confidence: float = 0.0              # 0-1
+    impulse_birth_fib_levels: Optional[FibonacciLevels] = None
 
 
 class FibonacciAnalyzer:
@@ -77,9 +87,207 @@ class FibonacciAnalyzer:
     Designed to integrate with Dexter's SMC + order-flow pipeline.
     """
 
-    def __init__(self, swing_lookback: int = 5, min_impulse_atr_mult: float = 1.2):
+    def __init__(
+        self,
+        swing_lookback: int = 5,
+        min_impulse_atr_mult: float = 1.2,
+        *,
+        impulse_birth_enabled: bool = True,
+        impulse_birth_base_bars: int = 8,
+        impulse_birth_max_base_atr: float = 1.2,
+        impulse_birth_min_break_atr: float = 0.5,
+        impulse_birth_min_body_pct: float = 0.55,
+        impulse_birth_max_breakout_age: int = 3,
+        impulse_birth_max_chase_atr: float = 1.5,
+        impulse_birth_whipsaw_lookback: int = 10,
+        impulse_birth_min_confidence: float = 0.55,
+        impulse_birth_score_bonus: float = 10.0,
+        impulse_birth_stale_age_bars: int = 25,
+    ):
         self.swing_lookback = swing_lookback
         self.min_impulse_atr_mult = min_impulse_atr_mult
+        # Impulse-birth thresholds (see analysis/fibonacci.py _detect_impulse_birth).
+        self.impulse_birth_enabled = bool(impulse_birth_enabled)
+        self.impulse_birth_base_bars = int(impulse_birth_base_bars)
+        self.impulse_birth_max_base_atr = float(impulse_birth_max_base_atr)
+        self.impulse_birth_min_break_atr = float(impulse_birth_min_break_atr)
+        self.impulse_birth_min_body_pct = float(impulse_birth_min_body_pct)
+        self.impulse_birth_max_breakout_age = int(impulse_birth_max_breakout_age)
+        self.impulse_birth_max_chase_atr = float(impulse_birth_max_chase_atr)
+        self.impulse_birth_whipsaw_lookback = int(impulse_birth_whipsaw_lookback)
+        self.impulse_birth_min_confidence = float(impulse_birth_min_confidence)
+        self.impulse_birth_score_bonus = float(impulse_birth_score_bonus)
+        self.impulse_birth_stale_age_bars = int(impulse_birth_stale_age_bars)
+
+    # ── Impulse Birth Detection ───────────────────────────────────────────────
+
+    def _detect_impulse_birth(
+        self,
+        df: pd.DataFrame,
+        current_price: float,
+        atr: float,
+    ) -> dict:
+        """Detect the *origin* of a nascent impulse before full expansion.
+
+        The late-retrace path anchors fib on a *completed* swing; this one
+        anchors on the base that the impulse is *just now* leaving. We
+        only fire when several conditions agree, because fake breakouts
+        on XAU are common:
+
+        1. Base: prior N bars have compressed range <= atr * max_base_atr.
+        2. Breakout: a recent bar (last `max_breakout_age` bars) closes
+           beyond the base's high/low by >= atr * min_break_atr.
+        3. Body dominance: the breakout bar's body is >= min_body_pct of
+           its full range (no big rejection wick).
+        4. Not-chased: current price is within max_chase_atr * atr of the
+           breakout close — keeps entries near the origin, not post-run.
+        5. Whipsaw guard: the prior `whipsaw_lookback` bars must NOT
+           contain a confirmed opposite-direction breakout that failed
+           (a recent failed break in the other direction is a trap flag).
+
+        Returns a dict; empty when no valid birth was found. Never raises.
+        """
+        result: dict = {
+            "detected": False,
+            "direction": "",
+            "anchor_price": 0.0,
+            "base_start_idx": 0,
+            "breakout_idx": 0,
+            "confidence": 0.0,
+            "reasons": [],
+        }
+        try:
+            if not self.impulse_birth_enabled:
+                return result
+            if df is None or df.empty or atr <= 0:
+                return result
+
+            n_total = len(df)
+            n_base = self.impulse_birth_base_bars
+            n_lookback = self.impulse_birth_whipsaw_lookback
+            max_age = max(1, self.impulse_birth_max_breakout_age)
+            # Minimum: one breakout candidate at offset=1 must have room
+            # for base + whipsaw history (no bars before whip window).
+            if n_total < n_base + n_lookback + 2:
+                return result
+
+            highs = df["high"].values
+            lows = df["low"].values
+            opens = df["open"].values
+            closes = df["close"].values
+
+            # Walk breakout candidates from newest to oldest, within max_age.
+            for offset in range(1, max_age + 1):
+                break_idx = n_total - offset
+                base_end = break_idx  # base ends the bar before breakout
+                base_start = base_end - n_base
+                if base_start <= n_lookback:
+                    continue
+
+                base_high = float(np.max(highs[base_start:base_end]))
+                base_low = float(np.min(lows[base_start:base_end]))
+                base_range = base_high - base_low
+                if base_range <= 0:
+                    continue
+
+                # Condition 1: tight base
+                if base_range > atr * self.impulse_birth_max_base_atr:
+                    continue
+
+                b_open = float(opens[break_idx])
+                b_close = float(closes[break_idx])
+                b_high = float(highs[break_idx])
+                b_low = float(lows[break_idx])
+                b_range = b_high - b_low
+                if b_range <= 0:
+                    continue
+                b_body = abs(b_close - b_open)
+                body_pct = b_body / b_range
+
+                bullish_break = b_close > base_high + atr * self.impulse_birth_min_break_atr
+                bearish_break = b_close < base_low - atr * self.impulse_birth_min_break_atr
+                if not (bullish_break or bearish_break):
+                    continue
+
+                # Condition 3: body dominance
+                if body_pct < self.impulse_birth_min_body_pct:
+                    continue
+
+                direction = "bullish" if bullish_break else "bearish"
+
+                # Condition 4: not chased past max_chase_atr from breakout close
+                chase = abs(current_price - b_close)
+                if chase > atr * self.impulse_birth_max_chase_atr:
+                    continue
+
+                # Condition 5: whipsaw guard — recent failed opposite break.
+                # Scan the `n_lookback` bars immediately preceding the base
+                # for a confirmed opposite-direction breakout (close beyond
+                # running extreme by >= min_break_atr * atr). If present,
+                # treat this new same-direction break as possible trap.
+                whip_slice_start = max(0, base_start - n_lookback)
+                whip_closes = closes[whip_slice_start:base_start]
+                whip_highs = highs[whip_slice_start:base_start]
+                whip_lows = lows[whip_slice_start:base_start]
+                whipsawed = False
+                break_thr = atr * self.impulse_birth_min_break_atr
+                for k in range(1, len(whip_closes)):
+                    prior_high = float(np.max(whip_highs[:k]))
+                    prior_low = float(np.min(whip_lows[:k]))
+                    if direction == "bullish":
+                        # Prior bearish break: close fell below prior low by thr.
+                        if float(whip_closes[k]) < prior_low - break_thr:
+                            whipsawed = True
+                            break
+                    else:
+                        # Prior bullish break: close rose above prior high by thr.
+                        if float(whip_closes[k]) > prior_high + break_thr:
+                            whipsawed = True
+                            break
+                if whipsawed:
+                    continue
+
+                # Confidence score — proportion-of-threshold rewards over-delivery
+                break_size = (b_close - base_high) if direction == "bullish" else (base_low - b_close)
+                break_ratio = break_size / max(atr * self.impulse_birth_min_break_atr, 1e-9)
+                tightness = 1.0 - (base_range / max(atr * self.impulse_birth_max_base_atr, 1e-9))
+                proximity = 1.0 - (chase / max(atr * self.impulse_birth_max_chase_atr, 1e-9))
+                body_score = min(max((body_pct - self.impulse_birth_min_body_pct) /
+                                     max(1.0 - self.impulse_birth_min_body_pct, 1e-9), 0.0), 1.0)
+                confidence = (
+                    0.30 * min(max(break_ratio, 0.0) / 1.5, 1.0)
+                    + 0.25 * max(tightness, 0.0)
+                    + 0.25 * max(proximity, 0.0)
+                    + 0.20 * body_score
+                )
+                confidence = round(min(max(confidence, 0.0), 1.0), 3)
+
+                if confidence < self.impulse_birth_min_confidence:
+                    continue
+
+                anchor = base_low if direction == "bullish" else base_high
+                reasons = [
+                    f"base_bars={n_base}",
+                    f"base_range_atr={base_range / max(atr, 1e-9):.2f}",
+                    f"break_atr={break_size / max(atr, 1e-9):.2f}",
+                    f"body_pct={body_pct:.2f}",
+                    f"chase_atr={chase / max(atr, 1e-9):.2f}",
+                    f"breakout_age={offset}",
+                ]
+                result.update({
+                    "detected": True,
+                    "direction": direction,
+                    "anchor_price": float(anchor),
+                    "base_start_idx": int(base_start),
+                    "breakout_idx": int(break_idx),
+                    "confidence": confidence,
+                    "reasons": reasons,
+                })
+                return result
+
+        except Exception as exc:
+            logger.debug("[FiboAnalyzer] impulse-birth error: %s", exc)
+        return result
 
     # ── Swing Detection ───────────────────────────────────────────────────────
 
@@ -318,6 +526,55 @@ class FibonacciAnalyzer:
         """
         ctx = FiboSignalContext()
 
+        def _annotate_birth_only(score: float = 0.0) -> FiboSignalContext:
+            """Populate ctx with birth info when no completed-impulse fib was
+            computed. Additive — does not alter the ctx on None paths that
+            could not access price/atr."""
+            try:
+                if df_structure is None or df_structure.empty:
+                    return ctx
+                birth_local = self._detect_impulse_birth(df_structure, current_price, atr)
+                if not birth_local.get("detected"):
+                    return ctx
+                ctx.impulse_birth_detected = True
+                ctx.impulse_birth_direction = birth_local["direction"]
+                ctx.impulse_birth_anchor_price = birth_local["anchor_price"]
+                ctx.impulse_birth_base_start_idx = birth_local["base_start_idx"]
+                ctx.impulse_birth_breakout_idx = birth_local["breakout_idx"]
+                ctx.impulse_birth_confidence = birth_local["confidence"]
+
+                b_idx = birth_local["breakout_idx"]
+                b_start = birth_local["base_start_idx"]
+                swing_end_price = (
+                    float(df_structure["high"].iloc[b_idx])
+                    if birth_local["direction"] == "bullish"
+                    else float(df_structure["low"].iloc[b_idx])
+                )
+                ctx.impulse_birth_fib_levels = self.compute_fibonacci_levels(
+                    swing_start=birth_local["anchor_price"],
+                    swing_end=swing_end_price,
+                    swing_start_idx=b_start,
+                    swing_end_idx=b_idx,
+                    impulse_strength=birth_local["confidence"],
+                )
+                ctx.entry_mode = "early_origin"
+                reasons_local = list(ctx.reasons or [])
+                reasons_local.append(
+                    f"impulse_birth_{birth_local['direction']}_conf_{birth_local['confidence']:.2f}"
+                )
+                for r in birth_local.get("reasons", []):
+                    reasons_local.append(f"birth:{r}")
+                reasons_local.append("entry_mode_early_origin_no_completed_impulse")
+                ctx.reasons = reasons_local
+                # Score only when there is no completed-impulse base score.
+                if ctx.fibo_confluence_score <= 0.0:
+                    ctx.fibo_confluence_score = round(
+                        min(score + self.impulse_birth_score_bonus *
+                            birth_local["confidence"], 100.0), 2)
+            except Exception as exc:
+                logger.debug("[FiboAnalyzer] birth-only annotate error: %s", exc)
+            return ctx
+
         try:
             if df_structure is None or df_structure.empty or len(df_structure) < 20:
                 ctx.warnings.append("insufficient_structure_data")
@@ -327,7 +584,7 @@ class FibonacciAnalyzer:
             swings = self.detect_swings(df_structure, left_bars=5, right_bars=3)
             if len(swings) < 4:
                 ctx.warnings.append("insufficient_swings")
-                return ctx
+                return _annotate_birth_only()
 
             # ── 2. Identify the most recent completed impulse ─────────────
             # Look at the last 4 swings: find a high-low or low-high pair
@@ -368,7 +625,7 @@ class FibonacciAnalyzer:
 
             if fib_levels is None:
                 ctx.warnings.append("no_valid_impulse_found")
-                return ctx
+                return _annotate_birth_only()
 
             ctx.fib_levels = fib_levels
 
@@ -469,6 +726,67 @@ class FibonacciAnalyzer:
                 if smc_context.recent_bos:
                     score += 5.0
                     reasons.append("bos_confirmed")
+
+            # ── 8. Impulse-birth detection (additive) ─────────────────
+            # Late-retrace path is primary. If a fresher origin is
+            # detected AND either the completed impulse has gone stale
+            # or no retracement zone is currently in play, promote
+            # entry_mode to "early_origin" and publish a birth-anchored
+            # fib for downstream use. Otherwise stay as late_retrace.
+            try:
+                df_latest_idx = len(df_structure) - 1
+                ctx.impulse_age_bars = max(0, df_latest_idx - int(impulse_end_idx))
+                ctx.entry_mode = "late_retrace"
+
+                birth = self._detect_impulse_birth(df_structure, current_price, atr)
+                if birth.get("detected"):
+                    ctx.impulse_birth_detected = True
+                    ctx.impulse_birth_direction = birth["direction"]
+                    ctx.impulse_birth_anchor_price = birth["anchor_price"]
+                    ctx.impulse_birth_base_start_idx = birth["base_start_idx"]
+                    ctx.impulse_birth_breakout_idx = birth["breakout_idx"]
+                    ctx.impulse_birth_confidence = birth["confidence"]
+
+                    # Build a birth-anchored fib for downstream use.
+                    b_idx = birth["breakout_idx"]
+                    b_start = birth["base_start_idx"]
+                    swing_end_price = (
+                        float(df_structure["high"].iloc[b_idx])
+                        if birth["direction"] == "bullish"
+                        else float(df_structure["low"].iloc[b_idx])
+                    )
+                    ctx.impulse_birth_fib_levels = self.compute_fibonacci_levels(
+                        swing_start=birth["anchor_price"],
+                        swing_end=swing_end_price,
+                        swing_start_idx=b_start,
+                        swing_end_idx=b_idx,
+                        impulse_strength=birth["confidence"],
+                    )
+
+                    reasons.append(
+                        f"impulse_birth_{birth['direction']}_conf_{birth['confidence']:.2f}"
+                    )
+                    for r in birth.get("reasons", []):
+                        reasons.append(f"birth:{r}")
+
+                    # Promote when late-retrace anchor is stale OR current
+                    # price is not in any useful retracement zone.
+                    stale = ctx.impulse_age_bars >= self.impulse_birth_stale_age_bars
+                    in_zone = (
+                        ctx.in_golden_pocket or ctx.in_382_zone or ctx.in_786_zone
+                    )
+                    if stale or not in_zone:
+                        ctx.entry_mode = "early_origin"
+                        score += self.impulse_birth_score_bonus * birth["confidence"]
+                        reasons.append("entry_mode_early_origin")
+                    else:
+                        reasons.append("entry_mode_late_retrace_birth_available")
+                else:
+                    ctx.entry_mode = "late_retrace"
+
+                ctx.fibo_confluence_score = round(min(score, 100.0), 2)
+            except Exception as exc:
+                logger.debug("[FiboAnalyzer] impulse-birth annotation error: %s", exc)
 
             ctx.fibo_confluence_score = round(min(score, 100.0), 2)
             ctx.reasons  = reasons

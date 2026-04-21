@@ -112,6 +112,15 @@ class Config:
     PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD", "1.25"))
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED: bool = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES: str = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES", "xau_scalp_tick_depth_filter,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_range_repair,xau_fibo_advance")
+    MEMPALACE_FAMILY_ENABLED: bool = os.getenv("MEMPALACE_FAMILY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    MEMPALACE_FAMILY_ALLOWED_SYMBOLS: str = os.getenv("MEMPALACE_FAMILY_ALLOWED_SYMBOLS", "XAUUSD")
+    MEMPALACE_FAMILY_ALLOWED_BASE_SOURCES: str = os.getenv("MEMPALACE_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd")
+    MEMPALACE_FAMILY_SIGNAL_PATH: str = os.getenv("MEMPALACE_FAMILY_SIGNAL_PATH", "data/runtime/mempalace_family_signal.json")
+    MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC: int = int(os.getenv("MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC", "180"))
+    MEMPALACE_FAMILY_MIN_CONFIDENCE: float = float(os.getenv("MEMPALACE_FAMILY_MIN_CONFIDENCE", "68"))
+    MEMPALACE_FAMILY_PRIORITY: int = int(os.getenv("MEMPALACE_FAMILY_PRIORITY", "165"))
+    MEMPALACE_FAMILY_STRATEGY_ID: str = os.getenv("MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1")
+    MEMPALACE_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("MEMPALACE_FAMILY_CTRADER_RISK_USD", "0.75"))
 
     # ── Fibonacci Advance (fibo_advance lane / xau_fibo_advance family) ────────
     FIBO_ADVANCE_ENABLED: bool = os.getenv("FIBO_ADVANCE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -143,6 +152,20 @@ class Config:
     # Institution-grade gates
     FIBO_ADVANCE_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_ADVANCE_SHARPNESS_KNIFE_THR", "30"))
     FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS", "40"))
+    # Impulse-birth detection (fibo-lane-local; annotates entry_mode and boosts
+    # score when a fresh impulse origin is detected from a tight base break).
+    # Additive: late_retrace behavior unchanged unless birth condition fires.
+    FIBO_IMPULSE_BIRTH_ENABLED: bool = os.getenv("FIBO_IMPULSE_BIRTH_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_IMPULSE_BIRTH_BASE_BARS: int = int(os.getenv("FIBO_IMPULSE_BIRTH_BASE_BARS", "8"))
+    FIBO_IMPULSE_BIRTH_MAX_BASE_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MAX_BASE_ATR", "1.2"))
+    FIBO_IMPULSE_BIRTH_MIN_BREAK_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_BREAK_ATR", "0.5"))
+    FIBO_IMPULSE_BIRTH_MIN_BODY_PCT: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_BODY_PCT", "0.55"))
+    FIBO_IMPULSE_BIRTH_MAX_BREAKOUT_AGE: int = int(os.getenv("FIBO_IMPULSE_BIRTH_MAX_BREAKOUT_AGE", "3"))
+    FIBO_IMPULSE_BIRTH_MAX_CHASE_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MAX_CHASE_ATR", "1.5"))
+    FIBO_IMPULSE_BIRTH_WHIPSAW_LOOKBACK: int = int(os.getenv("FIBO_IMPULSE_BIRTH_WHIPSAW_LOOKBACK", "10"))
+    FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE", "0.55"))
+    FIBO_IMPULSE_BIRTH_SCORE_BONUS: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SCORE_BONUS", "10.0"))
+    FIBO_IMPULSE_BIRTH_STALE_AGE_BARS: int = int(os.getenv("FIBO_IMPULSE_BIRTH_STALE_AGE_BARS", "25"))
     # Scout mode (H1→M15 intermediate setups — fires while waiting for Sniper)
     FIBO_SCOUT_ENABLED: bool = os.getenv("FIBO_SCOUT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_SCOUT_MIN_CONFIDENCE: float = float(os.getenv("FIBO_SCOUT_MIN_CONFIDENCE", "55.0"))

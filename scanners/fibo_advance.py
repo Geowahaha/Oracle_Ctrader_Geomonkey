@@ -59,6 +59,17 @@ sig  = SignalGenerator(min_confidence=config.MIN_SIGNAL_CONFIDENCE)
 fibo = FibonacciAnalyzer(
     swing_lookback=int(getattr(config, "FIBO_ADVANCE_SWING_LOOKBACK", 5) or 5),
     min_impulse_atr_mult=float(getattr(config, "FIBO_ADVANCE_MIN_IMPULSE_ATR", 1.2) or 1.2),
+    impulse_birth_enabled=bool(getattr(config, "FIBO_IMPULSE_BIRTH_ENABLED", True)),
+    impulse_birth_base_bars=int(getattr(config, "FIBO_IMPULSE_BIRTH_BASE_BARS", 8) or 8),
+    impulse_birth_max_base_atr=float(getattr(config, "FIBO_IMPULSE_BIRTH_MAX_BASE_ATR", 1.2) or 1.2),
+    impulse_birth_min_break_atr=float(getattr(config, "FIBO_IMPULSE_BIRTH_MIN_BREAK_ATR", 0.5) or 0.5),
+    impulse_birth_min_body_pct=float(getattr(config, "FIBO_IMPULSE_BIRTH_MIN_BODY_PCT", 0.55) or 0.55),
+    impulse_birth_max_breakout_age=int(getattr(config, "FIBO_IMPULSE_BIRTH_MAX_BREAKOUT_AGE", 3) or 3),
+    impulse_birth_max_chase_atr=float(getattr(config, "FIBO_IMPULSE_BIRTH_MAX_CHASE_ATR", 1.5) or 1.5),
+    impulse_birth_whipsaw_lookback=int(getattr(config, "FIBO_IMPULSE_BIRTH_WHIPSAW_LOOKBACK", 10) or 10),
+    impulse_birth_min_confidence=float(getattr(config, "FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE", 0.55) or 0.55),
+    impulse_birth_score_bonus=float(getattr(config, "FIBO_IMPULSE_BIRTH_SCORE_BONUS", 10.0) or 10.0),
+    impulse_birth_stale_age_bars=int(getattr(config, "FIBO_IMPULSE_BIRTH_STALE_AGE_BARS", 25) or 25),
 )
 autopilot = LiveProfileAutopilot()
 
