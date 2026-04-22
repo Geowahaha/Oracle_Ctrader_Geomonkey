@@ -3492,6 +3492,60 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("ctrader_source_profile_blocked")))
         self.assertIn("xau_scheduled_session_not_allowed", str(getattr(sig, "raw_scores", {}).get("ctrader_source_profile_reason", "")))
 
+    def test_ctrader_xau_scheduled_no_chase_block_emits_late_entry_telemetry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_guard_no_chase": True,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"xauusd_scheduled:winner"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london", "london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}), \
+             patch.object(scheduler_module.config, "get_mt5_xau_scheduled_live_sessions", return_value={"new_york"}), \
+             patch.object(scheduler_module.config, "get_mt5_xau_scheduled_live_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "MT5_XAU_SCHEDULED_LIVE_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.ctrader_executor, "journal_pre_dispatch_skip", return_value=18) as audit_call, \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal") as exec_call:
+            out = dexter._maybe_execute_ctrader_signal(sig, source="xauusd_scheduled")
+
+        self.assertIsNone(out)
+        self.assertEqual(exec_call.call_count, 0)
+        self.assertEqual(audit_call.call_count, 1)
+        self.assertEqual(audit_call.call_args.kwargs.get("gate"), "source_profile")
+        self.assertEqual(str(audit_call.call_args.kwargs.get("reason", "")), "xau_scheduled_no_chase_block")
+        execution_meta = dict(audit_call.call_args.kwargs.get("execution_meta") or {})
+        audit_tags = list(execution_meta.get("audit_tags") or [])
+        self.assertIn("xau_scheduled_late_entry_block", audit_tags)
+        self.assertIn("late_entry_reason:xau_scheduled_no_chase_block", audit_tags)
+        late_block = dict(execution_meta.get("xau_scheduled_late_entry_block") or {})
+        self.assertTrue(bool(late_block.get("active")))
+        self.assertEqual(str(late_block.get("reason") or ""), "xau_scheduled_no_chase_block")
+        self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("xau_scheduled_late_entry_blocked")))
+        self.assertEqual(
+            str(getattr(sig, "raw_scores", {}).get("xau_scheduled_late_entry_block_reason", "")),
+            "xau_scheduled_no_chase_block",
+        )
+
     def test_ctrader_btc_winner_profile_blocks_high_conf_or_wrong_session(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("BTCUSD", confidence=77.0)

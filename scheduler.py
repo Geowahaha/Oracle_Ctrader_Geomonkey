@@ -1475,12 +1475,17 @@ class DexterScheduler:
             or ""
         ).strip().lower()
         raw = self._apply_xau_observability_tags(raw, source=effective_source, family=family)
+        gate_token = str(gate or "").strip().lower()
+        reason_token = str(reason or "").strip().lower()
         raw["ctrader_pre_dispatch_blocked"] = True
         raw["ctrader_pre_dispatch_gate"] = str(gate or "")
         raw["ctrader_pre_dispatch_reason"] = str(reason or "")
         raw["ctrader_pre_dispatch_requested_source"] = str(requested_source or "")
         raw["ctrader_pre_dispatch_dispatch_source"] = str(dispatch_source or "")
         raw["ctrader_pre_dispatch_trace_tag"] = str(trace.get("tag", "-") or "-")
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}:
+            raw["xau_scheduled_late_entry_blocked"] = True
+            raw["xau_scheduled_late_entry_block_reason"] = reason_token
         if dispatch_meta:
             raw["ctrader_pre_dispatch_dispatch_meta"] = dict(dispatch_meta or {})
         try:
@@ -1525,9 +1530,21 @@ class DexterScheduler:
             "runtime_state": runtime_safe,
             "audit_tags": [
                 "xau_pre_dispatch_skip",
-                f"gate:{str(gate or '').strip().lower()}",
+                f"gate:{gate_token}",
             ],
         }
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}:
+            execution_meta["audit_tags"].extend([
+                "xau_scheduled_late_entry_block",
+                f"late_entry_reason:{reason_token}",
+            ])
+            execution_meta["xau_scheduled_late_entry_block"] = {
+                "active": True,
+                "reason": reason_token,
+                "requested_source": str(requested_source or ""),
+                "dispatch_source": str(dispatch_source or ""),
+                "family": family,
+            }
         try:
             return int(
                 ctrader_executor.journal_pre_dispatch_skip(
