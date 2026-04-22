@@ -49,6 +49,7 @@ from analysis.smc import SMCAnalyzer
 from analysis.signals import SignalGenerator, TradeSignal
 from analysis.fibonacci import FibonacciAnalyzer
 from config import config
+from learning.reversal_training_dataset import evaluate_reversal_template_fit
 from learning.live_profile_autopilot import LiveProfileAutopilot
 
 logger = logging.getLogger(__name__)
@@ -746,6 +747,56 @@ class FiboAdvanceScanner:
         if require_gp and not in_gp:
             return False, f"not_golden_pocket:ratio={ratio:.3f}:depth={depth:.3f}", details
 
+        template_enabled = bool(getattr(config, "FIBO_REVERSAL_TEMPLATE_ENABLED", True))
+        template_level_tol = max(0.0, float(getattr(config, "FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE", 0.020) or 0.020))
+        near_reversal_level = (
+            in_gp
+            or abs(ratio - 0.618) <= template_level_tol
+            or abs(ratio - 0.650) <= template_level_tol
+        )
+        template_info = {
+            "ok": True,
+            "applied": False,
+            "score": 0,
+            "min_score": int(getattr(config, "FIBO_REVERSAL_TEMPLATE_MIN_SCORE", 4) or 4),
+            "reason": "not_near_618",
+            "reasons": [],
+            "missing": [],
+        }
+        if template_enabled and near_reversal_level:
+            template_info = evaluate_reversal_template_fit(
+                direction,
+                snapshot.get("features", {}) if snapshot else {},
+                sharpness=sharpness,
+                profile="golden_pocket",
+                min_score=int(getattr(config, "FIBO_REVERSAL_TEMPLATE_MIN_SCORE", 4) or 4),
+                min_spots=int(getattr(config, "FIBO_REVERSAL_TEMPLATE_MIN_SPOTS", 6) or 6),
+                min_depth=int(getattr(config, "FIBO_REVERSAL_TEMPLATE_MIN_DEPTH", 24) or 24),
+                allow_unavailable=not bool(getattr(config, "FIBO_REVERSAL_TEMPLATE_STRICT_REQUIRE_CAPTURE", False)),
+            )
+            if not bool(template_info.get("ok", True)):
+                details.update({
+                    "reversal_template_enabled": True,
+                    "reversal_template_near_level": True,
+                    "reversal_template_applied": bool(template_info.get("applied", False)),
+                    "reversal_template_score": int(template_info.get("score", 0) or 0),
+                    "reversal_template_min_score": int(template_info.get("min_score", 0) or 0),
+                    "reversal_template_reason": str(template_info.get("reason") or ""),
+                    "reversal_template_reasons": list(template_info.get("reasons") or []),
+                    "reversal_template_missing": list(template_info.get("missing") or []),
+                })
+                return False, f"reversal_template:{template_info.get('reason') or 'failed'}", details
+        details.update({
+            "reversal_template_enabled": bool(template_enabled),
+            "reversal_template_near_level": bool(near_reversal_level),
+            "reversal_template_applied": bool(template_info.get("applied", False)),
+            "reversal_template_score": int(template_info.get("score", 0) or 0),
+            "reversal_template_min_score": int(template_info.get("min_score", 0) or 0),
+            "reversal_template_reason": str(template_info.get("reason") or ""),
+            "reversal_template_reasons": list(template_info.get("reasons") or []),
+            "reversal_template_missing": list(template_info.get("missing") or []),
+        })
+
         # Momentum quality score (must have enough confluence)
         score = 0
         reasons: list = []
@@ -779,6 +830,11 @@ class FiboAdvanceScanner:
         if bool(mtf_stacking):
             score += 1
             reasons.append("mtf_fib_stack")
+        if bool(template_info.get("applied")) and bool(template_info.get("ok", False)):
+            score += 1
+            reasons.append(
+                f"reversal_template:{int(template_info.get('score', 0) or 0)}/{int(template_info.get('min_score', 0) or 0)}"
+            )
 
         sharp = dict(sharpness or {})
         sharp_score = int(sharp.get("sharpness_score", 0) or 0)
@@ -967,6 +1023,7 @@ class FiboAdvanceScanner:
                       smc_context, df_entry: pd.DataFrame,
                       vp_adj: float = 0.0, vp_reason: str = "",
                       sharpness: dict = None,
+                      quality: dict = None,
                       mtf_bonus: float = 0.0, mtf_reason: str = "",
                       mode: str = "sniper") -> Optional[TradeSignal]:
         """
@@ -1073,11 +1130,15 @@ class FiboAdvanceScanner:
 
         reasons  = list(fibo_ctx.reasons)
         warnings = list(fibo_ctx.warnings)
+        quality_info = dict(quality or {})
 
         if vp_reason:
             reasons.append(vp_reason)
         if mtf_reason:
             reasons.append(mtf_reason)
+        if bool(quality_info.get("reversal_template_applied", False)):
+            template_reason = str(quality_info.get("reversal_template_reason") or "")
+            reasons.append(f"reversal_template:{template_reason or 'confirmed'}")
 
         session_str = ",".join(session_info.get("active_sessions", []) or [])
         trend_str   = (smc_context.current_trend if smc_context else "ranging") or "ranging"
@@ -1114,6 +1175,11 @@ class FiboAdvanceScanner:
                 "elliott_wave": fibo_ctx.elliott_wave_count,
                 "sharpness_score": int(sharpness_info.get("sharpness_score", 0) or 0),
                 "sharpness_band": sharpness_band,
+                "fibo_reversal_template_applied": bool(quality_info.get("reversal_template_applied", False)),
+                "fibo_reversal_template_score": int(quality_info.get("reversal_template_score", 0) or 0),
+                "fibo_reversal_template_min_score": int(quality_info.get("reversal_template_min_score", 0) or 0),
+                "fibo_reversal_template_near_618": bool(quality_info.get("reversal_template_near_level", False)),
+                "fibo_reversal_template_reason": str(quality_info.get("reversal_template_reason") or ""),
                 "fibo_entry_mode": anchor_mode,
                 "impulse_birth_confidence": round(
                     float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
@@ -1337,6 +1403,10 @@ class FiboAdvanceScanner:
         if mtf_reason:
             reasons.append(mtf_reason)
         reasons.append(fresh_reason)
+        if bool(quality.get("reversal_template_applied", False)):
+            reasons.append(
+                f"reversal_template:{str(quality.get('reversal_template_reason') or 'confirmed')}"
+            )
 
         session_str = ",".join(session_info.get("active_sessions", []) or [])
         trend_str   = (smc_context.current_trend if smc_context else h4_bias) or h4_bias
@@ -1385,6 +1455,11 @@ class FiboAdvanceScanner:
                 "mtf_reason": mtf_reason,
                 "sharpness_score": sharpness_score,
                 "sharpness_band": sharpness_band,
+                "fibo_reversal_template_applied": bool(quality.get("reversal_template_applied", False)),
+                "fibo_reversal_template_score": int(quality.get("reversal_template_score", 0) or 0),
+                "fibo_reversal_template_min_score": int(quality.get("reversal_template_min_score", 0) or 0),
+                "fibo_reversal_template_near_618": bool(quality.get("reversal_template_near_level", False)),
+                "fibo_reversal_template_reason": str(quality.get("reversal_template_reason") or ""),
                 "fibo_entry_mode": scout_anchor_mode,
                 "impulse_birth_confidence": round(
                     float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
@@ -1665,6 +1740,7 @@ class FiboAdvanceScanner:
                                         vp_adj=vp_adj,
                                         vp_reason=vp_reason,
                                         sharpness=sharpness,
+                                        quality=quality,
                                         mode="sniper",
                                     )
                                     if signal is not None:

@@ -212,6 +212,13 @@ class Config:
     FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE: float = float(os.getenv("FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE", "0.50") or 0.50)
     FIBO_ADVANCE_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_ADVANCE_MIN_MOMENTUM_SCORE", "4") or 4)
     FIBO_SCOUT_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_SCOUT_MIN_MOMENTUM_SCORE", "4") or 4)
+    # 61.8 / golden-pocket confirmation from learned reversal template.
+    FIBO_REVERSAL_TEMPLATE_ENABLED: bool = os.getenv("FIBO_REVERSAL_TEMPLATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_REVERSAL_TEMPLATE_STRICT_REQUIRE_CAPTURE: bool = os.getenv("FIBO_REVERSAL_TEMPLATE_STRICT_REQUIRE_CAPTURE", "0").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE: float = float(os.getenv("FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE", "0.020") or 0.020)
+    FIBO_REVERSAL_TEMPLATE_MIN_SCORE: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_SCORE", "4") or 4)
+    FIBO_REVERSAL_TEMPLATE_MIN_SPOTS: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_SPOTS", "6") or 6)
+    FIBO_REVERSAL_TEMPLATE_MIN_DEPTH: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_DEPTH", "24") or 24)
     FIBO_SCOUT_REQUIRE_MTF_STACKING: bool = os.getenv("FIBO_SCOUT_REQUIRE_MTF_STACKING", "1").strip().lower() in ("1", "true", "yes", "on")
     # Audit result: fibo_xauusd short is quarantined by default; long side remains available.
     FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED: bool = os.getenv("FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")  # DEPRECATED: replaced by FIBO_TREND_ALIGNMENT_GATE
@@ -1061,6 +1068,16 @@ class Config:
     CTRADER_MARKET_CAPTURE_DEPTH_LEVELS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_DEPTH_LEVELS", "5"))
     CTRADER_MARKET_CAPTURE_ON_START: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_MARKET_CAPTURE_ON_EXECUTE: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED: bool = os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED: bool = os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS: float = float(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS", "150"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC", "18"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC", "30"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS", "1200"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS", "8"))
+    XAU_REVERSAL_ZONE_CAPTURE_MIN_SWEEP_PIPS: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_MIN_SWEEP_PIPS", "0.5"))
+    XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_WICK_RATIO: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_WICK_RATIO", "0.40"))
+    XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_CLOSE_POS: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_CLOSE_POS", "0.45"))
 
     # ── Copy Trade System ──
     COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")

@@ -117,6 +117,7 @@ class DexterScheduler:
         self._mt5_repeat_guard_last_save_ts: float = 0.0
         self._last_bypass_tp_diag_ts: float = 0.0
         self._post_sl_reversal_last_fired_ts: float = 0.0
+        self._xau_reversal_zone_capture_seen: dict[str, float] = {}
         self._signal_trace_lock = threading.Lock()
         self._signal_trace_seq: int = 0
         cfg_guard_path = str(getattr(config, "MT5_REPEAT_ERROR_GUARD_PATH", "") or "").strip()
@@ -136,6 +137,139 @@ class DexterScheduler:
     @staticmethod
     def _now_ts() -> float:
         return float(time.time())
+
+    def _capture_xau_reversal_zone(self, sweep: dict, *, stage: str, trigger_source: str) -> dict:
+        stage_token = str(stage or "").strip().lower()
+        if stage_token not in {"armed", "confirmed"}:
+            return {"ok": False, "status": "invalid_stage"}
+        if not bool(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        if stage_token == "armed" and not bool(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED", True)):
+            return {"ok": False, "status": "armed_disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        direction = str((sweep or {}).get("direction") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return {"ok": False, "status": "direction_missing"}
+        event_key = str((sweep or {}).get("event_key") or f"{stage_token}:{direction}:{str((sweep or {}).get('event_utc') or '')}").strip()
+        if not event_key:
+            return {"ok": False, "status": "event_key_missing"}
+        now_ts = self._now_ts()
+        cooldown = max(15.0, float(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS", 150.0) or 150.0))
+        last_seen = float(self._xau_reversal_zone_capture_seen.get(event_key, 0.0) or 0.0)
+        if (now_ts - last_seen) < cooldown:
+            return {"ok": False, "status": "cooldown", "event_key": event_key}
+        duration_sec = max(
+            3,
+            int(
+                getattr(
+                    config,
+                    "CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC" if stage_token == "confirmed" else "CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC",
+                    30 if stage_token == "confirmed" else 18,
+                )
+                or (30 if stage_token == "confirmed" else 18)
+            ),
+        )
+        capture = dict(
+            ctrader_executor.capture_market_data(
+                symbols=["XAUUSD"],
+                duration_sec=duration_sec,
+                include_depth=True,
+                max_events=max(50, int(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS", 1200) or 1200)),
+                max_depth_levels=max(1, int(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS", 8) or 8)),
+            )
+            or {}
+        )
+        self._xau_reversal_zone_capture_seen[event_key] = now_ts
+        run_id = str(((capture.get("storage") or {}).get("run_id") or capture.get("run_id") or "")).strip()
+        snapshot_features: dict = {}
+        chart_state: dict = {}
+        sharpness: dict = {}
+        if run_id:
+            try:
+                lookback_sec = max(duration_sec + 10, int(getattr(config, "XAU_TICK_DEPTH_FILTER_LOOKBACK_SEC", 240) or 240))
+                snapshot = dict(
+                    live_profile_autopilot.latest_capture_feature_snapshot(
+                        symbol="XAUUSD",
+                        lookback_sec=lookback_sec,
+                        direction=direction,
+                        confidence=float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0),
+                    )
+                    or {}
+                )
+                snapshot_features = dict(snapshot.get("features") or (snapshot.get("gate") or {}).get("features") or {})
+                if snapshot_features:
+                    chart_state = dict(
+                        live_profile_classify_chart_state(
+                            direction,
+                            {"pattern": str((sweep or {}).get("pattern") or "")},
+                            capture_features=snapshot_features,
+                        )
+                        or {}
+                    )
+                    try:
+                        from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+
+                        sharpness = dict(
+                            _compute_sharpness(
+                                snapshot_features,
+                                direction,
+                                micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025),
+                                max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20),
+                            )
+                            or {}
+                        )
+                    except Exception:
+                        sharpness = {}
+            except Exception:
+                logger.debug("[ReversalZoneCapture] snapshot enrich failed", exc_info=True)
+        record = {}
+        try:
+            record = dict(
+                ctrader_executor.record_reversal_capture_event(
+                    symbol="XAUUSD",
+                    stage=stage_token,
+                    direction=direction,
+                    trigger_source=trigger_source,
+                    event_key=event_key,
+                    event_utc=str((sweep or {}).get("event_utc") or ""),
+                    capture_run_id=run_id,
+                    capture_status=str(capture.get("status", "") or ""),
+                    sweep_level=float((sweep or {}).get("sweep_level") or 0.0),
+                    sweep_wick_ratio=float((sweep or {}).get("sweep_wick_ratio") or 0.0),
+                    atr=float((sweep or {}).get("atr") or 0.0),
+                    reason=str((sweep or {}).get("reason") or ""),
+                    features=snapshot_features,
+                    context={
+                        **dict(sweep or {}),
+                        "chart_state": chart_state,
+                        "sharpness": sharpness,
+                        "capture_duration_sec": duration_sec,
+                    },
+                )
+                or {}
+            )
+        except Exception:
+            logger.debug("[ReversalZoneCapture] event record failed", exc_info=True)
+        logger.info(
+            "[ReversalZoneCapture] stage=%s dir=%s ok=%s run=%s key=%s",
+            stage_token,
+            direction,
+            bool(capture.get("ok")),
+            run_id or "-",
+            event_key,
+        )
+        return {
+            "ok": bool(capture.get("ok")),
+            "status": str(capture.get("status", "") or ""),
+            "event_key": event_key,
+            "run_id": run_id,
+            "capture": capture,
+            "record": record,
+            "features": snapshot_features,
+            "chart_state": chart_state,
+            "sharpness": sharpness,
+        }
 
     @staticmethod
     def _signal_trace_meta(signal) -> dict:
@@ -7916,6 +8050,15 @@ class DexterScheduler:
         except Exception as e:
             logger.debug("[PostSLReversal] detect error: %s", e)
             return False
+        if bool(sweep.get("armed")) and not bool(sweep.get("confirmed")):
+            try:
+                self._capture_xau_reversal_zone(
+                    sweep,
+                    stage=str(sweep.get("stage") or "armed"),
+                    trigger_source="post_sl_reversal_watch",
+                )
+            except Exception:
+                logger.debug("[ReversalZoneCapture] armed capture failed", exc_info=True)
         if not bool(sweep.get("confirmed")):
             logger.debug("[PostSLReversal] no pattern: %s", sweep.get("reason", "-"))
             return False
@@ -7926,6 +8069,15 @@ class DexterScheduler:
         wick_ratio = float(sweep.get("sweep_wick_ratio") or 0.0)
         if current_price <= 0 or atr <= 0:
             return False
+        try:
+            capture_meta = self._capture_xau_reversal_zone(
+                sweep,
+                stage="confirmed",
+                trigger_source="post_sl_reversal_watch",
+            )
+        except Exception:
+            logger.debug("[ReversalZoneCapture] confirmed capture failed", exc_info=True)
+            capture_meta = {}
         # ── Sharpness guard — block sweep reversal in knife microstructure ──
         if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
             try:
@@ -7974,6 +8126,8 @@ class DexterScheduler:
             "sweep_level": round(sweep_level, 2),
             "sweep_wick_ratio": round(wick_ratio, 3),
             "post_sl_reversal_signal": True,
+            "reversal_zone_capture_run_id": str((capture_meta or {}).get("run_id") or ""),
+            "reversal_zone_capture_stage": "confirmed",
         }
         logger.info(
             "[PostSLReversal] sweep confirmed dir=%s sweep_level=%.2f wick=%.2f entry=%.2f sl=%.2f tp1=%.2f",

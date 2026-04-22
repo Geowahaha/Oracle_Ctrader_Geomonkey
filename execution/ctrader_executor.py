@@ -350,6 +350,32 @@ class CTraderExecutor:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_depth_quotes_symbol_ts ON ctrader_depth_quotes(symbol, event_utc DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_depth_quotes_run ON ctrader_depth_quotes(run_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ctrader_reversal_capture_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ts REAL NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    symbol TEXT DEFAULT '',
+                    stage TEXT DEFAULT '',
+                    direction TEXT DEFAULT '',
+                    trigger_source TEXT DEFAULT '',
+                    event_key TEXT DEFAULT '',
+                    event_utc TEXT DEFAULT '',
+                    capture_run_id TEXT DEFAULT '',
+                    capture_status TEXT DEFAULT '',
+                    sweep_level REAL DEFAULT 0,
+                    sweep_wick_ratio REAL DEFAULT 0,
+                    atr REAL DEFAULT 0,
+                    reason TEXT DEFAULT '',
+                    features_json TEXT DEFAULT '{}',
+                    context_json TEXT DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_symbol_ts ON ctrader_reversal_capture_events(symbol, created_utc DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_run ON ctrader_reversal_capture_events(capture_run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_key ON ctrader_reversal_capture_events(event_key)")
 
     def _configured_account_id(self) -> tuple[Optional[int], str]:
         raw_login = str(getattr(config, "CTRADER_ACCOUNT_LOGIN", "") or "").strip()
@@ -4105,6 +4131,72 @@ class CTraderExecutor:
             "depth": len(depth),
             "symbols": symbols,
         }
+
+    def record_reversal_capture_event(
+        self,
+        *,
+        symbol: str,
+        stage: str,
+        direction: str,
+        trigger_source: str,
+        event_key: str,
+        event_utc: str = "",
+        capture_run_id: str = "",
+        capture_status: str = "",
+        sweep_level: float = 0.0,
+        sweep_wick_ratio: float = 0.0,
+        atr: float = 0.0,
+        reason: str = "",
+        features: Optional[dict] = None,
+        context: Optional[dict] = None,
+    ) -> dict:
+        created_ts = time.time()
+        created_utc = _utc_now_iso()
+        payload = {
+            "symbol": str(symbol or "").strip().upper(),
+            "stage": str(stage or "").strip().lower(),
+            "direction": str(direction or "").strip().lower(),
+            "trigger_source": str(trigger_source or "").strip().lower(),
+            "event_key": str(event_key or "").strip(),
+            "event_utc": str(event_utc or "").strip(),
+            "capture_run_id": str(capture_run_id or "").strip(),
+            "capture_status": str(capture_status or "").strip(),
+            "sweep_level": _safe_float(sweep_level, 0.0),
+            "sweep_wick_ratio": _safe_float(sweep_wick_ratio, 0.0),
+            "atr": _safe_float(atr, 0.0),
+            "reason": str(reason or "").strip(),
+            "features_json": json.dumps(dict(features or {}), ensure_ascii=True, separators=(",", ":")),
+            "context_json": json.dumps(dict(context or {}), ensure_ascii=True, separators=(",", ":")),
+        }
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO ctrader_reversal_capture_events(
+                    created_ts, created_utc, symbol, stage, direction, trigger_source,
+                    event_key, event_utc, capture_run_id, capture_status, sweep_level,
+                    sweep_wick_ratio, atr, reason, features_json, context_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    float(created_ts),
+                    created_utc,
+                    payload["symbol"],
+                    payload["stage"],
+                    payload["direction"],
+                    payload["trigger_source"],
+                    payload["event_key"],
+                    payload["event_utc"],
+                    payload["capture_run_id"],
+                    payload["capture_status"],
+                    payload["sweep_level"],
+                    payload["sweep_wick_ratio"],
+                    payload["atr"],
+                    payload["reason"],
+                    payload["features_json"],
+                    payload["context_json"],
+                ),
+            )
+        return {"ok": True, "created_utc": created_utc, **payload}
 
     def capture_market_data(
         self,
