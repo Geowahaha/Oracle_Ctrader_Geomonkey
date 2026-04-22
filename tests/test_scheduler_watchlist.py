@@ -4788,6 +4788,118 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "xau_scheduled_profile_pass")
 
+    def test_xau_scheduled_guard_blocks_no_chase_signal(self):
+        """Scheduled lane must reject stretched no-chase entries even when MTF is aligned."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+            "xau_guard_no_chase": True,
+            "xau_guard_penalty": 10.0,
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_no_chase_block")
+
+    def test_xau_scheduled_guard_blocks_trap_guard_blocked_signal(self):
+        """Scheduled lane must reject signals already blocked by scanner trap guard."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+            "xau_guard_blocked": True,
+            "xau_guard_penalty": 26.0,
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_trap_guard_block")
+
+    def test_xau_scheduled_guard_block_overrides_high_conf_bypass(self):
+        """No-chase/trap flags must still block even when neural_probability would otherwise bypass session gating."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "off_hours"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "neural_probability": 0.95,
+            "xau_guard_no_chase": True,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_no_chase_block")
+
     # --- Canary family BE config defaults ---
 
     def test_canary_family_be_config_defaults(self):

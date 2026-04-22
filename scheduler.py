@@ -1362,7 +1362,15 @@ class DexterScheduler:
             if conf < min_conf:
                 return False, f"xau_scheduled_conf_below:{conf:.1f}<{min_conf:.1f}"
             try:
-                _np_bypass = float((dict(getattr(signal, "raw_scores", {}) or {})).get("neural_probability", 0.0) or 0.0)
+                scheduled_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            except Exception:
+                scheduled_raw = {}
+            if bool(scheduled_raw.get("xau_guard_blocked")):
+                return False, "xau_scheduled_trap_guard_block"
+            if bool(scheduled_raw.get("xau_guard_no_chase")):
+                return False, "xau_scheduled_no_chase_block"
+            try:
+                _np_bypass = float(scheduled_raw.get("neural_probability", 0.0) or 0.0)
                 _np_threshold = float(getattr(config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85) or 0.85)
                 if _np_bypass >= _np_threshold:
                     return True, f"xau_scheduled_high_conf_session_bypass:np={_np_bypass:.2f}"
