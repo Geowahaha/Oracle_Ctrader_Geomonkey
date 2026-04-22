@@ -1122,6 +1122,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"scalp_xauusd"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_maybe_execute_mt5_signal") as mt5_call, \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="scalp_xauusd")
 
@@ -1229,6 +1230,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"xauusd_scheduled"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_load_strategy_family_candidates", return_value=[]), \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="xauusd_scheduled")
 
@@ -1267,6 +1269,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"xauusd_scheduled"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_load_strategy_family_candidates", return_value=[]), \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="xauusd_scheduled")
 
@@ -1323,6 +1326,43 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertEqual(rows[0]["family"], "xau_scalp_range_repair")
         self.assertEqual(rows[0]["strategy_id"], "xau_scalp_range_repair_v1")
         self.assertTrue(bool(rows[0]["experimental"]))
+
+    def test_strategy_family_candidates_include_mempalace_payload_when_enabled(self):
+        dexter = scheduler_module.DexterScheduler()
+        payload = {"candidates": []}
+        mempalace_payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "short",
+            "entry": 5201.2,
+            "stop_loss": 5204.4,
+            "entry_type": "sell_stop",
+            "confidence": 74.0,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-test-01",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-test-01"},
+        }
+        with patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", True), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 2), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_PRIORITY", 111), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1"), \
+             patch.object(scheduler_module.config, "get_persistent_canary_experimental_families", return_value=set()), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_active_families", return_value=set()), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=mempalace_payload), \
+             patch.object(scheduler_module.Path, "exists", return_value=True), \
+             patch.object(scheduler_module.Path, "read_text", return_value=json.dumps(payload)):
+            rows = dexter._load_strategy_family_candidates(symbol="XAUUSD", base_source="scalp_xauusd")
+
+        families = [str(row.get("family") or "") for row in rows]
+        self.assertIn("xau_scalp_mempalace_lane", families)
+        mem_row = next(row for row in rows if str(row.get("family") or "") == "xau_scalp_mempalace_lane")
+        self.assertTrue(bool(mem_row.get("experimental")))
+        self.assertEqual(str(mem_row.get("strategy_id") or ""), "xau_scalp_mempalace_lane_v1")
+        self.assertEqual(int(mem_row.get("priority", 0) or 0), 111)
+        self.assertEqual(str(mem_row.get("source") or ""), "mempalace_payload")
 
     def test_strategy_family_candidates_reserve_flow_short_sidecar_when_opportunity_sidecar_active(self):
         dexter = scheduler_module.DexterScheduler()
@@ -1918,6 +1958,97 @@ class SchedulerWatchlistTests(unittest.TestCase):
             "xau_scalp_microtrend_follow_up",
             "xau_scalp_flow_short_sidecar",
         ])
+
+    def test_build_family_canary_signal_for_mempalace_payload(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=72.0)
+        sig.direction = "long"
+        sig.entry = 5200.0
+        sig.stop_loss = 5197.0
+        sig.take_profit_1 = 5202.0
+        sig.take_profit_2 = 5204.0
+        sig.take_profit_3 = 5207.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_mempalace_lane",
+            "strategy_id": "xau_scalp_mempalace_lane_v1",
+            "priority": 155,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "short",
+            "entry": 5198.5,
+            "stop_loss": 5201.0,
+            "entry_type": "sell_stop",
+            "confidence": 74.2,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-1",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-1"},
+        }
+        with patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_CTRADER_RISK_USD", 0.66), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:mmp:canary")
+        self.assertEqual(str(getattr(lane_signal, "direction", "")), "short")
+        self.assertEqual(str(getattr(lane_signal, "entry_type", "")), "sell_stop")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertEqual(str(raw.get("strategy_family") or ""), "xau_scalp_mempalace_lane")
+        self.assertEqual(str(raw.get("strategy_family_executor") or ""), "scheduler_canary_family_mempalace")
+        self.assertEqual(str((raw.get("mempalace_family_payload") or {}).get("signal_id") or ""), "mmp-1")
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0), 0.66, places=3)
+
+    def test_build_family_canary_signal_for_mempalace_payload_without_price_plan_uses_base_geometry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=73.0)
+        sig.direction = "long"
+        sig.entry = 5200.0
+        sig.stop_loss = 5196.0
+        sig.take_profit_1 = 5202.5
+        sig.take_profit_2 = 5205.0
+        sig.take_profit_3 = 5208.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_mempalace_lane",
+            "strategy_id": "xau_scalp_mempalace_lane_v1",
+            "priority": 155,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry_type": "limit",
+            "confidence": 75.0,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-2",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-2"},
+        }
+        with patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:mmp:canary")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertTrue(bool((raw.get("mempalace_family_payload") or {}).get("used_base_signal_geometry")))
+        self.assertEqual(str((raw.get("mempalace_family_payload") or {}).get("signal_id") or ""), "mmp-2")
 
     def test_build_family_canary_signal_for_tick_depth_filter_uses_capture_gate(self):
         dexter = scheduler_module.DexterScheduler()

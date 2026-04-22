@@ -866,7 +866,12 @@ class Config:
     CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN", "95"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES: str = os.getenv(
         "CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES",
-        "xau_scalp_microtrend,xau_scalp_tick_depth_filter",
+        # 2026-04-22: added xau_scheduled_trend — prior list missed scheduled
+        # scanner so the manager directive (live_range_transition_limit_pause)
+        # blocked scalp_xauusd:* but xauusd_scheduled:canary kept firing shorts
+        # into a rally (6 SLs, $-28 across the day). Including scheduled here
+        # makes the directive cover ALL XAU short-limit lanes.
+        "xau_scalp_microtrend,xau_scalp_tick_depth_filter,xau_scheduled_trend",
     )
     CTRADER_XAU_PAIR_RISK_CAP_ENABLED: bool = os.getenv("CTRADER_XAU_PAIR_RISK_CAP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_XAU_PAIR_RISK_CAP_FAMILIES: str = os.getenv(
