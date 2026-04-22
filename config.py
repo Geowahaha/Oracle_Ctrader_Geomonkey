@@ -1041,6 +1041,12 @@ class Config:
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_LOSSES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_LOSSES", "2"))
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_DISTINCT_FAMILIES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_DISTINCT_FAMILIES", "2"))
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MAX_PNL_USD: float = float(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MAX_PNL_USD", "-5"))
+    # 2026-04-22: single-family bleed branch — triggers when ONE family loses
+    # repeatedly in the same direction (e.g. xauusd_scheduled:canary's 6 SHORTs
+    # into a +$50 rally on Apr 22). Stricter thresholds than the multi-family
+    # branch so normal noise doesn't trip the guard.
+    TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MIN_LOSSES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MIN_LOSSES", "3"))
+    TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MAX_PNL_USD: float = float(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MAX_PNL_USD", "-10"))
     TRADING_MANAGER_XAU_EXECUTION_DIRECTIVE_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_EXECUTION_DIRECTIVE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_REPAIR_MISSING_SL_ENABLED: bool = os.getenv("CTRADER_PM_REPAIR_MISSING_SL_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_BRIDGE_URL: str = os.getenv("CTRADER_BRIDGE_URL", "http://127.0.0.1:8788")

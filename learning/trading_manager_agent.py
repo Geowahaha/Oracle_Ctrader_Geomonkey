@@ -2651,15 +2651,50 @@ class TradingManagerAgent:
         min_losses = max(1, int(getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_LOSSES", 2) or 2))
         min_distinct = max(1, int(getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_DISTINCT_FAMILIES", 2) or 2))
         max_pnl = float(getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MAX_PNL_USD", -5.0) or -5.0)
-        if resolved < min_resolved or losses < min_losses or len(families) < min_distinct or pnl > max_pnl:
+        # 2026-04-22: add Path-B single-family bleed trigger. The original AND-chain
+        # required >=2 distinct families, so Apr 22 live forensics showed
+        # xauusd_scheduled:canary firing 6 SHORTs in a row into a rally without
+        # ever tripping this guard (families=1). Philosophy: we do NOT want to
+        # block everything — only pause the direction that's clearly mis-reading
+        # the regime. A single-family bleed at high loss-count + material pnl
+        # loss is the exact signature of "dumb bot stuck in wrong direction",
+        # and pausing only that direction still leaves the opposite direction /
+        # other families free to pursue profit.
+        single_min_losses = max(1, int(getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MIN_LOSSES", 3) or 3))
+        single_max_pnl = float(getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MAX_PNL_USD", -10.0) or -10.0)
+        multi_family_trigger = (
+            resolved >= min_resolved
+            and losses >= min_losses
+            and len(families) >= min_distinct
+            and pnl <= max_pnl
+        )
+        single_family_trigger = (
+            resolved >= single_min_losses
+            and losses >= single_min_losses
+            and len(families) >= 1
+            and pnl <= single_max_pnl
+        )
+        if not (multi_family_trigger or single_family_trigger):
             return {}
-        return {
-            "active": True,
-            "mode": "same_side_cluster_loss_guard",
-            "reason": (
+        # Differentiate mode so VM telemetry / trading_manager_state.json can
+        # tell the two triggers apart in audit logs.
+        if multi_family_trigger:
+            mode_label = "same_side_cluster_loss_guard"
+            reason_label = (
                 f"recent {dominant_direction} cluster lost {losses}/{resolved} across "
                 f"{len(families)} families pnl {pnl:.2f}"
-            ),
+            )
+        else:
+            mode_label = "same_side_single_family_bleed_guard"
+            family_name = families[0] if families else "unknown"
+            reason_label = (
+                f"recent {dominant_direction} single-family bleed: "
+                f"{family_name} lost {losses}/{resolved} pnl {pnl:.2f}"
+            )
+        return {
+            "active": True,
+            "mode": mode_label,
+            "reason": reason_label,
             "blocked_direction": dominant_direction,
             "window_min": int(regime.get("window_min", getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_WINDOW_MIN", 12)) or getattr(config, "TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_WINDOW_MIN", 12)),
             "losses": losses,
