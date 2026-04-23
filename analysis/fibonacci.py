@@ -79,6 +79,10 @@ class FiboSignalContext:
     impulse_birth_breakout_idx: int = 0
     impulse_birth_confidence: float = 0.0              # 0-1
     impulse_birth_fib_levels: Optional[FibonacciLevels] = None
+    correction_end_score: float = 0.0                  # 0-9 additive wave/fib/reclaim score
+    correction_end_confirmed: bool = False
+    wave_phase: str = "unknown"                       # unknown|impulse|correction|correction_end|impulse_restart
+    wave_confidence: float = 0.0                       # 0-1 confidence of current phase read
 
 
 class FibonacciAnalyzer:
@@ -506,6 +510,139 @@ class FibonacciAnalyzer:
 
         return retracement_vol < impulse_vol * 0.85  # volume < 85% of impulse = contracting
 
+    def _correction_reversal_signature(
+        self,
+        df_entry: pd.DataFrame,
+        *,
+        direction: str,
+        current_price: float,
+        atr: float,
+    ) -> dict:
+        """Detect whether the latest bars suggest a corrective move is finishing
+        and a fresh impulse is trying to start."""
+        out = {
+            "reclaim": False,
+            "reversal_bar": False,
+            "micro_higher_low": False,
+            "micro_lower_high": False,
+            "price_stretched": False,
+        }
+        if df_entry is None or len(df_entry) < 4:
+            return out
+        try:
+            last = df_entry.iloc[-1]
+            prev = df_entry.iloc[-2]
+            prev2 = df_entry.iloc[-3]
+            rng = max(float(last["high"]) - float(last["low"]), 1e-9)
+            body = abs(float(last["close"]) - float(last["open"]))
+            lower_wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+            upper_wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+            close_loc = (float(last["close"]) - float(last["low"])) / rng
+            atr_guard = max(float(atr or 0.0), 1e-9)
+            recent_span = abs(float(last["close"]) - float(prev2["close"]))
+
+            if direction == "bullish":
+                out["reclaim"] = (
+                    float(last["close"]) > float(prev["high"])
+                    and float(last["close"]) > float(prev2["close"])
+                )
+                out["reversal_bar"] = (
+                    float(last["close"]) > float(last["open"])
+                    and close_loc >= 0.62
+                    and lower_wick >= body * 0.8
+                )
+                out["micro_higher_low"] = float(last["low"]) >= min(float(prev["low"]), float(prev2["low"]))
+                out["price_stretched"] = recent_span <= atr_guard * 2.2
+            else:
+                out["reclaim"] = (
+                    float(last["close"]) < float(prev["low"])
+                    and float(last["close"]) < float(prev2["close"])
+                )
+                out["reversal_bar"] = (
+                    float(last["close"]) < float(last["open"])
+                    and close_loc <= 0.38
+                    and upper_wick >= body * 0.8
+                )
+                out["micro_lower_high"] = float(last["high"]) <= max(float(prev["high"]), float(prev2["high"]))
+                out["price_stretched"] = recent_span <= atr_guard * 2.2
+        except Exception:
+            return out
+        return out
+
+    def _evaluate_correction_end(
+        self,
+        *,
+        fib: FibonacciLevels,
+        ctx: FiboSignalContext,
+        df_entry: pd.DataFrame,
+        current_price: float,
+        atr: float,
+    ) -> dict:
+        reasons: list[str] = []
+        score = 0.0
+
+        if ctx.elliott_wave_count in (2, 4):
+            score += 2.0
+            reasons.append(f"wave_{ctx.elliott_wave_count}_corrective_context")
+        elif ctx.elliott_wave_count == 3:
+            reasons.append("wave_3_continuation_context")
+
+        if ctx.in_golden_pocket:
+            score += 2.0
+            reasons.append("correction_end_at_golden_pocket")
+        elif ctx.in_382_zone or ctx.in_786_zone:
+            score += 1.0
+            reasons.append(f"correction_end_near_fib_{ctx.nearest_level_ratio:.3f}")
+
+        if 0.382 <= float(ctx.retracement_depth or 0.0) <= 0.786 and ctx.retracement_healthy:
+            score += 1.0
+            reasons.append("correction_depth_healthy")
+        if ctx.volume_diminishing:
+            score += 1.0
+            reasons.append("correction_volume_contracting")
+
+        sig = self._correction_reversal_signature(
+            df_entry,
+            direction=fib.direction,
+            current_price=current_price,
+            atr=atr,
+        )
+        reversal_confirmed = False
+        if sig.get("reclaim"):
+            score += 1.0
+            reversal_confirmed = True
+            reasons.append("correction_reclaim")
+        if sig.get("reversal_bar"):
+            score += 1.0
+            reversal_confirmed = True
+            reasons.append("correction_reversal_bar")
+        if fib.direction == "bullish" and sig.get("micro_higher_low"):
+            score += 0.5
+            reasons.append("micro_higher_low")
+        if fib.direction == "bearish" and sig.get("micro_lower_high"):
+            score += 0.5
+            reasons.append("micro_lower_high")
+        if sig.get("price_stretched"):
+            score += 0.5
+            reasons.append("micro_price_not_overextended")
+
+        zone_supportive = bool(ctx.in_golden_pocket or ctx.in_382_zone or ctx.in_786_zone)
+        confirmed = bool(
+            score >= 5.0
+            and sig.get("reclaim")
+            and (sig.get("reversal_bar") or (zone_supportive and ctx.volume_diminishing))
+        )
+        phase = "correction_end" if confirmed else ("correction" if ctx.retracement_depth > 0 else "impulse")
+        if confirmed and sig.get("reclaim"):
+            phase = "impulse_restart"
+        return {
+            "score": round(score, 2),
+            "confirmed": confirmed,
+            "phase": phase,
+            "confidence": round(min(score / 9.0, 1.0), 3),
+            "reasons": reasons,
+        }
+
     # ── Main Analysis Entry Point ─────────────────────────────────────────────
 
     def analyze(self, df_structure: pd.DataFrame, df_entry: pd.DataFrame,
@@ -708,6 +845,22 @@ class FibonacciAnalyzer:
             elif ctx.elliott_wave_count == 3:
                 score += 5.0
                 reasons.append("ew_wave_3_continuation")
+
+            correction_state = self._evaluate_correction_end(
+                fib=fib_levels,
+                ctx=ctx,
+                df_entry=df_entry,
+                current_price=current_price,
+                atr=atr,
+            )
+            ctx.correction_end_score = float(correction_state.get("score", 0.0) or 0.0)
+            ctx.correction_end_confirmed = bool(correction_state.get("confirmed"))
+            ctx.wave_phase = str(correction_state.get("phase") or "unknown")
+            ctx.wave_confidence = float(correction_state.get("confidence", 0.0) or 0.0)
+            reasons.extend(list(correction_state.get("reasons") or []))
+            if ctx.correction_end_confirmed:
+                score += 12.0
+                reasons.append(f"correction_end_confirmed_{ctx.wave_phase}")
 
             # SMC confluence
             if smc_context is not None:
