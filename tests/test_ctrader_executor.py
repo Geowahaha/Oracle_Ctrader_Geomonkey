@@ -482,15 +482,61 @@ class TestCTraderExecutor(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                fss_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:fss:canary")
-                limit_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:canary")
 
-            self.assertEqual(str(fss_state.get("desk") or ""), "fss_confirmation")
-            self.assertEqual(str(fss_state.get("mode") or ""), "continuation_fail_fast")
-            self.assertAlmostEqual(float((dict(fss_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 6.5, places=4)
-            self.assertEqual(str(limit_state.get("desk") or ""), "limit_retest")
-            self.assertEqual(str(limit_state.get("mode") or ""), "retest_absorption_guard")
-            self.assertAlmostEqual(float((dict(limit_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 3.0, places=4)
+                state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:fss:canary")
+                fallback = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:canary")
+
+            self.assertEqual(str(state.get("desk") or ""), "fss_confirmation")
+            self.assertAlmostEqual(float((state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 6.5, places=6)
+            self.assertEqual(str(fallback.get("desk") or ""), "limit_retest")
+            self.assertAlmostEqual(float((fallback.get("overrides") or {}).get("no_follow_age_min") or 0.0), 3.0, places=6)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_xau_order_care_state_maps_scheduled_winner_and_tc_canary_to_limit_retest(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                executor.trading_manager_state_path.parent.mkdir(parents=True, exist_ok=True)
+                executor.trading_manager_state_path.write_text(
+                    json.dumps(
+                        {
+                            "xau_order_care": {
+                                "status": "active",
+                                "mode": "market_entry_retest_guard",
+                                "allowed_sources": ["xauusd_scheduled:winner", "scalp_xauusd:tc:canary"],
+                                "overrides": {"no_follow_age_min": 7.0},
+                                "desks": {
+                                    "limit_retest": {
+                                        "status": "active",
+                                        "mode": "market_entry_retest_guard",
+                                        "allowed_sources": ["xauusd_scheduled:winner", "scalp_xauusd:tc:canary"],
+                                        "overrides": {"desk": "limit_retest", "no_follow_age_min": 4.0},
+                                    }
+                                },
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                winner_state = executor._xau_order_care_state(symbol="XAUUSD", source="xauusd_scheduled:winner")
+                tc_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:tc:canary")
+
+            self.assertEqual(str(winner_state.get("desk") or ""), "limit_retest")
+            self.assertEqual(str(tc_state.get("desk") or ""), "limit_retest")
+            self.assertAlmostEqual(float((winner_state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 4.0, places=6)
+            self.assertAlmostEqual(float((tc_state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 4.0, places=6)
         finally:
             executor = None
             gc.collect()

@@ -1000,7 +1000,7 @@ class Config:
     TRADING_MANAGER_XAU_ORDER_CARE_MIN_ACTIVE_MIN: int = int(os.getenv("TRADING_MANAGER_XAU_ORDER_CARE_MIN_ACTIVE_MIN", "45"))
     TRADING_MANAGER_XAU_ORDER_CARE_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_ALLOWED_SOURCES",
-        "xauusd_scheduled:canary,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:rr:canary",
+        "xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:rr:canary,scalp_xauusd:tc:canary,scalp_xauusd:tc:winner",
     )
     TRADING_MANAGER_XAU_ORDER_CARE_FSS_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_FSS_ALLOWED_SOURCES",
@@ -1008,7 +1008,7 @@ class Config:
     )
     TRADING_MANAGER_XAU_ORDER_CARE_LIMIT_RETEST_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_LIMIT_RETEST_ALLOWED_SOURCES",
-        "xauusd_scheduled:canary,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary",
+        "xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:tc:canary,scalp_xauusd:tc:winner",
     )
     TRADING_MANAGER_XAU_ORDER_CARE_RANGE_REPAIR_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_RANGE_REPAIR_ALLOWED_SOURCES",

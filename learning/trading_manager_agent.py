@@ -874,14 +874,16 @@ class TradingManagerAgent:
             getattr(
                 config,
                 "TRADING_MANAGER_XAU_ORDER_CARE_LIMIT_RETEST_ALLOWED_SOURCES",
-                "xauusd_scheduled:canary,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary",
+                "xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:tc:canary,scalp_xauusd:tc:winner",
             )
         )
         return {
             "fss_confirmation": fss_sources or ["scalp_xauusd:fss:canary"],
             "limit_retest": limit_sources
             or [
+                "xauusd_scheduled",
                 "xauusd_scheduled:canary",
+                "xauusd_scheduled:winner",
                 "scalp_xauusd:canary",
                 "scalp_xauusd",
                 "scalp_xauusd:winner",
@@ -889,6 +891,8 @@ class TradingManagerAgent:
                 "scalp_xauusd:td:canary",
                 "scalp_xauusd:ff:canary",
                 "scalp_xauusd:mfu:canary",
+                "scalp_xauusd:tc:canary",
+                "scalp_xauusd:tc:winner",
             ],
             "range_repair": self._parse_family_csv(
                 getattr(config, "TRADING_MANAGER_XAU_ORDER_CARE_RANGE_REPAIR_ALLOWED_SOURCES", "scalp_xauusd:rr:canary")

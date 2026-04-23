@@ -1306,13 +1306,18 @@ class TradingManagerAgentTests(unittest.TestCase):
         care_state = dict(state.get("xau_order_care") or {})
         self.assertEqual(str(care_state.get("mode") or ""), "continuation_fail_fast")
         self.assertEqual(str(care_state.get("status") or ""), "active")
+        self.assertIn("xauusd_scheduled", list(care_state.get("allowed_sources") or []))
+        self.assertIn("xauusd_scheduled:winner", list(care_state.get("allowed_sources") or []))
         self.assertIn("scalp_xauusd:canary", list(care_state.get("allowed_sources") or []))
         self.assertIn("scalp_xauusd:td:canary", list(care_state.get("allowed_sources") or []))
+        self.assertIn("scalp_xauusd:tc:canary", list(care_state.get("allowed_sources") or []))
         desks = dict(care_state.get("desks") or {})
         self.assertIn("fss_confirmation", desks)
         self.assertIn("limit_retest", desks)
         self.assertEqual(str(((desks.get("fss_confirmation") or {}).get("mode") or "")), "continuation_fail_fast")
         self.assertEqual(str(((desks.get("limit_retest") or {}).get("mode") or "")), "retest_absorption_guard")
+        self.assertIn("xauusd_scheduled:winner", list((desks.get("limit_retest") or {}).get("allowed_sources") or []))
+        self.assertIn("scalp_xauusd:tc:canary", list((desks.get("limit_retest") or {}).get("allowed_sources") or []))
         self.assertAlmostEqual(float((dict(care_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 5.0, places=6)
         self.assertGreaterEqual(int((dict(care_state.get("overrides") or {})).get("close_score") or 0), 4)
 
@@ -1353,7 +1358,7 @@ class TradingManagerAgentTests(unittest.TestCase):
 
         self.assertEqual(str(apply_out.get("status") or ""), "held")
         self.assertEqual(str(care_state.get("status") or ""), "active")
-        self.assertIn("scalp_xauusd:canary", list(care_state.get("allowed_sources") or []))
+        self.assertEqual(list(care_state.get("allowed_sources") or []), ["scalp_xauusd:canary", "scalp_xauusd:td:canary"])
 
     def test_trading_manager_adds_flow_short_sidecar_to_experimental_set(self):
         (self.report_dir / "chart_state_memory_report.json").write_text(
