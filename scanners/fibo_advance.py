@@ -1047,6 +1047,62 @@ class FiboAdvanceScanner:
             logger.debug("[FiboAdvance] birth override error: %s", exc)
             return None
 
+    def _phase_trade_profile(self, *, fibo_ctx, mode: str, anchor_mode: str) -> dict:
+        phase = str(getattr(fibo_ctx, "wave_phase", "unknown") or "unknown").strip().lower()
+        correction_confirmed = bool(getattr(fibo_ctx, "correction_end_confirmed", False))
+        correction_score = float(getattr(fibo_ctx, "correction_end_score", 0.0) or 0.0)
+        wave_confidence = float(getattr(fibo_ctx, "wave_confidence", 0.0) or 0.0)
+        prefix = "FIBO_SCOUT" if mode == "scout" else "FIBO_ADVANCE"
+        profile = {
+            "phase": phase,
+            "conf_bonus": 0.0,
+            "risk_mult": 1.0,
+            "stop_buffer_mult": 1.0,
+            "tp2_mult": 1.0,
+            "tp3_mult": 1.0,
+            "winner_eligible": False,
+            "winner_regime": "building",
+            "winner_reason": f"wave_phase:{phase or 'unknown'}",
+        }
+        if phase == "impulse_restart" and correction_confirmed:
+            profile.update(
+                {
+                    "conf_bonus": float(getattr(config, f"{prefix}_IMPULSE_RESTART_CONF_BONUS", 4.0) or 4.0),
+                    "risk_mult": float(getattr(config, f"{prefix}_IMPULSE_RESTART_RISK_MULT", 1.25) or 1.25),
+                    "stop_buffer_mult": float(getattr(config, f"{prefix}_IMPULSE_RESTART_STOP_BUFFER_MULT", 0.90) or 0.90),
+                    "tp2_mult": float(getattr(config, f"{prefix}_IMPULSE_RESTART_TP2_MULT", 1.12) or 1.12),
+                    "tp3_mult": float(getattr(config, f"{prefix}_IMPULSE_RESTART_TP3_MULT", 1.18) or 1.18),
+                    "winner_eligible": bool(correction_score >= 6.0 and wave_confidence >= 0.70 and mode == "sniper"),
+                    "winner_regime": "strong",
+                    "winner_reason": "impulse_restart_confirmed",
+                }
+            )
+        elif phase == "correction_end" and correction_confirmed:
+            profile.update(
+                {
+                    "conf_bonus": float(getattr(config, f"{prefix}_CORRECTION_END_CONF_BONUS", 2.0) or 2.0),
+                    "risk_mult": float(getattr(config, f"{prefix}_CORRECTION_END_RISK_MULT", 1.05) or 1.05),
+                    "stop_buffer_mult": float(getattr(config, f"{prefix}_CORRECTION_END_STOP_BUFFER_MULT", 0.96) or 0.96),
+                    "tp2_mult": float(getattr(config, f"{prefix}_CORRECTION_END_TP2_MULT", 1.05) or 1.05),
+                    "tp3_mult": float(getattr(config, f"{prefix}_CORRECTION_END_TP3_MULT", 1.10) or 1.10),
+                    "winner_eligible": bool(correction_score >= 6.8 and wave_confidence >= 0.78 and mode == "sniper" and anchor_mode == "early_origin"),
+                    "winner_regime": "strong" if correction_score >= 7.0 else "building",
+                    "winner_reason": "correction_end_confirmed",
+                }
+            )
+        elif phase == "correction":
+            profile.update(
+                {
+                    "conf_bonus": -3.0 if mode == "sniper" else -2.0,
+                    "risk_mult": 0.85 if mode == "sniper" else 0.80,
+                    "stop_buffer_mult": 1.05,
+                    "tp2_mult": 0.96,
+                    "tp3_mult": 0.94,
+                    "winner_reason": "correction_phase_not_promotable",
+                }
+            )
+        return profile
+
     # ── Entry / SL / TP Construction ──────────────────────────────────────────
 
     def _build_signal(self, direction: str, fibo_ctx, current_price: float,
@@ -1074,16 +1130,22 @@ class FiboAdvanceScanner:
         # ── Early-origin override: swap fib + SL anchor when birth is fresh ──
         birth_override = self._resolve_birth_override(fibo_ctx, direction, current_price)
         anchor_mode = "late_retrace"
+        # ── Phase-aware position profile ───────────────────────────────────
+        phase_profile = self._phase_trade_profile(fibo_ctx=fibo_ctx, mode=mode, anchor_mode=anchor_mode)
+
         if birth_override is not None:
             fib = birth_override["fib"]
             entry = birth_override["entry"]
             sl_anchor = birth_override["sl_anchor"]
             sl_buffer = atr * float(_cfg("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", 0.25))
             anchor_mode = "early_origin"
+            phase_profile = self._phase_trade_profile(fibo_ctx=fibo_ctx, mode=mode, anchor_mode=anchor_mode)
         else:
             # SL: place beyond swing start (the 100% level) with ATR buffer
             sl_buffer = atr * float(_cfg("FIBO_ADVANCE_SL_ATR_BUFFER", 0.25))
             sl_anchor = fib.levels.get(1.0, fib.swing_start)
+
+        sl_buffer *= max(0.6, float(phase_profile.get("stop_buffer_mult", 1.0) or 1.0))
 
         if direction == "long":
             stop_loss = sl_anchor - sl_buffer
@@ -1125,6 +1187,21 @@ class FiboAdvanceScanner:
             return None
         tp1, tp2, tp3, rr = _ladder
 
+        if direction == "long":
+            tp2 = entry + (tp2 - entry) * max(0.85, float(phase_profile.get("tp2_mult", 1.0) or 1.0))
+            tp3 = entry + (tp3 - entry) * max(0.85, float(phase_profile.get("tp3_mult", 1.0) or 1.0))
+        else:
+            tp2 = entry - abs(tp2 - entry) * max(0.85, float(phase_profile.get("tp2_mult", 1.0) or 1.0))
+            tp3 = entry - abs(tp3 - entry) * max(0.85, float(phase_profile.get("tp3_mult", 1.0) or 1.0))
+        _ladder_phase = self._finalize_fib_tp_ladder(
+            direction, entry, risk, tp1, tp2, tp3,
+            scout=(mode == "scout"),
+            min_rr_tp2=float(_cfg("FIBO_SCOUT_MIN_RR" if mode == "scout" else "FIBO_ADVANCE_MIN_RR", 1.0 if mode == "scout" else 1.2)),
+        )
+        if _ladder_phase is None:
+            return None
+        tp1, tp2, tp3, rr = _ladder_phase
+
         # ── Confidence = Fib confluence + SMC + RSI + VP + MTF stacking ───
         base_conf = fibo_ctx.fibo_confluence_score
         smc_boost = 0.0
@@ -1140,7 +1217,7 @@ class FiboAdvanceScanner:
         # Uncapped base — cap is applied post-modifier in scan() so that
         # high-confluence signals retain their headroom to absorb downstream
         # trend/killer/session penalties. (FIBO_ADVANCE_MAX_CONFIDENCE=96.)
-        confidence = round(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus, 1)
+        confidence = round(base_conf + smc_boost + rsi_boost + vp_adj + mtf_bonus + float(phase_profile.get("conf_bonus", 0.0) or 0.0), 1)
         min_conf   = float(_cfg("FIBO_ADVANCE_MIN_CONFIDENCE", 62.0))
         # Pre-mod budget: trend/killer/session/cb modifiers are applied AFTER this
         # build. A borderline base that would pass with +5 aligned trend bonus
@@ -1173,6 +1250,7 @@ class FiboAdvanceScanner:
 
         session_str = ",".join(session_info.get("active_sessions", []) or [])
         trend_str   = (smc_context.current_trend if smc_context else "ranging") or "ranging"
+        phase_risk_usd = round(float(getattr(config, "FIBO_ADVANCE_CTRADER_RISK_USD", 1.0) or 1.0) * max(0.1, float(phase_profile.get("risk_mult", 1.0) or 1.0)), 4)
 
         return TradeSignal(
             symbol="XAUUSD",
@@ -1216,6 +1294,11 @@ class FiboAdvanceScanner:
                 "fibo_reversal_template_near_618": bool(quality_info.get("reversal_template_near_level", False)),
                 "fibo_reversal_template_reason": str(quality_info.get("reversal_template_reason") or ""),
                 "fibo_entry_mode": anchor_mode,
+                "fibo_phase_profile": dict(phase_profile),
+                "ctrader_risk_usd_override": phase_risk_usd,
+                "winner_logic_regime": str(phase_profile.get("winner_regime") or "building"),
+                "fibo_winner_eligible": bool(phase_profile.get("winner_eligible", False)),
+                "fibo_winner_reason": str(phase_profile.get("winner_reason") or ""),
                 "impulse_birth_confidence": round(
                     float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
                 ),
@@ -1227,15 +1310,15 @@ class FiboAdvanceScanner:
             entry_type="limit",
             sl_type="structure",
             sl_reason=(
-                f"early_origin:base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
+                f"phase={phase_profile.get('phase') or 'unknown'}|early_origin:base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
                 if anchor_mode == "early_origin"
-                else f"beyond_fib_100pct_swing_origin atr_buf:{sl_buffer:.1f}"
+                else f"phase={phase_profile.get('phase') or 'unknown'}|beyond_fib_100pct_swing_origin atr_buf:{sl_buffer:.1f}"
             ),
             tp_type="structure",
             tp_reason=(
-                f"birth_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
+                f"phase={phase_profile.get('phase') or 'unknown'}|birth_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
                 if anchor_mode == "early_origin"
-                else f"fibo_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
+                else f"phase={phase_profile.get('phase') or 'unknown'}|fibo_extensions_1272_{tp2:.1f}_1618_{tp3:.1f}"
             ),
             sl_liquidity_mapped=False,
             liquidity_pools_count=len(smc_context.liquidity_pools) if smc_context else 0,
@@ -1365,11 +1448,16 @@ class FiboAdvanceScanner:
             fib = scout_birth_override["fib"]
             entry = scout_birth_override["entry"]
             sl_anchor = scout_birth_override["sl_anchor"]
-            sl_buffer = atr_m15 * float(_cfg("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", 0.25))
             scout_anchor_mode = "early_origin"
+        if scout_anchor_mode == "early_origin":
+            phase_profile = self._phase_trade_profile(fibo_ctx=fibo_ctx, mode="scout", anchor_mode=scout_anchor_mode)
+            sl_buffer = atr_m15 * float(_cfg("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", 0.25))
         else:
+            phase_profile = self._phase_trade_profile(fibo_ctx=fibo_ctx, mode="scout", anchor_mode=scout_anchor_mode)
             sl_buffer = atr_m15 * float(_cfg("FIBO_SCOUT_SL_ATR_BUFFER", 0.20))
             sl_anchor = fib.levels.get(1.0, fib.swing_start)
+
+        sl_buffer *= max(0.6, float(phase_profile.get("stop_buffer_mult", 1.0) or 1.0))
 
         if scout_direction == "long":
             stop_loss = sl_anchor - sl_buffer
@@ -1408,13 +1496,26 @@ class FiboAdvanceScanner:
         if _ladder_sc is None:
             return None
         tp1, tp2, tp3, rr = _ladder_sc
+        if scout_direction == "long":
+            tp2 = entry + (tp2 - entry) * max(0.85, float(phase_profile.get("tp2_mult", 1.0) or 1.0))
+            tp3 = entry + (tp3 - entry) * max(0.85, float(phase_profile.get("tp3_mult", 1.0) or 1.0))
+        else:
+            tp2 = entry - abs(tp2 - entry) * max(0.85, float(phase_profile.get("tp2_mult", 1.0) or 1.0))
+            tp3 = entry - abs(tp3 - entry) * max(0.85, float(phase_profile.get("tp3_mult", 1.0) or 1.0))
+        _ladder_sc_phase = self._finalize_fib_tp_ladder(
+            scout_direction, entry, risk, tp1, tp2, tp3,
+            scout=True, min_rr_tp2=float(_cfg("FIBO_SCOUT_MIN_RR", 1.0)),
+        )
+        if _ladder_sc_phase is None:
+            return None
+        tp1, tp2, tp3, rr = _ladder_sc_phase
 
         smc_boost  = min(smc_context.confidence * 0.20, 10.0) if smc_context else 0.0
         # Uncapped base — cap is applied post-modifier in scan() so that
         # high-confluence scout setups retain headroom to absorb penalties.
         # (FIBO_SCOUT_MAX_CONFIDENCE=88.)
         confidence = round(
-            fibo_ctx.fibo_confluence_score + smc_boost + 5.0 + vp_adj + mtf_bonus,
+            fibo_ctx.fibo_confluence_score + smc_boost + 5.0 + vp_adj + mtf_bonus + float(phase_profile.get("conf_bonus", 0.0) or 0.0),
             1,
         )
         min_conf   = float(_cfg("FIBO_SCOUT_MIN_CONFIDENCE", 55.0))
@@ -1445,6 +1546,7 @@ class FiboAdvanceScanner:
 
         session_str = ",".join(session_info.get("active_sessions", []) or [])
         trend_str   = (smc_context.current_trend if smc_context else h4_bias) or h4_bias
+        phase_risk_usd = round(float(getattr(config, "FIBO_SCOUT_CTRADER_RISK_USD", 0.5) or 0.5) * max(0.1, float(phase_profile.get("risk_mult", 1.0) or 1.0)), 4)
 
         sharpness_score = int(sharpness.get("sharpness_score", 0) or 0)
         sharpness_band  = str(sharpness.get("sharpness_band", "normal") or "normal")
@@ -1500,6 +1602,11 @@ class FiboAdvanceScanner:
                 "fibo_reversal_template_near_618": bool(quality.get("reversal_template_near_level", False)),
                 "fibo_reversal_template_reason": str(quality.get("reversal_template_reason") or ""),
                 "fibo_entry_mode": scout_anchor_mode,
+                "fibo_phase_profile": dict(phase_profile),
+                "ctrader_risk_usd_override": phase_risk_usd,
+                "winner_logic_regime": str(phase_profile.get("winner_regime") or "building"),
+                "fibo_winner_eligible": bool(phase_profile.get("winner_eligible", False)),
+                "fibo_winner_reason": str(phase_profile.get("winner_reason") or ""),
                 "impulse_birth_confidence": round(
                     float(getattr(fibo_ctx, "impulse_birth_confidence", 0.0) or 0.0), 3
                 ),
@@ -1511,15 +1618,15 @@ class FiboAdvanceScanner:
             entry_type="limit",
             sl_type="structure",
             sl_reason=(
-                f"scout_early_origin_base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
+                f"phase={phase_profile.get('phase') or 'unknown'}|scout_early_origin_base_anchor_{sl_anchor:.2f} atr_buf:{sl_buffer:.1f}"
                 if scout_anchor_mode == "early_origin"
-                else f"scout_fib100_origin atr_buf:{sl_buffer:.1f}"
+                else f"phase={phase_profile.get('phase') or 'unknown'}|scout_fib100_origin atr_buf:{sl_buffer:.1f}"
             ),
             tp_type="structure",
             tp_reason=(
-                f"scout_birth_ext_1272:{tp2:.1f}"
+                f"phase={phase_profile.get('phase') or 'unknown'}|scout_birth_ext_1272:{tp2:.1f}"
                 if scout_anchor_mode == "early_origin"
-                else f"scout_ext_1272:{tp2:.1f}"
+                else f"phase={phase_profile.get('phase') or 'unknown'}|scout_ext_1272:{tp2:.1f}"
             ),
             sl_liquidity_mapped=False,
             liquidity_pools_count=len(smc_context.liquidity_pools) if smc_context else 0,

@@ -1826,21 +1826,38 @@ class DexterScheduler:
             meta["winner_reason"] = "allow_all"
             return base_source, meta
 
-        # ── Standalone scanners: bypass winner routing, dispatch directly ──────
-        # FiboAdvance is a self-contained scanner with its own confluence logic.
-        # It does not participate in winner/regime routing — pass through directly
-        # if the base source is allowed.
-        _standalone_sources = {"fibo_xauusd"}
-        if src in _standalone_sources and src in allowed_sources:
-            meta["dispatch_source"] = base_source
-            meta["winner_reason"] = "standalone_direct_pass"
-            return base_source, meta
-
-        winner_source = ""
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
         except Exception:
             raw = {}
+
+        # ── Standalone scanners: some can self-promote into winner lane based on
+        # internal phase/trade-structure evidence. FiboAdvance now supports this.
+        _standalone_sources = {"fibo_xauusd"}
+        if src in _standalone_sources and src in allowed_sources:
+            if src == "fibo_xauusd":
+                candidate = f"{base_source}:winner"
+                meta["winner_candidate"] = candidate
+                try:
+                    conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+                except Exception:
+                    conf = 0.0
+                fibo_winner_ok = bool(raw.get("fibo_winner_eligible"))
+                min_conf = max(0.0, float(getattr(config, "CTRADER_FIBO_WINNER_MIN_CONFIDENCE", 78.0) or 78.0))
+                if candidate.lower() in allowed_sources and fibo_winner_ok and conf >= min_conf:
+                    meta["dispatch_source"] = candidate
+                    meta["winner_reason"] = str(raw.get("fibo_winner_reason") or "fibo_phase_winner")
+                    return candidate, meta
+                if fibo_winner_ok and conf < min_conf:
+                    meta["winner_reason"] = f"fibo_winner_conf_below:{conf:.1f}<{min_conf:.1f}"
+                elif fibo_winner_ok:
+                    meta["winner_reason"] = "fibo_winner_source_not_allowed"
+            meta["dispatch_source"] = base_source
+            if not meta["winner_reason"]:
+                meta["winner_reason"] = "standalone_direct_pass"
+            return base_source, meta
+
+        winner_source = ""
         if (":winner" not in src) and (":bypass" not in src):
             candidate = f"{base_source}:winner"
             candidate_key = candidate.lower()

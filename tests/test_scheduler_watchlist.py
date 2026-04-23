@@ -1072,6 +1072,32 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertIs(result, fake_result)
         self.assertEqual(exec_call.call_args.kwargs.get("source"), "scalp_btcusd")
 
+    def test_ctrader_promotes_fibo_to_winner_lane_when_phase_profile_is_strong(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=84.0)
+        sig.pattern = "FIBO_GoldenPocket_EW2"
+        sig.raw_scores.update({
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "impulse_restart_confirmed",
+            "winner_logic_regime": "strong",
+            "wave_phase": "impulse_restart",
+        })
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_FIBO_WINNER_MIN_CONFIDENCE", 78.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"fibo_xauusd", "fibo_xauusd:winner"}), \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_result) as exec_call:
+            dispatch_source, dispatch_meta = dexter._ctrader_pick_dispatch_source(sig, source="fibo_xauusd")
+            self.assertEqual(dispatch_source, "fibo_xauusd:winner")
+            self.assertEqual(str(dispatch_meta.get("winner_reason") or ""), "impulse_restart_confirmed")
+            result = dexter._maybe_execute_ctrader_signal(sig, source="fibo_xauusd")
+
+        self.assertIs(result, fake_result)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "fibo_xauusd:winner")
+        self.assertEqual(getattr(sig, "raw_scores", {}).get("ctrader_dispatch_source"), "fibo_xauusd:winner")
+
     def test_ctrader_blocks_xau_scalp_outside_safe_live_filter(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("XAUUSD", confidence=67.5)
