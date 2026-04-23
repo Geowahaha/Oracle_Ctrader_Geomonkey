@@ -726,6 +726,23 @@ class FiboAdvanceScanner:
         max_depth = float(_cfg(f"{prefix}_MAX_RETRACEMENT_DEPTH", 0.786))
         require_gp = bool(getattr(config, f"{prefix}_REQUIRE_GOLDEN_POCKET", True))
         in_gp = bool(getattr(fibo_ctx, "in_golden_pocket", False))
+        wave_phase = str(getattr(fibo_ctx, "wave_phase", "unknown") or "unknown")
+        wave_confidence = float(getattr(fibo_ctx, "wave_confidence", 0.0) or 0.0)
+        correction_end_confirmed = bool(getattr(fibo_ctx, "correction_end_confirmed", False))
+        correction_end_score = float(getattr(fibo_ctx, "correction_end_score", 0.0) or 0.0)
+        correction_end_override_enabled = bool(getattr(config, f"{prefix}_ALLOW_CONFIRMED_CORRECTION_END_OUTSIDE_GP", True))
+        correction_end_min_score = float(getattr(config, f"{prefix}_CORRECTION_END_MIN_SCORE", 5.0) or 5.0)
+        correction_end_min_wave_conf = float(getattr(config, f"{prefix}_CORRECTION_END_MIN_WAVE_CONFIDENCE", 0.5) or 0.5)
+        correction_end_min_ratio = float(getattr(config, f"{prefix}_CORRECTION_END_MIN_ENTRY_RATIO", 0.55) or 0.55)
+        correction_end_max_ratio = float(getattr(config, f"{prefix}_CORRECTION_END_MAX_ENTRY_RATIO", 0.82) or 0.82)
+        correction_end_override = bool(
+            correction_end_override_enabled
+            and correction_end_confirmed
+            and wave_phase in {"correction_end", "impulse_restart"}
+            and correction_end_score >= correction_end_min_score
+            and wave_confidence >= correction_end_min_wave_conf
+            and correction_end_min_ratio <= ratio <= correction_end_max_ratio
+        )
         details = {
             "mode": mode,
             "direction": str(direction or ""),
@@ -735,22 +752,33 @@ class FiboAdvanceScanner:
             "min_entry_level_ratio": round(min_ratio, 4),
             "min_retracement_depth": round(min_depth, 4),
             "max_retracement_depth": round(max_depth, 4),
+            "wave_phase": wave_phase,
+            "wave_confidence": round(wave_confidence, 3),
+            "correction_end_confirmed": correction_end_confirmed,
+            "correction_end_score": round(correction_end_score, 2),
+            "correction_end_override": correction_end_override,
+            "correction_end_min_entry_ratio": round(correction_end_min_ratio, 4),
+            "correction_end_max_entry_ratio": round(correction_end_max_ratio, 4),
         }
 
-        # Must be at 61.8+ level (Golden Pocket zone)
-        if ratio + tol < min_ratio:
+        # Default rule: require 61.8+ / GP depth. Exception: confirmed correction-end
+        # / impulse-restart phase with additional evidence may enter slightly above
+        # or below the golden pocket when the reversal is already proving itself.
+        if ratio + tol < min_ratio and not correction_end_override:
             return False, f"pre_golden_level:{ratio:.3f}<{min_ratio:.3f}", details
-        if depth + tol < min_depth:
+        if depth + tol < min_depth and not correction_end_override:
             return False, f"pre_golden_depth:{depth:.3f}<{min_depth:.3f}", details
         if max_depth > 0 and depth - tol > max_depth:
             return False, f"overdeep_retracement:{depth:.3f}>{max_depth:.3f}", details
-        if require_gp and not in_gp:
+        if require_gp and not in_gp and not correction_end_override:
             return False, f"not_golden_pocket:ratio={ratio:.3f}:depth={depth:.3f}", details
 
         template_enabled = bool(getattr(config, "FIBO_REVERSAL_TEMPLATE_ENABLED", True))
         template_level_tol = max(0.0, float(getattr(config, "FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE", 0.020) or 0.020))
+        correction_end_min_template_score = int(getattr(config, f"{prefix}_CORRECTION_END_MIN_TEMPLATE_SCORE", 4) or 4)
         near_reversal_level = (
             in_gp
+            or correction_end_override
             or abs(ratio - 0.618) <= template_level_tol
             or abs(ratio - 0.650) <= template_level_tol
         )
@@ -796,6 +824,9 @@ class FiboAdvanceScanner:
             "reversal_template_reasons": list(template_info.get("reasons") or []),
             "reversal_template_missing": list(template_info.get("missing") or []),
         })
+        if correction_end_override and int(template_info.get("score", 0) or 0) < correction_end_min_template_score:
+            details["correction_end_override"] = False
+            return False, f"correction_end_template_weak:{int(template_info.get('score', 0) or 0)}<{correction_end_min_template_score}", details
 
         # Momentum quality score (must have enough confluence)
         score = 0
