@@ -2097,7 +2097,8 @@ class CTraderExecutor:
 
     @staticmethod
     def _is_scheduled_canary_source(source: str) -> bool:
-        return str(source or "").strip().lower() == "xauusd_scheduled:canary"
+        token = str(source or "").strip().lower()
+        return token in {"xauusd_scheduled:canary", "xauusd_scheduled:winner"}
 
     @staticmethod
     def _is_xau_symbol(symbol: str) -> bool:

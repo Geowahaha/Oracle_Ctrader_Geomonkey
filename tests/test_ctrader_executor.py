@@ -2850,6 +2850,42 @@ class TestCTraderExecutor(unittest.TestCase):
             gc.collect()
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_is_scheduled_canary_source_accepts_winner_lane(self):
+        self.assertTrue(ctrader_module.CTraderExecutor._is_scheduled_canary_source("xauusd_scheduled:winner"))
+        self.assertTrue(ctrader_module.CTraderExecutor._is_scheduled_canary_source("xauusd_scheduled:canary"))
+        self.assertFalse(ctrader_module.CTraderExecutor._is_scheduled_canary_source("scalp_xauusd"))
+
+    def test_scheduled_rebalanced_stop_applies_to_winner_lane(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", False), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_MIN_RR", 0.85), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO", 0.58), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+
+                new_sl = executor._scheduled_canary_rebalanced_stop(
+                    source="xauusd_scheduled:winner",
+                    direction="long",
+                    entry_price=4748.33,
+                    stop_loss=4715.00,
+                    take_profit=4765.00,
+                )
+
+            self.assertGreater(float(new_sl), 4715.00)
+            self.assertLess(float(new_sl), 4748.33)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_get_lane_stats_ignores_untracked_ctrader_rows(self):
         td = tempfile.mkdtemp()
         executor = None
