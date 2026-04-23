@@ -1953,6 +1953,7 @@ class DexterScheduler:
             "xau_scalp_flow_long_sidecar": "fls",
             "xau_scalp_range_repair": "rr",
             "xau_scalp_mempalace_lane": "mmp",
+            "xau_scalp_trading_central_intraday": "tc",
             "xau_scalp_prelondon_sweep_cont": "psc",
             "btc_weekday_lob_momentum": "bwl",
             "btc_scalp_flow_short_sidecar": "bfss",
@@ -2071,8 +2072,12 @@ class DexterScheduler:
         experimental_families = set(getattr(config, "get_persistent_canary_experimental_families", lambda: set())() or set()) if experimental_enabled else set()
         mempalace_family = self._mempalace_family_name()
         mempalace_enabled = bool(getattr(config, "MEMPALACE_FAMILY_ENABLED", False))
+        trading_central_family = self._trading_central_family_name()
+        trading_central_enabled = bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False))
         if mempalace_enabled and experimental_enabled:
             experimental_families.add(mempalace_family)
+        if trading_central_enabled and experimental_enabled:
+            experimental_families.add(trading_central_family)
         standard_limit = max(0, int(getattr(config, "PERSISTENT_CANARY_FAMILY_MAX_VARIANTS", 2) or 2))
         experimental_limit = max(0, int(getattr(config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 1) or 1))
         xau_opportunity_sidecar_active = False
@@ -2265,6 +2270,10 @@ class DexterScheduler:
             symbol=symbol_token,
             base_source=base_token,
         )
+        trading_central_payload = self._load_trading_central_lane_payload(
+            symbol=symbol_token,
+            base_source=base_token,
+        )
         for row in list((payload.get("candidates") if isinstance(payload, dict) else []) or []):
             if not isinstance(row, dict):
                 continue
@@ -2319,6 +2328,38 @@ class DexterScheduler:
                         "execution_ready": True,
                         "experimental": True,
                         "source": "mempalace_payload",
+                    }
+                )
+        if (
+            trading_central_enabled
+            and bool(trading_central_payload)
+            and symbol_token == "XAUUSD"
+            and base_token == "scalp_xauusd"
+            and trading_central_family in experimental_families
+            and _strategy_lab_family_allowed(trading_central_family)
+        ):
+            present_families = {
+                str(item.get("family") or "").strip().lower()
+                for item in [*list(standard_candidates or []), *list(experimental_candidates or [])]
+                if isinstance(item, dict)
+            }
+            if trading_central_family not in present_families:
+                experimental_candidates.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": trading_central_family,
+                        "strategy_id": str(
+                            getattr(
+                                config,
+                                "TRADING_CENTRAL_FAMILY_STRATEGY_ID",
+                                "xau_scalp_trading_central_intraday_v1",
+                            )
+                            or "xau_scalp_trading_central_intraday_v1"
+                        ).strip(),
+                        "priority": int(getattr(config, "TRADING_CENTRAL_FAMILY_PRIORITY", 166) or 166),
+                        "execution_ready": True,
+                        "experimental": True,
+                        "source": "trading_central_payload",
                     }
                 )
         if symbol_token == "XAUUSD" and base_token == "scalp_xauusd":
@@ -3680,7 +3721,20 @@ class DexterScheduler:
         return "xau_scalp_mempalace_lane"
 
     @staticmethod
+    def _trading_central_family_name() -> str:
+        return "xau_scalp_trading_central_intraday"
+
+    @staticmethod
     def _mempalace_parse_direction(value: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"long", "buy"}:
+            return "long"
+        if token in {"short", "sell"}:
+            return "short"
+        return ""
+
+    @staticmethod
+    def _trading_central_parse_direction(value: str) -> str:
         token = str(value or "").strip().lower()
         if token in {"long", "buy"}:
             return "long"
@@ -3698,6 +3752,176 @@ class DexterScheduler:
         if token in {"market", "limit"}:
             return token
         return "limit"
+
+    @staticmethod
+    def _trading_central_parse_entry_type(value: str, *, direction: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"buy_stop", "sell_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"stop", "break_stop", "market_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"market", "limit"}:
+            return token
+        return "limit"
+
+    def _load_trading_central_lane_payload(self, *, symbol: str, base_source: str) -> dict:
+        if not bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False)):
+            return {}
+        symbol_token = str(symbol or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        allowed_symbols = {
+            str(part or "").strip().upper()
+            for part in str(getattr(config, "TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS", "XAUUSD") or "").split(",")
+            if str(part or "").strip()
+        }
+        if allowed_symbols and symbol_token not in allowed_symbols:
+            return {}
+        allowed_sources = self._parse_lower_csv(
+            str(getattr(config, "TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd") or "")
+        )
+        if allowed_sources and base_token not in allowed_sources:
+            return {}
+        raw_path = str(
+            getattr(config, "TRADING_CENTRAL_FAMILY_SIGNAL_PATH", "data/runtime/trading_central_intraday_signal.json")
+            or ""
+        ).strip()
+        if not raw_path:
+            return {}
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        payload_symbol = str(payload.get("symbol") or symbol_token).strip().upper()
+        if payload_symbol and payload_symbol != symbol_token:
+            return {}
+        payload_base = str(payload.get("base_source") or payload.get("source") or base_token).strip().lower().split(":", 1)[0]
+        if payload_base and payload_base != base_token:
+            return {}
+        direction = self._trading_central_parse_direction(
+            payload.get("direction") or payload.get("side") or payload.get("action") or payload.get("bias")
+        )
+        if direction not in {"long", "short"}:
+            return {}
+        entry_raw = payload.get("entry")
+        if entry_raw is None:
+            entry_raw = payload.get("entry_price")
+        if entry_raw is None:
+            entry_raw = payload.get("current_price")
+        if entry_raw is None:
+            entry_raw = payload.get("price")
+        stop_raw = payload.get("stop_loss")
+        if stop_raw is None:
+            stop_raw = payload.get("sl")
+        if stop_raw is None:
+            stop_raw = payload.get("stop")
+        entry: float | None = None
+        stop_loss: float | None = None
+        if (entry_raw is not None) and (stop_raw is not None):
+            try:
+                entry = float(entry_raw or 0.0)
+                stop_loss = float(stop_raw or 0.0)
+            except Exception:
+                return {}
+            if entry <= 0.0 or stop_loss <= 0.0:
+                return {}
+            if direction == "long" and stop_loss >= entry:
+                return {}
+            if direction == "short" and stop_loss <= entry:
+                return {}
+        elif (entry_raw is not None) or (stop_raw is not None):
+            return {}
+        confidence = None
+        try:
+            if payload.get("confidence") is not None:
+                confidence = float(payload.get("confidence") or 0.0)
+        except Exception:
+            confidence = None
+        min_conf = float(getattr(config, "TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE", 0.0) or 0.0)
+        if confidence is not None and confidence < min_conf:
+            return {}
+        max_age = max(60, int(getattr(config, "TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC", 7200) or 7200))
+        now_utc = datetime.now(timezone.utc)
+        updated_text = str(
+            payload.get("updated_at")
+            or payload.get("timestamp")
+            or payload.get("generated_at")
+            or ""
+        ).strip()
+        if updated_text:
+            try:
+                updated_dt = datetime.fromisoformat(updated_text.replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_sec = (now_utc - updated_dt.astimezone(timezone.utc)).total_seconds()
+                if age_sec > float(max_age):
+                    return {}
+            except Exception:
+                return {}
+        else:
+            try:
+                age_sec = now_utc.timestamp() - float(path.stat().st_mtime)
+            except Exception:
+                age_sec = float(max_age + 1)
+            if age_sec > float(max_age):
+                return {}
+        target = None
+        target_raw = payload.get("target")
+        if target_raw is None:
+            target_raw = payload.get("take_profit")
+        if target_raw is None:
+            target_raw = payload.get("tp")
+        if target_raw is not None:
+            try:
+                target = float(target_raw or 0.0)
+            except Exception:
+                target = None
+            if target is not None and target <= 0.0:
+                target = None
+        pivot = None
+        if payload.get("pivot") is not None:
+            try:
+                pivot = float(payload.get("pivot") or 0.0)
+            except Exception:
+                pivot = None
+            if pivot is not None and pivot <= 0.0:
+                pivot = None
+        entry_type = self._trading_central_parse_entry_type(
+            payload.get("entry_type") or payload.get("order_type"),
+            direction=direction,
+        )
+        provider = str(
+            payload.get("provider")
+            or payload.get("source_name")
+            or payload.get("publisher")
+            or "Trading Central"
+        ).strip()
+        analysis_type = str(payload.get("analysis_type") or payload.get("idea_type") or "intraday").strip().lower()
+        timeframe = str(payload.get("timeframe") or payload.get("horizon") or analysis_type or "").strip().lower()
+        return {
+            "symbol": payload_symbol,
+            "base_source": payload_base or base_token,
+            "direction": direction,
+            "entry": None if entry is None else round(float(entry), 6),
+            "stop_loss": None if stop_loss is None else round(float(stop_loss), 6),
+            "target": None if target is None else round(float(target), 6),
+            "pivot": None if pivot is None else round(float(pivot), 6),
+            "entry_type": entry_type,
+            "confidence": confidence,
+            "updated_at": updated_text,
+            "signal_id": str(payload.get("signal_id") or payload.get("id") or "").strip(),
+            "provider": provider,
+            "analysis_type": analysis_type,
+            "timeframe": timeframe,
+            "path": str(path),
+            "raw": dict(payload),
+        }
 
     def _load_mempalace_lane_payload(self, *, symbol: str, base_source: str) -> dict:
         if not bool(getattr(config, "MEMPALACE_FAMILY_ENABLED", False)):
@@ -3923,11 +4147,135 @@ class DexterScheduler:
             pass
         return shaped, lane_source
 
+    def _build_trading_central_family_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        family = str((candidate or {}).get("family") or self._trading_central_family_name()).strip().lower()
+        if not bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="family_disabled",
+                reason="TRADING_CENTRAL_FAMILY_ENABLED=0",
+            )
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        payload = self._load_trading_central_lane_payload(symbol=symbol, base_source=base_token)
+        if not payload:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="external_payload",
+                reason="trading_central_payload_missing_or_stale",
+            )
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        direction = str(payload.get("direction") or "").strip().lower()
+        entry_type = str(payload.get("entry_type") or "limit").strip().lower() or "limit"
+        payload_entry = payload.get("entry")
+        payload_stop = payload.get("stop_loss")
+        if payload_entry is None or payload_stop is None:
+            base_direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
+            if direction and base_direction and direction != base_direction:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="external_payload",
+                    reason="trading_central_direction_mismatch_without_price_plan",
+                )
+                return None, ""
+            direction = base_direction or direction
+            try:
+                payload_entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
+                payload_stop = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
+            except Exception:
+                payload_entry = 0.0
+                payload_stop = 0.0
+            if payload_entry <= 0.0 or payload_stop <= 0.0:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="signal_geometry",
+                    reason="trading_central_missing_price_plan_and_base_geometry",
+                )
+                return None, ""
+        try:
+            lane_signal.direction = direction
+        except Exception:
+            pass
+        confidence = payload.get("confidence")
+        if confidence is not None:
+            try:
+                lane_signal.confidence = float(confidence)
+            except Exception:
+                pass
+        shaped = self._apply_family_price_plan(
+            lane_signal,
+            family=family,
+            entry=float(payload_entry or 0.0),
+            stop_loss=float(payload_stop or 0.0),
+            entry_type=entry_type,
+        )
+        if shaped is None:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="price_plan",
+                reason="trading_central_apply_family_price_plan_returned_none",
+            )
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = base_token
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str(
+                (candidate or {}).get("strategy_id")
+                or getattr(config, "TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1")
+                or ""
+            )
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_family_trading_central"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["experimental_family"] = bool((candidate or {}).get("experimental"))
+            raw["xau_multi_tf_guard_bypass"] = True
+            raw["xau_multi_tf_guard_bypass_reason"] = "trading_central_intraday_bias_override"
+            raw["trading_central_payload"] = {
+                "provider": str(payload.get("provider") or ""),
+                "analysis_type": str(payload.get("analysis_type") or ""),
+                "timeframe": str(payload.get("timeframe") or ""),
+                "updated_at": str(payload.get("updated_at") or ""),
+                "signal_id": str(payload.get("signal_id") or ""),
+                "path": str(payload.get("path") or ""),
+                "entry_type": entry_type,
+                "entry": float(payload_entry or 0.0),
+                "stop_loss": float(payload_stop or 0.0),
+                "target": payload.get("target"),
+                "pivot": payload.get("pivot"),
+                "used_base_signal_geometry": bool(payload.get("entry") is None or payload.get("stop_loss") is None),
+            }
+            risk_override = float(getattr(config, "TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", 0.0) or 0.0)
+            if risk_override > 0.0:
+                raw["ctrader_risk_usd_override"] = risk_override
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
     def _build_family_canary_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
         family = str((candidate or {}).get("family") or "").strip().lower()
         if signal is None:
             return None, ""
-        xau_mtf_guard = self._xau_multi_tf_entry_guard(signal, family=family) if family.startswith("xau_scalp_") else {}
+        skip_xau_mtf_guard = family == self._trading_central_family_name()
+        xau_mtf_guard = (
+            self._xau_multi_tf_entry_guard(signal, family=family)
+            if family.startswith("xau_scalp_") and not skip_xau_mtf_guard
+            else {}
+        )
         if bool(xau_mtf_guard.get("blocked")):
             try:
                 raw = dict(getattr(signal, "raw_scores", {}) or {})
@@ -4035,6 +4383,21 @@ class DexterScheduler:
             return None, ""
         if family == self._mempalace_family_name():
             return self._build_mempalace_family_signal(signal, base_source=base_source, candidate=candidate)
+        if family == self._trading_central_family_name():
+            lane_signal, lane_source = self._build_trading_central_family_signal(signal, base_source=base_source, candidate=candidate)
+            if lane_signal is not None:
+                try:
+                    raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+                    raw["xau_multi_tf_guard"] = {
+                        "blocked": False,
+                        "allowed": True,
+                        "family": family,
+                        "reason": "trading_central_intraday_bias_override",
+                    }
+                    lane_signal.raw_scores = raw
+                except Exception:
+                    pass
+            return lane_signal, lane_source
         if family not in {"xau_scalp_pullback_limit", "xau_scalp_breakout_stop"}:
             return None, ""
         lane_signal = copy.deepcopy(signal)

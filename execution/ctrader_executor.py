@@ -624,6 +624,12 @@ class CTraderExecutor:
                 fam = str(getattr(config, "DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane") or "").strip().lower()
                 if fam:
                     return fam
+        if bool(getattr(config, "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED", False)):
+            tc_tokens = set(getattr(config, "get_dexter_trading_central_source_tokens", lambda: set())() or set())
+            if tc_tokens and any(tt in token for tt in tc_tokens):
+                fam = str(getattr(config, "DEXTER_TRADING_CENTRAL_FAMILY_NAME", "xau_scalp_trading_central_intraday") or "").strip().lower()
+                if fam:
+                    return fam
         if ":rr:" in token or "range_repair" in token:
             return "xau_scalp_range_repair"
         if ":td:" in token or "tick_depth_filter" in token:

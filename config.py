@@ -121,6 +121,15 @@ class Config:
     MEMPALACE_FAMILY_PRIORITY: int = int(os.getenv("MEMPALACE_FAMILY_PRIORITY", "165"))
     MEMPALACE_FAMILY_STRATEGY_ID: str = os.getenv("MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1")
     MEMPALACE_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("MEMPALACE_FAMILY_CTRADER_RISK_USD", "0.75"))
+    TRADING_CENTRAL_FAMILY_ENABLED: bool = os.getenv("TRADING_CENTRAL_FAMILY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS: str = os.getenv("TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS", "XAUUSD")
+    TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES: str = os.getenv("TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd")
+    TRADING_CENTRAL_FAMILY_SIGNAL_PATH: str = os.getenv("TRADING_CENTRAL_FAMILY_SIGNAL_PATH", "data/runtime/trading_central_intraday_signal.json")
+    TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC: int = int(os.getenv("TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC", "7200"))
+    TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE: float = float(os.getenv("TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE", "0"))
+    TRADING_CENTRAL_FAMILY_PRIORITY: int = int(os.getenv("TRADING_CENTRAL_FAMILY_PRIORITY", "166"))
+    TRADING_CENTRAL_FAMILY_STRATEGY_ID: str = os.getenv("TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1")
+    TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", "0.65"))
 
     # ── Fibonacci Advance (fibo_advance lane / xau_fibo_advance family) ────────
     FIBO_ADVANCE_ENABLED: bool = os.getenv("FIBO_ADVANCE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -436,6 +445,15 @@ class Config:
     DEXTER_MEMPALACE_FAMILY_LANE_ENABLED: bool = os.getenv("DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     DEXTER_MEMPALACE_FAMILY_NAME: str = os.getenv("DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane")
     DEXTER_MEMPALACE_SOURCE_TOKENS: str = os.getenv("DEXTER_MEMPALACE_SOURCE_TOKENS", "mempalace,mempalac")
+    DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED: bool = os.getenv(
+        "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED",
+        os.getenv("TRADING_CENTRAL_FAMILY_ENABLED", "0"),
+    ).strip().lower() in ("1", "true", "yes", "on")
+    DEXTER_TRADING_CENTRAL_FAMILY_NAME: str = os.getenv("DEXTER_TRADING_CENTRAL_FAMILY_NAME", "xau_scalp_trading_central_intraday")
+    DEXTER_TRADING_CENTRAL_SOURCE_TOKENS: str = os.getenv(
+        "DEXTER_TRADING_CENTRAL_SOURCE_TOKENS",
+        "trading_central,tradingcentral,:tc:",
+    )
     CTRADER_XAU_PRIMARY_FAMILY: str = os.getenv("CTRADER_XAU_PRIMARY_FAMILY", "")
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES: str = os.getenv(
@@ -2722,11 +2740,19 @@ class Config:
             fam = str(getattr(cls, "DEXTER_MEMPALACE_FAMILY_NAME", "") or "").strip().lower()
             if fam:
                 families.add(fam)
+        if bool(getattr(cls, "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED", False)):
+            fam = str(getattr(cls, "DEXTER_TRADING_CENTRAL_FAMILY_NAME", "") or "").strip().lower()
+            if fam:
+                families.add(fam)
         return families
 
     @classmethod
     def get_dexter_mempalace_source_tokens(cls) -> set[str]:
         return cls._parse_lower_set(cls.DEXTER_MEMPALACE_SOURCE_TOKENS)
+
+    @classmethod
+    def get_dexter_trading_central_source_tokens(cls) -> set[str]:
+        return cls._parse_lower_set(cls.DEXTER_TRADING_CENTRAL_SOURCE_TOKENS)
 
     @classmethod
     def get_ctrader_pm_impulse_families(cls) -> set[str]:

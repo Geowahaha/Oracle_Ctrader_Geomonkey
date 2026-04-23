@@ -4520,6 +4520,7 @@ class LiveProfileAutopilot:
             "fss": "xau_scalp_flow_short_sidecar",
             "rr": "xau_scalp_range_repair",
             "mmp": "xau_scalp_mempalace_lane",
+            "tc": "xau_scalp_trading_central_intraday",
             "bwl": "btc_weekday_lob_momentum",
             "ewp": "eth_weekday_overlap_probe",
             "xau_scalp_pullback_limit": "xau_scalp_pullback_limit",
@@ -4530,6 +4531,7 @@ class LiveProfileAutopilot:
             "xau_scalp_flow_short_sidecar": "xau_scalp_flow_short_sidecar",
             "xau_scalp_range_repair": "xau_scalp_range_repair",
             "xau_scalp_mempalace_lane": "xau_scalp_mempalace_lane",
+            "xau_scalp_trading_central_intraday": "xau_scalp_trading_central_intraday",
             "btc_weekday_lob_momentum": "btc_weekday_lob_momentum",
             "eth_weekday_overlap_probe": "eth_weekday_overlap_probe",
         }

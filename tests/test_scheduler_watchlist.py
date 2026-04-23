@@ -1364,6 +1364,47 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertEqual(int(mem_row.get("priority", 0) or 0), 111)
         self.assertEqual(str(mem_row.get("source") or ""), "mempalace_payload")
 
+    def test_strategy_family_candidates_include_trading_central_payload_when_enabled(self):
+        dexter = scheduler_module.DexterScheduler()
+        payload = {"candidates": []}
+        trading_central_payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry": 4748.33,
+            "stop_loss": 4715.0,
+            "target": 4830.0,
+            "entry_type": "limit",
+            "confidence": 74.0,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-test-01",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-test-01"},
+        }
+        with patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", True), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 2), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_PRIORITY", 112), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1"), \
+             patch.object(scheduler_module.config, "get_persistent_canary_experimental_families", return_value=set()), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_active_families", return_value=set()), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=trading_central_payload), \
+             patch.object(scheduler_module.Path, "exists", return_value=True), \
+             patch.object(scheduler_module.Path, "read_text", return_value=json.dumps(payload)):
+            rows = dexter._load_strategy_family_candidates(symbol="XAUUSD", base_source="scalp_xauusd")
+
+        families = [str(row.get("family") or "") for row in rows]
+        self.assertIn("xau_scalp_trading_central_intraday", families)
+        tc_row = next(row for row in rows if str(row.get("family") or "") == "xau_scalp_trading_central_intraday")
+        self.assertTrue(bool(tc_row.get("experimental")))
+        self.assertEqual(str(tc_row.get("strategy_id") or ""), "xau_scalp_trading_central_intraday_v1")
+        self.assertEqual(int(tc_row.get("priority", 0) or 0), 112)
+        self.assertEqual(str(tc_row.get("source") or ""), "trading_central_payload")
+
     def test_strategy_family_candidates_reserve_flow_short_sidecar_when_opportunity_sidecar_active(self):
         dexter = scheduler_module.DexterScheduler()
         payload = {
@@ -2049,6 +2090,105 @@ class SchedulerWatchlistTests(unittest.TestCase):
         raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
         self.assertTrue(bool((raw.get("mempalace_family_payload") or {}).get("used_base_signal_geometry")))
         self.assertEqual(str((raw.get("mempalace_family_payload") or {}).get("signal_id") or ""), "mmp-2")
+
+    def test_build_family_canary_signal_for_trading_central_payload_bypasses_mtf_guard(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=71.0)
+        sig.direction = "short"
+        sig.entry = 4746.0
+        sig.stop_loss = 4752.0
+        sig.take_profit_1 = 4741.0
+        sig.take_profit_2 = 4736.0
+        sig.take_profit_3 = 4731.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_trading_central_intraday",
+            "strategy_id": "xau_scalp_trading_central_intraday_v1",
+            "priority": 156,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry": 4748.33,
+            "stop_loss": 4715.0,
+            "target": 4830.0,
+            "entry_type": "limit",
+            "confidence": 74.0,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-1",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-1"},
+        }
+        with patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", 0.61), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=payload), \
+             patch.object(dexter, "_xau_multi_tf_entry_guard", return_value={"blocked": True, "reason": "mtf_unit_test"}) as mtf_guard:
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:tc:canary")
+        self.assertEqual(str(getattr(lane_signal, "direction", "")), "long")
+        mtf_guard.assert_not_called()
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertEqual(str(raw.get("strategy_family") or ""), "xau_scalp_trading_central_intraday")
+        self.assertEqual(str(raw.get("strategy_family_executor") or ""), "scheduler_canary_family_trading_central")
+        self.assertTrue(bool(raw.get("xau_multi_tf_guard_bypass")))
+        self.assertEqual(str((raw.get("trading_central_payload") or {}).get("signal_id") or ""), "tc-1")
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0), 0.61, places=3)
+
+    def test_build_family_canary_signal_for_trading_central_payload_without_price_plan_uses_base_geometry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=73.0)
+        sig.direction = "long"
+        sig.entry = 4748.0
+        sig.stop_loss = 4742.0
+        sig.take_profit_1 = 4752.0
+        sig.take_profit_2 = 4756.0
+        sig.take_profit_3 = 4762.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_trading_central_intraday",
+            "strategy_id": "xau_scalp_trading_central_intraday_v1",
+            "priority": 156,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "confidence": 74.5,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-2",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-2"},
+        }
+        with patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:tc:canary")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertTrue(bool((raw.get("trading_central_payload") or {}).get("used_base_signal_geometry")))
+        self.assertEqual(str((raw.get("trading_central_payload") or {}).get("signal_id") or ""), "tc-2")
 
     def test_build_family_canary_signal_for_tick_depth_filter_uses_capture_gate(self):
         dexter = scheduler_module.DexterScheduler()

@@ -1,0 +1,16 @@
+{
+  "provider": "Trading Central",
+  "analysis_type": "intraday",
+  "timeframe": "5m",
+  "symbol": "XAUUSD",
+  "base_source": "scalp_xauusd",
+  "direction": "long",
+  "entry": 4748.33,
+  "stop_loss": 4715.0,
+  "target": 4830.0,
+  "entry_type": "limit",
+  "confidence": 74.0,
+  "updated_at": "2026-04-22T16:11:00+07:00",
+  "signal_id": "tc-example-20260422-1611",
+  "producer": "learning.trading_central_payload_producer"
+}
