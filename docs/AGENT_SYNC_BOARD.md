@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **E** — reversal-zone capture + Fib `61.8` template gate deployed on VM |
-| **Last updated (UTC)** | 2026-04-22T14:25Z |
+| **Phase now** | **E** — reversal-zone capture + Fib `61.8` template gate live; Trading Central intraday canary lane + payload producer deployed to VM (experimental) |
+| **Last updated (UTC)** | 2026-04-23T08:45Z |
 | **Last updated by** | codex |
 
 ---
@@ -37,7 +37,7 @@
 
 ## Owner — latest (≤1 paragraph)
 
-**2026-04-22:** Live bundle deployed on `deploy-xau-family-canary` at commit `323342e`: targeted XAU reversal-zone capture (`armed` + `confirmed`) now writes tagged capture events for dataset mining, and Fib `61.8/0.65` entries now require reversal-template fit when capture is available. Local verification passed (`py_compile`, reversal dataset tests, new Fib template tests, full Fib regression `90 passed`), VM pulled the commit and `dexter-monitor` restarted `active`; residual journal warning is the pre-existing stale auth token check, not a startup failure.
+**2026-04-23:** Trading Central intraday canary lane is now deployed on the VM (commit `213cd3e`) as experimental-only. New module `learning/trading_central_payload_producer.py` normalizes Trading Central panel text / raw JSON into `data/runtime/trading_central_intraday_signal.json`, and the scheduler can execute `xau_scalp_trading_central_intraday` via `scalp_xauusd:tc:canary` (family-level MTF guard bypass applies only to this lane). VM demo test trade succeeded (ORDER_ACCEPTED) after increasing VM `.env.local` `CTRADER_EXECUTOR_TIMEOUT_SEC` from `25` to `60` and restarting `dexter-monitor` (timeouts were blocking `:tc:` executions).
 
 ---
 
@@ -76,6 +76,24 @@ Format each entry:
 - Verification before deploy: `python -m py_compile ...`, `pytest tests/test_reversal_training_dataset.py tests/test_fibo_reversal_template_gate.py`, and full `tests/test_fibo_*.py` (`90 passed`).
 - VM post-restart note: journal shows pre-existing `infra.auth_health` stale-token warning; no traceback/module import failure from this rollout.
 - Next peer: watch new rows in `ctrader_reversal_capture_events`, then mine targeted reversal templates after 1-3 sessions of XAU flow.
+
+### 2026-04-22 UTC 14:44Z — codex — Phase E
+
+- Added local-only Trading Central intraday canary family lane `xau_scalp_trading_central_intraday`.
+- New lane design: external JSON payload input at `data/runtime/trading_central_intraday_signal.json`, source alias `scalp_xauusd:tc:canary`, family-level MTF guard bypass only for this lane, and fallback to base signal geometry when Trading Central provides direction without a full price plan.
+- Updated config/source mapping in `config.py`, `execution/ctrader_executor.py`, `learning/live_profile_autopilot.py`, and `scheduler.py`; added example payload file plus focused tests.
+- Verification: `py_compile` on changed files, `pytest tests/test_trading_central_family_lane.py tests/test_mempalace_family_lane.py`, and `pytest tests/test_scheduler_watchlist.py -k "mempalace_payload or trading_central"` all passed.
+- Next peer: if user wants VM rollout, wire the upstream Trading Central payload producer first, then deploy this lane as experimental only and monitor `:tc:canary` fills separately from existing families.
+
+### 2026-04-23 UTC 08:45Z — codex — Phase E
+
+- VM rollout: head is now `213cd3e` ("Add Trading Central intraday canary producer"); `dexter-monitor` active.
+- Producer output path: `data/runtime/trading_central_intraday_signal.json` (see `docs/trading_central_intraday_signal.example.json`).
+- Live test (DEMO, non-dry-run): executed one `scalp_xauusd:tc:canary` market BUY; broker response `ORDER_ACCEPTED` with `order_id=959356719` and `position_id=610034895`.
+- Operational issue: repeated `worker timeout after 25s` blocked execution and cTrader sync; fixed by updating VM `/opt/dexter_pro/.env.local`:
+- `CTRADER_EXECUTOR_TIMEOUT_SEC=60`
+- `CTRADER_HEALTHCHECK_TIMEOUT_SEC=45`
+- and restarting `dexter-monitor`.
 
 ---
 
