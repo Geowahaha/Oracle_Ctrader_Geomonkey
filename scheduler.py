@@ -1503,6 +1503,11 @@ class DexterScheduler:
                 return False, "xau_scheduled_trap_guard_block"
             if bool(scheduled_raw.get("xau_guard_no_chase")):
                 return False, "xau_scheduled_no_chase_block"
+            if (
+                str(scheduled_raw.get("engine") or "").strip().lower() == "behavioral_fallback_v2"
+                and bool(scheduled_raw.get("xau_guard_sweep"))
+            ):
+                return False, "xau_scheduled_sweep_trap_block"
             try:
                 _np_bypass = float(scheduled_raw.get("neural_probability", 0.0) or 0.0)
                 _np_threshold = float(getattr(config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85) or 0.85)
@@ -1617,7 +1622,7 @@ class DexterScheduler:
         raw["ctrader_pre_dispatch_requested_source"] = str(requested_source or "")
         raw["ctrader_pre_dispatch_dispatch_source"] = str(dispatch_source or "")
         raw["ctrader_pre_dispatch_trace_tag"] = str(trace.get("tag", "-") or "-")
-        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}:
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}:
             raw["xau_scheduled_late_entry_blocked"] = True
             raw["xau_scheduled_late_entry_block_reason"] = reason_token
         if dispatch_meta:
@@ -1667,7 +1672,7 @@ class DexterScheduler:
                 f"gate:{gate_token}",
             ],
         }
-        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}:
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}:
             execution_meta["audit_tags"].extend([
                 "xau_scheduled_late_entry_block",
                 f"late_entry_reason:{reason_token}",

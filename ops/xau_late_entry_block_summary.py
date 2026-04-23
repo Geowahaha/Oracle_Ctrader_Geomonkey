@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DB = Path("data/ctrader_openapi.db")
-LATE_REASONS = {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}
+LATE_REASONS = {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}
 
 
 def _safe_json(text: str | None) -> dict[str, Any]:

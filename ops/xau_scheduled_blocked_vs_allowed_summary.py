@@ -27,7 +27,7 @@ from typing import Any
 
 DEFAULT_DB = Path("data/ctrader_openapi.db")
 SCHEDULED_SOURCES = {"xauusd_scheduled:canary", "xauusd_scheduled:winner"}
-LATE_REASONS = {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block"}
+LATE_REASONS = {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}
 ALLOWED_STATUSES = {"accepted", "executed", "placed", "filled", "ok", "dry_run"}
 
 

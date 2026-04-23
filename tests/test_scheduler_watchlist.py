@@ -5094,6 +5094,44 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "xau_scheduled_no_chase_block")
 
+    def test_xau_scheduled_guard_blocks_sweep_trap_signal(self):
+        """Recent losing scheduled rows had sweep=True while the winner had sweep=False; block this trap before dispatch."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=81.9)
+        sig.direction = "long"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "engine": "behavioral_fallback_v2",
+            "signal_d1_trend": "bullish",
+            "signal_h4_trend": "bullish",
+            "signal_h1_trend": "bullish",
+            "xau_guard_sweep": True,
+            "xau_guard_no_chase": False,
+            "xau_guard_blocked": False,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bullish",
+                "h4_trend": "bullish",
+                "h1_trend": "bullish",
+                "strict_aligned_side": "long",
+                "strict_alignment": "aligned_bullish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_sweep_trap_block")
+
     # --- Canary family BE config defaults ---
 
     def test_canary_family_be_config_defaults(self):
