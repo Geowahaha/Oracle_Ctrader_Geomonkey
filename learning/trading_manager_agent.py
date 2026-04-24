@@ -1713,6 +1713,7 @@ class TradingManagerAgent:
         freeze_min = max(10, int(getattr(config, "TRADING_MANAGER_PRE_EVENT_FREEZE_MIN", 20) or 20))
         urgent_event = any(int(ev.get("minutes_to_event", 9999) or 9999) <= freeze_min for ev in list(upcoming_events or []))
         severe_loss = bool(int(losses.get("resolved", 0) or 0) > 0 and float(losses.get("pnl_usd", 0.0) or 0.0) < 0.0)
+        swarm_override_allowed = bool(swarm_enabled and swarm_active and not urgent_event and not severe_loss)
         preferred_same = self._family_from_bucket(best_same_situation)
         preferred_leader = self._family_from_bucket(best_family_today)
         memory_family = str((winner_memory_reference or {}).get("family") or "").strip().lower()
@@ -1733,7 +1734,10 @@ class TradingManagerAgent:
         )
         current_active = [fam for fam in current_active if fam in allowed] or list(allowed)
 
-        if swarm_enabled and swarm_active:
+        # Swarm sampling is useful for broad collection, but it must not override
+        # active caution states. In live loss windows we want concentration, not
+        # more concurrent family exposure.
+        if swarm_enabled and swarm_active and not urgent_event and not severe_loss:
             desired_active = [fam for fam in list(swarm_active or []) if fam in allowed] or list(current_active or allowed)
             current_active_set = {fam for fam in list(current_active or []) if fam}
             desired_active_set = {fam for fam in list(desired_active or []) if fam}
@@ -1766,7 +1770,7 @@ class TradingManagerAgent:
             mode = "pre_event_caution"
             primary = _valid_family(getattr(config, "TRADING_MANAGER_XAU_PRE_EVENT_PRIMARY_FAMILY", "xau_scalp_pullback_limit"))
             active = [fam for fam in self._parse_family_csv(getattr(config, "TRADING_MANAGER_XAU_PRE_EVENT_ACTIVE_FAMILIES", "xau_scalp_pullback_limit")) if fam in allowed]
-            if swarm_enabled and swarm_active:
+            if swarm_override_allowed:
                 active = list(swarm_active)
             next_event = dict((upcoming_events or [{}])[0] or {})
             reason = f"upcoming event {str(next_event.get('title') or '-')[:80]} in {int(next_event.get('minutes_to_event', 0) or 0)}m"
@@ -1774,7 +1778,7 @@ class TradingManagerAgent:
             mode = "shock_demote"
             primary = _valid_family(getattr(config, "TRADING_MANAGER_XAU_SHOCK_PRIMARY_FAMILY", "xau_scalp_pullback_limit"))
             active = [fam for fam in self._parse_family_csv(getattr(config, "TRADING_MANAGER_XAU_SHOCK_ACTIVE_FAMILIES", "xau_scalp_pullback_limit")) if fam in allowed]
-            if swarm_enabled and swarm_active:
+            if swarm_override_allowed:
                 active = list(swarm_active)
             reason = (
                 f"shock losses {int(losses.get('losses', 0) or 0)}/{int(losses.get('resolved', 0) or 0)} "
@@ -1827,7 +1831,7 @@ class TradingManagerAgent:
                     )
                     if fam in allowed
                 ]
-                if swarm_enabled and swarm_active:
+                if swarm_override_allowed:
                     active = list(swarm_active)
                 if scheduled_support_mode == "calibration_fallback":
                     reason = (
@@ -1859,7 +1863,7 @@ class TradingManagerAgent:
                 if promotion_family:
                     primary = promotion_family
                     active = [promotion_family]
-                    if swarm_enabled and swarm_active:
+                    if swarm_override_allowed:
                         active = list(swarm_active)
 
         primary = _valid_family(primary)
@@ -1872,13 +1876,12 @@ class TradingManagerAgent:
             return {}
         if not mode:
             return {}
-        if swarm_enabled:
+        if swarm_override_allowed:
             if current_primary:
                 primary = current_primary
             change_keys.discard("CTRADER_XAU_PRIMARY_FAMILY")
             change_keys.discard("PERSISTENT_CANARY_STRATEGY_FAMILIES")
-            if swarm_active:
-                active = list(swarm_active)
+            active = list(swarm_active)
         demoted = [fam for fam in current_active if fam not in active]
         promoted = [fam for fam in active if fam not in current_active or fam == primary]
         changes = {}

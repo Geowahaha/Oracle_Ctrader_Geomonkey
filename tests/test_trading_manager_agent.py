@@ -565,6 +565,33 @@ class TradingManagerAgentTests(unittest.TestCase):
         self.assertEqual(str((routing.get("changes") or {}).get("CTRADER_XAU_PRIMARY_FAMILY") or ""), "")
         self.assertEqual(str((routing.get("changes") or {}).get("CTRADER_XAU_ACTIVE_FAMILIES") or ""), swarm_families)
 
+    def test_trading_manager_swarm_support_yields_to_severe_loss(self):
+        swarm_families = "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up"
+        with patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", True, create=True), \
+             patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES", swarm_families, create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_PRIMARY_FAMILY", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.PERSISTENT_CANARY_STRATEGY_FAMILIES", swarm_families, create=True), \
+             patch.object(self.agent, "_current_value", side_effect=lambda key: {"CTRADER_XAU_PRIMARY_FAMILY": "xau_scalp_pullback_limit", "CTRADER_XAU_ACTIVE_FAMILIES": "xau_scalp_pullback_limit", "PERSISTENT_CANARY_STRATEGY_FAMILIES": swarm_families}.get(key, "")):
+            rec = self.agent._derive_xau_family_routing_recommendation(
+                selected_family="xau_scalp_pullback_limit",
+                shock={},
+                losses={"resolved": 5, "losses": 4, "pnl_usd": -12.5},
+                pb_source_stats={},
+                scheduled_source_stats={},
+                scheduled_family_calibration={},
+                best_same_situation={},
+                best_family_today={},
+                winner_memory_reference={},
+                upcoming_events=[],
+                post_event_learning=[],
+            )
+
+        self.assertEqual(str(rec.get("mode") or ""), "shock_demote")
+        self.assertNotEqual(str(rec.get("mode") or ""), "swarm_support_all")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_PRIMARY_FAMILY") or ""), "xau_scalp_pullback_limit")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_ACTIVE_FAMILIES") or ""), "xau_scalp_pullback_limit")
+
     def test_trading_manager_swarm_support_mode_does_not_flag_selected_family_lag(self):
         (self.report_dir / "mission_progress_report.json").write_text(
             json.dumps({"symbols": [{"symbol": "XAUUSD", "selected_family": "xau_scheduled_trend", "selected_regime": "trend_priority"}]}),
