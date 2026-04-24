@@ -7,6 +7,8 @@ class _DummyExecutor:
     _apply_fibo_phase_extension = CTraderExecutor._apply_fibo_phase_extension
     _target_valid_for_position = staticmethod(CTraderExecutor._target_valid_for_position)
     _stop_valid_for_position = staticmethod(CTraderExecutor._stop_valid_for_position)
+    _apply_fibo_winner_pm_profile = staticmethod(CTraderExecutor._apply_fibo_winner_pm_profile)
+    _fibo_partial_close_volume = staticmethod(CTraderExecutor._fibo_partial_close_volume)
 
 
 class TestFiboPhasePmExecutor(unittest.TestCase):
@@ -60,6 +62,19 @@ class TestFiboPhasePmExecutor(unittest.TestCase):
         pm = CTraderExecutor._fibo_phase_pm_profile({"phase": "impulse_restart", "winner_eligible": True})
         self.assertTrue(pm["winner_profile"])
         self.assertGreater(pm["live_extension_step_mult"], 1.0)
+
+    def test_winner_lane_profile_is_looser_than_base(self):
+        dummy = _DummyExecutor()
+        base = CTraderExecutor._fibo_phase_pm_profile({"phase": "impulse_restart", "winner_eligible": False})
+        winner = dummy._apply_fibo_winner_pm_profile("fibo_xauusd:winner", base)
+        self.assertTrue(winner["winner_profile"])
+        self.assertGreater(winner["live_extension_step_mult"], base["live_extension_step_mult"])
+        self.assertGreater(winner["time_lock_be_min_mult"], base["time_lock_be_min_mult"])
+
+    def test_partial_close_volume_keeps_remainder_tradeable(self):
+        dummy = _DummyExecutor()
+        self.assertEqual(dummy._fibo_partial_close_volume(4000, 0.25, min_volume=1000, step=1000), 1000)
+        self.assertEqual(dummy._fibo_partial_close_volume(1000, 0.50, min_volume=1000, step=1000), 0)
 
 
 if __name__ == "__main__":

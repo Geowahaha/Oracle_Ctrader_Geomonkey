@@ -910,6 +910,77 @@ class CTraderExecutor:
         return out
 
     @staticmethod
+    def _apply_fibo_winner_pm_profile(source: str, phase_pm: dict) -> dict:
+        out = dict(phase_pm or {})
+        src = str(source or "").strip().lower()
+        if not src.endswith(":winner"):
+            return out
+        out["winner_profile"] = True
+        out["time_lock_be_min_mult"] = max(1.0, _safe_float(out.get("time_lock_be_min_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_TIME_LOCK_BE_MULT", 1.25), 1.25))
+        out["time_lock_pct_mult"] = min(1.10, _safe_float(out.get("time_lock_pct_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_TIME_LOCK_PCT_MULT", 0.90), 0.90))
+        out["exhaustion_lock_pct_mult"] = min(1.05, _safe_float(out.get("exhaustion_lock_pct_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXHAUSTION_LOCK_PCT_MULT", 0.90), 0.90))
+        out["exhaustion_required_signals_delta"] = int(out.get("exhaustion_required_signals_delta", 0) or 0) + int(getattr(config, "FIBO_PM_WINNER_EXHAUSTION_REQUIRED_SIGNALS_DELTA", 1) or 1)
+        out["live_extension_step_mult"] = max(1.20, _safe_float(out.get("live_extension_step_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXTENSION_STEP_MULT", 1.25), 1.25))
+        out["live_extension_lock_r_mult"] = max(1.05, _safe_float(out.get("live_extension_lock_r_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXTENSION_LOCK_MULT", 1.10), 1.10))
+        return out
+
+    @staticmethod
+    def _fibo_pm_action_seen(journal_row: Optional[sqlite3.Row], *action_prefixes: str) -> bool:
+        row = dict(journal_row or {}) if journal_row is not None else {}
+        execution_meta = CTraderExecutor._safe_json_load(str(row.get("execution_meta_json", "") or ""))
+        audit = [dict(item or {}) for item in list(execution_meta.get("position_manager_audit") or []) if isinstance(item, dict)]
+        tags = [str(tag or "").strip().lower() for tag in list(execution_meta.get("audit_tags") or []) if str(tag or "").strip()]
+        wanted = tuple(str(prefix or "").strip().lower() for prefix in action_prefixes if str(prefix or "").strip())
+        if not wanted:
+            return False
+        for tag in tags:
+            if any(tag.startswith(prefix) for prefix in wanted):
+                return True
+        for item in audit:
+            action = str(item.get("action") or "").strip().lower()
+            if any(action.startswith(prefix) for prefix in wanted):
+                return True
+        return False
+
+    @staticmethod
+    def _fibo_partial_close_volume(volume: int, pct: float, min_volume: int = 1000, step: int = 1000) -> int:
+        total = max(0, int(volume or 0))
+        if total <= 0:
+            return 0
+        min_volume = max(1, int(min_volume or 1))
+        step = max(1, int(step or 1))
+        target = int(total * max(0.05, min(0.95, float(pct or 0.0))))
+        if target < min_volume:
+            target = min_volume
+        target = (target // step) * step
+        if target <= 0:
+            target = min_volume
+        if total - target < min_volume:
+            return 0
+        return min(total, target)
+
+    @staticmethod
+    def _enrich_fibo_pm_action(action: dict, *, phase_pm: dict, entry: float, stop_loss: float, current_price: float) -> dict:
+        out = dict(action or {})
+        details = dict(out.get("details") or {})
+        risk = abs(entry - stop_loss)
+        new_sl = _safe_float(out.get("new_stop_loss"), 0.0)
+        new_tp = _safe_float(out.get("new_take_profit"), 0.0)
+        if risk > 0:
+            if new_sl > 0:
+                if current_price >= new_sl:
+                    details["giveback_r_buffer"] = round(max(0.0, current_price - new_sl) / risk, 4)
+                else:
+                    details["giveback_r_buffer"] = round(max(0.0, new_sl - current_price) / risk, 4)
+                details["locked_r"] = round(max(0.0, abs(new_sl - entry)) / risk, 4)
+            if new_tp > 0:
+                details["target_r"] = round(max(0.0, abs(new_tp - entry)) / risk, 4)
+        details.setdefault("phase", str(phase_pm.get("phase") or "unknown"))
+        details.setdefault("winner_profile", bool(phase_pm.get("winner_profile")))
+        out["details"] = details
+        return out
+
+    @staticmethod
     def _worker_price_symbol(symbol: str) -> str:
         token = str(symbol or "").strip().upper()
         if token == "ETHUSD":
@@ -4516,7 +4587,11 @@ class CTraderExecutor:
         tracked_actions = [
             dict(item or {})
             for item in list(pm_actions or [])
-            if str((item or {}).get("action") or "").strip().lower().startswith("xau_profit_extension")
+            if (
+                str((item or {}).get("action") or "").strip().lower().startswith("xau_profit_extension")
+                or str((item or {}).get("action") or "").strip().lower().startswith("fibo_")
+                or str((item or {}).get("action") or "").strip().lower() == "xau_momentum_exhaustion_lock"
+            )
         ]
         if not tracked_actions:
             return 0
@@ -4572,7 +4647,10 @@ class CTraderExecutor:
                 ]
                 pm_audit.append(audit_entry)
                 execution_meta["position_manager_audit"] = pm_audit[-12:]
-                execution_meta["xau_profit_extension"] = audit_entry
+                if action_name.startswith("xau_profit_extension"):
+                    execution_meta["xau_profit_extension"] = audit_entry
+                elif action_name.startswith("fibo_") or action_name == "xau_momentum_exhaustion_lock":
+                    execution_meta["fibo_phase_pm"] = audit_entry
                 conn.execute(
                     "UPDATE execution_journal SET execution_meta_json=? WHERE id=?",
                     (json.dumps(execution_meta, ensure_ascii=True, separators=(",", ":")), journal_id),
@@ -6334,7 +6412,7 @@ class CTraderExecutor:
             # ----------------------------------
 
             fibo_phase_ctx = self._fibo_phase_context_from_journal(journal_row)
-            fibo_phase_pm = self._fibo_phase_pm_profile(fibo_phase_ctx)
+            fibo_phase_pm = self._apply_fibo_winner_pm_profile(source, self._fibo_phase_pm_profile(fibo_phase_ctx))
 
             # ── Fibo time-based profit lock (runs before active defense) ────
             if "fibo" in source and bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)) and r_now is not None and r_now > 0:
@@ -6380,14 +6458,14 @@ class CTraderExecutor:
                         if bool(res.ok):
                             report["amended_positions"] += 1
                             _tier_label = "be" if _lock_pct <= 0 else ("lock_%d" % int(_lock_pct * 100))
-                            report["pm_actions"].append({
+                            report["pm_actions"].append(self._enrich_fibo_pm_action({
                                 "position_id": position_id, "source": source, "symbol": symbol,
                                 "action": "fibo_time_profit_lock_%s" % _tier_label,
                                 "reference_price": round(ref, 4), "new_stop_loss": round(_new_sl, 4),
                                 "r_now": round(float(r_now), 4), "age_min": round(float(age_min), 1),
                                 "lock_pct": _lock_pct, "profit_pts": round(_profit_pts, 2),
                                 "phase": str(fibo_phase_pm.get("phase") or "unknown"),
-                            })
+                            }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                             logger.info(
                                 "[PM:FiboTimeLock] pos=%s %s %s | age=%.0fm | profit=%.1fpts | lock=%d%% | new_sl=%.2f",
                                 position_id, symbol, direction, age_min, _profit_pts, int(_lock_pct * 100), _new_sl,
@@ -6531,7 +6609,7 @@ class CTraderExecutor:
                                 )
                                 if bool(_exh_res.ok):
                                     report["amended_positions"] += 1
-                                    report["pm_actions"].append({
+                                    report["pm_actions"].append(self._enrich_fibo_pm_action({
                                         "journal_id": (journal_id or None),
                                         "position_id": position_id,
                                         "source": source,
@@ -6541,7 +6619,7 @@ class CTraderExecutor:
                                         "new_stop_loss": round(_exh_new_sl, 4),
                                         "r_now": round(float(r_now), 4),
                                         "details": dict(exhaustion.get("details") or {}),
-                                    })
+                                    }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                                     logger.info(
                                         "[PM:ExhaustionLock] pos=%s %s %s | r_now=%.2f | new_sl=%.2f",
                                         position_id, symbol, direction, r_now, _exh_new_sl,
@@ -6549,6 +6627,97 @@ class CTraderExecutor:
                                     continue
                 except Exception as _exh_exc:
                     logger.debug("[PM] momentum_exhaustion_lock error for %s: %s", symbol, _exh_exc)
+
+            if (
+                "fibo" in source
+                and bool(getattr(config, "FIBO_PM_PARTIAL_BANK_ENABLED", True))
+                and r_now is not None
+                and r_now > 0
+                and not self._fibo_pm_action_seen(journal_row, "fibo_partial_bank")
+            ):
+                _phase = str(fibo_phase_pm.get("phase") or "unknown")
+                _winner = bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner")
+                _partial_trigger_r = (
+                    _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_IMPULSE_RESTART_TRIGGER_R", 1.45), 1.45)
+                    if _phase == "impulse_restart"
+                    else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_CORRECTION_END_TRIGGER_R", 0.85), 0.85)
+                )
+                _partial_trigger_r = _safe_float(fibo_phase_pm.get("partial_bank_trigger_r"), _partial_trigger_r)
+                if _phase in {"correction_end", "impulse_restart"} and float(r_now) >= float(_partial_trigger_r):
+                    _partial_pct = (
+                        _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_WINNER_PCT", 0.25), 0.25)
+                        if _winner
+                        else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_BASE_PCT", 0.35), 0.35)
+                    )
+                    _partial_pct = _safe_float(fibo_phase_pm.get("partial_bank_pct"), _partial_pct)
+                    _partial_volume = self._fibo_partial_close_volume(
+                        volume,
+                        _partial_pct,
+                        int(getattr(config, "FIBO_PM_MIN_PARTIAL_VOLUME", 1000) or 1000),
+                        int(getattr(config, "FIBO_PM_PARTIAL_VOLUME_STEP", 1000) or 1000),
+                    )
+                    if _partial_volume > 0:
+                        _partial_res = self.close_position(position_id=position_id, volume=_partial_volume)
+                        if bool(_partial_res.ok):
+                            _lock_r = (
+                                _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_WINNER_LOCK_R", 0.25), 0.25)
+                                if _winner
+                                else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_BASE_LOCK_R", 0.12), 0.12)
+                            )
+                            _lock_r = _safe_float(fibo_phase_pm.get("partial_bank_lock_r"), _lock_r)
+                            _bank_sl = entry + (risk * _lock_r) if direction == "long" else entry - (risk * _lock_r)
+                            _bank_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else planned_tp
+                            if _phase == "correction_end" and risk > 0:
+                                _bank_tp = max(ref + (risk * 0.30), _bank_tp) if direction == "long" else (min(ref - (risk * 0.30), _bank_tp) if self._target_valid_for_position(direction, entry, _bank_tp) else (ref - (risk * 0.30)))
+                            _bank_amend_ok = False
+                            _bank_action_name = f"fibo_partial_bank_{_phase}"
+                            _bank_action_sl = 0.0
+                            _bank_action_tp = 0.0
+                            if self._stop_valid_for_position(direction, entry, _bank_sl):
+                                _bank_amend = self.amend_position_sltp(
+                                    position_id=position_id,
+                                    stop_loss=_bank_sl,
+                                    take_profit=_bank_tp if self._target_valid_for_position(direction, entry, _bank_tp) else 0.0,
+                                    trailing_stop_loss=False,
+                                )
+                                _bank_amend_ok = bool(_bank_amend.ok)
+                                if _bank_amend_ok:
+                                    report["amended_positions"] += 1
+                                    _bank_action_sl = round(_bank_sl, 4)
+                                    _bank_action_tp = round(_bank_tp, 4) if self._target_valid_for_position(direction, entry, _bank_tp) else 0.0
+                                else:
+                                    _bank_action_name = f"fibo_partial_bank_close_only_{_phase}"
+                            else:
+                                _bank_action_name = f"fibo_partial_bank_close_only_{_phase}"
+                            _bank_action = self._enrich_fibo_pm_action(
+                                {
+                                    "journal_id": (journal_id or None),
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": _bank_action_name,
+                                    "reference_price": round(ref, 4),
+                                    "new_stop_loss": _bank_action_sl,
+                                    "new_take_profit": _bank_action_tp,
+                                    "r_now": round(float(r_now), 4),
+                                    "age_min": round(float(age_min), 4),
+                                    "details": {
+                                        "trigger": "phase_partial_bank",
+                                        "partial_close_volume": int(_partial_volume),
+                                        "partial_close_pct": round(float(_partial_pct), 4),
+                                        "phase": _phase,
+                                        "winner_profile": _winner,
+                                        "partial_trigger_r": round(float(_partial_trigger_r), 4),
+                                        "amend_ok": _bank_amend_ok,
+                                    },
+                                },
+                                phase_pm=fibo_phase_pm,
+                                entry=entry,
+                                stop_loss=stop_loss,
+                                current_price=ref,
+                            )
+                            report["pm_actions"].append(_bank_action)
+                            continue
 
             planned_tp_valid = self._target_valid_for_position(direction, entry, planned_tp)
             live_tp_valid = self._target_valid_for_position(direction, entry, live_tp)
@@ -6600,7 +6769,7 @@ class CTraderExecutor:
                     )
                     if bool(res.ok):
                         report["amended_positions"] += 1
-                        report["pm_actions"].append({
+                        report["pm_actions"].append(self._enrich_fibo_pm_action({
                             "journal_id": (journal_id or None),
                             "position_id": position_id,
                             "source": source,
@@ -6617,7 +6786,7 @@ class CTraderExecutor:
                                 "phase": str(fibo_phase_pm.get("phase") or "unknown"),
                                 "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
                             },
-                        })
+                        }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                         continue
                 if "fibo" in source and str(fibo_phase_pm.get("phase") or "") == "correction_end" and r_now is not None and r_now > 0:
                     _phase_risk = abs(entry - stop_loss)
@@ -6637,7 +6806,7 @@ class CTraderExecutor:
                     )
                     if bool(_phase_res.ok):
                         report["amended_positions"] += 1
-                        report["pm_actions"].append({
+                        report["pm_actions"].append(self._enrich_fibo_pm_action({
                             "journal_id": (journal_id or None),
                             "position_id": position_id,
                             "source": source,
@@ -6653,7 +6822,7 @@ class CTraderExecutor:
                                 "winner_profile": bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner"),
                                 "lock_pct": _lock_pct,
                             },
-                        })
+                        }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                         continue
                 res = self.close_position(position_id=position_id, volume=volume)
                 if bool(res.ok):
@@ -6726,7 +6895,7 @@ class CTraderExecutor:
                         )
                         if bool(res.ok):
                             report["amended_positions"] += 1
-                            report["pm_actions"].append({
+                            report["pm_actions"].append(self._enrich_fibo_pm_action({
                                 "journal_id": (journal_id or None),
                                 "position_id": position_id,
                                 "source": source,
@@ -6743,7 +6912,7 @@ class CTraderExecutor:
                                     "phase": str(fibo_phase_pm.get("phase") or "unknown"),
                                     "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
                                 },
-                            })
+                            }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                             continue
                     res = self.close_position(position_id=position_id, volume=volume)
                     if bool(res.ok):
