@@ -1704,6 +1704,7 @@ class TradingManagerAgent:
         winner_memory_reference: dict,
         upcoming_events: list[dict],
         post_event_learning: list[dict],
+        recent_order_reviews: list[dict] | None = None,
     ) -> dict:
         allowed = self._allowed_xau_routing_families()
         if not allowed:
@@ -1713,7 +1714,14 @@ class TradingManagerAgent:
         freeze_min = max(10, int(getattr(config, "TRADING_MANAGER_PRE_EVENT_FREEZE_MIN", 20) or 20))
         urgent_event = any(int(ev.get("minutes_to_event", 9999) or 9999) <= freeze_min for ev in list(upcoming_events or []))
         severe_loss = bool(int(losses.get("resolved", 0) or 0) > 0 and float(losses.get("pnl_usd", 0.0) or 0.0) < 0.0)
-        swarm_override_allowed = bool(swarm_enabled and swarm_active and not urgent_event and not severe_loss)
+        recent_reviews = [dict(row) for row in list(recent_order_reviews or []) if isinstance(row, dict)]
+        recent_min_losses = max(1, int(getattr(config, "TRADING_MANAGER_XAU_ORDER_CARE_MIN_LOSSES", 2) or 2))
+        recent_losers = [row for row in recent_reviews if float(row.get("pnl_usd", 0.0) or 0.0) < 0.0]
+        recent_loss_regime = bool(
+            len(recent_losers) >= recent_min_losses
+            and float(sum(float(row.get("pnl_usd", 0.0) or 0.0) for row in list(recent_losers or []))) < 0.0
+        )
+        swarm_override_allowed = bool(swarm_enabled and swarm_active and not urgent_event and not severe_loss and not recent_loss_regime)
         preferred_same = self._family_from_bucket(best_same_situation)
         preferred_leader = self._family_from_bucket(best_family_today)
         memory_family = str((winner_memory_reference or {}).get("family") or "").strip().lower()
@@ -1737,7 +1745,7 @@ class TradingManagerAgent:
         # Swarm sampling is useful for broad collection, but it must not override
         # active caution states. In live loss windows we want concentration, not
         # more concurrent family exposure.
-        if swarm_enabled and swarm_active and not urgent_event and not severe_loss:
+        if swarm_override_allowed:
             desired_active = [fam for fam in list(swarm_active or []) if fam in allowed] or list(current_active or allowed)
             current_active_set = {fam for fam in list(current_active or []) if fam}
             desired_active_set = {fam for fam in list(desired_active or []) if fam}
@@ -1783,6 +1791,16 @@ class TradingManagerAgent:
             reason = (
                 f"shock losses {int(losses.get('losses', 0) or 0)}/{int(losses.get('resolved', 0) or 0)} "
                 f"| pnl {float(losses.get('pnl_usd', 0.0) or 0.0):.2f}"
+            )
+        elif recent_loss_regime and not preferred_same:
+            mode = "recent_loss_demote"
+            primary = _valid_family(getattr(config, "TRADING_MANAGER_XAU_SHOCK_PRIMARY_FAMILY", "xau_scalp_pullback_limit"))
+            active = [fam for fam in self._parse_family_csv(getattr(config, "TRADING_MANAGER_XAU_SHOCK_ACTIVE_FAMILIES", "xau_scalp_pullback_limit")) if fam in allowed]
+            if swarm_override_allowed:
+                active = list(swarm_active)
+            reason = (
+                f"recent losses {len(recent_losers)}/{len(recent_reviews)} "
+                f"| pnl {float(sum(float(row.get('pnl_usd', 0.0) or 0.0) for row in list(recent_losers or []))):.2f}"
             )
         else:
             pb_resolved = int(pb_source_stats.get("resolved", 0) or 0)
@@ -3427,6 +3445,7 @@ class TradingManagerAgent:
                         winner_memory_reference=top_memory,
                         upcoming_events=upcoming_events,
                         post_event_learning=post_event_learning,
+                        recent_order_reviews=recent_order_reviews,
                     )
                     if str(family_routing_recommendations.get("support_mode") or "") == "calibration_fallback":
                         manager_findings.append(
