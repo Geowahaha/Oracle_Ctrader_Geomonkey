@@ -332,6 +332,7 @@ class DexterScheduler:
         return self._signal_trace_meta(signal)
 
     def _send_signal_with_trace(self, signal, source: str) -> bool:
+        self._normalize_signal_confidence(signal, stage="send_signal")
         self._ensure_signal_trace(signal, source=source)
         return bool(notifier.send_signal(signal))
 
@@ -363,7 +364,7 @@ class DexterScheduler:
     @staticmethod
     def _signal_confidence_band(signal) -> str:
         try:
-            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+            conf = DexterScheduler._normalize_confidence_value(getattr(signal, "confidence", 0.0))
         except Exception:
             conf = 0.0
         return str(live_profile_confidence_band(conf) or "")
@@ -439,6 +440,47 @@ class DexterScheduler:
             return float(value)
         except Exception:
             return float(default)
+
+    @staticmethod
+    def _normalize_confidence_value(value, default: float = 0.0) -> float:
+        try:
+            conf = float(value)
+        except Exception:
+            conf = float(default)
+        conf = max(0.0, min(99.9, conf))
+        return round(conf, 1)
+
+    def _normalize_signal_confidence(self, signal, *, stage: str = "") -> float:
+        if signal is None:
+            return 0.0
+        try:
+            before = float(getattr(signal, "confidence", 0.0) or 0.0)
+        except Exception:
+            before = 0.0
+        normalized = self._normalize_confidence_value(before)
+        try:
+            signal.confidence = normalized
+        except Exception:
+            return normalized
+        if abs(normalized - before) > 1e-9:
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["confidence_clamped"] = True
+                raw["confidence_clamp_before"] = round(before, 3)
+                raw["confidence_clamp_after"] = round(normalized, 3)
+                raw["confidence_clamp_stage"] = str(stage or raw.get("confidence_clamp_stage") or "")
+                signal.raw_scores = raw
+            except Exception:
+                pass
+            logger.info(
+                "[CONF] clamped stage=%s %s %s conf %.1f->%.1f",
+                str(stage or "-"),
+                str(getattr(signal, "symbol", "") or ""),
+                str(getattr(signal, "direction", "") or "").upper(),
+                before,
+                normalized,
+            )
+        return normalized
 
     def _apply_adi_modifier(self, signal, source: str) -> dict:
         """Apply Adaptive Directional Intelligence confidence modifier.
@@ -4119,7 +4161,7 @@ class DexterScheduler:
         confidence = payload.get("confidence")
         if confidence is not None:
             try:
-                lane_signal.confidence = float(confidence)
+                lane_signal.confidence = self._normalize_confidence_value(confidence)
             except Exception:
                 pass
         shaped = self._apply_family_price_plan(
@@ -4227,7 +4269,7 @@ class DexterScheduler:
         confidence = payload.get("confidence")
         if confidence is not None:
             try:
-                lane_signal.confidence = float(confidence)
+                lane_signal.confidence = self._normalize_confidence_value(confidence)
             except Exception:
                 pass
         shaped = self._apply_family_price_plan(
@@ -7597,6 +7639,7 @@ class DexterScheduler:
         """
         if signal is None:
             return {"applied": False, "reason": "no_signal"}
+        self._normalize_signal_confidence(signal, stage="neural_pre")
         try:
             apply_entry_template_hints(signal)
             apply_entry_template_conf_tailwind(signal)
@@ -7628,7 +7671,7 @@ class DexterScheduler:
             if adjust.get("applied"):
                 adjusted = float(adjust.get("adjusted_confidence", base_conf))
                 delta = float(adjust.get("delta", adjusted - base_conf))
-                signal.confidence = round(adjusted, 1)
+                signal.confidence = self._normalize_confidence_value(adjusted)
                 raw_scores["confidence_post_neural"] = round(signal.confidence, 3)
                 raw_scores["neural_adjust_delta"] = round(delta, 3)
                 if prob is not None:
@@ -7659,6 +7702,7 @@ class DexterScheduler:
 
             raw_scores["neural_confidence_adjusted"] = True
             signal.raw_scores = raw_scores
+            self._normalize_signal_confidence(signal, stage="neural_post")
             return adjust
         except Exception as e:
             logger.debug("[NeuralBrain] soft-adjust error: %s", e)
@@ -8743,6 +8787,7 @@ class DexterScheduler:
         bypass = self._resolve_mt5_bypass_profile(signal, source)
         exec_source = str(bypass.get("source") or source)
         self._ensure_signal_trace(signal, source=exec_source)
+        self._normalize_signal_confidence(signal, stage="mt5_pre_execute")
         if bool(bypass.get("enabled")):
             try:
                 raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
@@ -8931,11 +8976,13 @@ class DexterScheduler:
         if not bool(getattr(config, "CTRADER_AUTOTRADE_ENABLED", False)):
             return None
         self._ensure_signal_trace(signal, source=str(source or ""))
+        self._normalize_signal_confidence(signal, stage="ctrader_pre_adi")
         # ── ADI: Adaptive Directional Intelligence confidence modifier ──
         try:
             self._apply_adi_modifier(signal, source=str(source or ""))
         except Exception as e:
             logger.debug("[ADI] _apply_adi_modifier failed (non-fatal): %s", e)
+        self._normalize_signal_confidence(signal, stage="ctrader_post_adi")
 
         # ── ADI Catastrophic Gate: hard-block when any dimension is extreme ──
         # catastrophic_flag fires when ANY of the 5 ADI dimensions ≤ -25
@@ -9193,6 +9240,7 @@ class DexterScheduler:
             bypass = self._resolve_mt5_bypass_profile(signal, source)
             exec_source = str(bypass.get("source") or source)
             self._ensure_signal_trace(signal, source=exec_source)
+            self._normalize_signal_confidence(signal, stage="mt5_batch_pre_execute")
             if bool(bypass.get("enabled")):
                 try:
                     raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
