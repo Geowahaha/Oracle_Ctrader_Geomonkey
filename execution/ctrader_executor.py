@@ -798,6 +798,118 @@ class CTraderExecutor:
         return payload
 
     @staticmethod
+    def _fibo_phase_context_from_journal(journal_row: Optional[sqlite3.Row]) -> dict:
+        row = dict(journal_row or {}) if journal_row is not None else {}
+        req = CTraderExecutor._safe_json_load(str(row.get("request_json", "") or ""))
+        raw = dict(req.get("raw_scores") or {})
+        phase_profile = dict(raw.get("fibo_phase_profile") or {})
+        return {
+            "phase": str((phase_profile.get("phase") or raw.get("wave_phase") or "unknown")).strip().lower(),
+            "wave_confidence": _safe_float(raw.get("wave_confidence"), 0.0),
+            "correction_end_score": _safe_float(raw.get("correction_end_score"), 0.0),
+            "correction_end_confirmed": bool(raw.get("correction_end_confirmed")),
+            "winner_eligible": bool(raw.get("fibo_winner_eligible") or phase_profile.get("winner_eligible")),
+            "winner_reason": str(raw.get("fibo_winner_reason") or phase_profile.get("winner_reason") or "").strip().lower(),
+            "risk_mult": _safe_float(phase_profile.get("risk_mult"), 1.0),
+            "tp2_mult": _safe_float(phase_profile.get("tp2_mult"), 1.0),
+            "tp3_mult": _safe_float(phase_profile.get("tp3_mult"), 1.0),
+            "stop_buffer_mult": _safe_float(phase_profile.get("stop_buffer_mult"), 1.0),
+        }
+
+    @staticmethod
+    def _fibo_phase_pm_profile(phase_ctx: dict) -> dict:
+        phase = str((phase_ctx or {}).get("phase") or "unknown").strip().lower()
+        out = {
+            "phase": phase,
+            "time_lock_be_min_mult": 1.0,
+            "time_lock_pct_mult": 1.0,
+            "exhaustion_lock_pct_mult": 1.0,
+            "exhaustion_required_signals_delta": 0,
+            "live_extension_step_mult": 1.0,
+            "live_extension_lock_r_mult": 1.0,
+            "winner_profile": False,
+        }
+        if phase == "impulse_restart":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.70,
+                    "time_lock_pct_mult": 1.20,
+                    "exhaustion_lock_pct_mult": 1.15,
+                    "exhaustion_required_signals_delta": 1,
+                    "live_extension_step_mult": 1.30,
+                    "live_extension_lock_r_mult": 1.20,
+                    "winner_profile": bool((phase_ctx or {}).get("winner_eligible")),
+                }
+            )
+        elif phase == "correction_end":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.85,
+                    "time_lock_pct_mult": 1.10,
+                    "exhaustion_lock_pct_mult": 1.05,
+                    "live_extension_step_mult": 1.10,
+                    "live_extension_lock_r_mult": 1.10,
+                    "winner_profile": bool((phase_ctx or {}).get("winner_eligible")),
+                }
+            )
+        elif phase == "correction":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.90,
+                    "time_lock_pct_mult": 1.05,
+                    "exhaustion_lock_pct_mult": 1.10,
+                    "exhaustion_required_signals_delta": -1,
+                    "live_extension_step_mult": 0.85,
+                    "live_extension_lock_r_mult": 1.05,
+                }
+            )
+        return out
+
+    def _apply_fibo_phase_extension(
+        self,
+        *,
+        extension: dict,
+        phase_pm: dict,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_tp: float,
+    ) -> dict:
+        if not bool((extension or {}).get("active")):
+            return dict(extension or {})
+        new_tp = _safe_float((extension or {}).get("new_take_profit"), 0.0)
+        new_sl = _safe_float((extension or {}).get("new_stop_loss"), 0.0)
+        phase = str((phase_pm or {}).get("phase") or "unknown")
+        step_mult = max(0.75, float((phase_pm or {}).get("live_extension_step_mult", 1.0) or 1.0))
+        lock_mult = max(0.75, float((phase_pm or {}).get("live_extension_lock_r_mult", 1.0) or 1.0))
+        if self._target_valid_for_position(direction, entry, current_tp) and self._target_valid_for_position(direction, entry, new_tp):
+            if direction == "long":
+                delta = max(0.0, new_tp - current_tp)
+                new_tp = current_tp + delta * step_mult
+            else:
+                delta = max(0.0, current_tp - new_tp)
+                new_tp = current_tp - delta * step_mult
+        if self._stop_valid_for_position(direction, entry, new_sl):
+            if direction == "long":
+                delta_sl = max(0.0, new_sl - stop_loss)
+                new_sl = stop_loss + delta_sl * lock_mult
+            else:
+                delta_sl = max(0.0, stop_loss - new_sl)
+                new_sl = stop_loss - delta_sl * lock_mult
+        out = dict(extension or {})
+        out["new_take_profit"] = round(new_tp, 4) if new_tp > 0 else 0.0
+        out["new_stop_loss"] = round(new_sl, 4) if new_sl > 0 else 0.0
+        out["reason"] = str(out.get("reason") or "xau_profit_extension")
+        out.setdefault("details", {})
+        out["details"] = {
+            **dict(out.get("details") or {}),
+            "phase": phase,
+            "phase_extension_step_mult": step_mult,
+            "phase_extension_lock_r_mult": lock_mult,
+        }
+        return out
+
+    @staticmethod
     def _worker_price_symbol(symbol: str) -> str:
         token = str(symbol or "").strip().upper()
         if token == "ETHUSD":
@@ -2979,6 +3091,7 @@ class CTraderExecutor:
         confidence: float,
         age_min: float,
         r_now: Optional[float],
+        phase_pm: Optional[dict] = None,
     ) -> dict:
         """
         Detect momentum exhaustion and lock profit BEFORE it evaporates.
@@ -3005,6 +3118,7 @@ class CTraderExecutor:
             return {"active": False, "reason": "not_in_profit"}
         order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
         order_care_overrides = dict(order_care_state.get("overrides") or {}) if order_care_state else {}
+        phase_pm = dict(phase_pm or {})
 
         min_age = float(order_care_overrides.get(
             "exhaustion_min_age_min",
@@ -3072,6 +3186,7 @@ class CTraderExecutor:
             "exhaustion_required_signals",
             getattr(config, "CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", 3) or 3,
         ) or 3)
+        required_signals = max(1, required_signals + int(phase_pm.get("exhaustion_required_signals_delta", 0) or 0))
         if exhaustion_signals < required_signals:
             return {"active": False, "reason": "exhaustion_not_confirmed", "details": {
                 "exhaustion_signals": exhaustion_signals,
@@ -3093,6 +3208,7 @@ class CTraderExecutor:
             lock_pct = 0.35   # 35% at 0.5R+
         else:
             lock_pct = 0.15   # 15% at 0.15R+
+        lock_pct = min(0.85, max(0.10, lock_pct * max(0.8, float(phase_pm.get("exhaustion_lock_pct_mult", 1.0) or 1.0))))
 
         keep_risk = risk * (1.0 - lock_pct)
         if direction == "long":
@@ -3117,6 +3233,7 @@ class CTraderExecutor:
             "bar_volume_proxy": round(bar_volume_proxy, 4),
             "adverse_drift": round(adverse_drift, 5),
             "rejection_ratio": round(rejection_ratio, 4),
+            "phase": str(phase_pm.get("phase") or "unknown"),
         }
         logger.info(
             "[PM:ExhaustionLock] %s %s | r_now=%.2f | signals=%d/%d | lock=%d%% | new_sl=%.2f | reasons=%s",
@@ -4399,7 +4516,7 @@ class CTraderExecutor:
         tracked_actions = [
             dict(item or {})
             for item in list(pm_actions or [])
-            if str((item or {}).get("action") or "").strip().lower() == "xau_profit_extension"
+            if str((item or {}).get("action") or "").strip().lower().startswith("xau_profit_extension")
         ]
         if not tracked_actions:
             return 0
@@ -6216,9 +6333,12 @@ class CTraderExecutor:
                     logger.error(f"[CTraderExecutor] Trailing brain evaluation crashed: {e}", exc_info=True)
             # ----------------------------------
 
+            fibo_phase_ctx = self._fibo_phase_context_from_journal(journal_row)
+            fibo_phase_pm = self._fibo_phase_pm_profile(fibo_phase_ctx)
+
             # ── Fibo time-based profit lock (runs before active defense) ────
             if "fibo" in source and bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)) and r_now is not None and r_now > 0:
-                _fibo_be_min = float(getattr(config, "FIBO_PM_BE_AFTER_MIN", 20))
+                _fibo_be_min = float(getattr(config, "FIBO_PM_BE_AFTER_MIN", 20)) * max(0.5, float(fibo_phase_pm.get("time_lock_be_min_mult", 1.0) or 1.0))
                 _fibo_lock_tiers = [
                     (float(getattr(config, "FIBO_PM_LOCK_30_AFTER_MIN", 45)), 0.30),
                     (float(getattr(config, "FIBO_PM_LOCK_50_AFTER_MIN", 90)), 0.50),
@@ -6228,7 +6348,7 @@ class CTraderExecutor:
                 _fibo_tighten = False
                 for _tier_min, _tier_pct in reversed(_fibo_lock_tiers):
                     if age_min >= _tier_min:
-                        _lock_pct = _tier_pct
+                        _lock_pct = min(0.85, _tier_pct * max(0.8, float(fibo_phase_pm.get("time_lock_pct_mult", 1.0) or 1.0)))
                         _fibo_tighten = True
                         break
                 if not _fibo_tighten and age_min >= _fibo_be_min:
@@ -6266,6 +6386,7 @@ class CTraderExecutor:
                                 "reference_price": round(ref, 4), "new_stop_loss": round(_new_sl, 4),
                                 "r_now": round(float(r_now), 4), "age_min": round(float(age_min), 1),
                                 "lock_pct": _lock_pct, "profit_pts": round(_profit_pts, 2),
+                                "phase": str(fibo_phase_pm.get("phase") or "unknown"),
                             })
                             logger.info(
                                 "[PM:FiboTimeLock] pos=%s %s %s | age=%.0fm | profit=%.1fpts | lock=%d%% | new_sl=%.2f",
@@ -6396,6 +6517,7 @@ class CTraderExecutor:
                         source=source, symbol=symbol, direction=direction,
                         entry=entry, stop_loss=stop_loss, current_price=ref,
                         confidence=confidence, age_min=age_min, r_now=r_now,
+                        phase_pm=fibo_phase_pm,
                     )
                     if bool(exhaustion.get("active")):
                         _exh_new_sl = _safe_float(exhaustion.get("new_stop_loss"), 0.0)
@@ -6458,6 +6580,15 @@ class CTraderExecutor:
                         extension = self._crypto_dom_tp_extension_plan(symbol=symbol, direction=direction, entry=entry, stop_loss=stop_loss, planned_tp=planned_tp, current_tp=target_tp, current_price=ref, r_now=r_now, age_min=age_min)
                     except Exception:
                         logger.debug("[PM] crypto_dom_tp_extension error for %s", symbol, exc_info=True)
+                if bool(extension.get("active")) and "fibo" in source:
+                    extension = self._apply_fibo_phase_extension(
+                        extension=extension,
+                        phase_pm=fibo_phase_pm,
+                        direction=direction,
+                        entry=entry,
+                        stop_loss=stop_loss,
+                        current_tp=target_tp,
+                    )
                 if bool(extension.get("active")):
                     new_sl = _safe_float(extension.get("new_stop_loss"), 0.0)
                     new_tp = _safe_float(extension.get("new_take_profit"), 0.0)
@@ -6483,6 +6614,44 @@ class CTraderExecutor:
                             "details": {
                                 **dict(extension.get("details") or {}),
                                 "trigger": "planned_target",
+                                "phase": str(fibo_phase_pm.get("phase") or "unknown"),
+                                "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
+                            },
+                        })
+                        continue
+                if "fibo" in source and str(fibo_phase_pm.get("phase") or "") == "correction_end" and r_now is not None and r_now > 0:
+                    _phase_risk = abs(entry - stop_loss)
+                    _lock_pct = 0.75 if bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner") else 0.60
+                    _keep_risk = _phase_risk * max(0.10, 1.0 - _lock_pct)
+                    if direction == "long":
+                        _phase_sl = entry + (_phase_risk - _keep_risk)
+                        _phase_tp = max(ref + (_phase_risk * 0.35), target_tp)
+                    else:
+                        _phase_sl = entry - (_phase_risk - _keep_risk)
+                        _phase_tp = min(ref - (_phase_risk * 0.35), target_tp) if target_tp > 0 else (ref - (_phase_risk * 0.35))
+                    _phase_res = self.amend_position_sltp(
+                        position_id=position_id,
+                        stop_loss=_phase_sl if self._stop_valid_for_position(direction, entry, _phase_sl) else stop_loss,
+                        take_profit=_phase_tp if self._target_valid_for_position(direction, entry, _phase_tp) else target_tp,
+                        trailing_stop_loss=False,
+                    )
+                    if bool(_phase_res.ok):
+                        report["amended_positions"] += 1
+                        report["pm_actions"].append({
+                            "journal_id": (journal_id or None),
+                            "position_id": position_id,
+                            "source": source,
+                            "symbol": symbol,
+                            "action": "fibo_correction_end_profit_lock",
+                            "reference_price": round(ref, 4),
+                            "new_stop_loss": round(_phase_sl, 4) if self._stop_valid_for_position(direction, entry, _phase_sl) else round(stop_loss, 4),
+                            "new_take_profit": round(_phase_tp, 4) if self._target_valid_for_position(direction, entry, _phase_tp) else round(target_tp, 4),
+                            "r_now": round(float(r_now), 4),
+                            "details": {
+                                "trigger": "planned_target",
+                                "phase": "correction_end",
+                                "winner_profile": bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner"),
+                                "lock_pct": _lock_pct,
                             },
                         })
                         continue
@@ -6537,6 +6706,15 @@ class CTraderExecutor:
                         age_min=age_min,
                         r_now=r_now,
                     )
+                    if bool(extension.get("active")) and "fibo" in source:
+                        extension = self._apply_fibo_phase_extension(
+                            extension=extension,
+                            phase_pm=fibo_phase_pm,
+                            direction=direction,
+                            entry=entry,
+                            stop_loss=stop_loss,
+                            current_tp=live_tp,
+                        )
                     if bool(extension.get("active")):
                         new_sl = _safe_float(extension.get("new_stop_loss"), 0.0)
                         new_tp = _safe_float(extension.get("new_take_profit"), 0.0)
@@ -6562,6 +6740,8 @@ class CTraderExecutor:
                                 "details": {
                                     **dict(extension.get("details") or {}),
                                     "trigger": "live_target",
+                                    "phase": str(fibo_phase_pm.get("phase") or "unknown"),
+                                    "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
                                 },
                             })
                             continue
