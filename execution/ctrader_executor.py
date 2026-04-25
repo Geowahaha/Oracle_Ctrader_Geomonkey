@@ -1530,6 +1530,90 @@ class CTraderExecutor:
             ), meta
         return True, "", meta
 
+    def _normalize_tp_for_min_rr(self, *, source: str, payload: dict) -> dict:
+        """Extend TP to meet target RR — Phase 2 symmetric SL/TP basis.
+
+        Apr 2026 audit: scalp lanes (FLS RR=0.61, MFU=0.79, winner RR<1 on
+        17/22) shipped TP based on tight pip rules while SL came from a
+        different basis — yielding asymmetric geometry that loses long-run
+        even at 60%+ win rate.
+
+        This function pushes TP further from entry, *only when*:
+        - feature is enabled (CTRADER_TP_NORMALIZER_ENABLED)
+        - source is not in blacklist (CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES;
+          fibo is default-blacklisted because its TPs are structural)
+        - current RR < target (CTRADER_TP_NORMALIZER_TARGET_RR, default 1.5)
+        - extension does not push TP more than MAX_EXTEND_PCT past the original
+          entry-to-TP distance (default 60%) — this caps excursion to plausible
+          near-future structure, not absurd far targets
+
+        Mutates payload.take_profit in place when applied. Returns metadata
+        for journaling (also stored in payload['raw_scores'] under tp_normalizer).
+        """
+        meta = {"applied": False}
+        if not bool(getattr(config, "CTRADER_TP_NORMALIZER_ENABLED", False)):
+            meta["reason"] = "disabled"
+            return meta
+        try:
+            entry = float(payload.get("entry") or 0.0)
+            sl = float(payload.get("stop_loss") or 0.0)
+            tp = float(payload.get("take_profit") or 0.0)
+            direction = str(payload.get("direction") or "").strip().lower()
+        except Exception:
+            meta["reason"] = "missing_levels"
+            return meta
+        if entry <= 0 or sl <= 0 or tp <= 0 or direction not in {"long", "short"}:
+            meta["reason"] = "incomplete_levels"
+            return meta
+        src_lower = str(source or "").lower()
+        try:
+            blacklist_raw = str(getattr(config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo") or "")
+            blacklist = {s.strip().lower() for s in blacklist_raw.split(",") if s.strip()}
+        except Exception:
+            blacklist = {"fibo"}
+        if any(b and (b == src_lower or src_lower.startswith(b)) for b in blacklist):
+            meta["reason"] = "source_blacklisted"
+            meta["source"] = src_lower
+            return meta
+        if direction == "long":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+        if risk <= 0 or reward <= 0:
+            meta["reason"] = "geometry_invalid"
+            return meta
+        rr = reward / risk
+        target_rr = float(getattr(config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5) or 1.5)
+        if rr >= target_rr:
+            meta["reason"] = "rr_already_at_target"
+            meta["rr"] = round(rr, 3)
+            return meta
+        max_extend_pct = float(getattr(config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 0.60) or 0.60)
+        target_reward = risk * target_rr
+        max_reward = reward * (1.0 + max_extend_pct)
+        new_reward = min(target_reward, max_reward)
+        if new_reward <= reward:
+            meta["reason"] = "no_room_to_extend"
+            return meta
+        if direction == "long":
+            new_tp = entry + new_reward
+        else:
+            new_tp = entry - new_reward
+        payload["take_profit"] = float(new_tp)
+        meta.update({
+            "applied": True,
+            "rr_before": round(rr, 3),
+            "rr_after": round(new_reward / risk, 3),
+            "tp_before": round(tp, 6),
+            "tp_after": round(new_tp, 6),
+            "target_rr": round(target_rr, 3),
+            "max_extend_pct": round(max_extend_pct, 3),
+            "source": src_lower,
+        })
+        return meta
+
     def _rr_floor_guard(self, *, source: str, payload: dict) -> tuple[bool, str, dict]:
         """Reject pre-trade if planned reward/risk < floor.
 
@@ -4937,6 +5021,22 @@ class CTraderExecutor:
         payload, reason = self._build_payload(signal, source)
         if payload is None:
             return _early_exit("invalid", reason)
+        tp_norm_meta = self._normalize_tp_for_min_rr(source=source, payload=payload)
+        if bool(tp_norm_meta.get("applied")):
+            logger.info(
+                "[tp_normalizer] extend source=%s rr %.2f->%.2f tp %.4f->%.4f",
+                source,
+                float(tp_norm_meta.get("rr_before") or 0.0),
+                float(tp_norm_meta.get("rr_after") or 0.0),
+                float(tp_norm_meta.get("tp_before") or 0.0),
+                float(tp_norm_meta.get("tp_after") or 0.0),
+            )
+            try:
+                rs = dict(payload.get("raw_scores") or {})
+                rs["tp_normalizer"] = dict(tp_norm_meta)
+                payload["raw_scores"] = rs
+            except Exception:
+                pass
         rr_ok, rr_reason, rr_meta = self._rr_floor_guard(source=source, payload=payload)
         if not rr_ok:
             logger.warning(

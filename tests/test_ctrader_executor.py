@@ -88,6 +88,55 @@ class TestCTraderExecutor(unittest.TestCase):
             gc.collect()
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_tp_normalizer_extends_low_rr(self):
+        # entry=5100 sl=5095 tp=5103 → risk=5 reward=3 RR=0.6
+        # target_rr=1.5 → reward needs to be 7.5; max_extend_pct=0.6 → cap at 4.8
+        # so new_reward = min(7.5, 4.8) = 4.8 → new_tp = 5104.8 → RR=0.96
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 0.60), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo"):
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5103.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertTrue(meta["applied"])
+        self.assertAlmostEqual(payload["take_profit"], 5104.8, places=4)
+        self.assertGreater(meta["rr_after"], meta["rr_before"])
+
+    def test_tp_normalizer_skips_when_rr_already_at_target(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5):
+            # RR = 8/5 = 1.6 — above target, no change
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5108.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(payload["take_profit"], 5108.0)
+
+    def test_tp_normalizer_skips_blacklisted_source(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo"):
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5103.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="fibo_xauusd", payload=payload)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(meta["reason"], "source_blacklisted")
+        self.assertEqual(payload["take_profit"], 5103.0)
+
+    def test_tp_normalizer_short_direction(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 1.0):
+            # short: entry=5100 sl=5105 (risk=5) tp=5097 (reward=3) → RR=0.6
+            # target_rr=1.5, reward=7.5; max_extend=100% → reward cap=6 → new_reward=min(7.5, 6)=6
+            # new_tp = 5100 - 6 = 5094
+            payload = {"entry": 5100.0, "stop_loss": 5105.0, "take_profit": 5097.0, "direction": "short"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertTrue(meta["applied"])
+        self.assertAlmostEqual(payload["take_profit"], 5094.0, places=4)
+
     def test_rr_floor_gate_accepts_above_floor(self):
         td = tempfile.mkdtemp()
         executor = None
