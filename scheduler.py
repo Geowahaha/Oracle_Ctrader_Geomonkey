@@ -8984,6 +8984,26 @@ class DexterScheduler:
             logger.debug("[ADI] _apply_adi_modifier failed (non-fatal): %s", e)
         self._normalize_signal_confidence(signal, stage="ctrader_post_adi")
 
+        # Fibo-specific final clamp — keep under FIBO_ADVANCE_MAX_CONFIDENCE after
+        # scheduler-level bonuses (ADI/Hermes) so band-gates and first_sample_mode
+        # don't see inflated values past the build-time ceiling.
+        if str(source or "").lower().startswith("fibo"):
+            try:
+                fibo_cap = float(getattr(config, "FIBO_ADVANCE_MAX_CONFIDENCE", 96.0) or 96.0)
+                cur_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+                if cur_conf > fibo_cap:
+                    raw = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw["fibo_post_bonus_clamp_before"] = round(cur_conf, 3)
+                    raw["fibo_post_bonus_clamp_after"] = round(fibo_cap, 3)
+                    signal.raw_scores = raw
+                    signal.confidence = fibo_cap
+                    logger.info(
+                        "[CONF] fibo post-bonus clamp source=%s %.1f->%.1f",
+                        str(source or "-"), cur_conf, fibo_cap,
+                    )
+            except Exception:
+                pass
+
         # ── ADI Catastrophic Gate: hard-block when any dimension is extreme ──
         # catastrophic_flag fires when ANY of the 5 ADI dimensions ≤ -25
         # (empirical collapse, all-TF counter-trend, extreme adverse flow, etc.)
