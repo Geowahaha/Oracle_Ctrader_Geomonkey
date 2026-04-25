@@ -1530,6 +1530,62 @@ class CTraderExecutor:
             ), meta
         return True, "", meta
 
+    def _rr_floor_guard(self, *, source: str, payload: dict) -> tuple[bool, str, dict]:
+        """Reject pre-trade if planned reward/risk < floor.
+
+        Audit Apr 2026 found 58% of live trades had RR<1.0 — geometric loss
+        regardless of win-rate. This gate kills that class at the executor.
+
+        Per-source overrides via CTRADER_RR_FLOOR_OVERRIDES (json:
+        {"scalp_xauusd:fls:canary": 0.9, ...}).
+        """
+        if not bool(getattr(config, "CTRADER_RR_FLOOR_ENABLED", True)):
+            return True, "", {"enabled": False}
+        try:
+            entry = float(payload.get("entry") or 0.0)
+            sl = float(payload.get("stop_loss") or 0.0)
+            tp = float(payload.get("take_profit") or 0.0)
+            direction = str(payload.get("direction") or "").strip().lower()
+        except Exception:
+            return True, "", {"enabled": True, "applied": False, "reason": "missing_levels"}
+        if entry <= 0 or sl <= 0 or tp <= 0 or direction not in {"long", "short"}:
+            return True, "", {"enabled": True, "applied": False, "reason": "incomplete_levels"}
+        if direction == "long":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+        if risk <= 0 or reward <= 0:
+            return True, "", {"enabled": True, "applied": False, "reason": "geometry_invalid",
+                              "risk": round(risk, 6), "reward": round(reward, 6)}
+        rr = reward / risk
+        floor = float(getattr(config, "CTRADER_RR_FLOOR_MIN", 1.2) or 1.2)
+        try:
+            overrides = getattr(config, "CTRADER_RR_FLOOR_OVERRIDES", None) or {}
+            if isinstance(overrides, str):
+                overrides = json.loads(overrides) if overrides.strip() else {}
+            src_key = str(source or "").strip().lower()
+            if isinstance(overrides, dict) and src_key in {str(k).lower() for k in overrides.keys()}:
+                for k, v in overrides.items():
+                    if str(k).lower() == src_key:
+                        floor = float(v)
+                        break
+        except Exception:
+            pass
+        meta = {
+            "enabled": True,
+            "applied": True,
+            "rr": round(rr, 3),
+            "floor": round(floor, 3),
+            "risk": round(risk, 6),
+            "reward": round(reward, 6),
+            "source": str(source or ""),
+        }
+        if rr < floor:
+            return False, f"rr_floor_below_min:rr={rr:.2f}<floor={floor:.2f}", meta
+        return True, "", meta
+
     def _market_entry_drift_guard(self, signal, *, source: str = "") -> tuple[bool, str, dict]:
         if not bool(getattr(config, "CTRADER_MARKET_ENTRY_DRIFT_GUARD_ENABLED", True)):
             return True, "", {"enabled": False}
@@ -1737,6 +1793,63 @@ class CTraderExecutor:
         if family in corrective:
             return "corrective"
         return "neutral"
+
+    def _stagnation_bail_plan(
+        self,
+        *,
+        symbol: str,
+        position_id: int,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        """Trade-not-working bail.
+
+        Apr 2026 audit: avgLossR ≈ -0.6 to -1.1 across families because losers
+        ride to full SL while winners get cut early. This guard exits stagnant
+        trades before they hit full SL, when peak_r never reached a meaningful
+        favorable threshold within the time window.
+
+        Conditions:
+        - age_min >= STAGNATION_MIN_AGE (per-symbol)
+        - peak_r < STAGNATION_MAX_PEAK_R (default 0.30)
+        - r_now <= STAGNATION_MAX_R (default 0.0 — only bail if currently in loss)
+
+        Output action='close'. Logs a structured details payload.
+        """
+        if not bool(getattr(config, "CTRADER_PM_STAGNATION_BAIL_ENABLED", False)):
+            return {"active": False, "reason": "disabled"}
+        if r_now is None or int(position_id or 0) <= 0:
+            return {"active": False, "reason": "missing_state"}
+        sym = (symbol or "").upper().strip()
+        if sym in {"BTCUSD", "ETHUSD"}:
+            min_age = float(getattr(config, "CTRADER_PM_STAGNATION_MIN_AGE_CRYPTO_MIN", 12.0) or 12.0)
+        else:
+            min_age = float(getattr(config, "CTRADER_PM_STAGNATION_MIN_AGE_XAU_MIN", 8.0) or 8.0)
+        if float(age_min) < min_age:
+            return {"active": False, "reason": "too_young", "age_min": round(float(age_min), 2), "min_age": round(min_age, 2)}
+        max_peak = float(getattr(config, "CTRADER_PM_STAGNATION_MAX_PEAK_R", 0.30) or 0.30)
+        max_r_now = float(getattr(config, "CTRADER_PM_STAGNATION_MAX_R_NOW", 0.0) or 0.0)
+        peak_r = float(self._position_peak_r.get(int(position_id), float(r_now)) or float(r_now))
+        # update peak (in case retrace_guard hasn't run yet)
+        peak_r = max(peak_r, float(r_now))
+        self._position_peak_r[int(position_id)] = peak_r
+        if peak_r >= max_peak:
+            return {"active": False, "reason": "peak_above_threshold", "peak_r": round(peak_r, 4)}
+        if float(r_now) > max_r_now:
+            return {"active": False, "reason": "r_above_threshold", "r_now": round(float(r_now), 4)}
+        return {
+            "active": True,
+            "action": "close",
+            "reason": "stagnation_bail",
+            "details": {
+                "age_min": round(float(age_min), 2),
+                "peak_r": round(peak_r, 4),
+                "r_now": round(float(r_now), 4),
+                "max_peak_r": round(max_peak, 4),
+                "max_r_now": round(max_r_now, 4),
+                "min_age_min": round(min_age, 2),
+            },
+        }
 
     def _profit_retrace_guard_plan(
         self,
@@ -4824,6 +4937,18 @@ class CTraderExecutor:
         payload, reason = self._build_payload(signal, source)
         if payload is None:
             return _early_exit("invalid", reason)
+        rr_ok, rr_reason, rr_meta = self._rr_floor_guard(source=source, payload=payload)
+        if not rr_ok:
+            logger.warning(
+                "[rr_floor] reject source=%s symbol=%s rr=%.2f floor=%.2f",
+                source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
+            )
+            return _early_exit(
+                "filtered",
+                rr_reason,
+                request_payload=payload,
+                execution_meta={"rr_floor": dict(rr_meta or {})},
+            )
         short_limit_pause = self._xau_short_limit_pause_state(source=source, payload=payload)
         if bool(short_limit_pause.get("active")):
             remain_min = float(short_limit_pause.get("remaining_min", 0.0) or 0.0)
@@ -7062,6 +7187,31 @@ class CTraderExecutor:
                             continue
                 except Exception:
                     logger.debug("[PM] crypto_dom_defense error for %s", symbol, exc_info=True)
+            stagnation = self._stagnation_bail_plan(
+                symbol=symbol,
+                position_id=position_id,
+                age_min=age_min,
+                r_now=r_now,
+            )
+            if bool(stagnation.get("active")):
+                logger.info(
+                    "[stagnation_bail] close pos=%s sym=%s age=%.1fm peak_r=%.2f r_now=%.2f",
+                    position_id, symbol, float(age_min or 0.0),
+                    float((stagnation.get("details") or {}).get("peak_r") or 0.0),
+                    float(r_now or 0.0),
+                )
+                res = self.close_position(position_id=position_id, volume=volume)
+                if bool(res.ok):
+                    report["pm_actions"].append({
+                        "position_id": position_id,
+                        "source": source,
+                        "symbol": symbol,
+                        "action": "stagnation_bail",
+                        "reference_price": round(ref, 4),
+                        "r_now": (None if r_now is None else round(float(r_now), 4)),
+                        "details": dict(stagnation.get("details") or {}),
+                    })
+                continue
             retrace_guard = self._profit_retrace_guard_plan(
                 source=source,
                 symbol=symbol,

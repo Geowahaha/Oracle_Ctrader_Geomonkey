@@ -44,6 +44,79 @@ def _execute_signal_with_fixture_reference(executor, signal: TradeSignal, *, sou
 
 
 class TestCTraderExecutor(unittest.TestCase):
+    def setUp(self):
+        # Default fixture has RR=0.6 (below floor=1.2). Legacy tests don't
+        # exercise the RR gate — disable it here. Dedicated RR-gate tests
+        # re-enable explicitly.
+        self._rr_floor_patch = patch.object(
+            ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", False
+        )
+        self._rr_floor_patch.start()
+
+    def tearDown(self):
+        try:
+            self._rr_floor_patch.stop()
+        except Exception:
+            pass
+
+    def test_rr_floor_gate_rejects_below_floor(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            sig = _make_signal()  # entry=5100 sl=5095 tp1=5103 → RR=0.6
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "43880642"), \
+                 patch.object(ctrader_module.config, "CTRADER_RISK_USD_PER_TRADE", 10.0), \
+                 patch.object(ctrader_module.config, "CTRADER_TP_LEVEL", 1), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_MIN", 1.2), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_symbols", return_value={"XAUUSD"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_default_volume_symbol_overrides", return_value={}), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                result = _execute_signal_with_fixture_reference(executor, sig, source="scalp_xauusd")
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "filtered")
+            self.assertIn("rr_floor_below_min", result.message)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_rr_floor_gate_accepts_above_floor(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            sig = _make_signal()
+            sig.take_profit_1 = 5106.0  # reward=6, risk=5 → RR=1.2
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "43880642"), \
+                 patch.object(ctrader_module.config, "CTRADER_RISK_USD_PER_TRADE", 10.0), \
+                 patch.object(ctrader_module.config, "CTRADER_TP_LEVEL", 1), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_MIN", 1.2), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_symbols", return_value={"XAUUSD"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_default_volume_symbol_overrides", return_value={}), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                result = _execute_signal_with_fixture_reference(executor, sig, source="scalp_xauusd")
+            self.assertTrue(result.ok)
+            self.assertEqual(result.status, "dry_run")
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_build_payload_carries_xau_multi_tf_metadata(self):
         td = tempfile.mkdtemp()
         executor = None
