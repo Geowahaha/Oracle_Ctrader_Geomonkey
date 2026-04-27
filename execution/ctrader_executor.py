@@ -4911,6 +4911,14 @@ class CTraderExecutor:
             _overlap_tag_signal(signal)
         except Exception:
             pass
+        # Trend-rider TP extension (Level 2) + tier-runner shadow plan (Level 3).
+        # Extends TP2/TP3 ONLY when overlap+compression say "ride"; never
+        # tightens. Emits shadow tier_runner_plan tag for evidence collection.
+        try:
+            from analysis.trend_rider_tp import apply_trend_rider as _apply_trend_rider
+            _apply_trend_rider(signal=signal)
+        except Exception:
+            pass
         symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
         pattern = str(getattr(signal, "pattern", "") or "").strip().upper()
         entry = _safe_float(getattr(signal, "entry", 0.0), 0.0)
