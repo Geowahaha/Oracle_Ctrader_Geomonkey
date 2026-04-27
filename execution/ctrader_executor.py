@@ -4919,6 +4919,32 @@ class CTraderExecutor:
             _apply_trend_rider(signal=signal)
         except Exception:
             pass
+        # Counter-move guard (Option B): skip live order if last 4/5 M1 bars
+        # contradict direction; instead log a "ghost trade" into
+        # xau_shadow_journal so we can compare would-have outcomes against
+        # taken trades and tune the threshold from evidence.
+        # Disable via CTRADER_COUNTER_MOVE_GUARD_ENABLED=0.
+        try:
+            if str(getattr(config, "CTRADER_COUNTER_MOVE_GUARD_ENABLED", "1")) not in ("0", "false", "False"):
+                from analysis.counter_move_guard import evaluate as _cm_eval, log_ghost_trade as _cm_ghost
+                _cm = _cm_eval(signal, enabled=True)
+                try:
+                    rs = dict(getattr(signal, "raw_scores", {}) or {})
+                    rs["counter_move_tag"] = _cm.get("tag", {})
+                    signal.raw_scores = rs
+                except Exception:
+                    pass
+                if _cm.get("skip"):
+                    _cm_ghost(signal=signal, block_reason=_cm.get("block_reason", "counter_move_skip"))
+                    logger.info("[counter_move] skip+ghost source=%s reason=%s", source, _cm.get("block_reason"))
+                    return CTraderExecutionResult(
+                        ok=False,
+                        status="filtered",
+                        message=str(_cm.get("block_reason", "counter_move_skip")),
+                        signal_symbol=str(getattr(signal, "symbol", "") or ""),
+                    )
+        except Exception:
+            pass
         symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
         pattern = str(getattr(signal, "pattern", "") or "").strip().upper()
         entry = _safe_float(getattr(signal, "entry", 0.0), 0.0)
