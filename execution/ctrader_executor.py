@@ -1615,13 +1615,21 @@ class CTraderExecutor:
         return meta
 
     def _rr_floor_guard(self, *, source: str, payload: dict) -> tuple[bool, str, dict]:
-        """Reject pre-trade if planned reward/risk < floor.
+        """RR-based size tilt + shadow log (was: hard block, now: never blocks).
 
-        Audit Apr 2026 found 58% of live trades had RR<1.0 — geometric loss
-        regardless of win-rate. This gate kills that class at the executor.
+        Replaces the old hard-block gate with a size-tilt + bucket logger.
+        Hard block violated the project rule "never block opportunity"; replaced
+        per user request 2026-04-27 after first profitable trade closed.
 
-        Per-source overrides via CTRADER_RR_FLOOR_OVERRIDES (json:
-        {"scalp_xauusd:fls:canary": 0.9, ...}).
+        Bucket → multiplier (applied to ctrader_risk_usd_override):
+            RR ≥ 1.5     → 1.00 (full)
+            1.0 ≤ RR < 1.5 → 1.00 (full)
+            0.7 ≤ RR < 1.0 → 0.50 (half — still trades, halved exposure)
+            RR < 0.7     → 0.30 (mini probe — keep collecting data)
+
+        Honors legacy hard-block path only if CTRADER_RR_FLOOR_HARD_BLOCK=1
+        (default off). Always writes raw_scores["rr_bucket_tag"] for shadow
+        analysis: bucket, rr, multiplier.
         """
         if not bool(getattr(config, "CTRADER_RR_FLOOR_ENABLED", True)):
             return True, "", {"enabled": False}
@@ -1644,30 +1652,68 @@ class CTraderExecutor:
             return True, "", {"enabled": True, "applied": False, "reason": "geometry_invalid",
                               "risk": round(risk, 6), "reward": round(reward, 6)}
         rr = reward / risk
-        floor = float(getattr(config, "CTRADER_RR_FLOOR_MIN", 1.2) or 1.2)
+
+        # Size-tilt bucket (configurable via env)
+        tier_full = float(getattr(config, "CTRADER_RR_TIER_FULL", 1.0) or 1.0)
+        tier_half = float(getattr(config, "CTRADER_RR_TIER_HALF", 0.7) or 0.7)
+        mult_full = float(getattr(config, "CTRADER_RR_MULT_FULL", 1.0) or 1.0)
+        mult_half = float(getattr(config, "CTRADER_RR_MULT_HALF", 0.5) or 0.5)
+        mult_mini = float(getattr(config, "CTRADER_RR_MULT_MINI", 0.3) or 0.3)
+        if rr >= tier_full:
+            bucket, multiplier = ("full", mult_full)
+        elif rr >= tier_half:
+            bucket, multiplier = ("half", mult_half)
+        else:
+            bucket, multiplier = ("mini", mult_mini)
+
+        # Shadow-log into payload.raw_scores so analytics can compare
         try:
-            overrides = getattr(config, "CTRADER_RR_FLOOR_OVERRIDES", None) or {}
-            if isinstance(overrides, str):
-                overrides = json.loads(overrides) if overrides.strip() else {}
-            src_key = str(source or "").strip().lower()
-            if isinstance(overrides, dict) and src_key in {str(k).lower() for k in overrides.keys()}:
-                for k, v in overrides.items():
-                    if str(k).lower() == src_key:
-                        floor = float(v)
-                        break
+            rs = dict(payload.get("raw_scores") or {})
+            rs["rr_bucket_tag"] = {
+                "rr": round(rr, 3),
+                "bucket": bucket,
+                "multiplier_applied": multiplier,
+                "risk": round(risk, 6),
+                "reward": round(reward, 6),
+                "source": str(source or ""),
+            }
+            # Apply size tilt to existing risk override (multiply, never blocks)
+            existing = float(rs.get("ctrader_risk_usd_override", 0.0) or 0.0)
+            if existing > 0 and multiplier != 1.0:
+                rs["ctrader_risk_usd_override"] = round(max(0.05, existing * multiplier), 4)
+            payload["raw_scores"] = rs
         except Exception:
             pass
+
         meta = {
             "enabled": True,
             "applied": True,
             "rr": round(rr, 3),
-            "floor": round(floor, 3),
+            "bucket": bucket,
+            "multiplier": multiplier,
             "risk": round(risk, 6),
             "reward": round(reward, 6),
             "source": str(source or ""),
         }
-        if rr < floor:
-            return False, f"rr_floor_below_min:rr={rr:.2f}<floor={floor:.2f}", meta
+
+        # Optional legacy hard-block (off by default)
+        if bool(getattr(config, "CTRADER_RR_FLOOR_HARD_BLOCK", False)):
+            floor = float(getattr(config, "CTRADER_RR_FLOOR_MIN", 0.8) or 0.8)
+            try:
+                overrides = getattr(config, "CTRADER_RR_FLOOR_OVERRIDES", None) or {}
+                if isinstance(overrides, str):
+                    overrides = json.loads(overrides) if overrides.strip() else {}
+                src_key = str(source or "").strip().lower()
+                if isinstance(overrides, dict):
+                    for k, v in overrides.items():
+                        if str(k).lower() == src_key:
+                            floor = float(v)
+                            break
+            except Exception:
+                pass
+            meta["floor"] = round(floor, 3)
+            if rr < floor:
+                return False, f"rr_floor_below_min:rr={rr:.2f}<floor={floor:.2f}", meta
         return True, "", meta
 
     def _market_entry_drift_guard(self, signal, *, source: str = "") -> tuple[bool, str, dict]:
