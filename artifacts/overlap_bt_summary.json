@@ -1,0 +1,46 @@
+{
+  "generated_utc": "2026-04-27T08:28:08.786803Z",
+  "data_coverage": {
+    "m5_bars": 8863,
+    "m5_first_ts": "2026-02-24 19:20:00+00:00",
+    "m5_last_ts": "2026-04-10 20:55:00+00:00",
+    "days_approx": 30.8,
+    "m1_bars": 15731,
+    "h1_bars": 1733
+  },
+  "method": {
+    "step_bars_m5": 3,
+    "forward_window_bars_m5": 24,
+    "forward_minutes": 120,
+    "sl_atr_mult": 1.5,
+    "tp_atr_mult": 3.0,
+    "rr_target": 2.0,
+    "confirms_max_historical": 4,
+    "confirms_layers_used": [
+      "m1_engulfing",
+      "compression",
+      "h1_dema_slope",
+      "failed_sweep_wick"
+    ]
+  },
+  "buckets": {
+    "overlap_confirms_0_1": {
+      "n": 1,
+      "wr": 1.0,
+      "exp_R": 1.11,
+      "avg_R": 1.11
+    },
+    "no_overlap": {
+      "n": 361,
+      "wr": 0.338,
+      "exp_R": -0.112,
+      "avg_R": -0.112
+    }
+  },
+  "overlap_4plus_by_session": {},
+  "size_tilt_recommendation": {
+    "confirms_4_plus": 1.0,
+    "confirms_2_3": 1.0
+  },
+  "decision": "shadow_only_collect_more"
+}

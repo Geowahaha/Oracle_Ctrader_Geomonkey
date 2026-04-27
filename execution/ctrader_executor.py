@@ -4857,6 +4857,14 @@ class CTraderExecutor:
         return persisted
 
     def execute_signal(self, signal, *, source: str = "") -> CTraderExecutionResult:
+        # Overlap tagger: single chokepoint that attaches red/blue zone overlap
+        # context + reversal_confirms to signal.raw_scores. Currently SHADOW
+        # ONLY (size tilt = 1.0 unless XAU_OVERLAP_TILT_* env set). Fail-silent.
+        try:
+            from analysis.overlap_tagger import tag_signal as _overlap_tag_signal
+            _overlap_tag_signal(signal)
+        except Exception:
+            pass
         symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
         pattern = str(getattr(signal, "pattern", "") or "").strip().upper()
         entry = _safe_float(getattr(signal, "entry", 0.0), 0.0)
