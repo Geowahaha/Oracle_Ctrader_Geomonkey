@@ -9995,6 +9995,17 @@ class DexterScheduler:
             return False
         return True
 
+    def _run_shock_v2_refresh(self):
+        """Refresh shock V2 state. Fail-silent. Never blocks anything."""
+        try:
+            from learning.shock_resolver import refresh_state
+            refresh_state(save=True)
+        except Exception as e:
+            try:
+                logger.warning("[ShockV2] refresh error: %s", str(e)[:80])
+            except Exception:
+                pass
+
     def _run_xau_reversal_setup_scan(self):
         """5-layer reversal setup detector tick. Fail-silent. Never blocks
         existing scanners. Emits live market/limit signals when conditions
@@ -13854,6 +13865,11 @@ class DexterScheduler:
             _rs_mins = max(1, int(getattr(config, "XAU_REVERSAL_SETUP_SCAN_INTERVAL_MIN", 5) or 5))
             schedule.every(_rs_mins).minutes.do(self._run_xau_reversal_setup_scan)
             logger.info("[ReversalSetup] Scheduled every %dmin (5-layer detector)", _rs_mins)
+        # Shock V2 state refresher — multi-source shock score, NEVER blocks
+        if str(getattr(config, "SHOCK_V2_ENABLED", "1")) not in ("0", "false", "False"):
+            _shock_mins = max(1, int(getattr(config, "SHOCK_V2_REFRESH_MIN", 5) or 5))
+            schedule.every(_shock_mins).minutes.do(self._run_shock_v2_refresh)
+            logger.info("[ShockV2] Scheduled every %dmin (multi-source, never blocks)", _shock_mins)
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):

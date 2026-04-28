@@ -4945,6 +4945,25 @@ class CTraderExecutor:
                     )
         except Exception:
             pass
+        # Shock V2 — multi-source confirm + size/SL tilt. NEVER blocks.
+        # Reads cached shock state (refreshed by scheduler every 5 min).
+        # Opportunity override: high-conviction setups get HALF the penalty.
+        try:
+            if str(getattr(config, "SHOCK_V2_ENABLED", "1")) not in ("0", "false", "False"):
+                from learning.shock_resolver import get_current_shock
+                from analysis.shock_action_tilt import apply_shock_tilt
+                _ss = get_current_shock(max_staleness_min=10.0)
+                if not _ss.get("stale"):
+                    apply_shock_tilt(
+                        signal=signal,
+                        shock_score=float(_ss.get("score", 0.0) or 0.0),
+                        layers=_ss.get("layers"),
+                        reasons=_ss.get("reasons", []),
+                    )
+        except Exception:
+            pass
+        except Exception:
+            pass
         symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
         pattern = str(getattr(signal, "pattern", "") or "").strip().upper()
         entry = _safe_float(getattr(signal, "entry", 0.0), 0.0)
