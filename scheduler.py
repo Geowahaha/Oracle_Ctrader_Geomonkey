@@ -9995,6 +9995,21 @@ class DexterScheduler:
             return False
         return True
 
+    def _run_xau_reversal_setup_scan(self):
+        """5-layer reversal setup detector tick. Fail-silent. Never blocks
+        existing scanners. Emits live market/limit signals when conditions
+        align; logs shadow ghost trades for tentative scores.
+        """
+        try:
+            from learning.reversal_setup_runner import run_xau_reversal_setup_scan
+            executor = getattr(self, "ctrader_executor", None) or ctrader_executor
+            run_xau_reversal_setup_scan(executor=executor, logger=logger)
+        except Exception as e:
+            try:
+                logger.warning("[ReversalSetup] scan error: %s", str(e)[:80])
+            except Exception:
+                pass
+
     def _run_xauusd_scan(self, force_alert: bool = False, source: str = "scheduled"):
         """Execute XAUUSD scan and send alert if signal found."""
         session_info = session_manager.get_session_info()
@@ -13833,6 +13848,12 @@ class DexterScheduler:
 
         # ── Continuous scanners ──────────────────────────────────────────────
         schedule.every(xauusd_mins).minutes.do(self._run_xauusd_scan)
+        # 5-layer reversal setup scanner — emits live market/limit signals
+        # when 5-layer score qualifies (additive, never blocks existing scanners)
+        if str(getattr(config, "XAU_REVERSAL_SETUP_SCANNER_ENABLED", "1")) not in ("0", "false", "False"):
+            _rs_mins = max(1, int(getattr(config, "XAU_REVERSAL_SETUP_SCAN_INTERVAL_MIN", 5) or 5))
+            schedule.every(_rs_mins).minutes.do(self._run_xau_reversal_setup_scan)
+            logger.info("[ReversalSetup] Scheduled every %dmin (5-layer detector)", _rs_mins)
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
