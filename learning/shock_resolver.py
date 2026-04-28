@@ -60,11 +60,13 @@ def _fetch_xau(tf: str, bars: int) -> list[dict]:
 
 
 def _make_news_client() -> Any | None:
-    """Factory: build news client only if env keys present (deferred to next session)."""
-    if not os.environ.get("NEWSAPI_KEY"):
+    """Factory: build news client. ForexFactory works without any key, so
+    by default we always get a client unless NEWS_API_DISABLED=1."""
+    try:
+        from api.news_api_client import make_client
+        return make_client()
+    except Exception:
         return None
-    # Placeholder for future api/news_api_client wrapper
-    return None
 
 
 def _make_cross_asset_client() -> Any | None:
