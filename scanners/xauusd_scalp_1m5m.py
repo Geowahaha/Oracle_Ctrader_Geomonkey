@@ -584,12 +584,18 @@ class XAUUSDScalp1M5MScanner:
         live_price = xauusd_provider.get_current_price()
         current_price = float(live_price) if live_price else float(df_m5.iloc[-1]["close"])
 
-        # Kill zone check
+        # 2026-04-29 surgery: kill_zone is now soft by default (XAUUSD_SCALP_REQUIRE_KILL_ZONE=0).
+        # Off-zone signals are still scored, but tagged + can carry a confidence penalty so the
+        # downstream gate decides — instead of silently dropping every NY-evening setup.
         kill_zone = self._current_kill_zone()
         kz_enabled = bool(getattr(config, "XAUUSD_SCALP_REQUIRE_KILL_ZONE", True))
-        if kz_enabled and kill_zone == "off_kill_zone":
-            logger.debug("[XAUScalp1M5M] Off kill zone — skip")
+        off_zone_penalty = float(getattr(config, "XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY", 0.0) or 0.0)
+        off_zone = (kill_zone == "off_kill_zone")
+        if off_zone and kz_enabled:
+            logger.debug("[XAUScalp1M5M] Off kill zone (hard gate) — skip")
             return None
+        if off_zone:
+            logger.info("[XAUScalp1M5M] Off kill zone (soft gate) — continuing with penalty=%s", off_zone_penalty)
 
         # Get ATR
         try:
@@ -634,6 +640,12 @@ class XAUUSDScalp1M5MScanner:
 
         # Score confidence
         confidence, reasons = self._score_confidence(kill_zone, sweep, fvg, macro, direction, m1_trigger)
+
+        # 2026-04-29 surgery: apply soft kill_zone penalty so off-zone signals
+        # still surface but with a clear scoring drag — gate decides downstream.
+        if off_zone and off_zone_penalty > 0:
+            confidence = max(0.0, confidence - off_zone_penalty)
+            reasons.append(f"⚠️ off_kill_zone soft-penalty -{off_zone_penalty:.1f}")
 
         min_conf = float(getattr(config, "XAUUSD_SCALP_MIN_CONFIDENCE", 58.0))
         if confidence < min_conf:

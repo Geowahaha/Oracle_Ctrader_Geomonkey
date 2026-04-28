@@ -1520,10 +1520,27 @@ class DexterScheduler:
                 and entry_type in blocked_entry_types
                 and ((family and family in blocked_families) or src in blocked_sources)
             ):
-                raw["xau_manager_directive_block"] = True
-                raw["xau_manager_directive_block_reason"] = str(xau_execution_directive.get("reason") or "")
-                signal.raw_scores = raw
-                return False, f"xau_manager_directive_block:{str(xau_execution_directive.get('mode') or 'directive')}:{family or src}"
+                # 2026-04-29 surgery: if the incoming signal is unusually strong, let it
+                # through anyway — directive locks were silently freezing NY for hours
+                # while the strongest setups of the day waited at the gate.
+                bypass_threshold = float(getattr(config, "XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", 999) or 999)
+                if 0 < bypass_threshold < 200 and float(conf or 0.0) >= bypass_threshold:
+                    raw["xau_manager_directive_block"] = False
+                    raw["xau_manager_directive_bypass_high_confidence"] = {
+                        "threshold": bypass_threshold,
+                        "confidence": float(conf or 0.0),
+                        "reason": str(xau_execution_directive.get("reason") or ""),
+                    }
+                    signal.raw_scores = raw
+                    logger.info(
+                        "[Scheduler] XAU directive bypass: conf=%.1f >= %.1f — allowing %s on %s",
+                        float(conf or 0.0), bypass_threshold, direction or "?", family or src,
+                    )
+                else:
+                    raw["xau_manager_directive_block"] = True
+                    raw["xau_manager_directive_block_reason"] = str(xau_execution_directive.get("reason") or "")
+                    signal.raw_scores = raw
+                    return False, f"xau_manager_directive_block:{str(xau_execution_directive.get('mode') or 'directive')}:{family or src}"
 
         if symbol == "XAUUSD":
             allowed_style, style_reason = self._xau_forced_style_guard(signal, source=src, runtime_state=runtime_state)
@@ -2099,12 +2116,39 @@ class DexterScheduler:
         if str(state.get("status") or "").strip().lower() != "active":
             return {}
         pause_until_raw = str(state.get("pause_until_utc") or "").strip()
+        now_utc = datetime.now(timezone.utc)
+        # 2026-04-29 surgery: hard ceiling so a stale or over-long directive cannot
+        # freeze the lane beyond what is operationally acceptable. Any pause that
+        # claims more than ceiling_min from "applied_at" (or trigger_ts) is treated
+        # as if it had already expired — the lane is released, observability stays
+        # via the directive payload still being readable on disk.
+        ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        if ceiling_min > 0:
+            anchor_ts = None
+            try:
+                if state.get("trigger_ts") is not None:
+                    anchor_ts = float(state.get("trigger_ts") or 0.0) or None
+            except Exception:
+                anchor_ts = None
+            if anchor_ts is None:
+                applied_raw = str(state.get("applied_at") or "").strip()
+                if applied_raw:
+                    try:
+                        applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                        if applied_dt.tzinfo is None:
+                            applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                        anchor_ts = applied_dt.timestamp()
+                    except Exception:
+                        anchor_ts = None
+            if anchor_ts is not None:
+                if (now_utc.timestamp() - anchor_ts) >= (ceiling_min * 60.0):
+                    return {}
         if pause_until_raw:
             try:
                 pause_until = datetime.fromisoformat(pause_until_raw.replace("Z", "+00:00"))
                 if pause_until.tzinfo is None:
                     pause_until = pause_until.replace(tzinfo=timezone.utc)
-                if pause_until.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                if pause_until.astimezone(timezone.utc) <= now_utc:
                     return {}
             except Exception:
                 pass
@@ -2116,12 +2160,27 @@ class DexterScheduler:
         if str(state.get("status") or "").strip().lower() != "active":
             return {}
         hold_until_raw = str(state.get("hold_until_utc") or "").strip()
+        now_utc = datetime.now(timezone.utc)
+        # 2026-04-29 surgery: same ceiling as execution_directive so regime transitions
+        # cannot wedge the lane indefinitely after a single bad bar.
+        ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        if ceiling_min > 0:
+            applied_raw = str(state.get("applied_at") or "").strip()
+            if applied_raw:
+                try:
+                    applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                    if applied_dt.tzinfo is None:
+                        applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                    if (now_utc - applied_dt).total_seconds() >= (ceiling_min * 60.0):
+                        return {}
+                except Exception:
+                    pass
         if hold_until_raw:
             try:
                 hold_until = datetime.fromisoformat(hold_until_raw.replace("Z", "+00:00"))
                 if hold_until.tzinfo is None:
                     hold_until = hold_until.replace(tzinfo=timezone.utc)
-                if hold_until.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                if hold_until.astimezone(timezone.utc) <= now_utc:
                     return {}
             except Exception:
                 pass

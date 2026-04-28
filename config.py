@@ -947,7 +947,12 @@ class Config:
     CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED: bool = os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT: float = float(os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT", "1.15"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED: bool = os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-    CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN", "20"))
+    # 2026-04-29 surgery: cap directive pause to 5min so a single bad trade can't freeze NY for hours.
+    CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN", "5"))
+    # Hard ceiling enforced at directive read-time — no XAU directive may pause longer than this.
+    XAU_DIRECTIVE_PAUSE_CEILING_MIN: int = int(os.getenv("XAU_DIRECTIVE_PAUSE_CEILING_MIN", "10"))
+    # Confidence (0-100) at which a fresh signal bypasses the directive block. Set to 999 to disable bypass.
+    XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS: float = float(os.getenv("XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", "82"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN", "95"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES: str = os.getenv(
         "CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES",
@@ -1677,7 +1682,10 @@ class Config:
     XAUUSD_SCALP_ENABLED: bool = os.getenv("XAUUSD_SCALP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAUUSD_SCALP_SCAN_INTERVAL: int = int(os.getenv("XAUUSD_SCALP_SCAN_INTERVAL", "60"))     # seconds (every 1 min)
     XAUUSD_SCALP_MIN_CONFIDENCE: float = float(os.getenv("XAUUSD_SCALP_MIN_CONFIDENCE", "58.0"))
-    XAUUSD_SCALP_REQUIRE_KILL_ZONE: bool = os.getenv("XAUUSD_SCALP_REQUIRE_KILL_ZONE", "1").strip().lower() in ("1", "true", "yes", "on")
+    # 2026-04-29 surgery: kill_zone defaults to soft (warn-only) so off-zone opportunities are not silently dropped.
+    XAUUSD_SCALP_REQUIRE_KILL_ZONE: bool = os.getenv("XAUUSD_SCALP_REQUIRE_KILL_ZONE", "0").strip().lower() in ("1", "true", "yes", "on")
+    # When kill_zone gate is soft, off-zone signals get this confidence penalty (0 = no penalty).
+    XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY: float = float(os.getenv("XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY", "5"))
     XAUUSD_SCALP_REQUIRE_M1_TRIGGER: bool = os.getenv("XAUUSD_SCALP_REQUIRE_M1_TRIGGER", "1").strip().lower() in ("1", "true", "yes", "on")
     XAUUSD_SCALP_ALERT_COOLDOWN_SEC: int = int(os.getenv("XAUUSD_SCALP_ALERT_COOLDOWN_SEC", "300"))  # 5 min cooldown
     XAUUSD_SCALP_FVG_LOOKBACK: int = int(os.getenv("XAUUSD_SCALP_FVG_LOOKBACK", "25"))

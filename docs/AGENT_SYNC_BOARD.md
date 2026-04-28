@@ -19,9 +19,9 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **E** — reversal-zone capture + Fib `61.8` template gate live; Trading Central intraday canary lane + payload producer deployed to VM (experimental) |
-| **Last updated (UTC)** | 2026-04-23T08:45Z |
-| **Last updated by** | codex |
+| **Phase now** | **E+ops** — surgery 2026-04-29 on `deploy-xau-family-canary`: XAU directive pause ceiling (10m hard cap) + high-conf bypass + soft kill_zone (warn-only). Awaits VM deploy. |
+| **Last updated (UTC)** | 2026-04-29T16:05Z |
+| **Last updated by** | claude (opus 4.7) |
 
 ---
 
@@ -37,7 +37,7 @@
 
 ## Owner — latest (≤1 paragraph)
 
-**2026-04-23:** Trading Central intraday canary lane is now deployed on the VM (commit `213cd3e`) as experimental-only. New module `learning/trading_central_payload_producer.py` normalizes Trading Central panel text / raw JSON into `data/runtime/trading_central_intraday_signal.json`, and the scheduler can execute `xau_scalp_trading_central_intraday` via `scalp_xauusd:tc:canary` (family-level MTF guard bypass applies only to this lane). VM demo test trade succeeded (ORDER_ACCEPTED) after increasing VM `.env.local` `CTRADER_EXECUTOR_TIMEOUT_SEC` from `25` to `60` and restarting `dexter-monitor` (timeouts were blocking `:tc:` executions).
+**2026-04-29:** Forensic review of 28-Apr trading day: 9 SHORT XAU trades (4W/5L net +$1.47), but the system **froze for ~4 hours during NY** (11:23–15:20 UTC) while price ran a clean 90-pt range — entire NY breakdown + reversal missed. Root cause: an `xau_execution_directive` set after the -$3.50 loss left `pause_until_utc` hours in the future and there was no global ceiling, so a single bad bar wedged the lane until manual session reset. Surgery patch (this session) adds `XAU_DIRECTIVE_PAUSE_CEILING_MIN=10` enforced at directive read-time, a `XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS=82` so strong setups punch through stale locks, and softens `XAUUSD_SCALP_REQUIRE_KILL_ZONE` to default off (warn-only with -5 conf penalty) so off-zone setups stay visible. Also defaulted `CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN` 20→5. Tests: 5 new passes in `test_xau_directive_ceiling.py`; 192/195 of pre-existing relevant suite still passing (3 failures are stale, pre-existing). Awaits VM deploy. Note: `artifacts/xau_dependency_web_2026_04_28.md` was retracted at the top — its `sync_and_reconcile()` proposal was based on misreading deal direction column.
 
 ---
 
@@ -85,15 +85,25 @@ Format each entry:
 - Verification: `py_compile` on changed files, `pytest tests/test_trading_central_family_lane.py tests/test_mempalace_family_lane.py`, and `pytest tests/test_scheduler_watchlist.py -k "mempalace_payload or trading_central"` all passed.
 - Next peer: if user wants VM rollout, wire the upstream Trading Central payload producer first, then deploy this lane as experimental only and monitor `:tc:canary` fills separately from existing families.
 
-### 2026-04-23 UTC 08:45Z — codex — Phase E
+### 2026-04-29 UTC 16:05Z — claude (opus 4.7) — Surgery: unblock NY opportunities
 
-- VM rollout: head is now `213cd3e` ("Add Trading Central intraday canary producer"); `dexter-monitor` active.
-- Producer output path: `data/runtime/trading_central_intraday_signal.json` (see `docs/trading_central_intraday_signal.example.json`).
-- Live test (DEMO, non-dry-run): executed one `scalp_xauusd:tc:canary` market BUY; broker response `ORDER_ACCEPTED` with `order_id=959356719` and `position_id=610034895`.
-- Operational issue: repeated `worker timeout after 25s` blocked execution and cTrader sync; fixed by updating VM `/opt/dexter_pro/.env.local`:
-- `CTRADER_EXECUTOR_TIMEOUT_SEC=60`
-- `CTRADER_HEALTHCHECK_TIMEOUT_SEC=45`
-- and restarting `dexter-monitor`.
+- Forensic on 2026-04-28: 9 XAU SHORT trades, all closed cleanly (4W/5L, net +$1.47) — but ~4h NY freeze (11:23→15:20 UTC) missed ~90pts of price action. Root cause: `xau_execution_directive` `pause_until_utc` had no ceiling.
+- Patch (additive, no breaking change):
+  - `config.py` — added `XAU_DIRECTIVE_PAUSE_CEILING_MIN=10`, `XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS=82`, `XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY=5`; defaulted `XAUUSD_SCALP_REQUIRE_KILL_ZONE` 1→0; lowered `CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN` 20→5.
+  - `scheduler.py` — `_active_xau_execution_directive` + `_active_xau_regime_transition` now enforce the ceiling against `applied_at` / `trigger_ts`; the directive block in `_xau_*_route_filter` honors a high-confidence bypass with telemetry into `raw_scores["xau_manager_directive_bypass_high_confidence"]`.
+  - `scanners/xauusd_scalp_1m5m.py` — kill_zone is soft by default; off-zone signals carry a configurable confidence penalty instead of being silently dropped.
+  - `tests/test_xau_directive_ceiling.py` — 5 new tests (within-ceiling, past-ceiling, expired, inactive, regime_transition ceiling) all pass.
+- Pre-existing failures (NOT introduced by this surgery): `test_trading_manager_demotes_pb_when_scheduled_outperforms`, `test_trading_manager_demotes_pb_with_scheduled_calibration_fallback`, `test_ctrader_xau_scheduled_no_chase_block_emits_late_entry_telemetry` — verified by `git stash` rerun.
+- Retraction: `artifacts/xau_dependency_web_2026_04_28.md` headed with "RETRACTED — DO NOT ACT" — original report misread `direction` column of `ctrader_deals` (each position has 2 legs); the proposed `sync_and_reconcile()` fix would have broken working executor logic.
+- Next peer / owner: redeploy VM to latest, then watch `data/runtime/trading_manager_state.json` for `applied_at` discipline (any state that lingers >10m past `applied_at` should be treated as cleared by the new ceiling).
+
+### 2026-04-24 UTC 12:10Z — codex — routing follow-up after live verification
+
+- Owner reran env setup and VM deploy successfully; local WSL now has `.venv`, `dotenv/pandas/pytest`, and targeted routing tests are runnable with `PYTHONPATH=.`.
+- Post-deploy runtime check on VM with commit `9572282` showed why routing still stayed `swarm_support_all`: `xau_shock_profile` was inactive, and `_derive_xau_family_routing_recommendation()` only treated `losses` from `shock_rows` as severe-loss input. The active drawdown signal was instead coming from `xau_order_care.review_window` / recent losing reviews, so swarm mode still won despite live losses.
+- Implemented follow-up commit `9fd939e fix(xau): route by recent loss regime, not shock only`: family routing now also consumes `recent_order_reviews`, computes `recent_loss_regime`, blocks swarm sample-collection during that regime, and emits `recent_loss_demote` when losses are live but not shock-tagged. Added regression test `test_trading_manager_swarm_support_yields_to_recent_loss_regime`.
+- Validation after patch: `python3 -m py_compile learning/trading_manager_agent.py tests/test_trading_manager_agent.py` passed, and `PYTHONPATH=. .venv/bin/pytest -q tests/test_trading_manager_agent.py -k 'swarm_support'` passed (`3 passed`). Commit pushed to `dexter/deploy-xau-family-canary`.
+- Next peer / owner command: redeploy VM to `9fd939e`, then re-read `data/runtime/trading_manager_state.json`; expected change is that active XAU drawdown without shock should no longer leave `xau_family_routing.mode = swarm_support_all`.
 
 ---
 
