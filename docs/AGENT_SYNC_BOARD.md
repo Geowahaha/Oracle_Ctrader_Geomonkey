@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **E+ops** — surgery 2026-04-29 on `deploy-xau-family-canary`: XAU directive pause ceiling (10m hard cap) + high-conf bypass + soft kill_zone (warn-only). Awaits VM deploy. |
-| **Last updated (UTC)** | 2026-04-29T16:05Z |
+| **Phase now** | **E+ops** — surgery 1 (`ab027c0`) + surgery 2 (`b5b8c4d`) deployed live on VM 129.150.36.17, branch `deploy-xau-family-canary`. Lane is unblocked: ceiling backstop on every `xau_*` state, source-attribution fallback at executor, ETH/BTC weekday/weekend family routing, 5-min opportunity health beacon emitting to journalctl. |
+| **Last updated (UTC)** | 2026-04-29T02:10Z |
 | **Last updated by** | claude (opus 4.7) |
 
 ---
@@ -85,7 +85,23 @@ Format each entry:
 - Verification: `py_compile` on changed files, `pytest tests/test_trading_central_family_lane.py tests/test_mempalace_family_lane.py`, and `pytest tests/test_scheduler_watchlist.py -k "mempalace_payload or trading_central"` all passed.
 - Next peer: if user wants VM rollout, wire the upstream Trading Central payload producer first, then deploy this lane as experimental only and monitor `:tc:canary` fills separately from existing families.
 
-### 2026-04-29 UTC 16:05Z — claude (opus 4.7) — Surgery: unblock NY opportunities
+### 2026-04-29 UTC 02:10Z — claude (opus 4.7) — Surgery 2: full-perimeter ceiling + observability
+
+- VM post-restart inspection (after surgery 1) showed `xau_shock_profile`, `xau_family_routing`, `xau_order_care`, `xau_reason_memory`, `xau_parallel_families` were ALSO state machines that linger after a single bad bar — same failure mode as the original NY freeze, just under different keys not covered by surgery 1.
+- Patch (commit `b5b8c4d`):
+  - `scheduler.py`:
+    - `_apply_runtime_state_ceiling(payload)` — load-time backstop that flips any `xau_*` state with `applied_at` older than `XAU_DIRECTIVE_PAUSE_CEILING_MIN` to `inactive` with `ceiling_expired=True` for ops-side observability.
+    - `_run_opportunity_health_beacon` — every 5 min emits `[OpportunityHealth] ceiling=10min bypass>=82 kill_zone_hard=False active_states=…` so silent freezes are impossible to miss in journalctl.
+    - Both load functions (`_load_trading_manager_runtime_state`, `_load_trading_team_runtime_state`) now return ceilinged state — every consumer (telegram, autopilot, executor) benefits.
+  - `execution/ctrader_executor.py`:
+    - Deal reconcile fallback: parses broker label/comment via `_parse_label_meta` → journal source → `untagged_external` (instead of empty string). Recovers `source` for the path that produced 8/9 untagged trades on 2026-04-28.
+    - `_source_family` for `scalp_btcusd:*` / `scalp_ethusd:*` now picks weekday (`btc_weekday_lob_momentum` / `eth_weekday_overlap_probe`) on Mon-Fri UTC, weekend variants on Sat-Sun. Fixes `eth_weekend_winner` showing as priority on Tuesday.
+  - `config.py`: `XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED=1`, `*_MIN=5`.
+- Tests: 9 new in `tests/test_xau_directive_ceiling.py` (+4 new this round) — all pass. 169/170 of focused regression pass; the 1 remaining failure (`test_ctrader_xau_scheduled_no_chase_block_emits_late_entry_telemetry`) was confirmed pre-existing in surgery 1.
+- VM: pulled `b5b8c4d`, `dexter-monitor` restarted active, `[OpportunityHealth] Scheduled every 5min` confirmed in journalctl. First beacon emission expected within 5min of this entry.
+- Next peer / owner: watch `journalctl -u dexter-monitor -f | grep OpportunityHealth` for 1-2 cycles to confirm beacon is emitting; observe whether any `ceiling_expired=True` appears in `data/runtime/trading_manager_state.json` after a bad bar (indicates ceiling auto-cleared a stale lock).
+
+### 2026-04-29 UTC 16:05Z — claude (opus 4.7) — Surgery 1: unblock NY opportunities
 
 - Forensic on 2026-04-28: 9 XAU SHORT trades, all closed cleanly (4W/5L, net +$1.47) — but ~4h NY freeze (11:23→15:20 UTC) missed ~90pts of price action. Root cause: `xau_execution_directive` `pause_until_utc` had no ceiling.
 - Patch (additive, no breaking change):
