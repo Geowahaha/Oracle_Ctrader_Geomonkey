@@ -83,6 +83,9 @@ class DexterScheduler:
         self._us_open_mood_weak_cycles: int = 0
         self._us_open_mood_stop_triggered: bool = False
         self._us_open_mood_stop_reason: str = ""
+        # 2026-04-29 surgery: 5-min opportunity health beacon — emits compact
+        # "active blockers + scan cadence" line so silent freezes show up in logs.
+        self._opportunity_health_last_ts: float = 0.0
         self._last_xauusd_alert_ts: float = 0.0
         self._last_xauusd_direction: str = ""
         self._last_xauusd_entry: float = 0.0
@@ -2053,12 +2056,63 @@ class DexterScheduler:
         alias = self._strategy_family_alias(family)
         return f"{base}:{alias}:canary"
 
+    @staticmethod
+    def _apply_runtime_state_ceiling(payload: dict) -> dict:
+        """2026-04-29 surgery: apply a global age-ceiling to every active xau_*
+        state machine read from the runtime json. Without this, a single bad
+        bar can leave shock_demote / order_care / family_routing pinned for
+        hours after conditions have normalized. The directive-specific
+        readers (_active_xau_execution_directive etc) already enforce the
+        ceiling at consumer-side; this is the load-time backstop so EVERY
+        consumer of the file (telegram, telemetry, autopilot) sees fresh state.
+
+        Behaviour: any xau_* dict with status="active" and an applied_at older
+        than XAU_DIRECTIVE_PAUSE_CEILING_MIN minutes is flipped to
+        status="inactive" with reverted_at=now and ceiling_expired=True so the
+        operator can see WHY it was cleared.
+        """
+        if not isinstance(payload, dict) or not payload:
+            return payload
+        try:
+            ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        except Exception:
+            ceiling_min = 10
+        if ceiling_min <= 0:
+            return payload
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=ceiling_min)
+        for key, val in list(payload.items()):
+            if not isinstance(val, dict):
+                continue
+            if not str(key or "").startswith("xau_"):
+                continue
+            if str(val.get("status") or "").strip().lower() != "active":
+                continue
+            applied_raw = str(val.get("applied_at") or "").strip()
+            if not applied_raw:
+                continue
+            try:
+                applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                if applied_dt.tzinfo is None:
+                    applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if applied_dt > cutoff:
+                continue
+            val["status"] = "inactive"
+            val["reverted_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            val["ceiling_expired"] = True
+            val["ceiling_expired_after_min"] = ceiling_min
+        return payload
+
     def _load_trading_manager_runtime_state(self) -> dict:
         path = Path(__file__).resolve().parent / "data" / "runtime" / "trading_manager_state.json"
         try:
             if path.exists():
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                return payload if isinstance(payload, dict) else {}
+                if isinstance(payload, dict):
+                    return self._apply_runtime_state_ceiling(payload)
+                return {}
         except Exception:
             return {}
         return {}
@@ -2082,7 +2136,7 @@ class DexterScheduler:
                     )
                 ):
                     return {}
-                return payload
+                return self._apply_runtime_state_ceiling(payload)
         except Exception:
             return {}
         return {}
@@ -10065,6 +10119,60 @@ class DexterScheduler:
             except Exception:
                 pass
 
+    def _run_opportunity_health_beacon(self):
+        """2026-04-29 surgery: opportunity health beacon. Never blocks anything;
+        purely emits a compact log line every N minutes summarising:
+          - which xau_* state machines are currently 'active' (= potential blockers)
+          - their applied_at age (the ceiling auto-clears at >XAU_DIRECTIVE_PAUSE_CEILING_MIN)
+          - the directive bypass threshold + soft kill_zone status
+
+        Goal: a silent half-day freeze (the failure mode that wrecked 2026-04-28 NY)
+        is impossible to miss in journalctl after this.
+        """
+        try:
+            runtime_state = self._load_trading_routing_runtime_state() or {}
+            now_utc = datetime.now(timezone.utc)
+            ceiling_min = int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 10)
+            actives: list[str] = []
+            for key, val in runtime_state.items():
+                if not isinstance(val, dict):
+                    continue
+                if not str(key or "").startswith("xau_"):
+                    continue
+                if str(val.get("status") or "").strip().lower() != "active":
+                    continue
+                applied_raw = str(val.get("applied_at") or "").strip()
+                age_str = "?"
+                if applied_raw:
+                    try:
+                        applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                        if applied_dt.tzinfo is None:
+                            applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                        age_min = (now_utc - applied_dt).total_seconds() / 60.0
+                        age_str = f"{age_min:.1f}m"
+                    except Exception:
+                        pass
+                mode = str(val.get("mode") or "")
+                actives.append(f"{key}({mode})/{age_str}")
+            bypass = float(getattr(config, "XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", 999) or 999)
+            kz_hard = bool(getattr(config, "XAUUSD_SCALP_REQUIRE_KILL_ZONE", False))
+            self._opportunity_health_last_ts = time.time()
+            if actives:
+                logger.info(
+                    "[OpportunityHealth] ceiling=%dmin bypass>=%.0f kill_zone_hard=%s active_states=%s",
+                    ceiling_min, bypass, kz_hard, ",".join(actives) or "none",
+                )
+            else:
+                logger.info(
+                    "[OpportunityHealth] ceiling=%dmin bypass>=%.0f kill_zone_hard=%s NO_ACTIVE_BLOCKERS — lane open",
+                    ceiling_min, bypass, kz_hard,
+                )
+        except Exception as e:
+            try:
+                logger.warning("[OpportunityHealth] beacon error: %s", str(e)[:80])
+            except Exception:
+                pass
+
     def _run_xau_reversal_setup_scan(self):
         """5-layer reversal setup detector tick. Fail-silent. Never blocks
         existing scanners. Emits live market/limit signals when conditions
@@ -13929,6 +14037,14 @@ class DexterScheduler:
             _shock_mins = max(1, int(getattr(config, "SHOCK_V2_REFRESH_MIN", 5) or 5))
             schedule.every(_shock_mins).minutes.do(self._run_shock_v2_refresh)
             logger.info("[ShockV2] Scheduled every %dmin (multi-source, never blocks)", _shock_mins)
+        # 2026-04-29 surgery: opportunity health beacon — emits a compact log line
+        # every N minutes summarising active blockers + cadence so silent freezes
+        # (the kind that lost an entire NY session on 2026-04-28) become visible
+        # immediately in journalctl. Pure observability — never blocks signals.
+        if str(getattr(config, "XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED", "1")) not in ("0", "false", "False"):
+            _beacon_mins = max(1, int(getattr(config, "XAU_OPPORTUNITY_HEALTH_BEACON_MIN", 5) or 5))
+            schedule.every(_beacon_mins).minutes.do(self._run_opportunity_health_beacon)
+            logger.info("[OpportunityHealth] Scheduled every %dmin (observability beacon)", _beacon_mins)
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):

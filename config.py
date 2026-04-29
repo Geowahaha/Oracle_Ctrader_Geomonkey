@@ -953,6 +953,11 @@ class Config:
     XAU_DIRECTIVE_PAUSE_CEILING_MIN: int = int(os.getenv("XAU_DIRECTIVE_PAUSE_CEILING_MIN", "10"))
     # Confidence (0-100) at which a fresh signal bypasses the directive block. Set to 999 to disable bypass.
     XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS: float = float(os.getenv("XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", "82"))
+    # 5-minute opportunity health beacon — observability log emitted on a fixed cadence
+    # so silent freezes (the kind that lost the entire 2026-04-28 NY session) show up
+    # immediately in journalctl. Pure observability — never blocks signals.
+    XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED: bool = os.getenv("XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPPORTUNITY_HEALTH_BEACON_MIN: int = int(os.getenv("XAU_OPPORTUNITY_HEALTH_BEACON_MIN", "5"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN", "95"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES: str = os.getenv(
         "CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES",

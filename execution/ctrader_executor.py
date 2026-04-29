@@ -651,8 +651,22 @@ class CTraderExecutor:
         if token.startswith("scalp_xauusd"):
             return "xau_scalp_microtrend"
         if token.startswith("scalp_btcusd"):
+            # 2026-04-29 surgery: route by weekday/weekend rather than always-weekend.
+            # Mon-Fri uses btc_weekday_lob_momentum; Sat-Sun keeps btc_weekend_winner.
+            try:
+                from datetime import datetime, timezone
+                if datetime.now(timezone.utc).weekday() < 5:
+                    return "btc_weekday_lob_momentum"
+            except Exception:
+                pass
             return "btc_weekend_winner"
         if token.startswith("scalp_ethusd"):
+            try:
+                from datetime import datetime, timezone
+                if datetime.now(timezone.utc).weekday() < 5:
+                    return "eth_weekday_overlap_probe"
+            except Exception:
+                pass
             return "eth_weekend_winner"
         return ""
 
@@ -8183,6 +8197,16 @@ class CTraderExecutor:
                     signal_run_id = str(prow["signal_run_id"] or "")
                     signal_run_no = int(prow["signal_run_no"] or 0)
                 else:
+                    # 2026-04-29 surgery: when there is no prior position row, try the
+                    # broker label/comment carried on the deal payload itself before
+                    # falling back to journal — that recovers the source field for
+                    # the path that bypassed sync_account_state (the silent-untagged
+                    # path responsible for 8/9 untagged trades on 2026-04-28).
+                    deal_meta = self._parse_label_meta(
+                        str(deal.get("label", "") or ""),
+                        str(deal.get("comment", "") or ""),
+                    )
+                    deal_source_hint = str(deal_meta.get("source") or "").strip().lower()
                     jrow = self._find_journal_match(
                         conn,
                         position_id=position_id,
@@ -8194,9 +8218,23 @@ class CTraderExecutor:
                     journal_id = int(jrow["id"]) if jrow is not None else None
                     jrow_obj = dict(jrow) if jrow is not None else {}
                     source = str(jrow_obj.get("source", "") or "").strip().lower()
+                    # If journal lookup also empty, use the broker label hint we just parsed.
+                    if not source and deal_source_hint:
+                        source = deal_source_hint
+                    # Last-resort observability tag so the deal does not disappear from
+                    # winner-logic / family-promotion analytics.
+                    if not source and symbol:
+                        source = "untagged_external"
                     lane = self._source_lane(source)
                     signal_run_id = str(jrow_obj.get("signal_run_id", "") or "")
                     signal_run_no = int(jrow_obj.get("signal_run_no", 0) or 0)
+                    if not signal_run_id:
+                        signal_run_id = str(deal_meta.get("run_id") or "")
+                    if signal_run_no <= 0:
+                        try:
+                            signal_run_no = int(deal_meta.get("run_no") or 0)
+                        except Exception:
+                            signal_run_no = 0
                 journal_detail_row = None
                 if journal_id is not None:
                     journal_detail_row = conn.execute(

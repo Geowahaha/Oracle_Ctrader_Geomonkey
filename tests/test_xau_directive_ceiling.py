@@ -82,5 +82,87 @@ class TestActiveDirectiveCeiling(unittest.TestCase):
         self.assertEqual(state, {})
 
 
+class TestRuntimeStateCeilingApplied(unittest.TestCase):
+    """The load-time ceiling backstop catches every xau_* state machine, not just
+    the directive/transition pair. Without this, shock_demote / order_care /
+    family_routing remained pinned for hours after a single bad bar."""
+
+    def test_stale_active_xau_states_flipped_to_inactive(self):
+        now = datetime.now(timezone.utc)
+        payload = {
+            "xau_shock_profile": {
+                "status": "active",
+                "mode": "shock_protect",
+                "applied_at": _iso(now - timedelta(minutes=240)),
+            },
+            "xau_family_routing": {
+                "status": "active",
+                "mode": "shock_demote",
+                "applied_at": _iso(now - timedelta(minutes=60)),
+            },
+            "xau_order_care": {
+                "status": "active",
+                "mode": "continuation_fail_fast",
+                "applied_at": _iso(now - timedelta(minutes=2)),  # fresh — must keep
+            },
+            "non_xau_thing": {"status": "active", "applied_at": _iso(now - timedelta(hours=24))},
+        }
+        with patch.object(scheduler_module.config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10):
+            cleaned = scheduler_module.DexterScheduler._apply_runtime_state_ceiling(payload)
+        self.assertEqual(cleaned["xau_shock_profile"]["status"], "inactive")
+        self.assertTrue(cleaned["xau_shock_profile"].get("ceiling_expired"))
+        self.assertEqual(cleaned["xau_family_routing"]["status"], "inactive")
+        self.assertEqual(cleaned["xau_order_care"]["status"], "active")  # within ceiling
+        # non-xau states untouched
+        self.assertEqual(cleaned["non_xau_thing"]["status"], "active")
+
+    def test_ceiling_skipped_when_no_applied_at(self):
+        payload = {
+            "xau_some_state": {
+                "status": "active",
+                "mode": "test",
+                # no applied_at — leave alone (cannot judge age)
+            }
+        }
+        with patch.object(scheduler_module.config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10):
+            cleaned = scheduler_module.DexterScheduler._apply_runtime_state_ceiling(payload)
+        self.assertEqual(cleaned["xau_some_state"]["status"], "active")
+
+    def test_ceiling_disabled_when_zero(self):
+        now = datetime.now(timezone.utc)
+        payload = {
+            "xau_shock_profile": {
+                "status": "active",
+                "applied_at": _iso(now - timedelta(hours=24)),
+            }
+        }
+        with patch.object(scheduler_module.config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 0):
+            cleaned = scheduler_module.DexterScheduler._apply_runtime_state_ceiling(payload)
+        self.assertEqual(cleaned["xau_shock_profile"]["status"], "active")
+
+
+class TestCryptoFamilyWeekdayMap(unittest.TestCase):
+    """ETH/BTC mapping flips between weekday and weekend variants based on UTC date.
+
+    Note: the production helper imports `datetime` lazily inside the function so
+    we cannot patch it via `patch("execution.ctrader_executor.datetime")`. We
+    therefore assert that on a real weekday execution, the weekday families are
+    returned — which is the regression we actually want to guard against
+    (eth_weekend_winner being the default on a Tuesday).
+    """
+
+    def test_real_today_routes_via_weekday_branch_on_weekdays(self):
+        from execution.ctrader_executor import CTraderExecutor
+        today_weekday = datetime.now(timezone.utc).weekday()
+        family_btc = CTraderExecutor._source_family("scalp_btcusd:canary")
+        family_eth = CTraderExecutor._source_family("scalp_ethusd:canary")
+        if today_weekday < 5:
+            self.assertEqual(family_btc, "btc_weekday_lob_momentum")
+            self.assertEqual(family_eth, "eth_weekday_overlap_probe")
+        else:
+            self.assertEqual(family_btc, "btc_weekend_winner")
+            self.assertEqual(family_eth, "eth_weekend_winner")
+
+
 if __name__ == "__main__":
     unittest.main()
