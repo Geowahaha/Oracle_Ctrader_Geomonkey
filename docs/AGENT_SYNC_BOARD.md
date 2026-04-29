@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **E+ops** — surgery 1 (`ab027c0`) + surgery 2 (`b5b8c4d`) deployed live on VM 129.150.36.17, branch `deploy-xau-family-canary`. Lane is unblocked: ceiling backstop on every `xau_*` state, source-attribution fallback at executor, ETH/BTC weekday/weekend family routing, 5-min opportunity health beacon emitting to journalctl. |
-| **Last updated (UTC)** | 2026-04-29T02:10Z |
+| **Phase now** | **E+ops** — surgery 1+2+3 live on VM. Surgery 3 (2026-04-29 ~12:55Z): fibo pending TTL bumped 45→240min; patient strategies (fibo/scheduled) immune to far_from_market sweep + force_close_direction so the planned 1.5R+ Fibo target isn't abandoned at -0.04R. |
+| **Last updated (UTC)** | 2026-04-29T12:55Z |
 | **Last updated by** | claude (opus 4.7) |
 
 ---
@@ -84,6 +84,24 @@ Format each entry:
 - Updated config/source mapping in `config.py`, `execution/ctrader_executor.py`, `learning/live_profile_autopilot.py`, and `scheduler.py`; added example payload file plus focused tests.
 - Verification: `py_compile` on changed files, `pytest tests/test_trading_central_family_lane.py tests/test_mempalace_family_lane.py`, and `pytest tests/test_scheduler_watchlist.py -k "mempalace_payload or trading_central"` all passed.
 - Next peer: if user wants VM rollout, wire the upstream Trading Central payload producer first, then deploy this lane as experimental only and monitor `:tc:canary` fills separately from existing families.
+
+### 2026-04-29 UTC 12:55Z — claude (opus 4.7) — Surgery 3: protect patient strategies (fibo, scheduled)
+
+- Live forensics today after surgery 1+2 deploy: XAU **was** trading via fibo lane (`source=fibo_xauusd` ✓ source attribution recovered). But two failure modes still bled profit:
+  1. **Premature pending cancel**: a perfect sell-limit `dexter:XAUUSD:fibo_xauusd:4 @ 4604.62` (created 04:36Z) was cancelled at 05:51Z by `stale_ttl:45m` from `_pending_order_ttl_min` — fibo was being treated as a scalp family. Price later rallied to 4608+ where it would have hit cleanly. Missed the trade entirely.
+  2. **Premature open-position close**: `dexter:XAUUSD:fibo_xauusd:2` opened 04:13Z at 4601.45 short with planned SL 4616.68 / TP 4571.37, then closed 04:30Z at 4602.05 (just -0.04R) by `xau_order_care.force_close_direction=short`. Abandoned the planned 30+pt TP for a 0.6pt scratch loss.
+- Patch (commit pending — see git log):
+  - `config.py`:
+    - `CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN=240` (4 hours, was implicit 45m via XAU_SCALP).
+    - `CTRADER_PATIENT_STRATEGY_SOURCES="fibo_xauusd,fibo_xauusd:winner,fibo_xauusd:scout,xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner"` (csv).
+    - `CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE=1`, `..._PROTECT_FROM_FAR_FROM_MARKET=1`.
+  - `execution/ctrader_executor.py`:
+    - Added `_patient_strategy_sources()` set + `_is_patient_strategy_source(source)` classifier (fibo_*, scheduled, plus prefix matches).
+    - `_pending_order_ttl_min`: fibo branch returns 240m.
+    - `_pending_order_cancel_reason`: skips `far_from_market` for patient sources.
+    - `_manage_open_positions` force_close branch: skipped for patient sources, with explicit log line `force_close_skipped (patient_strategy)`.
+- Tests: 2 new in `tests/test_xau_directive_ceiling.py` (fibo source recognition + 240m TTL). All 11 in file pass.
+- Owner / next peer: redeploy VM, watch the open `fibo_xauusd:6` short (position 612766209) live to TP/SL **without** premature force-close interference. Confirm next cancelled fibo limit only carries reasons stale_ttl (>=240m) or symbol_position_cap, never far_from_market.
 
 ### 2026-04-29 UTC 02:10Z — claude (opus 4.7) — Surgery 2: full-perimeter ceiling + observability
 

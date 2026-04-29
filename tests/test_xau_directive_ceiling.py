@@ -164,5 +164,32 @@ class TestCryptoFamilyWeekdayMap(unittest.TestCase):
             self.assertEqual(family_eth, "eth_weekend_winner")
 
 
+class TestPatientStrategyProtection(unittest.TestCase):
+    """Surgery 3 (2026-04-29) — fibo/scheduled limits must not be cancelled or
+    closed by scalp-side heuristics. Without these guards, a 4604.62 sell-limit
+    gets killed at 74min before price rallies to hit it, and an open fibo
+    short gets force-closed at -0.04R abandoning the planned 1.5R+ target."""
+
+    def test_is_patient_strategy_source_recognises_fibo(self):
+        from execution.ctrader_executor import CTraderExecutor
+        self.assertTrue(CTraderExecutor._is_patient_strategy_source("fibo_xauusd"))
+        self.assertTrue(CTraderExecutor._is_patient_strategy_source("fibo_xauusd:winner"))
+        self.assertTrue(CTraderExecutor._is_patient_strategy_source("fibo_xauusd:scout"))
+        self.assertTrue(CTraderExecutor._is_patient_strategy_source("xauusd_scheduled"))
+        self.assertTrue(CTraderExecutor._is_patient_strategy_source("xauusd_scheduled:canary"))
+        # Scalp sources are NOT patient
+        self.assertFalse(CTraderExecutor._is_patient_strategy_source("scalp_xauusd:fss:canary"))
+        self.assertFalse(CTraderExecutor._is_patient_strategy_source("scalp_xauusd:winner"))
+        self.assertFalse(CTraderExecutor._is_patient_strategy_source(""))
+
+    def test_pending_order_ttl_fibo_uses_240min(self):
+        from execution.ctrader_executor import ctrader_executor as exec_inst
+        ttl = exec_inst._pending_order_ttl_min("fibo_xauusd", "XAUUSD")
+        self.assertGreaterEqual(ttl, 240)  # at least 4 hours
+        # Scalp source still uses the short TTL
+        ttl_scalp = exec_inst._pending_order_ttl_min("scalp_xauusd:fss:canary", "XAUUSD")
+        self.assertLessEqual(ttl_scalp, 60)
+
+
 if __name__ == "__main__":
     unittest.main()

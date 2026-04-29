@@ -5566,11 +5566,39 @@ class CTraderExecutor:
                 }
         return {}
 
+    @staticmethod
+    def _patient_strategy_sources() -> set[str]:
+        """2026-04-29 surgery 3: sources that trade on a multi-hour patience horizon
+        (fibo, scheduled). They must NOT be cancelled/closed by scalp-side heuristics
+        (far_from_market, stale_ttl@45m, force_close_direction, order_care exits)."""
+        raw = str(getattr(config, "CTRADER_PATIENT_STRATEGY_SOURCES", "") or "").strip().lower()
+        return {token.strip() for token in raw.split(",") if token.strip()}
+
+    @classmethod
+    def _is_patient_strategy_source(cls, source: str) -> bool:
+        token = str(source or "").strip().lower()
+        if not token:
+            return False
+        patient = cls._patient_strategy_sources()
+        if token in patient:
+            return True
+        # also match any prefix in the patient list (so fibo_xauusd:future_variant works)
+        for entry in patient:
+            if entry and token.startswith(entry):
+                return True
+        # default: anything that starts with "fibo" is a patient strategy
+        if token.startswith("fibo_") or token.startswith("fibo:"):
+            return True
+        return False
+
     def _pending_order_ttl_min(self, source: str, symbol: str) -> int:
         token = str(source or "").strip().lower()
         symbol_u = str(symbol or "").strip().upper()
         default_ttl = max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_DEFAULT_MIN", 120) or 120))
         if symbol_u == "XAUUSD":
+            # 2026-04-29 surgery 3: fibo is patient — needs hours not minutes.
+            if token.startswith("fibo_") or token.startswith("fibo:") or "fibo_xauusd" in token:
+                return max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN", 240) or 240))
             if ":td:" in token or "tick_depth_filter" in token:
                 return max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN", 45) or 45))
             if ":bs:" in token or "breakout_stop" in token:
@@ -6302,11 +6330,18 @@ class CTraderExecutor:
         ttl_min = float(self._pending_order_ttl_min(source, symbol))
         if age_min >= max(1.0, ttl_min):
             return f"stale_ttl:{int(ttl_min)}m"
+        # 2026-04-29 surgery 3: patient strategies (fibo, scheduled) sit at strategic
+        # levels by design and must not be cancelled for "being too far from market".
+        # Without this guard, a perfect 4604.62 sell-limit gets killed at ~05:51 even
+        # though price would later rally to 4608+ and hit it cleanly.
+        _is_patient = self._is_patient_strategy_source(source)
+        _protect_far = bool(getattr(config, "CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET", True))
         if (
             bool(getattr(config, "CTRADER_PENDING_ORDER_MAX_DISTANCE_ENABLED", True))
             and symbol == "XAUUSD"
             and order_type == "limit"
             and family in set(getattr(config, "get_ctrader_pending_order_dynamic_reprice_families", lambda: set())() or set())
+            and not (_is_patient and _protect_far)
         ):
             min_age_sec = max(10, int(getattr(config, "CTRADER_PENDING_ORDER_MAX_DISTANCE_MIN_AGE_SEC", 120) or 120))
             age_sec = max(0.0, float(now_ts) - created_ts) if created_ts > 0 else 0.0
@@ -6912,7 +6947,13 @@ class CTraderExecutor:
             # ── Force-close directive: close all positions in target direction ──
             force_close_dir = str(order_care_state.get("force_close_direction") or "").strip().lower()
             force_close_reason = str(order_care_state.get("force_close_reason") or "order_care_force_close")
-            if force_close_dir and direction == force_close_dir:
+            # 2026-04-29 surgery 3: never force-close patient strategies. fibo/scheduled
+            # were getting killed at -0.04R by a scalp-side directive, abandoning the
+            # planned 1.5R+ Fibonacci target. Patient sources hit their own SL/TP only.
+            _force_close_protected = self._is_patient_strategy_source(source) and bool(
+                getattr(config, "CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE", True)
+            )
+            if force_close_dir and direction == force_close_dir and not _force_close_protected:
                 res = self.close_position(position_id=position_id, volume=0)
                 action_entry = {
                     "journal_id": (journal_id or None),
@@ -6931,6 +6972,11 @@ class CTraderExecutor:
                 if bool(res.ok):
                     report["closed_profit_positions"] += 1
                 continue
+            if force_close_dir and direction == force_close_dir and _force_close_protected:
+                logger.info(
+                    "[PM] force_close_skipped (patient_strategy) pos=%s source=%s direction=%s — letting planned SL/TP run",
+                    position_id, source, direction,
+                )
 
             # ── Momentum exhaustion profit lock (before extension) ────────
             # If momentum is dead and trade is profitable, lock profit NOW

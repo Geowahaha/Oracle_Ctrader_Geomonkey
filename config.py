@@ -1186,6 +1186,19 @@ class Config:
     CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN", "45"))
     CTRADER_PENDING_ORDER_TTL_XAU_BREAKOUT_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_BREAKOUT_MIN", "15"))
     CTRADER_PENDING_ORDER_TTL_XAU_SCHEDULED_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_SCHEDULED_MIN", "240"))
+    # 2026-04-29 surgery 3: Fibonacci is a patient/strategic strategy — limits often need
+    # hours to retrace into the entry zone. The previous default (45m via XAU_SCALP) was
+    # killing valid setups before the planned move materialised (the 4604.62 sell-limit
+    # cancelled at 74m before price actually rallied to 4608+ where it would have hit).
+    CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN", "240"))
+    # Patient sources that must NOT be subject to scalp-side cancel/close heuristics:
+    # far_from_market sweep, force_close_direction, order_care premature close.
+    CTRADER_PATIENT_STRATEGY_SOURCES: str = os.getenv(
+        "CTRADER_PATIENT_STRATEGY_SOURCES",
+        "fibo_xauusd,fibo_xauusd:winner,fibo_xauusd:scout,xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner",
+    )
+    CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE: bool = os.getenv("CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET: bool = os.getenv("CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PENDING_ORDER_TTL_CRYPTO_WINNER_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_CRYPTO_WINNER_MIN", "180"))
     CTRADER_PENDING_ORDER_MAX_PER_SOURCE_SYMBOL: int = int(os.getenv("CTRADER_PENDING_ORDER_MAX_PER_SOURCE_SYMBOL", "3"))
     CTRADER_PENDING_ORDER_MAX_PER_SYMBOL: int = int(os.getenv("CTRADER_PENDING_ORDER_MAX_PER_SYMBOL", "2"))
