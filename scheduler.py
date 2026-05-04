@@ -10683,7 +10683,8 @@ class DexterScheduler:
             return report
         try:
             signals = fibo_mtf_shadow_scanner.scan(
-                include_suppressed=bool(getattr(config, "FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", True))
+                include_suppressed=bool(getattr(config, "FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", True)),
+                emit_all=bool(getattr(config, "FIBO_MTF_SHADOW_EMIT_ALL", True)),
             )
             report["signals"] = len(list(signals or []))
             for sig in list(signals or []):

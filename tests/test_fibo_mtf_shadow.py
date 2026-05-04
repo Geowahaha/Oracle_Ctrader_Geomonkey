@@ -22,7 +22,13 @@ fake_market.xauusd_provider = None
 fake_market.session_manager = SimpleNamespace(get_session_info=lambda: {"active_sessions": []})
 sys.modules.setdefault("market.data_fetcher", fake_market)
 
-from scanners.fibo_mtf_shadow import FiboMtfShadowScanner, FiboMtfSpec, dedupe_by_parent_impulse
+from scanners.fibo_mtf_shadow import (
+    FiboMtfShadowScanner,
+    FiboMtfSpec,
+    apply_alignment_boosters,
+    dedupe_by_parent_impulse,
+    parent_chain_for_tf,
+)
 from analysis.signals import TradeSignal
 
 
@@ -112,6 +118,9 @@ def test_mtf_shadow_scanner_emits_shadow_only_tf_payload():
     assert raw["tf_label"] == "M1"
     assert raw["ratio_zone"] == "near_0.618"
     assert raw["impulse_tf_stack"]["parent_tf"] == "M5"
+    assert raw["parent_chain"] == ["M5", "M15", "M30"]
+    assert raw["opportunity_first"] is True
+    assert raw["tf_alignment_policy"] == "booster_not_gate"
 
 
 def _sig(pid, conf):
@@ -123,12 +132,39 @@ def _sig(pid, conf):
     )
 
 
-def test_dedupe_marks_weaker_same_parent_impulse_suppressed():
+def test_parent_grouping_does_not_suppress_same_parent_impulse_opportunities():
     weak = _sig("H1:bull:100:200", 60)
     strong = _sig("H1:bull:100:200", 72)
     out = dedupe_by_parent_impulse([weak, strong])
     assert len(out) == 2
-    kept = [s for s in out if not s.raw_scores.get("suppressed_duplicate")]
-    suppressed = [s for s in out if s.raw_scores.get("suppressed_duplicate")]
-    assert kept[0].confidence == 72
-    assert suppressed[0].confidence == 60
+    assert not any(s.raw_scores.get("suppressed_duplicate") for s in out)
+    assert {s.raw_scores.get("parent_impulse_group_size") for s in out} == {2}
+    leaders = [s for s in out if s.raw_scores.get("parent_impulse_group_leader")]
+    assert len(leaders) == 1
+    assert leaders[0].confidence == 72
+
+
+def test_alignment_booster_tags_agreeing_tfs_without_gating():
+    m1 = _sig("p1", 60)
+    m1.timeframe = "M1"
+    m1.raw_scores["tf_label"] = "M1"
+    m5 = _sig("p2", 63)
+    m5.timeframe = "M5"
+    m5.raw_scores["tf_label"] = "M5"
+    h1 = _sig("p3", 70)
+    h1.timeframe = "H1"
+    h1.raw_scores["tf_label"] = "H1"
+    out = apply_alignment_boosters([m1, m5, h1])
+    for sig in out:
+        raw = sig.raw_scores
+        assert raw["alignment_booster"] is True
+        assert raw["alignment_is_gate"] is False
+        assert raw["aligned_tf_count"] == 3
+        assert raw["aligned_tf_list"] == ["M1", "M5", "H1"]
+        assert raw["opportunity_score"] >= sig.confidence
+
+
+def test_parent_chain_is_multilevel_not_only_adjacent_tf():
+    assert parent_chain_for_tf("M1") == ["M5", "M15", "M30"]
+    assert parent_chain_for_tf("H1") == ["H4", "D1", "W1"]
+    assert parent_chain_for_tf("W1") == []

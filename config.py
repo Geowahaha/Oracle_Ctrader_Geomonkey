@@ -185,7 +185,12 @@ class Config:
     FIBO_ADVANCE_SCAN_INTERVAL_SEC: int = int(os.getenv("FIBO_ADVANCE_SCAN_INTERVAL_SEC", "300"))
     # P2/P3 Fibo multi-timeframe shadow/analytics. Shadow-only; never dispatches orders.
     FIBO_MTF_SHADOW_ENABLED: bool = os.getenv("FIBO_MTF_SHADOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Opportunity-first: emit every TF candidate. Alignment is a booster, never a gate/blocker.
+    FIBO_MTF_SHADOW_EMIT_ALL: bool = os.getenv("FIBO_MTF_SHADOW_EMIT_ALL", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED: bool = os.getenv("FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF", "3.0") or 3.0)
+    FIBO_MTF_ALIGN_BONUS_MAX: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_MAX", "12.0") or 12.0)
+    FIBO_MTF_PARENT_DEPTH: int = int(os.getenv("FIBO_MTF_PARENT_DEPTH", "3") or 3)
     FIBO_MTF_ANALYTICS_MIN_TRADES: int = int(os.getenv("FIBO_MTF_ANALYTICS_MIN_TRADES", "30") or 30)
     FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR: float = float(os.getenv("FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR", "1.3") or 1.3)
     FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE: float = float(os.getenv("FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE", "0.10") or 0.10)
