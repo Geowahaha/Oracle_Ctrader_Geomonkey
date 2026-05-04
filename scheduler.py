@@ -62,6 +62,13 @@ from infra.db_health import run_full_health_check
 from infra.auth_health import check_token_health, log_token_health_summary
 from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
 from analysis.xau_impulse_guard import evaluate_xau_impulse_guard
+from analysis.nonfibo_redesign import (
+    apply_size_multiplier_to_signal,
+    compute_dynamic_confidence_floor,
+    compute_side_throttle,
+    is_nonfibo_xau_source,
+    planned_rr as nonfibo_planned_rr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1352,6 +1359,108 @@ class DexterScheduler:
         )
         return self._dispatch_mt5_lane_signal(signal, base_source, meta=meta, strict_limit=True)
 
+    @staticmethod
+    def _ctrader_db_path_for_learning() -> Path:
+        configured = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+
+    def _compute_xau_dynamic_floor(self, signal, source: str, base_floor: float) -> dict:
+        if not bool(getattr(config, "XAU_CONF_FLOOR_DYNAMIC", True)):
+            return {"active": False, "floor": float(base_floor), "reason": "disabled"}
+        try:
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            symbol = str(getattr(signal, "symbol", "") or "").strip().upper() or "XAUUSD"
+            if not is_nonfibo_xau_source(source):
+                return {"active": False, "floor": float(base_floor), "reason": "not_nonfibo_xau"}
+            if bool(getattr(config, "XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE", True)):
+                throttle_probe = compute_side_throttle(
+                    self._ctrader_db_path_for_learning(),
+                    source=str(source or ""),
+                    symbol=symbol,
+                    direction=direction,
+                    lookback_hours=float(getattr(config, "XAU_RASG_LOOKBACK_HOURS", 144.0) or 144.0),
+                    min_trades=int(getattr(config, "XAU_RASG_MIN_TRADES", 3) or 3),
+                    max_consecutive_losses=int(getattr(config, "XAU_RASG_MAX_CONSECUTIVE_LOSSES", 3) or 3),
+                    loss_usd_trigger=float(getattr(config, "XAU_RASG_LOSS_USD_TRIGGER", 8.0) or 8.0),
+                    throttle_mult=float(getattr(config, "XAU_RASG_THROTTLE_MULT", 0.30) or 0.30),
+                )
+                if bool(throttle_probe.active):
+                    meta = throttle_probe.as_dict()
+                    raw = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw["xau_dynamic_conf_floor"] = {
+                        "active": False,
+                        "floor": float(base_floor),
+                        "base_floor": float(base_floor),
+                        "reason": "rasg_active_no_floor_stack",
+                        "rasg": meta,
+                    }
+                    signal.raw_scores = raw
+                    return raw["xau_dynamic_conf_floor"]
+            floor = compute_dynamic_confidence_floor(
+                self._ctrader_db_path_for_learning(),
+                source=str(source or ""),
+                symbol=symbol,
+                direction=direction,
+                base_floor=float(base_floor or 0.0),
+                lookback_hours=float(getattr(config, "XAU_CONF_FLOOR_LOOKBACK_HOURS", 336.0) or 336.0),
+                window=int(getattr(config, "XAU_CONF_FLOOR_WINDOW", 10) or 10),
+                min_trades=int(getattr(config, "XAU_CONF_FLOOR_MIN_TRADES", 5) or 5),
+                low_wr=float(getattr(config, "XAU_CONF_FLOOR_LOW_WR", 0.35) or 0.35),
+                high_wr=float(getattr(config, "XAU_CONF_FLOOR_HIGH_WR", 0.55) or 0.55),
+                raise_delta=float(getattr(config, "XAU_CONF_FLOOR_RAISE_DELTA", 5.0) or 5.0),
+                lower_delta=float(getattr(config, "XAU_CONF_FLOOR_LOWER_DELTA", -3.0) or -3.0),
+                max_delta=float(getattr(config, "XAU_CONF_FLOOR_DELTA_MAX", 5.0) or 5.0),
+            )
+            meta = floor.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_dynamic_conf_floor"] = meta
+            signal.raw_scores = raw
+            return meta
+        except Exception as exc:
+            logger.debug("[XAUConfFloor] skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "floor": float(base_floor), "reason": "error"}
+
+    def _apply_xau_rasg_throttle(self, signal, source: str) -> dict:
+        if not bool(getattr(config, "XAU_RASG_ENABLED", True)):
+            return {"active": False, "reason": "disabled"}
+        try:
+            symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if symbol != "XAUUSD" or direction not in {"long", "short"} or not is_nonfibo_xau_source(source):
+                return {"active": False, "reason": "not_applicable"}
+            throttle = compute_side_throttle(
+                self._ctrader_db_path_for_learning(),
+                source=str(source or ""),
+                symbol=symbol,
+                direction=direction,
+                lookback_hours=float(getattr(config, "XAU_RASG_LOOKBACK_HOURS", 144.0) or 144.0),
+                min_trades=int(getattr(config, "XAU_RASG_MIN_TRADES", 3) or 3),
+                max_consecutive_losses=int(getattr(config, "XAU_RASG_MAX_CONSECUTIVE_LOSSES", 3) or 3),
+                loss_usd_trigger=float(getattr(config, "XAU_RASG_LOSS_USD_TRIGGER", 8.0) or 8.0),
+                throttle_mult=float(getattr(config, "XAU_RASG_THROTTLE_MULT", 0.30) or 0.30),
+            )
+            meta = throttle.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_rasg"] = meta
+            signal.raw_scores = raw
+            if throttle.active:
+                apply_size_multiplier_to_signal(
+                    signal,
+                    multiplier=throttle.size_mult,
+                    reason=throttle.reason,
+                    default_risk_usd=float(getattr(config, "CTRADER_RISK_USD_PER_TRADE", 10.0) or 10.0),
+                )
+                logger.info(
+                    "[XAU_RASG] throttled source=%s side=%s mult=%.2f reason=%s",
+                    str(source or ""), direction, float(throttle.size_mult), throttle.reason,
+                )
+            return meta
+        except Exception as exc:
+            logger.debug("[XAU_RASG] skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "reason": "error"}
+
     def _allow_scalp_xau_live_mt5(self, signal, source: str) -> tuple[bool, str]:
         src = str(source or "").strip().lower()
         if src in {"scalp_ethusd", "scalp_btcusd"}:
@@ -1387,6 +1496,11 @@ class DexterScheduler:
             except Exception:
                 conf = 0.0
             conf_min = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0) or 72.0)
+            floor_meta = self._compute_xau_dynamic_floor(signal, source=src, base_floor=conf_min)
+            try:
+                conf_min = max(conf_min, float((floor_meta or {}).get("floor", conf_min) or conf_min))
+            except Exception:
+                pass
             conf_max = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0) or 75.0)
             if conf < conf_min:
                 return False, f"conf_below_live_band:{conf:.1f}<{conf_min:.1f}"
@@ -1556,6 +1670,11 @@ class DexterScheduler:
 
         if base_source == "xauusd_scheduled":
             min_conf = max(0.0, float(getattr(config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0) or 70.0))
+            floor_meta = self._compute_xau_dynamic_floor(signal, source=src, base_floor=min_conf)
+            try:
+                min_conf = max(min_conf, float((floor_meta or {}).get("floor", min_conf) or min_conf))
+            except Exception:
+                pass
             allowed_sessions = set(config.get_ctrader_xau_scheduled_allowed_sessions() or set())
             allowed_tfs = set(config.get_ctrader_xau_scheduled_allowed_timeframes() or set())
             allowed_entry_types = set(config.get_ctrader_xau_scheduled_allowed_entry_types() or set())
@@ -9287,6 +9406,43 @@ class DexterScheduler:
                 signal.raw_scores = raw_scores
             except Exception:
                 pass
+        # Opus non-Fibo redesign: opportunity-first protection. Do not turn a
+        # family off after recent bleeding; throttle side-specific risk and
+        # enforce minimum planned RR only when the explicit kill switch is not set.
+        try:
+            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+            src_key = str(dispatch_source or "").strip().lower()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if sym == "XAUUSD" and is_nonfibo_xau_source(src_key) and not bool(getattr(config, "XAU_NONFIBO_REDESIGN_KILL", False)):
+                entry = float(getattr(signal, "entry", 0.0) or 0.0)
+                stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+                tp = float(getattr(signal, "take_profit_1", 0.0) or 0.0)
+                rr = nonfibo_planned_rr(entry, stop_loss, tp, direction)
+                min_rr = float(getattr(config, "XAU_MIN_PLANNED_RR", 2.7) or 2.7)
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["xau_min_rr_check"] = {
+                    "rr": round(rr, 4),
+                    "min_rr": round(min_rr, 4),
+                    "tp_used": round(tp, 4),
+                    "tp_policy": "take_profit_1",
+                    "enforced": bool(getattr(config, "XAU_MIN_RR_ENFORCE", False)),
+                }
+                signal.raw_scores = raw
+                if bool(getattr(config, "XAU_MIN_RR_ENFORCE", False)) and 0.0 < rr < min_rr:
+                    skip_reason = f"xau_min_rr_below:{rr:.2f}<{min_rr:.2f}"
+                    logger.info("[CTRADER] skipped source=%s symbol=%s reason=%s", src_key, sym, skip_reason)
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source=str(dispatch_source or ""),
+                        gate="xau_min_rr",
+                        reason=skip_reason,
+                        dispatch_meta=dispatch_meta,
+                    )
+                    return None
+                self._apply_xau_rasg_throttle(signal, dispatch_source)
+        except Exception as exc:
+            logger.debug("[XAU_NONFIBO] redesign guard skipped source=%s err=%s", dispatch_source, exc, exc_info=True)
         try:
             result = ctrader_executor.execute_signal(signal, source=dispatch_source)
             logger.info(
