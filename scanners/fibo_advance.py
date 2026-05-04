@@ -48,6 +48,7 @@ from analysis.technical import TechnicalAnalysis
 from analysis.smc import SMCAnalyzer
 from analysis.signals import SignalGenerator, TradeSignal
 from analysis.fibonacci import FibonacciAnalyzer
+from analysis.fibo_tf_telemetry import fibo_telemetry_payload
 from config import config
 from learning.reversal_training_dataset import evaluate_reversal_template_fit
 from learning.live_profile_autopilot import LiveProfileAutopilot
@@ -1251,6 +1252,14 @@ class FiboAdvanceScanner:
         session_str = ",".join(session_info.get("active_sessions", []) or [])
         trend_str   = (smc_context.current_trend if smc_context else "ranging") or "ranging"
         phase_risk_usd = round(float(getattr(config, "FIBO_ADVANCE_CTRADER_RISK_USD", 1.0) or 1.0) * max(0.1, float(phase_profile.get("risk_mult", 1.0) or 1.0)), 4)
+        tf_telemetry = fibo_telemetry_payload(
+            entry_tf="H1",
+            setup_tf="H1",
+            parent_tf="H4",
+            fibo_ctx=fibo_ctx,
+            fib_levels=fib,
+            source="fibo_xauusd",
+        )
 
         return TradeSignal(
             symbol="XAUUSD",
@@ -1281,6 +1290,13 @@ class FiboAdvanceScanner:
                 "mtf_reason": mtf_reason,
                 "retracement_depth": round(fibo_ctx.retracement_depth, 3),
                 "impulse_strength": round(fib.impulse_strength, 3),
+                **tf_telemetry,
+                "impulse_tf_stack": {
+                    "parent_tf": tf_telemetry.get("parent_tf"),
+                    "setup_tf": tf_telemetry.get("setup_tf"),
+                    "entry_tf": tf_telemetry.get("entry_tf"),
+                    "mode": "sniper",
+                },
                 "elliott_wave": fibo_ctx.elliott_wave_count,
                 "wave_phase": str(getattr(fibo_ctx, "wave_phase", "unknown") or "unknown"),
                 "wave_confidence": round(float(getattr(fibo_ctx, "wave_confidence", 0.0) or 0.0), 3),
@@ -1550,6 +1566,14 @@ class FiboAdvanceScanner:
 
         sharpness_score = int(sharpness.get("sharpness_score", 0) or 0)
         sharpness_band  = str(sharpness.get("sharpness_band", "normal") or "normal")
+        tf_telemetry = fibo_telemetry_payload(
+            entry_tf="M15",
+            setup_tf="M15",
+            parent_tf="H1",
+            fibo_ctx=fibo_ctx,
+            fib_levels=fib,
+            source="fibo_xauusd",
+        )
 
         logger.info("[FiboAdvance:Scout] SIGNAL | %s | Conf:%.1f | Fib:%.3f | "
                     "Entry:%.2f | SL:%.2f | TP2:%.2f | RR:%.2f | "
@@ -1585,6 +1609,14 @@ class FiboAdvanceScanner:
                 "h4_bias": h4_bias,
                 "retracement_depth": round(fibo_ctx.retracement_depth, 3),
                 "impulse_strength": round(fib.impulse_strength, 3),
+                **tf_telemetry,
+                "impulse_tf_stack": {
+                    "parent_tf": tf_telemetry.get("parent_tf"),
+                    "setup_tf": tf_telemetry.get("setup_tf"),
+                    "entry_tf": tf_telemetry.get("entry_tf"),
+                    "mode": "scout",
+                    "h4_bias": h4_bias,
+                },
                 "wave_phase": str(getattr(fibo_ctx, "wave_phase", "unknown") or "unknown"),
                 "wave_confidence": round(float(getattr(fibo_ctx, "wave_confidence", 0.0) or 0.0), 3),
                 "correction_end_score": round(float(getattr(fibo_ctx, "correction_end_score", 0.0) or 0.0), 2),

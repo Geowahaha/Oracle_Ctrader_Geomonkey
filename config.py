@@ -183,6 +183,12 @@ class Config:
     FIBO_ADVANCE_SOFT_PAUSE_CONSEC: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_CONSEC", "5"))
     FIBO_ADVANCE_SOFT_PAUSE_MIN: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_MIN", "30"))
     FIBO_ADVANCE_SCAN_INTERVAL_SEC: int = int(os.getenv("FIBO_ADVANCE_SCAN_INTERVAL_SEC", "300"))
+    # P2/P3 Fibo multi-timeframe shadow/analytics. Shadow-only; never dispatches orders.
+    FIBO_MTF_SHADOW_ENABLED: bool = os.getenv("FIBO_MTF_SHADOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED: bool = os.getenv("FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_ANALYTICS_MIN_TRADES: int = int(os.getenv("FIBO_MTF_ANALYTICS_MIN_TRADES", "30") or 30)
+    FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR: float = float(os.getenv("FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR", "1.3") or 1.3)
+    FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE: float = float(os.getenv("FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE", "0.10") or 0.10)
     # Institution-grade gates
     FIBO_ADVANCE_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_ADVANCE_SHARPNESS_KNIFE_THR", "30"))
     FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS", "40"))

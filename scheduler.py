@@ -27,7 +27,9 @@ from scanners.xauusd import xauusd_scanner
 # from scanners.stock_scanner import stock_scanner
 from scanners.scalping_scanner import scalping_scanner
 from scanners.fibo_advance import FiboAdvanceScanner
+from scanners.fibo_mtf_shadow import FiboMtfShadowScanner
 fibo_advance_scanner = FiboAdvanceScanner()
+fibo_mtf_shadow_scanner = FiboMtfShadowScanner()
 from notifier.telegram_bot import notifier
 from market.data_fetcher import session_manager, xauusd_provider
 from market.economic_calendar import economic_calendar
@@ -10673,6 +10675,41 @@ class DexterScheduler:
         except Exception as e:
             logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
 
+    def _run_fibo_mtf_shadow_scan(self, source: str = "fibo_mtf_shadow") -> dict:
+        """Persist multi-timeframe Fibo candidates as shadow rows only; no alerts/orders."""
+        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "error": ""}
+        if not report["enabled"]:
+            report["error"] = "disabled"
+            return report
+        try:
+            signals = fibo_mtf_shadow_scanner.scan(
+                include_suppressed=bool(getattr(config, "FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", True))
+            )
+            report["signals"] = len(list(signals or []))
+            for sig in list(signals or []):
+                try:
+                    self._ensure_signal_trace(sig, source=source)
+                    self._store_shadow_signal(sig, block_reason="fibo_mtf_shadow")
+                    report["stored"] += 1
+                except Exception as exc:
+                    logger.debug("[FiboMTFShadow:Scheduler] store failed: %s", exc)
+            if report["signals"]:
+                tf_counts = {}
+                for sig in list(signals or []):
+                    raw = dict(getattr(sig, "raw_scores", {}) or {})
+                    tf = str(raw.get("tf_label") or getattr(sig, "timeframe", "") or "?")
+                    tf_counts[tf] = int(tf_counts.get(tf, 0)) + 1
+                logger.info(
+                    "[FiboMTFShadow:Scheduler] generated=%s stored=%s tf_counts=%s",
+                    report["signals"], report["stored"], tf_counts,
+                )
+            report["ok"] = True
+            return report
+        except Exception as e:
+            report["error"] = str(e)
+            logger.warning("[FiboMTFShadow:Scheduler] scan error: %s", e, exc_info=True)
+            return report
+
     def _run_fibo_advance_scan(self, force_alert: bool = False):
         """
         Fibonacci Advance scanner — dual-speed Sniper (H4+H1) and Scout (H1+M15).
@@ -10681,6 +10718,12 @@ class DexterScheduler:
         """
         if not bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
             return
+        try:
+            # Intentional: P2 telemetry still runs in toxic hours because it is DB-only
+            # shadow evidence; live fibo dispatch remains protected by the guard below.
+            self._run_fibo_mtf_shadow_scan(source="fibo_mtf_shadow")
+        except Exception as e:
+            logger.debug("[FiboMTFShadow:Scheduler] cycle skipped: %s", e)
         if bool(getattr(config, "XAU_TOXIC_HOUR_GUARD_ENABLED", True)):
             try:
                 toxic_hours = {int(h.strip()) for h in str(getattr(config, "XAU_TOXIC_HOURS_UTC", "1") or "1").split(",") if h.strip().isdigit()}

@@ -1,0 +1,134 @@
+from types import ModuleType, SimpleNamespace
+import sys
+
+sys.modules.setdefault("numpy", ModuleType("numpy"))
+fake_pd = ModuleType("pandas")
+fake_pd.DataFrame = object
+sys.modules.setdefault("pandas", fake_pd)
+fake_technical = ModuleType("analysis.technical")
+fake_technical.TechnicalAnalysis = lambda: None
+sys.modules.setdefault("analysis.technical", fake_technical)
+fake_smc = ModuleType("analysis.smc")
+fake_smc.SMCAnalyzer = lambda: None
+fake_smc.SMCContext = object
+fake_smc.LiquidityPool = object
+sys.modules.setdefault("analysis.smc", fake_smc)
+
+fake_fibonacci = ModuleType("analysis.fibonacci")
+fake_fibonacci.FibonacciAnalyzer = lambda: None
+sys.modules.setdefault("analysis.fibonacci", fake_fibonacci)
+fake_market = ModuleType("market.data_fetcher")
+fake_market.xauusd_provider = None
+fake_market.session_manager = SimpleNamespace(get_session_info=lambda: {"active_sessions": []})
+sys.modules.setdefault("market.data_fetcher", fake_market)
+
+from scanners.fibo_mtf_shadow import FiboMtfShadowScanner, FiboMtfSpec, dedupe_by_parent_impulse
+from analysis.signals import TradeSignal
+
+
+class SimpleSeries:
+    def __init__(self, values):
+        self.values = list(values)
+        self.iloc = self
+    def __getitem__(self, idx):
+        return self.values[idx]
+    def tail(self, n):
+        return SimpleSeries(self.values[-n:])
+    def astype(self, _typ):
+        return SimpleSeries([float(v) for v in self.values])
+    def mean(self):
+        return sum(self.values) / len(self.values) if self.values else 0.0
+    def __sub__(self, other):
+        return SimpleSeries([float(a) - float(b) for a, b in zip(self.values, other.values)])
+
+
+class SimpleRow(dict):
+    pass
+
+
+class SimpleDF:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.empty = not self.rows
+    def __len__(self):
+        return len(self.rows)
+    def __getitem__(self, key):
+        return SimpleSeries([row[key] for row in self.rows])
+    def tail(self, n):
+        return SimpleDF(self.rows[-n:])
+    def iterrows(self):
+        for i, row in enumerate(self.rows):
+            yield i, SimpleRow(row)
+
+
+class FakeProvider:
+    def __init__(self):
+        self.calls = []
+
+    def fetch(self, *, timeframe, bars):
+        self.calls.append((timeframe, bars))
+        rows = []
+        price = 2300.0
+        for i in range(90):
+            open_p = price + i * 0.8
+            close_p = open_p + 0.45
+            rows.append({"open": open_p, "high": close_p + 0.3, "low": open_p - 0.3, "close": close_p, "volume": 100 + i})
+        return SimpleDF(rows)
+
+
+class FakeAnalyzer:
+    def analyze(self, *, df_structure, df_entry, current_price, atr, smc_context=None):
+        fib = SimpleNamespace(direction="bullish", swing_start=current_price - 12.0, swing_end=current_price + 8.0, impulse_strength=0.72)
+        return SimpleNamespace(
+            fib_levels=fib,
+            nearest_level_price=current_price - 2.0,
+            nearest_level_ratio=0.618,
+            retracement_depth=0.618,
+            fibo_confluence_score=64.0,
+            wave_phase="correction_end_resume",
+            wave_confidence=0.71,
+            correction_end_score=6.0,
+            correction_end_confirmed=True,
+        )
+
+
+def test_mtf_shadow_scanner_emits_shadow_only_tf_payload():
+    scanner = FiboMtfShadowScanner(
+        provider=FakeProvider(),
+        analyzer=FakeAnalyzer(),
+        specs=[FiboMtfSpec("M1", "1m", "M1", "M5", 90)],
+    )
+    signals = scanner.scan()
+    assert len(signals) == 1
+    sig = signals[0]
+    raw = sig.raw_scores
+    assert sig.symbol == "XAUUSD"
+    assert sig.direction == "long"
+    assert sig.timeframe == "M1"
+    assert raw["fibo_mtf_shadow"] is True
+    assert raw["fibo_mtf_live_enabled"] is False
+    assert raw["source"] == "fibo_xauusd"
+    assert raw["display_source"] == "fibo_M1_xauusd"
+    assert raw["tf_label"] == "M1"
+    assert raw["ratio_zone"] == "near_0.618"
+    assert raw["impulse_tf_stack"]["parent_tf"] == "M5"
+
+
+def _sig(pid, conf):
+    return TradeSignal(
+        symbol="XAUUSD", direction="long", confidence=conf, entry=2300, stop_loss=2290,
+        take_profit_1=2310, take_profit_2=2320, take_profit_3=2330, risk_reward=3.0,
+        timeframe="M1", session="", trend="", rsi=0, atr=1, pattern="x",
+        raw_scores={"parent_impulse_id": pid, "impulse_state_confidence": conf / 100.0},
+    )
+
+
+def test_dedupe_marks_weaker_same_parent_impulse_suppressed():
+    weak = _sig("H1:bull:100:200", 60)
+    strong = _sig("H1:bull:100:200", 72)
+    out = dedupe_by_parent_impulse([weak, strong])
+    assert len(out) == 2
+    kept = [s for s in out if not s.raw_scores.get("suppressed_duplicate")]
+    suppressed = [s for s in out if s.raw_scores.get("suppressed_duplicate")]
+    assert kept[0].confidence == 72
+    assert suppressed[0].confidence == 60
