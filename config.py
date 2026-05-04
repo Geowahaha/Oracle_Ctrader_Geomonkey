@@ -394,6 +394,24 @@ class Config:
     ETH_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("ETH_CLUSTER_LOSS_WINDOW_HOURS", "2.0"))
     ETH_CLUSTER_LOSS_MIN_LOSSES: int = int(os.getenv("ETH_CLUSTER_LOSS_MIN_LOSSES", "2"))
     ETH_DAILY_TRADE_CAP: int = int(os.getenv("ETH_DAILY_TRADE_CAP", "2"))
+    CRYPTO_CLUSTER_LOSS_PER_FAMILY: bool = os.getenv("CRYPTO_CLUSTER_LOSS_PER_FAMILY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── BTC/ETH Redesign v2 (Opus 4.7) — default shadow-only/no live behavior change ──
+    CRYPTO_REDESIGN_KILL_SWITCH: bool = os.getenv("CRYPTO_REDESIGN_KILL_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_REDESIGN_V2_ENABLED: bool = os.getenv("BTC_LOB_REDESIGN_V2_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_REDESIGN_V2_SHADOW_ONLY: bool = os.getenv("BTC_LOB_REDESIGN_V2_SHADOW_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_TIER_SIZING_ENABLED: bool = os.getenv("BTC_LOB_TIER_SIZING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_TP1_RR: float = float(os.getenv("BTC_LOB_TP1_RR", "0.70"))
+    BTC_LOB_RUNNER_TP_RR: float = float(os.getenv("BTC_LOB_RUNNER_TP_RR", "2.50"))
+    BTC_LOB_LIMIT_MAX_AGE_SEC: int = int(os.getenv("BTC_LOB_LIMIT_MAX_AGE_SEC", "180"))
+    BTC_LOB_LIMIT_AUTOCANCEL_ENABLED: bool = os.getenv("BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_ENABLED: bool = os.getenv("ETH_SMART_V2_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_SHADOW_ONLY: bool = os.getenv("ETH_SMART_V2_SHADOW_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_TIER_SIZING_ENABLED: bool = os.getenv("ETH_SMART_V2_TIER_SIZING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_TP1_RR: float = float(os.getenv("ETH_SMART_V2_TP1_RR", "0.70"))
+    ETH_SMART_V2_RUNNER_TP_RR: float = float(os.getenv("ETH_SMART_V2_RUNNER_TP_RR", "2.20"))
+    ETH_SMART_V2_RISK_FLOOR_USD: float = float(os.getenv("ETH_SMART_V2_RISK_FLOOR_USD", "0.65"))
+    ETH_MRD_ENABLED: bool = os.getenv("ETH_MRD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
     # ── BTC Flow Short Sidecar (BFSS) — crypto clone of XAU FSS, isolated ──
     BTC_FSS_ENABLED: bool = os.getenv("BTC_FSS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")

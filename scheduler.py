@@ -69,6 +69,11 @@ from analysis.nonfibo_redesign import (
     is_nonfibo_xau_source,
     planned_rr as nonfibo_planned_rr,
 )
+from analysis.crypto_redesign import (
+    decision_for as crypto_redesign_decision,
+    metadata as crypto_redesign_metadata,
+    rr_price_plan as crypto_rr_price_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -6382,7 +6387,7 @@ class DexterScheduler:
         if is_weekend and not bool(getattr(config, "CRYPTO_WEEKEND_TRADING_ENABLED", False)):
             return None, ""
         # Phase 1: Cluster loss guard + daily cap (isolated per symbol, no XAU impact)
-        _clg_blocked, _clg_reason = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _clg_reason = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _cap_reason = self._crypto_daily_cap_check(symbol)
@@ -6408,12 +6413,16 @@ class DexterScheduler:
         raw = dict(getattr(signal, "raw_scores", {}) or {})
         winner_regime = str(raw.get("crypto_winner_logic_regime") or raw.get("winner_logic_regime") or "").strip().lower()
         neural_prob = float(raw.get("neural_probability", 0.0) or 0.0)
+        crypto_v2 = self._crypto_v2_decision(symbol=symbol, family=family, confidence=confidence)
+        crypto_v2_live = bool(crypto_v2 and crypto_v2.enabled and not crypto_v2.shadow_only)
         relaxed_gate_reasons: list[str] = []
         if family == "btc_weekday_lob_momentum":
             if symbol != "BTCUSD" or base_token != "scalp_btcusd":
                 return None, ""
-            if direction != "long":
+            if direction != "long" and not crypto_v2_live:
                 return None, ""
+            if direction == "short" and crypto_v2_live:
+                relaxed_gate_reasons.append("btc_lob_v2_short_enabled")
             btc_sessions = set(config.get_crypto_weekend_btc_allowed_sessions() or set()) if is_weekend else set(config.get_btc_weekday_lob_allowed_sessions() or set())
             if "*" not in btc_sessions and not self._session_signature_matches(session_sig, btc_sessions):
                 # Phase 3: high-confidence session bypass (mirror of XAU Priority #1)
@@ -6429,8 +6438,12 @@ class DexterScheduler:
             if confidence < float(getattr(config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0) or 70.0):
                 return None, ""
             if confidence > float(getattr(config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9) or 74.9):
-                return None, ""
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append("btc_lob_v2_conf_ceiling_removed")
             allowed_patterns = set(config.get_btc_weekday_lob_allowed_patterns() or set())
+            if crypto_v2_live:
+                allowed_patterns.update({"sweep_reversal"})
             if allowed_patterns and ((not pattern) or pattern.lower() not in allowed_patterns):
                 return None, ""
             neutral_ob_allowed = (
@@ -6446,11 +6459,16 @@ class DexterScheduler:
             if weekend_neutral_ok:
                 relaxed_gate_reasons.append("weekend_neutral_winner")
             if bool(getattr(config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not neutral_ob_allowed and not weekend_neutral_ok:
-                return None, ""
-            # Phase 4 MRD: block LOB longs when BTC macro micro-regime is bearish
-            _lob_mrd_regime, _ = self._btc_mrd_check("long")
-            if _lob_mrd_regime == "bearish_micro":
-                return None, ""
+                if not (crypto_v2_live and winner_regime in {"neutral", "cold", ""} and confidence >= 70.0 and neural_prob >= 0.60):
+                    return None, ""
+                relaxed_gate_reasons.append("btc_lob_v2_neutral_winner_probe")
+            # Phase 4 MRD: block LOB longs when BTC macro micro-regime is bearish unless v2 is live soft-tiered
+            _lob_mrd_regime, _ = self._btc_mrd_check(direction)
+            if (direction == "long" and _lob_mrd_regime == "bearish_micro") or (direction == "short" and _lob_mrd_regime == "bullish_micro"):
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append(f"btc_lob_v2_mrd_soft:{_lob_mrd_regime}")
+                crypto_v2 = self._crypto_v2_decision(symbol=symbol, family=family, confidence=confidence, soft_mrd_penalty=-0.20)
             if entry_type == "market" and not bool(getattr(config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True)):
                 return None, ""
             if "choch_entry" in pattern and entry_type != "limit":
@@ -6472,6 +6490,8 @@ class DexterScheduler:
             risk_usd = float(getattr(config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9) or 0.9)
             if relaxed_gate_reasons:
                 risk_usd *= float(getattr(config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.70) or 0.70)
+            if crypto_v2_live and crypto_v2 is not None:
+                risk_usd *= max(0.1, float(getattr(crypto_v2, "size_multiplier", 1.0) or 1.0))
             if is_weekend:
                 risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         else:
@@ -6480,21 +6500,33 @@ class DexterScheduler:
             eth_sessions = set(config.get_crypto_weekend_eth_allowed_sessions() or set()) if is_weekend else set(config.get_eth_weekday_probe_allowed_sessions() or set())
             if "*" not in eth_sessions and not self._session_signature_matches(session_sig, eth_sessions):
                 return None, ""
-            if confidence < float(getattr(config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0) or 74.0):
+            eth_min_conf = float(getattr(config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0) or 74.0)
+            if crypto_v2_live:
+                eth_min_conf = min(eth_min_conf, 70.0)
+            if confidence < eth_min_conf:
                 return None, ""
             if confidence > float(getattr(config, "ETH_WEEKDAY_PROBE_MAX_CONFIDENCE", 79.9) or 79.9):
-                return None, ""
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append("eth_smart_v2_conf_ceiling_removed")
             allowed_patterns = set(config.get_eth_weekday_probe_allowed_patterns() or set())
+            if crypto_v2_live:
+                allowed_patterns.update({"choch_entry", "sweep_reversal"})
             if allowed_patterns and ((not pattern) or pattern.lower() not in allowed_patterns):
                 return None, ""
             eth_weekend_neutral_ok = is_weekend and bool(getattr(config, "CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", True)) and winner_regime == "neutral"
             if eth_weekend_neutral_ok:
                 relaxed_gate_reasons.append("weekend_neutral_winner")
             if bool(getattr(config, "ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not eth_weekend_neutral_ok:
-                return None, ""
+                if not (crypto_v2_live and winner_regime in {"neutral", "cold", ""} and confidence >= 70.0 and neural_prob >= 0.60):
+                    return None, ""
+                relaxed_gate_reasons.append("eth_smart_v2_neutral_winner_probe")
             if entry_type == "market" and not bool(getattr(config, "ETH_WEEKDAY_PROBE_ALLOW_MARKET", True)):
                 return None, ""
             risk_usd = float(getattr(config, "ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", 0.35) or 0.35)
+            if crypto_v2_live and crypto_v2 is not None:
+                risk_usd = max(risk_usd, float(getattr(config, "ETH_SMART_V2_RISK_FLOOR_USD", 0.65) or 0.65))
+                risk_usd *= max(0.1, float(getattr(crypto_v2, "size_multiplier", 1.0) or 1.0))
             if is_weekend:
                 risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         lane_signal = copy.deepcopy(signal)
@@ -6507,6 +6539,7 @@ class DexterScheduler:
         )
         if shaped is None:
             return None, ""
+        shaped = self._apply_crypto_v2_price_plan(shaped, decision=crypto_v2)
         lane_source = self._strategy_family_lane_source(base_source, family)
         self._ensure_signal_trace(shaped, source=lane_source)
         try:
@@ -6530,6 +6563,22 @@ class DexterScheduler:
             raw["crypto_weekday_pattern"] = pattern
             raw["strategy_family_relaxed_gate"] = bool(relaxed_gate_reasons)
             raw["strategy_family_relaxed_reason"] = ",".join(relaxed_gate_reasons)
+            if crypto_v2 is not None:
+                raw.update(
+                    crypto_redesign_metadata(
+                        crypto_v2,
+                        entry=float(getattr(shaped, "entry", 0.0) or 0.0),
+                        stop_loss=float(getattr(shaped, "stop_loss", 0.0) or 0.0),
+                        take_profit_1=float(getattr(shaped, "take_profit_1", 0.0) or 0.0),
+                        direction=str(getattr(shaped, "direction", "") or ""),
+                        blocked_by="",
+                    )
+                )
+                if bool(crypto_v2.enabled) and not bool(crypto_v2.shadow_only) and str(getattr(shaped, "entry_type", "") or "").strip().lower() == "limit":
+                    raw["crypto_limit_autocancel_enabled"] = bool(getattr(config, "BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", True))
+                    raw["crypto_limit_max_age_sec"] = int(getattr(config, "BTC_LOB_LIMIT_MAX_AGE_SEC", 180) or 180)
+                    raw.setdefault("crypto_limit_fill_rate_window", "shadow_pending")
+                    raw.setdefault("crypto_limit_slippage_bps", "shadow_pending")
             raw["mt5_ignore_open_positions"] = True
             raw["ctrader_risk_usd_override"] = risk_usd
             raw["mt5_limit_allow_market_fallback"] = False
@@ -6603,6 +6652,22 @@ class DexterScheduler:
             raw["ctrader_risk_usd_override"] = risk_usd
             raw["mt5_limit_allow_market_fallback"] = False
             raw["persistent_canary_symbol"] = ctx.get("symbol", "")
+            crypto_v2 = self._crypto_v2_decision(
+                symbol=str(ctx.get("symbol") or ""),
+                family=family,
+                confidence=float(ctx.get("confidence", 0.0) or 0.0),
+            )
+            if crypto_v2 is not None:
+                raw.update(
+                    crypto_redesign_metadata(
+                        crypto_v2,
+                        entry=float(getattr(shaped, "entry", 0.0) or 0.0),
+                        stop_loss=float(getattr(shaped, "stop_loss", 0.0) or 0.0),
+                        take_profit_1=float(getattr(shaped, "take_profit_1", 0.0) or 0.0),
+                        direction=str(getattr(shaped, "direction", "") or ""),
+                        blocked_by="",
+                    )
+                )
             if extra_tags:
                 raw.update(extra_tags)
             shaped.raw_scores = raw
@@ -6610,9 +6675,86 @@ class DexterScheduler:
             pass
         return shaped, lane_source
 
+    # ── BTC/ETH Redesign v2 (Opus 4.7): shadow-safe helpers ─────────────────
+
+    def _crypto_v2_decision(self, *, symbol: str, family: str, confidence: float, soft_mrd_penalty: float = 0.0):
+        if bool(getattr(config, "CRYPTO_REDESIGN_KILL_SWITCH", False)):
+            return None
+        sym = str(symbol or "").strip().upper()
+        fam = str(family or "").strip().lower()
+        if sym == "BTCUSD":
+            enabled = bool(getattr(config, "BTC_LOB_REDESIGN_V2_ENABLED", False))
+            shadow_only = bool(getattr(config, "BTC_LOB_REDESIGN_V2_SHADOW_ONLY", True))
+            tier_enabled = bool(getattr(config, "BTC_LOB_TIER_SIZING_ENABLED", False))
+            tp1_rr = float(getattr(config, "BTC_LOB_TP1_RR", 0.70) or 0.70)
+            runner_rr = float(getattr(config, "BTC_LOB_RUNNER_TP_RR", 2.50) or 2.50)
+        elif sym == "ETHUSD":
+            enabled = bool(getattr(config, "ETH_SMART_V2_ENABLED", False))
+            shadow_only = bool(getattr(config, "ETH_SMART_V2_SHADOW_ONLY", True))
+            tier_enabled = bool(getattr(config, "ETH_SMART_V2_TIER_SIZING_ENABLED", False))
+            tp1_rr = float(getattr(config, "ETH_SMART_V2_TP1_RR", 0.70) or 0.70)
+            runner_rr = float(getattr(config, "ETH_SMART_V2_RUNNER_TP_RR", 2.20) or 2.20)
+        else:
+            return None
+        return crypto_redesign_decision(
+            sym,
+            fam,
+            float(confidence or 0.0),
+            enabled=enabled,
+            shadow_only=shadow_only,
+            tier_sizing_enabled=tier_enabled,
+            tp1_rr=tp1_rr,
+            runner_rr=runner_rr,
+            soft_mrd_penalty=soft_mrd_penalty,
+        )
+
+    def _annotate_crypto_v2_signal(self, signal, *, decision, blocked_by: str = "") -> object:
+        if signal is None or decision is None:
+            return signal
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw.update(
+                crypto_redesign_metadata(
+                    decision,
+                    entry=float(getattr(signal, "entry", 0.0) or 0.0),
+                    stop_loss=float(getattr(signal, "stop_loss", 0.0) or 0.0),
+                    take_profit_1=float(getattr(signal, "take_profit_1", 0.0) or 0.0),
+                    direction=str(getattr(signal, "direction", "") or ""),
+                    blocked_by=blocked_by,
+                )
+            )
+            if bool(decision.enabled) and not bool(decision.shadow_only) and str(getattr(signal, "entry_type", "") or "").strip().lower() == "limit":
+                raw["crypto_limit_autocancel_enabled"] = bool(getattr(config, "BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", True))
+                raw["crypto_limit_max_age_sec"] = int(getattr(config, "BTC_LOB_LIMIT_MAX_AGE_SEC", 180) or 180)
+                raw.setdefault("crypto_limit_fill_rate_window", "shadow_pending")
+                raw.setdefault("crypto_limit_slippage_bps", "shadow_pending")
+            signal.raw_scores = raw
+        except Exception:
+            pass
+        return signal
+
+    def _apply_crypto_v2_price_plan(self, signal, *, decision) -> object:
+        if signal is None or decision is None:
+            return signal
+        if not bool(decision.enabled) or bool(decision.shadow_only):
+            return signal
+        try:
+            entry = float(getattr(signal, "entry", 0.0) or 0.0)
+            stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            tp1, tp2, tp3 = crypto_rr_price_plan(entry, stop_loss, direction, decision.tp1_rr, decision.runner_rr)
+            if tp1 > 0 and tp2 > 0:
+                signal.take_profit_1 = round(float(tp1), 4)
+                signal.take_profit_2 = round(float(tp2), 4)
+                signal.take_profit_3 = round(float(tp3), 4)
+                signal.risk_reward = round(float(decision.tp1_rr), 2)
+        except Exception:
+            pass
+        return signal
+
     # ── Crypto Guards: Cluster Loss + Daily Cap (Phase 1) ────────────────────
 
-    def _crypto_cluster_loss_check(self, symbol: str) -> tuple[bool, str]:
+    def _crypto_cluster_loss_check(self, symbol: str, family: str = "") -> tuple[bool, str]:
         """Block if too many recent losses for this crypto symbol (mirror of XAU cluster loss guard)."""
         if bool(self._is_pytest_runtime()):
             return False, ""
@@ -6630,14 +6772,28 @@ class DexterScheduler:
         try:
             db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
             db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+            fam = str(family or "").strip().lower()
+            per_family = bool(getattr(config, "CRYPTO_CLUSTER_LOSS_PER_FAMILY", False)) and bool(fam)
             with sqlite3.connect(str(db_path), timeout=3) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending') AND execution_utc >= datetime('now', ? || ' hours')",
-                    (sym, f"-{window_h:.1f}"),
-                ).fetchone()
+                if per_family:
+                    row = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM ctrader_deals
+                         WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending')
+                           AND execution_utc >= datetime('now', ? || ' hours')
+                           AND LOWER(COALESCE(source,''))=?
+                        """,
+                        (sym, f"-{window_h:.1f}", fam),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending') AND execution_utc >= datetime('now', ? || ' hours')",
+                        (sym, f"-{window_h:.1f}"),
+                    ).fetchone()
             loss_count = int((row or [0])[0] or 0)
             if loss_count >= min_losses:
-                return True, f"crypto_cluster_loss_guard:{sym} {loss_count}>={min_losses} losses in {window_h:.1f}h"
+                scope = fam if per_family else sym
+                return True, f"crypto_cluster_loss_guard:{scope} {loss_count}>={min_losses} losses in {window_h:.1f}h"
         except Exception:
             pass
         return False, ""
@@ -6726,7 +6882,7 @@ class DexterScheduler:
         if confidence < float(getattr(config, "BTC_FSS_MIN_CONFIDENCE", 67.0) or 67.0):
             return None, ""
         # Phase 1 guards re-applied (BFSS skips weekday builder, call directly)
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
@@ -6839,7 +6995,7 @@ class DexterScheduler:
         if confidence < float(getattr(config, "BTC_FLS_MIN_CONFIDENCE", 67.0) or 67.0):
             return None, ""
         # Phase 1 guards
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
@@ -6946,7 +7102,7 @@ class DexterScheduler:
         if direction not in {"long", "short"}:
             return None, ""
         # Phase 1 guards
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
