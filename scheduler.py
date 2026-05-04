@@ -59,6 +59,7 @@ from notifier.access_control import access_manager
 from infra.db_health import run_full_health_check
 from infra.auth_health import check_token_health, log_token_health_summary
 from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
+from analysis.xau_impulse_guard import evaluate_xau_impulse_guard
 
 logger = logging.getLogger(__name__)
 
@@ -9100,6 +9101,26 @@ class DexterScheduler:
             )
         except Exception as shadow_exc:
             logger.debug("[XAUImpulseShadow] ctrader annotation skipped: %s", shadow_exc, exc_info=True)
+        try:
+            impulse_guard = evaluate_xau_impulse_guard(
+                signal,
+                config=config,
+                source=str(source or ""),
+                stage="ctrader_pre_dispatch",
+                logger=logger,
+            )
+            if impulse_guard.blocked:
+                self._audit_xau_pre_dispatch_skip(
+                    signal,
+                    requested_source=str(source or ""),
+                    dispatch_source="",
+                    gate="xau_impulse_guard",
+                    reason=impulse_guard.reason,
+                    dispatch_meta={"xau_impulse_guard": True, "xau_impulse_shadow": impulse_guard.payload},
+                )
+                return None
+        except Exception as guard_exc:
+            logger.debug("[XAUImpulseGuard] ctrader check skipped: %s", guard_exc, exc_info=True)
         # ── ADI: Adaptive Directional Intelligence confidence modifier ──
         try:
             self._apply_adi_modifier(signal, source=str(source or ""))
@@ -10265,6 +10286,35 @@ class DexterScheduler:
                 )
             except Exception as shadow_exc:
                 logger.debug("[XAUImpulseShadow] annotation skipped: %s", shadow_exc, exc_info=True)
+            try:
+                impulse_guard = evaluate_xau_impulse_guard(
+                    signal,
+                    config=config,
+                    source=f"xauusd_{source}",
+                    stage="candidate",
+                    logger=logger,
+                )
+                if impulse_guard.blocked:
+                    result["status"] = "xau_impulse_guard_blocked"
+                    result["signal"]["xau_impulse_guard"] = {
+                        "blocked": True,
+                        "reason": impulse_guard.reason,
+                        "shadow": impulse_guard.payload,
+                    }
+                    logger.info("[Scheduler] XAUUSD signal blocked by impulse guard: %s", impulse_guard.reason)
+                    try:
+                        result["diagnostics"] = xauusd_scanner.get_last_scan_diagnostics()
+                    except Exception:
+                        result["diagnostics"] = {}
+                    try:
+                        self._attach_xau_previous_signal_context(result)
+                        if self._should_send_xauusd_scan_status(source):
+                            notifier.send_xauusd_scan_status(result)
+                    except Exception:
+                        logger.debug("[Scheduler] XAUUSD impulse-guard status send failed", exc_info=True)
+                    return result
+            except Exception as guard_exc:
+                logger.debug("[XAUImpulseGuard] candidate check skipped: %s", guard_exc, exc_info=True)
 
             if signal.confidence < config.MIN_SIGNAL_CONFIDENCE:
                 result["status"] = "below_confidence"
