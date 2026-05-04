@@ -58,6 +58,7 @@ from api.scalp_signal_store import scalp_store, ScalpSignalRecord
 from notifier.access_control import access_manager
 from infra.db_health import run_full_health_check
 from infra.auth_health import check_token_health, log_token_health_summary
+from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -9090,6 +9091,15 @@ class DexterScheduler:
             return None
         self._ensure_signal_trace(signal, source=str(source or ""))
         self._normalize_signal_confidence(signal, stage="ctrader_pre_adi")
+        try:
+            annotate_xau_impulse_shadow(
+                signal,
+                source=str(source or ""),
+                stage="ctrader_pre_dispatch",
+                logger=logger,
+            )
+        except Exception as shadow_exc:
+            logger.debug("[XAUImpulseShadow] ctrader annotation skipped: %s", shadow_exc, exc_info=True)
         # ── ADI: Adaptive Directional Intelligence confidence modifier ──
         try:
             self._apply_adi_modifier(signal, source=str(source or ""))
@@ -10246,6 +10256,15 @@ class DexterScheduler:
                 "take_profit_2": float(signal.take_profit_2),
                 "atr": float(signal.atr or 0),
             }
+            try:
+                result["signal"]["xau_impulse_shadow"] = annotate_xau_impulse_shadow(
+                    signal,
+                    source=f"xauusd_{source}",
+                    stage="candidate",
+                    logger=logger,
+                )
+            except Exception as shadow_exc:
+                logger.debug("[XAUImpulseShadow] annotation skipped: %s", shadow_exc, exc_info=True)
 
             if signal.confidence < config.MIN_SIGNAL_CONFIDENCE:
                 result["status"] = "below_confidence"
