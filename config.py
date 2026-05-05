@@ -97,6 +97,18 @@ class Config:
     XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE: bool = os.getenv("XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MIN_RR_ENFORCE: bool = os.getenv("XAU_MIN_RR_ENFORCE", "0").strip().lower() in ("1", "true", "yes", "on")
     XAU_MIN_PLANNED_RR: float = float(os.getenv("XAU_MIN_PLANNED_RR", "2.7"))
+    # XAU Behavior V3 (Opus 4.7): post-capitulation reclaim/staircase capture.
+    # Default is shadow-safe: metadata only, no live gate bypass or sizing change.
+    XAU_RECLAIM_V3_ENABLED: bool = os.getenv("XAU_RECLAIM_V3_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RECLAIM_V3_SHADOW: bool = os.getenv("XAU_RECLAIM_V3_SHADOW", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RECLAIM_MIN_SCORE: float = float(os.getenv("XAU_RECLAIM_MIN_SCORE", "62"))
+    XAU_RECLAIM_CONF_BONUS: float = float(os.getenv("XAU_RECLAIM_CONF_BONUS", "2.5"))
+    XAU_RECLAIM_CONF_BONUS_CAP: float = float(os.getenv("XAU_RECLAIM_CONF_BONUS_CAP", "85"))
+    XAU_RECLAIM_BASE_COMPRESS_RATIO: float = float(os.getenv("XAU_RECLAIM_BASE_COMPRESS_RATIO", "0.70"))
+    XAU_RECLAIM_BASE_MIN_BARS: int = int(os.getenv("XAU_RECLAIM_BASE_MIN_BARS", "4"))
+    XAU_RECLAIM_MAX_RISK_MULT: float = float(os.getenv("XAU_RECLAIM_MAX_RISK_MULT", "1.75"))
+    XAU_RECLAIM_MIN_RR: float = float(os.getenv("XAU_RECLAIM_MIN_RR", "3.0"))
+    XAU_RECLAIM_WINNER_OVERRIDE: bool = os.getenv("XAU_RECLAIM_WINNER_OVERRIDE", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED: bool = os.getenv("CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_SCHEDULED_CANARY_MIN_RR: float = float(os.getenv("CTRADER_SCHEDULED_CANARY_MIN_RR", "0.85"))
     CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO: float = float(os.getenv("CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO", "0.58"))

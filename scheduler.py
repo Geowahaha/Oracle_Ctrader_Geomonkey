@@ -69,6 +69,11 @@ from analysis.nonfibo_redesign import (
     is_nonfibo_xau_source,
     planned_rr as nonfibo_planned_rr,
 )
+from analysis.xau_reclaim_staircase import (
+    apply_confidence_bonus as apply_xau_reclaim_confidence_bonus,
+    apply_risk_multiplier as apply_xau_reclaim_risk_multiplier,
+    decision_from_signal as xau_reclaim_v3_decision,
+)
 from analysis.crypto_redesign import (
     decision_for as crypto_redesign_decision,
     metadata as crypto_redesign_metadata,
@@ -1466,6 +1471,88 @@ class DexterScheduler:
             logger.debug("[XAU_RASG] skipped source=%s err=%s", source, exc, exc_info=True)
             return {"active": False, "reason": "error"}
 
+    def _xau_reclaim_v3_decision(self, signal, source: str) -> dict:
+        """Attach XAU reclaim/staircase V3 metadata; live changes require flags."""
+        try:
+            decision = xau_reclaim_v3_decision(
+                signal,
+                source=str(source or ""),
+                enabled=bool(getattr(config, "XAU_RECLAIM_V3_ENABLED", False)),
+                shadow_only=bool(getattr(config, "XAU_RECLAIM_V3_SHADOW", True)),
+                min_score=float(getattr(config, "XAU_RECLAIM_MIN_SCORE", 62.0) or 62.0),
+                confidence_bonus=float(getattr(config, "XAU_RECLAIM_CONF_BONUS", 2.5) or 2.5),
+                max_risk_mult=float(getattr(config, "XAU_RECLAIM_MAX_RISK_MULT", 1.75) or 1.75),
+                min_rr=float(getattr(config, "XAU_RECLAIM_MIN_RR", 3.0) or 3.0),
+                winner_override=bool(getattr(config, "XAU_RECLAIM_WINNER_OVERRIDE", True)),
+                base_compress_ratio=float(getattr(config, "XAU_RECLAIM_BASE_COMPRESS_RATIO", 0.70) or 0.70),
+                base_min_bars=int(getattr(config, "XAU_RECLAIM_BASE_MIN_BARS", 4) or 4),
+            )
+            meta = decision.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_reclaim_v3"] = meta
+            signal.raw_scores = raw
+            if bool(decision.active):
+                logger.info(
+                    "[XAU_RECLAIM_V3] source=%s side=%s phase=%s score=%.1f enabled=%s shadow=%s bypass=%s winner_override=%s reason=%s",
+                    str(source or ""),
+                    str(decision.direction or ""),
+                    str(decision.phase or ""),
+                    float(decision.score or 0.0),
+                    bool(decision.enabled),
+                    bool(decision.shadow_only),
+                    bool(decision.bypass_conf_below),
+                    bool(decision.winner_partial_override),
+                    str(decision.reason or ""),
+                )
+            return meta
+        except Exception as exc:
+            logger.debug("[XAU_RECLAIM_V3] decision skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "reason": "error"}
+
+    def _apply_xau_reclaim_v3_live_adjustments(self, signal, source: str) -> dict:
+        meta = {}
+        try:
+            decision = xau_reclaim_v3_decision(
+                signal,
+                source=str(source or ""),
+                enabled=bool(getattr(config, "XAU_RECLAIM_V3_ENABLED", False)),
+                shadow_only=bool(getattr(config, "XAU_RECLAIM_V3_SHADOW", True)),
+                min_score=float(getattr(config, "XAU_RECLAIM_MIN_SCORE", 62.0) or 62.0),
+                confidence_bonus=float(getattr(config, "XAU_RECLAIM_CONF_BONUS", 2.5) or 2.5),
+                max_risk_mult=float(getattr(config, "XAU_RECLAIM_MAX_RISK_MULT", 1.75) or 1.75),
+                min_rr=float(getattr(config, "XAU_RECLAIM_MIN_RR", 3.0) or 3.0),
+                winner_override=bool(getattr(config, "XAU_RECLAIM_WINNER_OVERRIDE", True)),
+                base_compress_ratio=float(getattr(config, "XAU_RECLAIM_BASE_COMPRESS_RATIO", 0.70) or 0.70),
+                base_min_bars=int(getattr(config, "XAU_RECLAIM_BASE_MIN_BARS", 4) or 4),
+            )
+            meta = decision.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_reclaim_v3"] = meta
+            try:
+                setattr(signal, "raw_scores", raw)
+            except Exception:
+                pass
+            if bool(meta.get("active")) and bool(meta.get("enabled")) and not bool(meta.get("shadow_only")):
+                if float(meta.get("confidence_bonus", 0.0) or 0.0) > 0.0:
+                    bonus_cap = float(getattr(config, "XAU_RECLAIM_CONF_BONUS_CAP", 85.0) or 85.0)
+                    src = str(source or "").strip().lower()
+                    if src in {"scalp_xauusd", "scalp_xauusd:winner"} and bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)):
+                        live_max = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0) or 75.0)
+                        bonus_cap = min(bonus_cap, max(0.0, live_max - 0.1))
+                    apply_xau_reclaim_confidence_bonus(signal, decision, cap=bonus_cap)
+                if float(meta.get("risk_mult", 1.0) or 1.0) > 1.0:
+                    apply_xau_reclaim_risk_multiplier(
+                        signal,
+                        decision,
+                        default_risk_usd=float(getattr(config, "CTRADER_RISK_USD_PER_TRADE", 10.0) or 10.0),
+                    )
+        except Exception as exc:
+            logger.debug("[XAU_RECLAIM_V3] live adjustment skipped source=%s err=%s", source, exc, exc_info=True)
+        try:
+            return dict((getattr(signal, "raw_scores", {}) or {}).get("xau_reclaim_v3") or meta or {})
+        except Exception:
+            return dict(meta or {})
+
     def _allow_scalp_xau_live_mt5(self, signal, source: str) -> tuple[bool, str]:
         src = str(source or "").strip().lower()
         if src in {"scalp_ethusd", "scalp_btcusd"}:
@@ -1511,6 +1598,8 @@ class DexterScheduler:
                 return False, f"conf_below_live_band:{conf:.1f}<{conf_min:.1f}"
             if conf >= conf_max:
                 return False, f"conf_above_live_band:{conf:.1f}>={conf_max:.1f}"
+        if src in {"scalp_xauusd", "scalp_xauusd:winner"}:
+            self._apply_xau_reclaim_v3_live_adjustments(signal, src)
         if _is_sweep_reversal and bool(getattr(config, "POST_SL_REVERSAL_BYPASS_MTF", False)):
             return True, "live_band_pass_sweep_reversal"
         mtf_guard = self._scalp_xau_direct_mtf_guard(signal)
@@ -1530,7 +1619,17 @@ class DexterScheduler:
             guard_countertrend = bool((mtf_guard or {}).get("countertrend_confirmed"))
             direction = str((mtf_guard or {}).get("direction") or self._signal_direction_token(signal) or "").strip().lower()
             if direction == "long" and guard_reason.startswith("partial_2of3_aligned:") and not (guard_flow_confirmed or guard_countertrend):
-                return False, "winner_partial_long_no_flow_confirm"
+                reclaim_v3 = self._xau_reclaim_v3_decision(signal, src)
+                if bool((reclaim_v3 or {}).get("winner_partial_override")):
+                    logger.info(
+                        "[XAU_RECLAIM_V3] winner partial long override source=%s score=%.1f phase=%s reason=%s",
+                        src,
+                        float((reclaim_v3 or {}).get("score", 0.0) or 0.0),
+                        str((reclaim_v3 or {}).get("phase") or ""),
+                        str((reclaim_v3 or {}).get("reason") or ""),
+                    )
+                else:
+                    return False, "winner_partial_long_no_flow_confirm"
 
             # During manager transition mode, do not allow ANY winner entries.
             # Range transition = market structure shifting — winner regime from
@@ -1683,8 +1782,18 @@ class DexterScheduler:
             allowed_sessions = set(config.get_ctrader_xau_scheduled_allowed_sessions() or set())
             allowed_tfs = set(config.get_ctrader_xau_scheduled_allowed_timeframes() or set())
             allowed_entry_types = set(config.get_ctrader_xau_scheduled_allowed_entry_types() or set())
-            if conf < min_conf:
+            reclaim_v3 = self._xau_reclaim_v3_decision(signal, src)
+            if conf < min_conf and not bool((reclaim_v3 or {}).get("bypass_conf_below")):
                 return False, f"xau_scheduled_conf_below:{conf:.1f}<{min_conf:.1f}"
+            if conf < min_conf and bool((reclaim_v3 or {}).get("bypass_conf_below")):
+                logger.info(
+                    "[XAU_RECLAIM_V3] bypass scheduled conf floor source=%s conf=%.1f min=%.1f score=%.1f phase=%s",
+                    src,
+                    float(conf or 0.0),
+                    float(min_conf or 0.0),
+                    float((reclaim_v3 or {}).get("score", 0.0) or 0.0),
+                    str((reclaim_v3 or {}).get("phase") or ""),
+                )
             try:
                 scheduled_raw = dict(getattr(signal, "raw_scores", {}) or {})
             except Exception:
@@ -9597,6 +9706,8 @@ class DexterScheduler:
                     )
                     return None
                 self._apply_xau_rasg_throttle(signal, dispatch_source)
+                if src_key.split(":", 1)[0] == "scalp_xauusd":
+                    self._apply_xau_reclaim_v3_live_adjustments(signal, dispatch_source)
         except Exception as exc:
             logger.debug("[XAU_NONFIBO] redesign guard skipped source=%s err=%s", dispatch_source, exc, exc_info=True)
         try:
