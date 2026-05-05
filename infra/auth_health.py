@@ -149,6 +149,54 @@ def check_token_health(
     return result
 
 
+def _get_token_manager():
+    """Late import token manager so auth_health remains lightweight/testable."""
+    from api.ctrader_token_manager import token_manager
+    return token_manager
+
+
+def refresh_stale_token_if_needed(max_age_hours: float = 24.0) -> dict:
+    """Proactively refresh a cTrader token when persisted state is stale.
+
+    This does not expose token values. It only attempts refresh when both an
+    access token and refresh token are present and last_refresh_utc is older
+    than max_age_hours. Returns metadata for logging/diagnostics.
+    """
+    state = _load_token_state()
+    result = {
+        "attempted": False,
+        "refreshed": False,
+        "reason": "",
+        "hours_since_refresh": None,
+    }
+    if not state:
+        result["reason"] = "state_missing"
+        return result
+    if not state.get("access_token") or not state.get("refresh_token"):
+        result["reason"] = "token_or_refresh_missing"
+        return result
+    last_refresh = _parse_utc(state.get("last_refresh_utc", ""))
+    if not last_refresh:
+        result["reason"] = "last_refresh_missing"
+        return result
+    age = datetime.now(timezone.utc) - last_refresh
+    age_hours = age.total_seconds() / 3600
+    result["hours_since_refresh"] = round(age_hours, 1)
+    if age_hours <= float(max_age_hours):
+        result["reason"] = "fresh"
+        return result
+    result["attempted"] = True
+    result["reason"] = "stale"
+    try:
+        new_token = _get_token_manager().try_refresh()
+        result["refreshed"] = bool(new_token)
+        result["reason"] = "refreshed" if new_token else "refresh_failed"
+    except Exception as exc:
+        logger.warning("[auth_health] proactive token refresh failed: %s", exc)
+        result["reason"] = "refresh_exception"
+    return result
+
+
 def log_token_health_summary() -> None:
     """Log a structured summary of token health. Call at scheduler startup."""
     health = check_token_health()

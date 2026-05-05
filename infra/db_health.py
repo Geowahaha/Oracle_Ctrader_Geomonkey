@@ -201,9 +201,8 @@ def run_full_health_check(
     if report["file_system"]["size_mb"] > 4000:
         issues.append(f"DB size {report['file_system']['size_mb']} MB exceeds 4 GB threshold")
 
-    # WAL check
-    if report["sqlite"].get("journal_mode") == "wal" and not report["file_system"]["wal_exists"]:
-        issues.append("WAL mode reported but no -wal file exists")
+    # WAL mode with no -wal companion file is normal when SQLite has checkpointed
+    # and there are no active uncheckpointed frames. Do not warn on absence alone.
 
     # Largest table check
     tables = report["sqlite"].get("tables", {})

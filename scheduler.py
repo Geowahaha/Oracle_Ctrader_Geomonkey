@@ -59,7 +59,7 @@ from api.report_store import report_store
 from api.scalp_signal_store import scalp_store, ScalpSignalRecord
 from notifier.access_control import access_manager
 from infra.db_health import run_full_health_check
-from infra.auth_health import check_token_health, log_token_health_summary
+from infra.auth_health import check_token_health, log_token_health_summary, refresh_stale_token_if_needed
 from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
 from analysis.xau_impulse_guard import evaluate_xau_impulse_guard
 from analysis.nonfibo_redesign import (
@@ -14826,7 +14826,15 @@ class DexterScheduler:
         
         # ── Hermes infrastructure: startup health checks ──────────────────
         try:
-            log_token_health_summary(check_token_health())
+            refresh_meta = refresh_stale_token_if_needed()
+            if refresh_meta.get("attempted"):
+                logger.info(
+                    "[Hermes] proactive cTrader token refresh attempted: refreshed=%s age_h=%s reason=%s",
+                    refresh_meta.get("refreshed"),
+                    refresh_meta.get("hours_since_refresh"),
+                    refresh_meta.get("reason"),
+                )
+            log_token_health_summary()
         except Exception:
             logger.debug("[Hermes] auth health check skipped", exc_info=True)
         try:
