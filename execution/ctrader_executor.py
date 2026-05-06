@@ -4947,6 +4947,10 @@ class CTraderExecutor:
             _apply_trend_rider(signal=signal)
         except Exception:
             pass
+        xau_opportunity_first = bool(
+            str(getattr(signal, "symbol", "") or "").strip().upper() == "XAUUSD"
+            and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+        )
         # Counter-move guard (Option B): skip live order if last 4/5 M1 bars
         # contradict direction; instead log a "ghost trade" into
         # xau_shadow_journal so we can compare would-have outcomes against
@@ -4963,14 +4967,23 @@ class CTraderExecutor:
                 except Exception:
                     pass
                 if _cm.get("skip"):
-                    _cm_ghost(signal=signal, block_reason=_cm.get("block_reason", "counter_move_skip"))
-                    logger.info("[counter_move] skip+ghost source=%s reason=%s", source, _cm.get("block_reason"))
-                    return CTraderExecutionResult(
-                        ok=False,
-                        status="filtered",
-                        message=str(_cm.get("block_reason", "counter_move_skip")),
-                        signal_symbol=str(getattr(signal, "symbol", "") or ""),
-                    )
+                    if xau_opportunity_first:
+                        try:
+                            rs = dict(getattr(signal, "raw_scores", {}) or {})
+                            rs.setdefault("xau_opportunity_first_executor_bypassed", []).append(str(_cm.get("block_reason", "counter_move_skip")))
+                            signal.raw_scores = rs
+                        except Exception:
+                            pass
+                        logger.info("[XAU_OPPORTUNITY_FIRST] bypass counter_move source=%s reason=%s", source, _cm.get("block_reason"))
+                    else:
+                        _cm_ghost(signal=signal, block_reason=_cm.get("block_reason", "counter_move_skip"))
+                        logger.info("[counter_move] skip+ghost source=%s reason=%s", source, _cm.get("block_reason"))
+                        return CTraderExecutionResult(
+                            ok=False,
+                            status="filtered",
+                            message=str(_cm.get("block_reason", "counter_move_skip")),
+                            signal_symbol=str(getattr(signal, "symbol", "") or ""),
+                        )
         except Exception:
             pass
         # Shock V2 — multi-source confirm + size/SL tilt. NEVER blocks.
@@ -5142,10 +5155,16 @@ class CTraderExecutor:
             )
         price_ok, price_reason, _price_meta = self._price_sanity_guard(signal, source=source)
         if not price_ok:
-            return _early_exit("filtered", price_reason)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass price_sanity source=%s reason=%s", source, price_reason)
+            else:
+                return _early_exit("filtered", price_reason)
         drift_ok, drift_reason, _drift_meta = self._market_entry_drift_guard(signal, source=source)
         if not drift_ok:
-            return _early_exit("filtered", drift_reason)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass market_entry_drift source=%s reason=%s", source, drift_reason)
+            else:
+                return _early_exit("filtered", drift_reason)
 
         if bool(getattr(config, "CTRADER_EXEC_FEATURE_PACK_ENABLED", False)):
             try:
@@ -5174,41 +5193,61 @@ class CTraderExecutor:
                 pass
         rr_ok, rr_reason, rr_meta = self._rr_floor_guard(source=source, payload=payload)
         if not rr_ok:
-            logger.warning(
-                "[rr_floor] reject source=%s symbol=%s rr=%.2f floor=%.2f",
-                source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
-            )
-            return _early_exit(
-                "filtered",
-                rr_reason,
-                request_payload=payload,
-                execution_meta={"rr_floor": dict(rr_meta or {})},
-            )
+            if xau_opportunity_first:
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] bypass rr_floor source=%s symbol=%s rr=%.2f floor=%.2f",
+                    source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
+                )
+            else:
+                logger.warning(
+                    "[rr_floor] reject source=%s symbol=%s rr=%.2f floor=%.2f",
+                    source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
+                )
+                return _early_exit(
+                    "filtered",
+                    rr_reason,
+                    request_payload=payload,
+                    execution_meta={"rr_floor": dict(rr_meta or {})},
+                )
         short_limit_pause = self._xau_short_limit_pause_state(source=source, payload=payload)
         if bool(short_limit_pause.get("active")):
             remain_min = float(short_limit_pause.get("remaining_min", 0.0) or 0.0)
             run_id = str(short_limit_pause.get("trigger_run_id") or "")
             support_state = str(short_limit_pause.get("support_state") or "fss_support")
-            return _early_exit(
-                "filtered",
-                f"xau_short_limit_pause_active:{remain_min:.1f}m:{support_state}:{run_id}",
-                request_payload=payload,
-                execution_meta={"short_limit_pause": dict(short_limit_pause or {})},
-            )
+            pause_reason = f"xau_short_limit_pause_active:{remain_min:.1f}m:{support_state}:{run_id}"
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass short_limit_pause source=%s reason=%s", source, pause_reason)
+            else:
+                return _early_exit(
+                    "filtered",
+                    pause_reason,
+                    request_payload=payload,
+                    execution_meta={"short_limit_pause": dict(short_limit_pause or {})},
+                )
         dup_ok, dup_reason, _dup_meta = self._source_run_duplicate_guard(source=source, payload=payload)
         if not dup_ok:
-            return _early_exit("filtered", dup_reason, request_payload=payload)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass duplicate_guard source=%s reason=%s", source, dup_reason)
+            else:
+                return _early_exit("filtered", dup_reason, request_payload=payload)
         pair_cap = self._apply_xau_same_run_pair_risk_cap(source=source, payload=payload)
         if bool(pair_cap.get("active")) and bool(pair_cap.get("blocked")):
-            return _early_exit(
-                "filtered",
-                f"same_run_pair_risk_cap_exhausted:{str(payload.get('signal_run_id') or '')}",
-                request_payload=payload,
-                execution_meta={"pair_risk_cap": dict(pair_cap or {})},
-            )
+            pair_reason = f"same_run_pair_risk_cap_exhausted:{str(payload.get('signal_run_id') or '')}"
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass pair_risk_cap source=%s reason=%s", source, pair_reason)
+            else:
+                return _early_exit(
+                    "filtered",
+                    pair_reason,
+                    request_payload=payload,
+                    execution_meta={"pair_risk_cap": dict(pair_cap or {})},
+                )
         pos_ok, pos_reason, _pos_meta = self._position_direction_guard(symbol=symbol, direction=str(getattr(signal, "direction", "") or ""), source=source)
         if not pos_ok:
-            return _early_exit("filtered", pos_reason, request_payload=payload)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass position_direction_guard source=%s reason=%s", source, pos_reason)
+            else:
+                return _early_exit("filtered", pos_reason, request_payload=payload)
 
         if self.dry_run:
             result = CTraderExecutionResult(
