@@ -5249,6 +5249,45 @@ class CTraderExecutor:
             else:
                 return _early_exit("filtered", pos_reason, request_payload=payload)
 
+        # Guardian v2 stop-bleed governor: unlike the old opportunity-first
+        # bypasses, this is not a generic entry blocker. It freezes only the
+        # currently adverse/crowded XAU side/family while preserving opposite-side
+        # and future opportunity-first entries. Demo live explicitly requested.
+        try:
+            if symbol == "XAUUSD" and bool(getattr(config, "XAU_GOVERNOR_V2_ENABLED", True)):
+                from execution.xau_governor_v2 import GovernorConfig, XAUExposureGovernor
+                _gov = XAUExposureGovernor(self.db_path, GovernorConfig.from_config(config))
+                _verdict = _gov.allow_entry(
+                    symbol=symbol,
+                    direction=str(payload.get("direction") or getattr(signal, "direction", "") or ""),
+                    source=str(source or payload.get("source") or ""),
+                    confidence=_safe_float(payload.get("confidence", getattr(signal, "confidence", 0.0)), 0.0),
+                )
+                try:
+                    rs = dict(payload.get("raw_scores") or {})
+                    rs["xau_governor_v2"] = dict(_verdict.to_dict())
+                    payload["raw_scores"] = rs
+                except Exception:
+                    pass
+                if not bool(_verdict.allowed):
+                    logger.warning("[XAU_GOVERNOR_V2] freeze entry side=%s source=%s reason=%s metrics=%s", _verdict.side, source, _verdict.reason, _verdict.metrics)
+                    return _early_exit(
+                        "filtered",
+                        f"xau_governor_v2:{_verdict.reason}",
+                        request_payload=payload,
+                        execution_meta={"xau_governor_v2": dict(_verdict.to_dict())},
+                    )
+                if _verdict.guards:
+                    logger.info("[XAU_GOVERNOR_V2] dryrun_allow side=%s source=%s reason=%s", _verdict.side, source, _verdict.reason)
+        except Exception as _gov_exc:
+            logger.warning("[XAU_GOVERNOR_V2] fail-safe freeze source=%s error=%s", source, _gov_exc)
+            return _early_exit(
+                "filtered",
+                f"xau_governor_v2_error:{type(_gov_exc).__name__}",
+                request_payload=payload,
+                execution_meta={"xau_governor_v2_error": str(_gov_exc)},
+            )
+
         if self.dry_run:
             result = CTraderExecutionResult(
                 ok=True,
