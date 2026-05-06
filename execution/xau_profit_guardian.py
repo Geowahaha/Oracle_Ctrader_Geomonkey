@@ -493,8 +493,12 @@ class XAUProfitGuardianDB:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10)
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+        except Exception:
+            pass
         self.ensure_schema(conn)
         return conn
 
