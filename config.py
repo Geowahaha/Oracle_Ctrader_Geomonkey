@@ -74,6 +74,10 @@ class Config:
     CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES: str = os.getenv("CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES", "limit")
     CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED: bool = os.getenv("CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_IMPULSE_GUARD_ENABLED: bool = os.getenv("XAU_IMPULSE_GUARD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Highest-priority XAU live rule: if a scanner emits an XAUUSD opportunity,
+    # route it to cTrader live execution; strategy gates may tag/adjust but must
+    # not turn the opportunity into shadow-only or pre-dispatch filtered.
+    XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED: bool = os.getenv("XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     XAU_IMPULSE_GUARD_MIN_CONFIDENCE: float = float(os.getenv("XAU_IMPULSE_GUARD_MIN_CONFIDENCE", "0.70"))
     XAU_IMPULSE_GUARD_BLOCK_STATES: str = os.getenv("XAU_IMPULSE_GUARD_BLOCK_STATES", "impulse_run")
     # Opus 4.7 non-Fibo redesign (demo-first): dynamic confidence floors,

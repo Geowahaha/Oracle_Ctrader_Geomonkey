@@ -9471,6 +9471,30 @@ class DexterScheduler:
         elif (not result.ok) and config.MT5_NOTIFY_FAILED and status in {"rejected", "error", "invalid_stops", "blocked"}:
             notifier.send_mt5_execution_update(signal, result, source=source)
 
+    def _xau_opportunity_first_live_unlock(self, signal) -> bool:
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        return bool(
+            symbol == "XAUUSD"
+            and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+        )
+
+    @staticmethod
+    def _tag_xau_opportunity_first_bypass(signal, gate: str, reason: str, *, source: str = "") -> None:
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_opportunity_first_live_unlock"] = True
+            raw["xau_opportunity_first_rule"] = "opportunity_wins_over_blocks"
+            bypassed = list(raw.get("xau_opportunity_first_bypassed_gates") or [])
+            bypassed.append({
+                "gate": str(gate or ""),
+                "reason": str(reason or ""),
+                "source": str(source or ""),
+            })
+            raw["xau_opportunity_first_bypassed_gates"] = bypassed
+            signal.raw_scores = raw
+        except Exception:
+            return
+
     def _maybe_execute_ctrader_signal(self, signal, source: str):
         if not bool(getattr(config, "CTRADER_ENABLED", False)):
             return None
@@ -9478,6 +9502,9 @@ class DexterScheduler:
             return None
         self._ensure_signal_trace(signal, source=str(source or ""))
         self._normalize_signal_confidence(signal, stage="ctrader_pre_adi")
+        xau_opportunity_first = self._xau_opportunity_first_live_unlock(signal)
+        if xau_opportunity_first:
+            self._tag_xau_opportunity_first_bypass(signal, "policy", "enabled", source=str(source or ""))
         try:
             annotate_xau_impulse_shadow(
                 signal,
@@ -9496,15 +9523,22 @@ class DexterScheduler:
                 logger=logger,
             )
             if impulse_guard.blocked:
-                self._audit_xau_pre_dispatch_skip(
-                    signal,
-                    requested_source=str(source or ""),
-                    dispatch_source="",
-                    gate="xau_impulse_guard",
-                    reason=impulse_guard.reason,
-                    dispatch_meta={"xau_impulse_guard": True, "xau_impulse_shadow": impulse_guard.payload},
-                )
-                return None
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "xau_impulse_guard", impulse_guard.reason, source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass xau_impulse_guard source=%s symbol=%s reason=%s",
+                        str(source or ""), getattr(signal, "symbol", ""), impulse_guard.reason,
+                    )
+                else:
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="xau_impulse_guard",
+                        reason=impulse_guard.reason,
+                        dispatch_meta={"xau_impulse_guard": True, "xau_impulse_shadow": impulse_guard.payload},
+                    )
+                    return None
         except Exception as guard_exc:
             logger.debug("[XAUImpulseGuard] ctrader check skipped: %s", guard_exc, exc_info=True)
         # ── ADI: Adaptive Directional Intelligence confidence modifier ──
@@ -9541,26 +9575,33 @@ class DexterScheduler:
             _adi_raw = dict(getattr(signal, "raw_scores", {}) or {})
             _adi_catastrophic = bool(_adi_raw.get("adi_catastrophic", False))
             _adi_gate_enabled = bool(getattr(config, "ADI_CATASTROPHIC_GATE_ENABLED", True))
+            _adi_rec = str(_adi_raw.get("adi_recommendation", ""))
+            _sig_dir = str(getattr(signal, "direction", "") or "")
+            _sig_sym = str(getattr(signal, "symbol", "") or "")
             if _adi_catastrophic and _adi_gate_enabled:
-                _adi_rec = str(_adi_raw.get("adi_recommendation", ""))
-                _sig_dir = str(getattr(signal, "direction", "") or "")
-                _sig_sym = str(getattr(signal, "symbol", "") or "")
-                logger.info(
-                    "[ADI-GATE] CATASTROPHIC hard-block | %s %s %s | conf=%.1f | rec=%s | dims=%s",
-                    str(source or ""), _sig_sym, _sig_dir,
-                    float(getattr(signal, "confidence", 0)),
-                    _adi_rec,
-                    str(_adi_raw.get("adi_dimensions", {})),
-                )
-                self._audit_xau_pre_dispatch_skip(
-                    signal,
-                    requested_source=str(source or ""),
-                    dispatch_source="",
-                    gate="adi_catastrophic",
-                    reason=f"adi_catastrophic:{_adi_rec}",
-                    dispatch_meta={"adi_catastrophic": True, "adi_recommendation": _adi_rec},
-                )
-                return None
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "adi_catastrophic", str(_adi_rec), source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass adi_catastrophic source=%s symbol=%s rec=%s",
+                        str(source or ""), _sig_sym, _adi_rec,
+                    )
+                else:
+                    logger.info(
+                        "[ADI-GATE] CATASTROPHIC hard-block | %s %s %s | conf=%.1f | rec=%s | dims=%s",
+                        str(source or ""), _sig_sym, _sig_dir,
+                        float(getattr(signal, "confidence", 0)),
+                        _adi_rec,
+                        str(_adi_raw.get("adi_dimensions", {})),
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="adi_catastrophic",
+                        reason=f"adi_catastrophic:{_adi_rec}",
+                        dispatch_meta={"adi_catastrophic": True, "adi_recommendation": _adi_rec},
+                    )
+                    return None
         except Exception as e:
             logger.debug("[ADI-GATE] catastrophic check error (non-fatal): %s", e)
 
@@ -9581,88 +9622,121 @@ class DexterScheduler:
                     and _hermes_samples >= _hermes_toxic_min_samples):
                 _sig_dir = str(getattr(signal, "direction", "") or "")
                 _sig_sym = str(getattr(signal, "symbol", "") or "")
-                logger.info(
-                    "[HERMES-GATE] TOXIC hard-block | %s %s %s | hermes_mod=%.1f | "
-                    "samples=%d | avg_wr=%.3f | conf=%.1f",
-                    str(source or ""), _sig_sym, _sig_dir,
-                    _hermes_mod, _hermes_samples, _hermes_avg_wr,
-                    float(getattr(signal, "confidence", 0)),
-                )
-                self._audit_xau_pre_dispatch_skip(
-                    signal,
-                    requested_source=str(source or ""),
-                    dispatch_source="",
-                    gate="hermes_toxic",
-                    reason=f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}",
-                    dispatch_meta={"hermes_toxic": True, "hermes_modifier": _hermes_mod,
-                                   "hermes_avg_wr": _hermes_avg_wr, "hermes_samples": _hermes_samples},
-                )
-                return None
+                if xau_opportunity_first:
+                    reason = f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}"
+                    self._tag_xau_opportunity_first_bypass(signal, "hermes_toxic", reason, source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass hermes_toxic source=%s symbol=%s reason=%s",
+                        str(source or ""), _sig_sym, reason,
+                    )
+                else:
+                    logger.info(
+                        "[HERMES-GATE] TOXIC hard-block | %s %s %s | hermes_mod=%.1f | "
+                        "samples=%d | avg_wr=%.3f | conf=%.1f",
+                        str(source or ""), _sig_sym, _sig_dir,
+                        _hermes_mod, _hermes_samples, _hermes_avg_wr,
+                        float(getattr(signal, "confidence", 0)),
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="hermes_toxic",
+                        reason=f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}",
+                        dispatch_meta={"hermes_toxic": True, "hermes_modifier": _hermes_mod,
+                                       "hermes_avg_wr": _hermes_avg_wr, "hermes_samples": _hermes_samples},
+                    )
+                    return None
         except Exception as e:
             logger.debug("[HERMES-GATE] toxic check error (non-fatal): %s", e)
 
         dispatch_source, dispatch_meta = self._ctrader_pick_dispatch_source(signal, source)
         if not dispatch_source:
             skip_reason = str((dispatch_meta or {}).get("winner_reason", "source_not_allowed"))
-            logger.info(
-                "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                str(source or ""),
-                getattr(signal, "symbol", ""),
-                skip_reason,
-            )
-            self._audit_xau_pre_dispatch_skip(
-                signal,
-                requested_source=str(source or ""),
-                dispatch_source="",
-                gate="dispatch_source",
-                reason=skip_reason,
-                dispatch_meta=dispatch_meta,
-            )
-            return None
-        if str(dispatch_source or "").strip().lower() in {"scalp_xauusd", "scalp_xauusd:winner"}:
-            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source=dispatch_source)
-            if not allow_xau:
-                skip_reason = str(xau_reason or "xau_live_filter_blocked")
+            if xau_opportunity_first and str(source or "").strip():
+                dispatch_source = str(source or "").strip()
+                dispatch_meta = dict(dispatch_meta or {})
+                dispatch_meta["dispatch_source"] = dispatch_source
+                dispatch_meta["winner_reason"] = f"xau_opportunity_first_source_unlock:{skip_reason}"
+                self._tag_xau_opportunity_first_bypass(signal, "dispatch_source", skip_reason, source=dispatch_source)
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] unlock dispatch source=%s symbol=%s previous_reason=%s",
+                    dispatch_source, getattr(signal, "symbol", ""), skip_reason,
+                )
+            else:
                 logger.info(
                     "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                    str(dispatch_source or ""),
+                    str(source or ""),
                     getattr(signal, "symbol", ""),
                     skip_reason,
                 )
                 self._audit_xau_pre_dispatch_skip(
                     signal,
                     requested_source=str(source or ""),
-                    dispatch_source=str(dispatch_source or ""),
-                    gate="xau_live_filter",
+                    dispatch_source="",
+                    gate="dispatch_source",
                     reason=skip_reason,
                     dispatch_meta=dispatch_meta,
                 )
                 return None
+        if str(dispatch_source or "").strip().lower() in {"scalp_xauusd", "scalp_xauusd:winner"}:
+            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source=dispatch_source)
+            if not allow_xau:
+                skip_reason = str(xau_reason or "xau_live_filter_blocked")
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "xau_live_filter", skip_reason, source=str(dispatch_source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass xau_live_filter source=%s symbol=%s reason=%s",
+                        str(dispatch_source or ""), getattr(signal, "symbol", ""), skip_reason,
+                    )
+                else:
+                    logger.info(
+                        "[CTRADER] skipped source=%s symbol=%s reason=%s",
+                        str(dispatch_source or ""),
+                        getattr(signal, "symbol", ""),
+                        skip_reason,
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source=str(dispatch_source or ""),
+                        gate="xau_live_filter",
+                        reason=skip_reason,
+                        dispatch_meta=dispatch_meta,
+                    )
+                    return None
         allow_source, source_reason = self._allow_ctrader_source_profile(signal, dispatch_source)
         if not allow_source:
             skip_reason = str(source_reason or "source_profile_blocked")
-            logger.info(
-                "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                str(dispatch_source or ""),
-                getattr(signal, "symbol", ""),
-                skip_reason,
-            )
-            try:
-                raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
-                raw_scores["ctrader_source_profile_blocked"] = True
-                raw_scores["ctrader_source_profile_reason"] = skip_reason
-                signal.raw_scores = raw_scores
-            except Exception:
-                pass
-            self._audit_xau_pre_dispatch_skip(
-                signal,
-                requested_source=str(source or ""),
-                dispatch_source=str(dispatch_source or ""),
-                gate="source_profile",
-                reason=skip_reason,
-                dispatch_meta=dispatch_meta,
-            )
-            return None
+            if xau_opportunity_first:
+                self._tag_xau_opportunity_first_bypass(signal, "source_profile", skip_reason, source=str(dispatch_source or ""))
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] bypass source_profile source=%s symbol=%s reason=%s",
+                    str(dispatch_source or ""), getattr(signal, "symbol", ""), skip_reason,
+                )
+            else:
+                logger.info(
+                    "[CTRADER] skipped source=%s symbol=%s reason=%s",
+                    str(dispatch_source or ""),
+                    getattr(signal, "symbol", ""),
+                    skip_reason,
+                )
+                try:
+                    raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw_scores["ctrader_source_profile_blocked"] = True
+                    raw_scores["ctrader_source_profile_reason"] = skip_reason
+                    signal.raw_scores = raw_scores
+                except Exception:
+                    pass
+                self._audit_xau_pre_dispatch_skip(
+                    signal,
+                    requested_source=str(source or ""),
+                    dispatch_source=str(dispatch_source or ""),
+                    gate="source_profile",
+                    reason=skip_reason,
+                    dispatch_meta=dispatch_meta,
+                )
+                return None
         if dispatch_source != str(source or ""):
             try:
                 raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
@@ -11099,8 +11173,8 @@ class DexterScheduler:
             logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
 
     def _run_fibo_mtf_shadow_scan(self, source: str = "fibo_mtf_shadow") -> dict:
-        """Persist multi-timeframe Fibo candidates as shadow rows only; no alerts/orders."""
-        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "error": ""}
+        """Run Fibo MTF candidates live under opportunity-first XAU policy; no shadow-only storage."""
+        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "error": ""}
         if not report["enabled"]:
             report["error"] = "disabled"
             return report
@@ -11110,13 +11184,21 @@ class DexterScheduler:
                 emit_all=bool(getattr(config, "FIBO_MTF_SHADOW_EMIT_ALL", True)),
             )
             report["signals"] = len(list(signals or []))
+            live_unlock = bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
             for sig in list(signals or []):
                 try:
-                    self._ensure_signal_trace(sig, source=source)
-                    self._store_shadow_signal(sig, block_reason="fibo_mtf_shadow")
-                    report["stored"] += 1
+                    if live_unlock:
+                        self._ensure_signal_trace(sig, source="fibo_xauusd")
+                        self._tag_xau_opportunity_first_bypass(sig, "fibo_mtf_shadow", "promoted_to_live", source="fibo_xauusd")
+                        result = self._maybe_execute_ctrader_signal(sig, source="fibo_xauusd")
+                        if result is not None:
+                            report["executed"] += 1
+                    else:
+                        self._ensure_signal_trace(sig, source=source)
+                        self._store_shadow_signal(sig, block_reason="fibo_mtf_shadow")
+                        report["stored"] += 1
                 except Exception as exc:
-                    logger.debug("[FiboMTFShadow:Scheduler] store failed: %s", exc)
+                    logger.debug("[FiboMTFShadow:Scheduler] dispatch/store failed: %s", exc)
             if report["signals"]:
                 tf_counts = {}
                 for sig in list(signals or []):
@@ -11124,8 +11206,8 @@ class DexterScheduler:
                     tf = str(raw.get("tf_label") or getattr(sig, "timeframe", "") or "?")
                     tf_counts[tf] = int(tf_counts.get(tf, 0)) + 1
                 logger.info(
-                    "[FiboMTFShadow:Scheduler] generated=%s stored=%s tf_counts=%s",
-                    report["signals"], report["stored"], tf_counts,
+                    "[FiboMTFShadow:Scheduler] generated=%s executed=%s stored=%s tf_counts=%s",
+                    report["signals"], report["executed"], report["stored"], tf_counts,
                 )
             report["ok"] = True
             return report

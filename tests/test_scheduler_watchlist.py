@@ -979,6 +979,52 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertIn("session mismatch", str(getattr(result, "message", "")).lower())
         self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("mt5_xau_scheduled_live_rejected")))
 
+    def test_ctrader_xau_opportunity_first_bypasses_winner_neutral_and_live_band(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=62.5)
+        sig.pattern = "SCALP_FLOW_FORCE"
+        sig.raw_scores.update({"winner_logic_regime": "neutral"})
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", True), \
+             patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd:winner"}), \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_result) as exec_call:
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIs(result, fake_result)
+        self.assertEqual(exec_call.call_count, 1)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "scalp_xauusd")
+        raw = getattr(sig, "raw_scores", {})
+        self.assertTrue(raw.get("xau_opportunity_first_live_unlock"))
+        gates = [str(item.get("gate")) for item in raw.get("xau_opportunity_first_bypassed_gates", [])]
+        self.assertIn("xau_live_filter", gates)
+
+    def test_fibo_mtf_candidates_execute_live_not_shadow_only(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=72.0)
+        sig.pattern = "Fibo MTF 0.618 continuation"
+        sig.raw_scores.update({"tf_label": "M1", "opportunity_score": 72, "block_reason": "fibo_mtf_shadow"})
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "FIBO_MTF_SHADOW_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", True), \
+             patch.object(scheduler_module.fibo_mtf_shadow_scanner, "scan", return_value=[sig]), \
+             patch.object(dexter, "_maybe_execute_ctrader_signal", return_value=fake_result) as exec_call, \
+             patch.object(dexter, "_store_shadow_signal") as shadow_call:
+            report = dexter._run_fibo_mtf_shadow_scan()
+
+        self.assertTrue(report.get("ok"))
+        self.assertEqual(report.get("signals"), 1)
+        self.assertEqual(report.get("executed"), 1)
+        self.assertEqual(report.get("stored"), 0)
+        self.assertEqual(shadow_call.call_count, 0)
+        self.assertEqual(exec_call.call_count, 1)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "fibo_xauusd")
+        self.assertTrue(getattr(sig, "raw_scores", {}).get("xau_opportunity_first_live_unlock"))
+
     def test_ctrader_prefers_crypto_winner_lane_when_allowed(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("ETHUSD", confidence=79.0)

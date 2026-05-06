@@ -433,6 +433,10 @@ class CTraderExecutor:
             canary_allowed = set(getattr(config, "get_persistent_canary_allowed_sources", lambda: set())() or set())
             if base and (base in canary_allowed or root in canary_allowed):
                 return True
+        if bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False)):
+            root = token.split(":", 1)[0]
+            if root in {"scalp_xauusd", "xauusd_scheduled", "fibo_xauusd", "fibo_mtf_shadow"}:
+                return True
         if not allowed:
             return True
         return token in allowed
@@ -463,6 +467,16 @@ class CTraderExecutor:
             side = "short"
         if not src or side not in {"long", "short"}:
             return True, "", {"source": src, "direction": side}
+        try:
+            source_norm = str(source or "").strip().lower()
+            symbol_norm = str(symbol or "").strip().upper()
+            if (
+                symbol_norm == "XAUUSD"
+                and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+            ):
+                return True, "", {"source": source_norm, "direction": side, "xau_opportunity_first_live_unlock": True}
+        except Exception:
+            pass
         protected = set(getattr(config, "get_ctrader_protected_source_directions", lambda: set())() or set())
         meta = {
             "source": src,
