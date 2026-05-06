@@ -78,6 +78,19 @@ class Config:
     # route it to cTrader live execution; strategy gates may tag/adjust but must
     # not turn the opportunity into shadow-only or pre-dispatch filtered.
     XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED: bool = os.getenv("XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Profit Reservoir / Basket Guardian (Opus 4.7): post-fill PM only.
+    # Default shadow keeps opportunity-first entries intact and records would-actions;
+    # live actions require explicit XAU_GUARDIAN_MODE=micro_live|half_live|full.
+    XAU_GUARDIAN_ENABLED: bool = os.getenv("XAU_GUARDIAN_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GUARDIAN_MODE: str = os.getenv("XAU_GUARDIAN_MODE", "shadow").strip().lower()
+    XAU_GUARDIAN_INTERVAL_SEC: int = int(os.getenv("XAU_GUARDIAN_INTERVAL_SEC", "60"))
+    XAU_GUARDIAN_BASE_GIVEBACK_PCT: float = float(os.getenv("XAU_GUARDIAN_BASE_GIVEBACK_PCT", "0.10"))
+    XAU_GUARDIAN_HARD_GIVEBACK_PCT: float = float(os.getenv("XAU_GUARDIAN_HARD_GIVEBACK_PCT", "0.25"))
+    XAU_GUARDIAN_MAX_PRUNE_POSITIONS: int = int(os.getenv("XAU_GUARDIAN_MAX_PRUNE_POSITIONS", "2"))
+    XAU_GUARDIAN_MAX_ACTIONS_PER_5MIN: int = int(os.getenv("XAU_GUARDIAN_MAX_ACTIONS_PER_5MIN", "3"))
+    XAU_GUARDIAN_RUNNER_PRESERVE_R: float = float(os.getenv("XAU_GUARDIAN_RUNNER_PRESERVE_R", "1.5"))
+    XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC: int = int(os.getenv("XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC", "120"))
+    XAU_GUARDIAN_RUNTIME_PATH: str = os.getenv("XAU_GUARDIAN_RUNTIME_PATH", "data/runtime/xau_basket_truth.json")
     XAU_IMPULSE_GUARD_MIN_CONFIDENCE: float = float(os.getenv("XAU_IMPULSE_GUARD_MIN_CONFIDENCE", "0.70"))
     XAU_IMPULSE_GUARD_BLOCK_STATES: str = os.getenv("XAU_IMPULSE_GUARD_BLOCK_STATES", "impulse_run")
     # Opus 4.7 non-Fibo redesign (demo-first): dynamic confidence floors,

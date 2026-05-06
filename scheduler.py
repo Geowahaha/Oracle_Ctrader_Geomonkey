@@ -37,6 +37,7 @@ from market.macro_news import macro_news
 from market.macro_impact_tracker import macro_impact_tracker
 from execution.mt5_executor import mt5_executor, MT5ExecutionResult
 from execution.ctrader_executor import ctrader_executor
+from execution.xau_profit_guardian import GuardianConfig, XAUProfitGuardianDB
 from learning.neural_brain import neural_brain
 from learning.mt5_autopilot_core import mt5_autopilot_core
 from learning.mt5_orchestrator import mt5_orchestrator
@@ -161,6 +162,48 @@ class DexterScheduler:
     @staticmethod
     def _now_ts() -> float:
         return float(time.time())
+
+    def _run_xau_profit_guardian(self, force: bool = False) -> dict:
+        """Run Opus 4.7 Profit Reservoir guardian for XAU post-fill PM.
+
+        Entry dispatch remains opportunity-first.  In default shadow mode this
+        only records basket truth, equity ratchets, hazard tier, and would-actions.
+        Live PM actions require XAU_GUARDIAN_MODE=micro_live|half_live|full.
+        """
+        if not bool(getattr(config, "XAU_GUARDIAN_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        try:
+            cfg = GuardianConfig.from_config(config)
+            db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+            runtime_path = str(getattr(config, "XAU_GUARDIAN_RUNTIME_PATH", "data/runtime/xau_basket_truth.json") or "data/runtime/xau_basket_truth.json")
+            features = {}
+            try:
+                snap = dict(getattr(self, "_last_xauusd_signal_snapshot", {}) or {})
+                features.update({k: v for k, v in snap.items() if k in {"atr", "atr_percentile", "delta_slope", "volume_z", "hh_hl_streak", "swing_break", "trend_direction", "delta_flip", "dom_imbalance_flip", "news_window", "regime_quality"}})
+            except Exception:
+                pass
+            guardian = XAUProfitGuardianDB(db_path=db_path, runtime_path=runtime_path, config=cfg)
+            report = guardian.run_once(executor=ctrader_executor, features=features)
+            basket = dict(report.get("basket") or {})
+            directives = list(report.get("directives") or [])
+            executed = list(report.get("executed") or [])
+            logger.info(
+                "[XAU_GUARDIAN] mode=%s tier=%s combined=%.2f peak=%.2f floor=%.2f hazard=%.1f directives=%d executed=%d",
+                str(report.get("mode") or cfg.mode),
+                str(basket.get("tier_state") or ""),
+                float(basket.get("combined_pnl") or 0.0),
+                float(basket.get("combined_peak") or 0.0),
+                float(basket.get("ratchet_floor") or 0.0),
+                float(basket.get("hazard_score") or 0.0),
+                len(directives),
+                len(executed),
+            )
+            return report
+        except Exception as exc:
+            logger.warning("[XAU_GUARDIAN] run failed: %s", exc, exc_info=True)
+            return {"ok": False, "status": "error", "error": str(exc)}
 
     def _capture_xau_reversal_zone(self, sweep: dict, *, stage: str, trigger_source: str) -> dict:
         stage_token = str(stage or "").strip().lower()
@@ -14663,6 +14706,13 @@ class DexterScheduler:
             _beacon_mins = max(1, int(getattr(config, "XAU_OPPORTUNITY_HEALTH_BEACON_MIN", 5) or 5))
             schedule.every(_beacon_mins).minutes.do(self._run_opportunity_health_beacon)
             logger.info("[OpportunityHealth] Scheduled every %dmin (observability beacon)", _beacon_mins)
+        if bool(getattr(config, "XAU_GUARDIAN_ENABLED", True)):
+            _guardian_sec = max(15, int(getattr(config, "XAU_GUARDIAN_INTERVAL_SEC", 60) or 60))
+            if _guardian_sec < 60:
+                schedule.every(_guardian_sec).seconds.do(self._run_xau_profit_guardian)
+            else:
+                schedule.every(max(1, _guardian_sec // 60)).minutes.do(self._run_xau_profit_guardian)
+            logger.info("[XAU_GUARDIAN] Scheduled every %ds mode=%s (post-fill Profit Reservoir)", _guardian_sec, str(getattr(config, "XAU_GUARDIAN_MODE", "shadow") or "shadow"))
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
@@ -15181,6 +15231,8 @@ class DexterScheduler:
             results["auto_apply_live_profile_report"] = self._run_auto_apply_live_profile(force=True)
         if task in ("canary_audit", "canary_post_trade", "canary_post_trade_audit"):
             results["canary_post_trade_audit_report"] = self._run_canary_post_trade_audit(force=True)
+        if task in ("xau_guardian", "profit_guardian", "basket_guardian", "snowball"):
+            results["xau_profit_guardian"] = self._run_xau_profit_guardian(force=True)
         if task in ("ctrader_data_integrity", "data_integrity", "integrity_report"):
             results["ctrader_data_integrity_report"] = self._run_ctrader_data_integrity_report(force=True)
         if task in ("strategy_lab", "strategy_lab_report"):
