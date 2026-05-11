@@ -62,6 +62,7 @@ from notifier.access_control import access_manager
 from infra.db_health import run_full_health_check
 from infra.auth_health import check_token_health, log_token_health_summary, refresh_stale_token_if_needed
 from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
+from analysis.fibo_mtf_trade_planner import annotate_signal_with_fibo_mtf_plan
 from analysis.xau_impulse_guard import evaluate_xau_impulse_guard
 from analysis.nonfibo_redesign import (
     apply_size_multiplier_to_signal,
@@ -11272,8 +11273,14 @@ class DexterScheduler:
             logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
 
     def _run_fibo_mtf_shadow_scan(self, source: str = "fibo_mtf_shadow") -> dict:
-        """Run Fibo MTF candidates live under opportunity-first XAU policy; no shadow-only storage."""
-        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "error": ""}
+        """Run Fibo MTF scanner as shadow evidence with route-planner metadata.
+
+        The scanner remains DB-only telemetry.  Opportunity-first live unlock does
+        not promote FIBO_MTF_SHADOW signals directly; the separate planner writes
+        observe/probe/base_live/runner_add route metadata for Opus review and
+        later explicit promotion via a non-shadow adapter.
+        """
+        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "planned": 0, "planner_errors": 0, "routes": {}, "error": ""}
         if not report["enabled"]:
             report["error"] = "disabled"
             return report
@@ -11283,21 +11290,20 @@ class DexterScheduler:
                 emit_all=bool(getattr(config, "FIBO_MTF_SHADOW_EMIT_ALL", True)),
             )
             report["signals"] = len(list(signals or []))
-            live_unlock = bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
             for sig in list(signals or []):
                 try:
-                    if live_unlock:
-                        self._ensure_signal_trace(sig, source="fibo_xauusd")
-                        self._tag_xau_opportunity_first_bypass(sig, "fibo_mtf_shadow", "promoted_to_live", source="fibo_xauusd")
-                        result = self._maybe_execute_ctrader_signal(sig, source="fibo_xauusd")
-                        if result is not None:
-                            report["executed"] += 1
-                    else:
-                        self._ensure_signal_trace(sig, source=source)
-                        self._store_shadow_signal(sig, block_reason="fibo_mtf_shadow")
-                        report["stored"] += 1
+                    decision = annotate_signal_with_fibo_mtf_plan(sig)
+                    report["planned"] += 1
+                    route = str(getattr(decision, "route", "unknown") or "unknown")
+                    routes = dict(report.get("routes") or {})
+                    routes[route] = int(routes.get(route, 0)) + 1
+                    report["routes"] = routes
+                    self._ensure_signal_trace(sig, source=source)
+                    self._store_shadow_signal(sig, block_reason=f"fibo_mtf_planner:{route}")
+                    report["stored"] += 1
                 except Exception as exc:
-                    logger.debug("[FiboMTFShadow:Scheduler] dispatch/store failed: %s", exc)
+                    report["planner_errors"] = int(report.get("planner_errors", 0) or 0) + 1
+                    logger.debug("[FiboMTFShadow:Scheduler] plan/store failed: %s", exc)
             if report["signals"]:
                 tf_counts = {}
                 for sig in list(signals or []):
@@ -11305,8 +11311,8 @@ class DexterScheduler:
                     tf = str(raw.get("tf_label") or getattr(sig, "timeframe", "") or "?")
                     tf_counts[tf] = int(tf_counts.get(tf, 0)) + 1
                 logger.info(
-                    "[FiboMTFShadow:Scheduler] generated=%s executed=%s stored=%s tf_counts=%s",
-                    report["signals"], report["executed"], report["stored"], tf_counts,
+                    "[FiboMTFShadow:Scheduler] generated=%s planned=%s planner_errors=%s executed=%s stored=%s routes=%s tf_counts=%s",
+                    report["signals"], report["planned"], report["planner_errors"], report["executed"], report["stored"], report.get("routes"), tf_counts,
                 )
             report["ok"] = True
             return report

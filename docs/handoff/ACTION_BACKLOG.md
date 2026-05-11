@@ -1,6 +1,6 @@
 # Action Backlog
 
-> Last updated: 2026-04-20 (delta: TRAILING_STRUCT fixed, DB emergency elevated, r_peak confirmed absent, Hermes infra modules created: atomic_write, db_health, auth_health)
+> Last updated: 2026-05-11 (delta: Fibo MTF shadow leak closed; route planner wired shadow-only; Opus 4.7 approved shadow deploy with micro-live promotion gates)
 > Format: Prioritized, owner-assigned, dependency-tracked
 > Update this file after every session. Move items between P-levels as needed.
 
@@ -17,6 +17,9 @@
 | P0-4 | TRAILING_STRUCT enforcement | — | **DONE** | — | Fixed in commit 720b8f0. Verified in code: elif branch reading sl_floor_r + amend_position_sltp in ctrader_executor.py. |
 | P0-5 | Verify r_peak is actually written during trade recording | Opus | TODO | — | Code review only. Trace r_peak through trade lifecycle. |
 | P0-6 | Trace TRAILING_STRUCT from definition to execution caller | Opus | **DONE** | — | Fixed in 720b8f0. Opus should verify fix completeness. |
+| P0-7 | Fibo MTF shadow-to-live leak invariant | Hermes + Opus | **DONE** — invariant + scheduler shadow-only planner wiring, Opus approved shadow deploy | — | Do not promote FIBO_MTF_SHADOW directly; future live requires separate non-shadow adapter. |
+| P0-8 | Fibo MTF planner shadow evidence collection | Hermes | TODO | P0-7 | Deploy/restart after tests; verify xau_shadow_journal block_reason `fibo_mtf_planner:<route>` and route counts. |
+| P0-9 | Fibo MTF micro-live probe promotion decision | Opus | BLOCKED | P0-8 | Need ≥30 shadow probe decisions, ≥14 days, expectancy ≥ +0.4R, conflict/news/broker context, explicit env kill switch. |
 
 ---
 
@@ -79,6 +82,7 @@
 | P0-0b | DB health check module + second diagnostic | Hermes | 2026-04-20 | infra/db_health.py created. DB openable (warning: 5.4 GB, depth_quotes 8M rows). WAL files appear/disappear (live system checkpointing). |
 | P0-1 | Atomic write utility | Hermes | 2026-04-20 | utils/atomic_write.py created. atomic_json_write, atomic_json_read, atomic_json_update. 14 runtime JSON files registered. Functional test passed. |
 | P0-3 | Token/auth health monitoring | Hermes | 2026-04-20 | infra/auth_health.py created. First check: CRITICAL — token last refreshed 142h ago. |
+| P0-7 | Fibo MTF shadow leak + planner foundation | Hermes + Opus | 2026-05-11 | Commits in progress: invariant blocks shadow dispatch, `FiboMtfTradePlanner` routes observe/probe/base_live/runner_add, scheduler stores route metadata shadow-only; Opus 4.7 approved shadow deploy and defined micro-live gates. |
 
 ---
 

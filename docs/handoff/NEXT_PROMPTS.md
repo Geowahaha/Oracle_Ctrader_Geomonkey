@@ -8,38 +8,32 @@
 ## Next Prompt for Opus
 
 ```
-You are Opus, continuing the Dexter Pro live-trading audit.
+You are Opus 4.7, reviewer only for Dexter Pro Fibo MTF trading behavior.
 
-CONTEXT:
-- Your baseline findings are in docs/handoff/OPUS_BASELINE.md
-- Hermes has created infrastructure for observability (see HERMES_BASELINE.md)
-- The action backlog is in docs/handoff/ACTION_BACKLOG.md
+Read first:
+- docs/handoff/OPUS47_FIBO_MTF_PLANNER_REVIEW_20260511.md
+- docs/handoff/ACTION_BACKLOG.md P0-7/P0-8/P0-9
 
-TASK (pick the highest-priority unfinished P0/P1 item from the backlog):
+Current accepted truth:
+- FIBO_MTF_SHADOW live leak caused major losses and must not dispatch directly.
+- Hermes wired `FiboMtfTradePlanner` as shadow-only route metadata: observe_only/probe/base_live/runner_add.
+- Current patch forces `fibo_mtf_live_enabled=False` and stores `xau_shadow_journal.block_reason=fibo_mtf_planner:<route>`.
 
-Priority order:
-1. Verify whether r_peak is actually persisted to trading_manager_state.json
-   during trade recording. Trace it through the full lifecycle.
-   If not persisted, design the fix.
+TASK:
+After shadow telemetry exists, evaluate route evidence for profitability and decide whether `probe` may be promoted to micro-live.
 
-2. Trace TRAILING_STRUCT from its definition to the execution caller.
-   Find the exact point where enforcement breaks.
-   Design the fix.
+Required gates before approve:
+1. ≥30 shadow probe decisions, ≥14 calendar days, ≥2 sessions.
+2. Planner-geometry shadow expectancy ≥ +0.4R and win-rate ≥50%.
+3. No simulated MAE > 3.5R.
+4. ≥95% probe decisions have real local execution anchors.
+5. Fresh cTrader tick/spread/min-stop/news/conflict context included in any future live adapter.
+6. Distinct non-shadow source token and env kill switch are mandatory.
 
-3. Classify all learning/ modules as causal, decorative, or uncertain.
-   For each module, answer: "Does this module causally affect whether
-   trades win or lose?"
-
-CONSTRAINTS:
-- Do NOT modify code. Read-only audit.
-- Focus on live-trading behavior, not code elegance
-- If a module is fake-smart, say so clearly — do not hedge
-- Every finding must be traceable to specific code locations
-
-OUTPUT:
-- Update docs/handoff/OPUS_BASELINE.md with new findings
-- Update docs/handoff/ACTION_BACKLOG.md with status changes
-- If you found a critical issue, add it to P0 in the backlog
+Output:
+- APPROVE/BLOCK/NEEDS CHANGES for micro-live probe only.
+- Exact evidence and line-level blockers.
+- Do not implement code unless explicitly asked.
 ```
 
 ---

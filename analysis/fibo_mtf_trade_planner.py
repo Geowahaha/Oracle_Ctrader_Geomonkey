@@ -96,8 +96,10 @@ class FiboMtfTradePlanner:
         side = "long" if side in {"long", "buy"} else "short"
         atr = max(float(candidate.atr or 0.0), 0.01)
         entry = self._entry_price(candidate)
-        raw_sl_distance = abs(float(candidate.raw_stop_loss or entry) - entry)
         cap_distance = self.sl_atr_cap_multiplier * atr
+        raw_stop = float(candidate.raw_stop_loss or 0.0)
+        raw_sl_missing = raw_stop <= 0.0
+        raw_sl_distance = abs(raw_stop - entry) if not raw_sl_missing else cap_distance + 0.0001
         tf = str(candidate.timeframe or "").strip().lower()
         ratio_zone = str(candidate.ratio_zone or "").strip().lower()
         impulse_state = str(candidate.impulse_state or "").strip().lower()
@@ -109,6 +111,13 @@ class FiboMtfTradePlanner:
         impulse_active = impulse_state in IMPULSE_ACTIVE_STATES
         ratio_quality = ratio_zone in GOLDEN_RATIO_ZONES
         reasons: list[str] = []
+
+        if raw_sl_missing and not self._has_execution_anchor(candidate, side):
+            return self._observe(["raw_stop_loss_missing", "execution_anchor_missing"], intent="learn_context", metadata={
+                "raw_sl_distance": round(raw_sl_distance, 4),
+                "cap_distance": round(cap_distance, 4),
+                "timeframe": tf,
+            })
 
         if ratio_zone == "other" and impulse_state == "idle" and not has_trigger:
             observe_reasons = ["idle_no_trigger", "ratio_other"]
@@ -128,10 +137,11 @@ class FiboMtfTradePlanner:
             })
 
         if candidate.winner_basket_aligned and impulse_state == "mature" and has_trigger:
+            # Winner-aligned mature impulse is treated as an add-on, not a fresh full-size base entry.
             route = "runner_add"
         elif ratio_quality and impulse_active and candidate.correction_end_confirmed and has_trigger and candidate.confidence >= self.base_live_min_confidence:
             route = "base_live"
-        elif has_trigger or candidate.impulse_birth_confirmed:
+        elif has_trigger:
             route = "probe"
             if ratio_zone == "other":
                 reasons.append("other_zone_triggered_probe")
@@ -242,3 +252,115 @@ class FiboMtfTradePlanner:
             trade_plan=None,
             metadata=dict(metadata or {}),
         )
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return float(value) != 0.0
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "confirmed", "pass", "passed"}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _first_float(raw: dict[str, Any], keys: tuple[str, ...], default: float | None = None) -> float | None:
+    for key in keys:
+        if key in raw and raw.get(key) is not None:
+            try:
+                return float(raw.get(key))
+            except Exception:
+                continue
+    return default
+
+
+def _decision_to_metadata(decision: FiboMtfRouteDecision) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "route": decision.route,
+        "intent": decision.intent,
+        "reasons": list(decision.reasons or []),
+        "metadata": dict(decision.metadata or {}),
+        "live_enabled": False,
+    }
+    plan = decision.trade_plan
+    if plan is not None:
+        meta["live_enabled"] = True
+        meta["trade_plan"] = {
+            "route": plan.route,
+            "entry_type": plan.entry_type,
+            "entry_price": plan.entry_price,
+            "stop_loss": plan.stop_loss,
+            "thesis_stop_loss": plan.thesis_stop_loss,
+            "size_multiplier": plan.size_multiplier,
+            "runner_enabled": plan.runner_enabled,
+            "tp_plan": [
+                {"price": tp.price, "fraction": tp.fraction, "label": tp.label}
+                for tp in list(plan.tp_plan or [])
+            ],
+            "metadata": dict(plan.metadata or {}),
+        }
+    return meta
+
+
+def planner_input_from_signal(signal: Any) -> FiboMtfPlannerInput:
+    """Build a planner input from an existing Fibo MTF shadow TradeSignal.
+
+    This adapter intentionally treats existing entry/SL/TP as structural scanner
+    telemetry.  The planner may reuse only bounded execution geometry; high-TF
+    swing-start SL stays thesis metadata, not broker-live permission.
+    """
+    raw = dict(getattr(signal, "raw_scores", {}) or {})
+    direction = str(getattr(signal, "direction", "") or raw.get("direction") or "").strip().lower()
+    entry = _safe_float(getattr(signal, "entry", 0.0) or raw.get("entry"), 0.0)
+    current = _safe_float(raw.get("current_price"), entry) or entry
+    atr = _safe_float(getattr(signal, "atr", 0.0) or raw.get("atr"), 0.0)
+    nearest = _safe_float(raw.get("nearest_level_price"), entry) or entry
+    return FiboMtfPlannerInput(
+        symbol=str(getattr(signal, "symbol", "XAUUSD") or "XAUUSD"),
+        direction=direction,
+        timeframe=str(raw.get("tf_label") or getattr(signal, "timeframe", "") or ""),
+        current_price=current,
+        nearest_level_price=nearest,
+        raw_stop_loss=_safe_float(getattr(signal, "stop_loss", 0.0) or raw.get("stop_loss"), current),
+        atr=atr,
+        ratio_zone=str(raw.get("ratio_zone") or raw.get("nearest_ratio_zone") or ""),
+        impulse_state=str(raw.get("impulse_state_name") or raw.get("impulse_state") or ""),
+        correction_end_confirmed=_truthy(raw.get("correction_end_confirmed")),
+        confidence=_safe_float(getattr(signal, "confidence", 0.0), 0.0),
+        reclaim_confirmed=_truthy(raw.get("reclaim_confirmed") or raw.get("reclaim_trigger") or raw.get("flow_reclaim_confirmed")),
+        sweep_confirmed=_truthy(raw.get("sweep_confirmed") or raw.get("liquidity_sweep_confirmed") or raw.get("sweep_trigger")),
+        impulse_birth_confirmed=_truthy(raw.get("impulse_birth_confirmed") or raw.get("impulse_restart_confirmed")),
+        execution_swing_low=_first_float(raw, ("execution_swing_low", "local_swing_low", "recent_swing_low")),
+        execution_swing_high=_first_float(raw, ("execution_swing_high", "local_swing_high", "recent_swing_high")),
+        regime=str(raw.get("regime") or raw.get("market_regime") or raw.get("trend_regime") or "transition"),
+        winner_basket_aligned=_truthy(raw.get("winner_basket_aligned") or raw.get("basket_trend_aligned")),
+        broker_min_stop_distance=_safe_float(raw.get("broker_min_stop_distance"), 0.0),
+    )
+
+
+def annotate_signal_with_fibo_mtf_plan(signal: Any, planner: FiboMtfTradePlanner | None = None) -> FiboMtfRouteDecision:
+    """Attach planner route metadata to a Fibo MTF shadow signal.
+
+    The signal remains shadow telemetry by default.  This function writes
+    ``raw_scores.fibo_mtf_trade_planner`` and keeps ``fibo_mtf_live_enabled``
+    false unless a later, reviewed live-promotion adapter explicitly clones a
+    non-shadow signal.
+    """
+    planner = planner or FiboMtfTradePlanner()
+    decision = planner.plan(planner_input_from_signal(signal))
+    raw = dict(getattr(signal, "raw_scores", {}) or {})
+    raw["fibo_mtf_trade_planner"] = _decision_to_metadata(decision)
+    raw["fibo_mtf_route"] = decision.route
+    raw["fibo_mtf_route_intent"] = decision.intent
+    raw["fibo_mtf_route_reasons"] = list(decision.reasons or [])
+    raw["fibo_mtf_live_enabled"] = False
+    raw["fibo_mtf_planner_shadow_only"] = True
+    setattr(signal, "raw_scores", raw)
+    return decision

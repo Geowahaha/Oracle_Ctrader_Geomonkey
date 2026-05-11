@@ -110,5 +110,88 @@ class FiboMtfTradePlannerTests(unittest.TestCase):
         self.assertIn("sl_distance_over_cap", decision.reasons)
 
 
+    def test_missing_raw_stop_without_execution_anchor_observes(self):
+        planner = FiboMtfTradePlanner()
+        decision = planner.plan(
+            FiboMtfPlannerInput(
+                symbol="XAUUSD",
+                direction="long",
+                timeframe="M5",
+                current_price=2300.0,
+                nearest_level_price=2300.0,
+                raw_stop_loss=0.0,
+                atr=1.0,
+                ratio_zone="0.618",
+                impulse_state="restart",
+                correction_end_confirmed=True,
+                confidence=70.0,
+                reclaim_confirmed=True,
+            )
+        )
+
+        self.assertEqual(decision.route, "observe_only")
+        self.assertIn("raw_stop_loss_missing", decision.reasons)
+        self.assertIn("execution_anchor_missing", decision.reasons)
+
+
+    def test_annotate_shadow_signal_keeps_shadow_only_and_writes_route_metadata(self):
+        from types import SimpleNamespace
+        from analysis.fibo_mtf_trade_planner import annotate_signal_with_fibo_mtf_plan
+
+        sig = SimpleNamespace(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=44.0,
+            entry=2300.0,
+            stop_loss=2298.0,
+            atr=1.0,
+            timeframe="M5",
+            raw_scores={
+                "fibo_mtf_shadow": True,
+                "fibo_mtf_live_enabled": False,
+                "tf_label": "M5",
+                "ratio_zone": "other",
+                "impulse_state_name": "idle",
+                "reclaim_confirmed": True,
+                "execution_swing_low": 2298.6,
+            },
+        )
+        decision = annotate_signal_with_fibo_mtf_plan(sig)
+
+        raw = sig.raw_scores
+        self.assertEqual(decision.route, "probe")
+        self.assertEqual(raw["fibo_mtf_route"], "probe")
+        self.assertTrue(raw["fibo_mtf_planner_shadow_only"])
+        self.assertFalse(raw["fibo_mtf_live_enabled"])
+        self.assertEqual(raw["fibo_mtf_trade_planner"]["trade_plan"]["size_multiplier"], 0.30)
+
+    def test_annotate_shadow_signal_detects_bad_htf_geometry_as_observe(self):
+        from types import SimpleNamespace
+        from analysis.fibo_mtf_trade_planner import annotate_signal_with_fibo_mtf_plan
+
+        sig = SimpleNamespace(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=24.0,
+            entry=4668.22,
+            stop_loss=5656.86,
+            atr=9.0,
+            timeframe="W1",
+            raw_scores={
+                "fibo_mtf_shadow": True,
+                "fibo_mtf_live_enabled": False,
+                "tf_label": "W1",
+                "ratio_zone": "other",
+                "impulse_state_name": "idle",
+                "correction_end_confirmed": False,
+            },
+        )
+        decision = annotate_signal_with_fibo_mtf_plan(sig)
+
+        self.assertEqual(decision.route, "observe_only")
+        self.assertFalse(sig.raw_scores["fibo_mtf_live_enabled"])
+        self.assertIn("sl_distance_over_cap", sig.raw_scores["fibo_mtf_route_reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()
