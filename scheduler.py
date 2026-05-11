@@ -2150,6 +2150,50 @@ class DexterScheduler:
         )
         return profile
 
+    @staticmethod
+    def _is_fibo_mtf_shadow_signal(signal, source: str, raw: dict | None = None) -> bool:
+        """Permanent invariant: Fibo MTF shadow telemetry must never dispatch live.
+
+        This remains outside FiboAdvance's core scanner logic. Opportunity-first
+        routing can still promote canonical ``fibo_xauusd`` opportunities, but any
+        signal carrying explicit FIBO_MTF_SHADOW markers stays evidence-only unless
+        a separate live planner emits a real non-shadow trade-plan source.
+        """
+        try:
+            raw_map = dict(raw or getattr(signal, "raw_scores", {}) or {})
+        except Exception:
+            raw_map = {}
+        tokens = [str(source or "")]
+        for key in (
+            "source",
+            "requested_source",
+            "display_source",
+            "pattern",
+            "setup_pattern",
+            "mode",
+            "scanner_mode",
+            "block_reason",
+        ):
+            val = raw_map.get(key)
+            if val is not None:
+                tokens.append(str(val))
+        for attr in ("pattern", "source", "scanner_mode"):
+            try:
+                val = getattr(signal, attr, None)
+            except Exception:
+                val = None
+            if val is not None:
+                tokens.append(str(val))
+        joined = "|".join(tokens).lower()
+        if "fibo_mtf_shadow" in joined or "fibo-mtf-shadow" in joined:
+            return True
+        if raw_map.get("fibo_mtf_shadow") is True or raw_map.get("shadow_only") is True:
+            return True
+        if "fibo_mtf_live_enabled" in raw_map and not bool(raw_map.get("fibo_mtf_live_enabled")):
+            if str(source or "").strip().lower().startswith("fibo") or "fibo" in joined:
+                return True
+        return False
+
     def _ctrader_pick_dispatch_source(self, signal, source: str) -> tuple[str, dict]:
         base_source = str(source or "").strip()
         src = base_source.lower()
@@ -2162,16 +2206,28 @@ class DexterScheduler:
         if not base_source:
             meta["winner_reason"] = "missing_source"
             return "", meta
-        allowed_sources = set(getattr(config, "get_ctrader_allowed_sources", lambda: set())() or set())
-        if not allowed_sources:
-            meta["dispatch_source"] = base_source
-            meta["winner_reason"] = "allow_all"
-            return base_source, meta
 
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
         except Exception:
             raw = {}
+        if self._is_fibo_mtf_shadow_signal(signal, base_source, raw):
+            meta["winner_reason"] = "shadow_to_live_invariant"
+            meta["shadow_to_live_blocked"] = True
+            meta["shadow_source"] = base_source
+            meta["shadow_pattern"] = str(
+                raw.get("pattern")
+                or raw.get("setup_pattern")
+                or getattr(signal, "pattern", "")
+                or ""
+            )
+            return "", meta
+
+        allowed_sources = set(getattr(config, "get_ctrader_allowed_sources", lambda: set())() or set())
+        if not allowed_sources:
+            meta["dispatch_source"] = base_source
+            meta["winner_reason"] = "allow_all"
+            return base_source, meta
 
         # ── Standalone scanners: some can self-promote into winner lane based on
         # internal phase/trade-structure evidence. FiboAdvance now supports this.

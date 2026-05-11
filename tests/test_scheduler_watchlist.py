@@ -95,6 +95,47 @@ class SchedulerWatchlistTests(unittest.TestCase):
     def test_scheduler_logs_quality_and_watchlist_counts(self):
         pass
 
+    def test_ctrader_dispatch_blocks_fibo_mtf_shadow_pattern_even_when_winner_eligible(self):
+        dexter = scheduler_module.DexterScheduler()
+        signal = make_signal("XAUUSD", confidence=96.0)
+        signal.raw_scores = {
+            "pattern": "FIBO_MTF_SHADOW_H1",
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "phase_winner",
+            "fibo_mtf_live_enabled": False,
+        }
+
+        with patch.object(
+            scheduler_module.config,
+            "get_ctrader_allowed_sources",
+            return_value={"fibo_xauusd", "fibo_xauusd:winner"},
+        ):
+            dispatch_source, meta = dexter._ctrader_pick_dispatch_source(signal, "fibo_xauusd")
+
+        self.assertEqual(dispatch_source, "")
+        self.assertEqual(meta.get("winner_reason"), "shadow_to_live_invariant")
+        self.assertTrue(meta.get("shadow_to_live_blocked"))
+
+    def test_ctrader_dispatch_keeps_canonical_fibo_winner_opportunity_first(self):
+        dexter = scheduler_module.DexterScheduler()
+        signal = make_signal("XAUUSD", confidence=96.0)
+        signal.raw_scores = {
+            "pattern": "FIBO_ADVANCE_GOLDEN_POCKET",
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "phase_winner",
+        }
+
+        with patch.object(
+            scheduler_module.config,
+            "get_ctrader_allowed_sources",
+            return_value={"fibo_xauusd", "fibo_xauusd:winner"},
+        ):
+            dispatch_source, meta = dexter._ctrader_pick_dispatch_source(signal, "fibo_xauusd")
+
+        self.assertEqual(dispatch_source, "fibo_xauusd:winner")
+        self.assertEqual(meta.get("winner_reason"), "phase_winner")
+        self.assertFalse(meta.get("shadow_to_live_blocked", False))
+
     def test_xauusd_scheduled_scan_respects_cooldown(self):
         dexter = scheduler_module.DexterScheduler()
         signal = make_signal("XAUUSD", confidence=85.0)
