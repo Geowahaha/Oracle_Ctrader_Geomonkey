@@ -126,6 +126,7 @@ as the working memory spine for all future sessions.
 - Graded degrade policy is the intended direction for DB/auth health response (not warn-only forever). Not fully wired yet.
 - DB health remains an elevated production risk.
 - **2026-05-11 Fibo MTF loss delta:** FIBO_MTF_SHADOW live bleed is closed locally by invariant + shadow-only scheduler wiring. `FiboMtfTradePlanner` now annotates every MTF candidate with route intelligence (`observe_only`, `probe`, `base_live`, `runner_add`) while forcing `fibo_mtf_live_enabled=False`. Opus 4.7 approved shadow-only deploy and blocked micro-live until route evidence gates are met.
+- **2026-05-12 Fibo MTF planner evidence delta:** VM is on commit `67562b2` and `dexter-monitor` is active. `xau_shadow_journal` contains 541 `fibo_mtf_planner:observe_only` rows from 2026-05-11T14:58:32Z through 2026-05-12T15:36:13Z; no `probe` route sample exists yet. Hermes added `ops/fibo_mtf_planner_shadow_report.py` to summarize route/TF/zone evidence and explicitly block micro-live until Opus gates are met.
 - Current baton:
   - **Opus:** evaluate Fibo MTF shadow route evidence after collection; approve/deny micro-live probe only after sample/expectancy gates
   - **Hermes:** deploy shadow-only planner wiring, verify route telemetry in `xau_shadow_journal`, keep live promotion disabled

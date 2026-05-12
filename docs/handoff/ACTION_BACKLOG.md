@@ -18,7 +18,7 @@
 | P0-5 | Verify r_peak is actually written during trade recording | Opus | TODO | — | Code review only. Trace r_peak through trade lifecycle. |
 | P0-6 | Trace TRAILING_STRUCT from definition to execution caller | Opus | **DONE** | — | Fixed in 720b8f0. Opus should verify fix completeness. |
 | P0-7 | Fibo MTF shadow-to-live leak invariant | Hermes + Opus | **DONE** — invariant + scheduler shadow-only planner wiring, Opus approved shadow deploy | — | Do not promote FIBO_MTF_SHADOW directly; future live requires separate non-shadow adapter. |
-| P0-8 | Fibo MTF planner shadow evidence collection | Hermes | TODO | P0-7 | Deploy/restart after tests; verify xau_shadow_journal block_reason `fibo_mtf_planner:<route>` and route counts. |
+| P0-8 | Fibo MTF planner shadow evidence collection | Hermes | **IN PROGRESS** — VM records `fibo_mtf_planner:observe_only` rows; local evidence report script added | P0-7 | Continue shadow collection; current gate blocks micro-live: no `probe` route sample, only 2 calendar days, MAE/anchor context absent. Use `ops/fibo_mtf_planner_shadow_report.py`. |
 | P0-9 | Fibo MTF micro-live probe promotion decision | Opus | BLOCKED | P0-8 | Need ≥30 shadow probe decisions, ≥14 days, expectancy ≥ +0.4R, conflict/news/broker context, explicit env kill switch. |
 
 ---
