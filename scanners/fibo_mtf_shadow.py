@@ -139,6 +139,48 @@ def _safe_atr(df) -> float:
         return 0.0
 
 
+def _series_values(series) -> list[float]:
+    try:
+        return [float(v) for v in list(getattr(series, "values", []) or [])]
+    except Exception:
+        return []
+
+
+def _execution_anchor_payload(spec: FiboMtfSpec, df) -> dict:
+    """Telemetry-only local structure anchors for later Fibo MTF route review.
+
+    These fields do not promote the scanner signal to live. They give the
+    planner/backtester a real execution-TF invalidation reference instead of the
+    high-timeframe Fib swing start that caused the previous bad broker geometry.
+    """
+    tf = normalize_tf(spec.tf_label)
+    try:
+        lookback = max(5, min(20, len(df)))
+        tail = df.tail(lookback)
+        lows = _series_values(tail["low"].astype(float))
+        highs = _series_values(tail["high"].astype(float))
+        if not lows or not highs:
+            raise ValueError("no_anchor_values")
+        swing_low = min(lows)
+        swing_high = max(highs)
+    except Exception:
+        return {
+            "execution_anchor_source": "unavailable",
+            "execution_anchor_tf": tf,
+            "execution_anchor_is_live_plan": False,
+        }
+    return {
+        "execution_anchor_source": f"recent_{tf}_structure",
+        "execution_anchor_tf": tf,
+        "execution_anchor_is_live_plan": False,
+        "execution_swing_low": round(swing_low, 5),
+        "execution_swing_high": round(swing_high, 5),
+        "local_swing_low": round(swing_low, 5),
+        "local_swing_high": round(swing_high, 5),
+        "execution_anchor_lookback_bars": lookback,
+    }
+
+
 def _candidate_from_context(spec: FiboMtfSpec, df, fibo: FibonacciAnalyzer) -> TradeSignal | None:
     if df is None or getattr(df, "empty", True) or len(df) < 30:
         return None
@@ -210,6 +252,7 @@ def _candidate_from_context(spec: FiboMtfSpec, df, fibo: FibonacciAnalyzer) -> T
         "impulse_state_confidence": round(float(impulse.confidence or 0.0), 3),
         "impulse_state_reasons": list(impulse.reasons),
         "suppressed_duplicate": False,
+        **_execution_anchor_payload(spec, df),
     }
     conf = min(85.0, max(0.0, confluence))
     return TradeSignal(

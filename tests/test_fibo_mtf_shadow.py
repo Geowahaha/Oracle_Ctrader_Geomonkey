@@ -121,6 +121,11 @@ def test_mtf_shadow_scanner_emits_shadow_only_tf_payload():
     assert raw["parent_chain"] == ["M5", "M15", "M30"]
     assert raw["opportunity_first"] is True
     assert raw["tf_alignment_policy"] == "booster_not_gate"
+    assert raw["execution_anchor_source"] == "recent_M1_structure"
+    assert raw["execution_swing_low"] > 0
+    assert raw["execution_swing_high"] > raw["execution_swing_low"]
+    assert raw["execution_anchor_tf"] == "M1"
+    assert raw["execution_anchor_is_live_plan"] is False
 
 
 def _sig(pid, conf):

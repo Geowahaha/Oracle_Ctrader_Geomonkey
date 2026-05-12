@@ -121,11 +121,15 @@ def _mae_r(row: dict, raw: dict) -> float | None:
 def load_rows(db_path: Path, days: int = 30, limit: int = 5000) -> list[dict]:
     conn = connect_ro(db_path)
     try:
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(xau_shadow_journal)").fetchall()}
+        optional_cols = [name for name in ("shadow_mae_rr", "shadow_mfe_rr") if name in cols]
+        optional_select = (", " + ", ".join(optional_cols)) if optional_cols else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT id, signal_utc, symbol, direction, confidence, entry, stop_loss,
                    take_profit_1, take_profit_2, take_profit_3, block_reason,
                    raw_scores_json, shadow_outcome, resolved_utc, shadow_pnl_rr
+                   {optional_select}
               FROM xau_shadow_journal
              WHERE block_reason LIKE 'fibo_mtf_planner:%'
                AND signal_utc >= datetime('now', ?)

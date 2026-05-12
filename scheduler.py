@@ -13545,9 +13545,19 @@ class DexterScheduler:
                         raw_scores_json TEXT NOT NULL DEFAULT '{}',
                         shadow_outcome TEXT,
                         resolved_utc TEXT,
-                        shadow_pnl_rr REAL
+                        shadow_pnl_rr REAL,
+                        shadow_mae_rr REAL,
+                        shadow_mfe_rr REAL
                     )
                 """)
+                for ddl in (
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mae_rr REAL",
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mfe_rr REAL",
+                ):
+                    try:
+                        conn.execute(ddl)
+                    except Exception:
+                        pass
                 conn.execute("""
                     INSERT INTO xau_shadow_journal
                         (signal_utc, symbol, direction, confidence, entry, stop_loss,

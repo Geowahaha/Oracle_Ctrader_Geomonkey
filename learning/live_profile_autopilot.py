@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import config
+from analysis.shadow_outcome_metrics import compute_shadow_path_metrics
 from utils.atomic_write import atomic_json_write
 
 
@@ -7207,9 +7208,19 @@ class LiveProfileAutopilot:
                         raw_scores_json TEXT NOT NULL DEFAULT '{}',
                         shadow_outcome TEXT,
                         resolved_utc TEXT,
-                        shadow_pnl_rr REAL
+                        shadow_pnl_rr REAL,
+                        shadow_mae_rr REAL,
+                        shadow_mfe_rr REAL
                     )
                 """)
+                for ddl in (
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mae_rr REAL",
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mfe_rr REAL",
+                ):
+                    try:
+                        cconn.execute(ddl)
+                    except Exception:
+                        pass
                 pending_rows = cconn.execute(
                     """
                     SELECT id, signal_utc, direction, entry, stop_loss, take_profit_1
@@ -7309,30 +7320,16 @@ class LiveProfileAutopilot:
                     if not bars:
                         skipped += 1
                         continue
-                    outcome = "expired"
-                    pnl_rr = None
-                    for high, low in bars:
-                        if direction == "long":
-                            tp_hit = high >= tp1
-                            sl_hit = low <= sl
-                        else:
-                            tp_hit = low <= tp1
-                            sl_hit = high >= sl
-                        if tp_hit and sl_hit:
-                            outcome = "tp_hit"
-                            pnl_rr = round(abs(tp1 - entry) / risk, 4)
-                            break
-                        elif tp_hit:
-                            outcome = "tp_hit"
-                            pnl_rr = round(abs(tp1 - entry) / risk, 4)
-                            break
-                        elif sl_hit:
-                            outcome = "sl_hit"
-                            pnl_rr = round(-1.0, 4)
-                            break
+                    metrics = compute_shadow_path_metrics(
+                        direction,
+                        entry=entry,
+                        stop_loss=sl,
+                        take_profit_1=tp1,
+                        bars=bars,
+                    )
                     cconn.execute(
-                        "UPDATE xau_shadow_journal SET shadow_outcome=?, resolved_utc=?, shadow_pnl_rr=? WHERE id=?",
-                        (outcome, now_iso, pnl_rr, row_id),
+                        "UPDATE xau_shadow_journal SET shadow_outcome=?, resolved_utc=?, shadow_pnl_rr=?, shadow_mae_rr=?, shadow_mfe_rr=? WHERE id=?",
+                        (metrics.get("outcome"), now_iso, metrics.get("pnl_rr"), metrics.get("mae_rr"), metrics.get("mfe_rr"), row_id),
                     )
                     newly_resolved += 1
                 cconn.commit()
