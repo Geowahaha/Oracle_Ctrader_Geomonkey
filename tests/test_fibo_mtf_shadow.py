@@ -26,6 +26,7 @@ from scanners.fibo_mtf_shadow import (
     FiboMtfShadowScanner,
     FiboMtfSpec,
     _execution_anchor_payload,
+    _series_values,
     apply_alignment_boosters,
     dedupe_by_parent_impulse,
     parent_chain_for_tf,
@@ -146,6 +147,21 @@ def _sig(pid, conf):
         timeframe="M1", session="", trend="", rsi=0, atr=1, pattern="x",
         raw_scores={"parent_impulse_id": pid, "impulse_state_confidence": conf / 100.0},
     )
+
+
+class NumpyLikeValues:
+    def __iter__(self):
+        return iter(["1.25", "2.5"])
+    def __bool__(self):
+        raise ValueError("ambiguous truth value")
+
+
+class PandasLikeSeries:
+    values = NumpyLikeValues()
+
+
+def test_series_values_handles_pandas_numpy_values_without_truthiness_check():
+    assert _series_values(PandasLikeSeries()) == [1.25, 2.5]
 
 
 def test_execution_anchor_payload_excludes_signal_bar_to_avoid_lookahead():

@@ -141,7 +141,10 @@ def _safe_atr(df) -> float:
 
 def _series_values(series) -> list[float]:
     try:
-        return [float(v) for v in list(getattr(series, "values", []) or [])]
+        values = getattr(series, "values", None)
+        if values is None:
+            values = series
+        return [float(v) for v in list(values)]
     except Exception:
         return []
 
