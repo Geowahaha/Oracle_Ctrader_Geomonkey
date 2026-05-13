@@ -225,14 +225,23 @@ def load_positions(db_path: Path, symbol: str = "XAUUSD", days: int = 90, limit:
     return [_enrich(dict(row)) for row in rows]
 
 
+def _qualified_family_items(families: dict, min_positions: int = 30):
+    return [
+        (name, stats)
+        for name, stats in families.items()
+        if name != "unknown" and int(stats.get("positions") or 0) >= min_positions
+    ] or list(families.items())
+
+
 def _actionable_findings(report: dict) -> list[dict]:
     """Return compact evidence leads for the next analysis pass."""
     findings: list[dict] = []
     families = report.get("by_family", {})
     sessions = report.get("by_session", {})
-    if families:
-        best_family, best_stats = max(families.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
-        worst_family, worst_stats = min(families.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+    family_items = _qualified_family_items(families)
+    if family_items:
+        best_family, best_stats = max(family_items, key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+        worst_family, worst_stats = min(family_items, key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
         findings.append({"kind": "best_family", "family": best_family, "stats": best_stats})
         findings.append({"kind": "worst_family", "family": worst_family, "stats": worst_stats})
     if sessions:

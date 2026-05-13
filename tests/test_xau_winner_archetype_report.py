@@ -97,6 +97,19 @@ def test_build_report_groups_winners_by_family_session_archetype_and_risk_geomet
     assert report["notes"][0].startswith("Read-only")
 
 
+def test_actionable_findings_ignore_unknown_or_tiny_family_as_best_signal():
+    rows = [
+        _position(position_id=1, family="unknown", pnl_usd=100),
+        *[_position(position_id=100 + i, family="xauusd_scheduled", pnl_usd=2) for i in range(30)],
+        *[_position(position_id=200 + i, family="fibo_xauusd", pnl_usd=-3) for i in range(30)],
+    ]
+
+    report = build_report(rows, top_n=2)
+    best_family = next(item for item in report["actionable_findings"] if item["kind"] == "best_family")
+
+    assert best_family["family"] == "xauusd_scheduled"
+
+
 def test_load_positions_uses_positions_direction_and_sums_deals(tmp_path: Path):
     db = tmp_path / "trades.db"
     conn = sqlite3.connect(db)
