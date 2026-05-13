@@ -114,10 +114,58 @@ def _summarize_pnls(values: list[float]) -> dict:
     }
 
 
-def mine_stophunt_inversions(rows: Iterable[dict], max_minutes: int = 30, min_samples: int = 10) -> list[dict]:
+def _bucket_key(loss: dict, bucket_level: str) -> tuple:
+    family = str(loss.get("family") or "unknown")
+    session = str(loss.get("session") or "unknown")
+    direction = str(loss.get("direction") or "unknown")
+    if bucket_level == "family_session_dir":
+        return family, session, direction
+    if bucket_level == "family_dir":
+        return family, direction
+    if bucket_level == "session_dir":
+        return session, direction
+    if bucket_level == "family_session":
+        return family, session
+    if bucket_level == "family":
+        return (family,)
+    if bucket_level == "direction":
+        return (direction,)
+    return family, session, direction
+
+
+def _cluster_from_events(bucket_level: str, key: tuple, events: list[dict], max_minutes: int, min_samples: int) -> dict | None:
+    pnls = [float(e["followup"].get("pnl_usd") or 0.0) for e in events]
+    if len(pnls) < int(min_samples):
+        return None
+    summary = _summarize_pnls(pnls)
+    first_loss = events[0]["loss"]
+    lost_direction = str(first_loss.get("direction") or "unknown")
+    theoretical_direction = _opposite(lost_direction)
+    cluster_key = "|".join(str(v) for v in key)
+    return {
+        "cluster_id": f"stophunt_inversion|{cluster_key}|{max_minutes}m",
+        "bucket_level": bucket_level,
+        "bucket_key": list(key),
+        "source_family_that_lost": str(first_loss.get("family") or "unknown"),
+        "session": str(first_loss.get("session") or "unknown"),
+        "lost_direction": lost_direction,
+        "theoretical_direction": theoretical_direction,
+        "window_minutes": int(max_minutes),
+        **summary,
+        "phase_a_shadow_candidate": bool(summary["samples"] >= min_samples and summary["inversion_net_usd"] > 0 and summary["profit_factor"] >= 1.2),
+        "example_position_ids": [e["loss"].get("position_id") for e in events[:5]],
+    }
+
+
+def mine_stophunt_inversions(
+    rows: Iterable[dict],
+    max_minutes: int = 30,
+    min_samples: int = 10,
+    bucket_level: str = "family_session_dir",
+) -> list[dict]:
     """Find losing-position buckets followed by opposite-side trades inside max_minutes."""
     items = sorted((_enrich(r) for r in rows), key=lambda r: r.get("open_dt") or datetime.min.replace(tzinfo=timezone.utc))
-    buckets: dict[tuple[str, str, str], list[dict]] = {}
+    buckets: dict[tuple, list[dict]] = {}
     for idx, loss in enumerate(items[:-1]):
         if loss.get("pnl_usd", 0.0) >= 0.0 or not loss.get("close_dt"):
             continue
@@ -131,29 +179,23 @@ def mine_stophunt_inversions(rows: Iterable[dict], max_minutes: int = 30, min_sa
             if gap_min > max_minutes:
                 break
             if str(nxt.get("direction") or "") == _opposite(loss_dir):
-                key = (str(loss.get("family") or "unknown"), str(loss.get("session") or "unknown"), loss_dir)
+                key = _bucket_key(loss, bucket_level)
                 buckets.setdefault(key, []).append({"loss": loss, "followup": nxt, "gap_minutes": round(gap_min, 2)})
                 break
 
     clusters: list[dict] = []
-    for (family, session, lost_direction), events in buckets.items():
-        pnls = [float(e["followup"].get("pnl_usd") or 0.0) for e in events]
-        if len(pnls) < int(min_samples):
-            continue
-        summary = _summarize_pnls(pnls)
-        theoretical_direction = _opposite(lost_direction)
-        cluster = {
-            "cluster_id": f"stophunt_inversion|{family}|{session}|{lost_direction}|{max_minutes}m",
-            "source_family_that_lost": family,
-            "session": session,
-            "lost_direction": lost_direction,
-            "theoretical_direction": theoretical_direction,
-            "window_minutes": int(max_minutes),
-            **summary,
-            "phase_a_shadow_candidate": bool(summary["samples"] >= min_samples and summary["inversion_net_usd"] > 0 and summary["profit_factor"] >= 1.2),
-            "example_position_ids": [e["loss"].get("position_id") for e in events[:5]],
-        }
-        clusters.append(cluster)
+    for key, events in buckets.items():
+        cluster = _cluster_from_events(bucket_level, key, events, max_minutes, min_samples)
+        if cluster is not None:
+            clusters.append(cluster)
+    return sorted(clusters, key=lambda c: (c["phase_a_shadow_candidate"], c["inversion_net_usd"], c["samples"]), reverse=True)
+
+
+def mine_multilevel_stophunt_inversions(rows: Iterable[dict], max_minutes: int = 30, min_samples: int = 10) -> list[dict]:
+    """Mine exact and broader buckets so sparse exact samples do not hide real edges."""
+    clusters: list[dict] = []
+    for level in ("family_session_dir", "family_dir", "session_dir", "family_session", "family", "direction"):
+        clusters.extend(mine_stophunt_inversions(rows, max_minutes=max_minutes, min_samples=min_samples, bucket_level=level))
     return sorted(clusters, key=lambda c: (c["phase_a_shadow_candidate"], c["inversion_net_usd"], c["samples"]), reverse=True)
 
 
@@ -161,7 +203,7 @@ def build_report(rows: Iterable[dict], min_samples: int = 10) -> dict:
     items = [_enrich(r) for r in rows]
     clusters: list[dict] = []
     for window in (15, 30, 60):
-        clusters.extend(mine_stophunt_inversions(items, max_minutes=window, min_samples=min_samples))
+        clusters.extend(mine_multilevel_stophunt_inversions(items, max_minutes=window, min_samples=min_samples))
     seen = set()
     unique = []
     for c in clusters:

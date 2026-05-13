@@ -1,4 +1,8 @@
-from ops.xau_mistake_diamond_miner import build_report, mine_stophunt_inversions
+from ops.xau_mistake_diamond_miner import (
+    build_report,
+    mine_multilevel_stophunt_inversions,
+    mine_stophunt_inversions,
+)
 
 
 def _pos(pid, family, direction, pnl, opened, closed=None):
@@ -37,6 +41,24 @@ def test_mine_stophunt_inversions_finds_opposite_followup_cluster():
     assert cluster["phase_a_shadow_candidate"] is True
 
 
+def test_multilevel_miner_can_promote_broad_bucket_when_exact_bucket_is_too_small():
+    rows = []
+    for i in range(4):
+        day = 10 + i
+        rows.extend(
+            [
+                _pos(i * 2 + 1, "fibo_xauusd", "long", -5, f"2026-05-{day:02d}T08:00:00Z", f"2026-05-{day:02d}T08:10:00Z"),
+                _pos(i * 2 + 2, "scalp_xauusd", "short", 8, f"2026-05-{day:02d}T08:18:00Z", f"2026-05-{day:02d}T08:30:00Z"),
+            ]
+        )
+
+    clusters = mine_multilevel_stophunt_inversions(rows, max_minutes=30, min_samples=4)
+
+    assert clusters[0]["bucket_level"] == "family_session_dir"
+    assert clusters[0]["samples"] == 4
+    assert clusters[0]["phase_a_shadow_candidate"] is True
+
+
 def test_build_report_surfaces_diamonds_and_guards_tiny_samples():
     rows = [
         _pos(1, "fibo_xauusd", "short", -8, "2026-05-12T08:00:00Z", "2026-05-12T08:10:00Z"),
@@ -50,6 +72,6 @@ def test_build_report_surfaces_diamonds_and_guards_tiny_samples():
     report = build_report(rows, min_samples=1)
 
     assert report["summary"]["positions"] == 6
-    assert report["diamonds"][0]["inversion_net_usd"] == 40.0
+    assert report["diamonds"][0]["inversion_net_usd"] == 50.0
     assert report["strategy_scaffold"]["family"] == "xau_stophunt_inversion_shadow"
     assert report["strategy_scaffold"]["live_enabled"] is False
