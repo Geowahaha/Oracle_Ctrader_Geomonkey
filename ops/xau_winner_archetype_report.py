@@ -110,6 +110,29 @@ def _float(value) -> float | None:
         return None
 
 
+def classify_risk_geometry(row: dict) -> str:
+    """Bucket position by initial risk/target geometry."""
+    entry = _float(row.get("entry_price"))
+    stop = _float(row.get("stop_loss"))
+    if entry is None or stop is None:
+        return "unknown"
+    risk_price = abs(entry - stop)
+    if risk_price <= 0.0:
+        return "missing_or_zero_risk"
+    if risk_price < 1.0:
+        return "tiny_stop"
+    target_r = _target_distance_r(row)
+    if target_r is None:
+        return "unknown"
+    if target_r < 1.0:
+        return "sub_1r_target"
+    if target_r < 2.0:
+        return "one_to_2r_target"
+    if target_r <= 5.0:
+        return "healthy_2r_to_5r"
+    return "wide_runner_target"
+
+
 def classify_archetype(row: dict) -> str:
     """Classify a position into deterministic winner/loser archetypes."""
     pnl = _float(row.get("pnl_usd")) or 0.0
@@ -156,6 +179,7 @@ def _enrich(row: dict) -> dict:
     item["session"] = session_bucket(item.get("first_seen_utc"))
     item["duration_minutes"] = _duration_minutes(item.get("first_seen_utc"), item.get("close_utc") or item.get("last_seen_utc"))
     item["target_distance_R"] = _target_distance_r(item)
+    item["risk_geometry"] = classify_risk_geometry(item)
     item["archetype"] = classify_archetype(item)
     return item
 
@@ -201,26 +225,54 @@ def load_positions(db_path: Path, symbol: str = "XAUUSD", days: int = 90, limit:
     return [_enrich(dict(row)) for row in rows]
 
 
+def _actionable_findings(report: dict) -> list[dict]:
+    """Return compact evidence leads for the next analysis pass."""
+    findings: list[dict] = []
+    families = report.get("by_family", {})
+    sessions = report.get("by_session", {})
+    if families:
+        best_family, best_stats = max(families.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+        worst_family, worst_stats = min(families.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+        findings.append({"kind": "best_family", "family": best_family, "stats": best_stats})
+        findings.append({"kind": "worst_family", "family": worst_family, "stats": worst_stats})
+    if sessions:
+        best_session, best_stats = max(sessions.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+        findings.append({"kind": "best_session", "session": best_session, "stats": best_stats})
+    risk = report.get("by_risk_geometry", {})
+    if risk:
+        worst_risk, worst_stats = min(risk.items(), key=lambda item: float(item[1].get("net_pnl_usd") or 0.0))
+        findings.append({"kind": "worst_risk_geometry", "risk_geometry": worst_risk, "stats": worst_stats})
+    return findings
+
+
 def build_report(rows: Iterable[dict], top_n: int = 15) -> dict:
     """Build deterministic winner archetype report from position rows."""
     enriched = [_enrich(r) if "family" not in r else dict(r) for r in rows]
     by_family: dict[str, list[dict]] = defaultdict(list)
     by_session: dict[str, list[dict]] = defaultdict(list)
     by_archetype: dict[str, list[dict]] = defaultdict(list)
+    by_family_archetype: dict[str, list[dict]] = defaultdict(list)
+    by_risk_geometry: dict[str, list[dict]] = defaultdict(list)
     by_direction: dict[str, list[dict]] = defaultdict(list)
     for row in enriched:
-        by_family[str(row.get("family") or "unknown")].append(row)
+        family = str(row.get("family") or "unknown")
+        archetype = str(row.get("archetype") or "unknown")
+        by_family[family].append(row)
         by_session[str(row.get("session") or "unknown")].append(row)
-        by_archetype[str(row.get("archetype") or "unknown")].append(row)
+        by_archetype[archetype].append(row)
+        by_family_archetype[f"{family}|{archetype}"].append(row)
+        by_risk_geometry[str(row.get("risk_geometry") or "unknown")].append(row)
         by_direction[str(row.get("direction") or "unknown")].append(row)
 
     top_winners = sorted((r for r in enriched if float(r.get("pnl_usd") or 0.0) > 0.0), key=lambda r: float(r.get("pnl_usd") or 0.0), reverse=True)[:top_n]
     top_losers = sorted((r for r in enriched if float(r.get("pnl_usd") or 0.0) < 0.0), key=lambda r: float(r.get("pnl_usd") or 0.0))[:top_n]
-    return {
+    report = {
         "summary": _summarize(enriched),
         "by_family": {k: _summarize(v) for k, v in sorted(by_family.items())},
         "by_session": {k: _summarize(v) for k, v in sorted(by_session.items())},
         "by_archetype": {k: _summarize(v) for k, v in sorted(by_archetype.items())},
+        "by_family_archetype": {k: _summarize(v) for k, v in sorted(by_family_archetype.items())},
+        "by_risk_geometry": {k: _summarize(v) for k, v in sorted(by_risk_geometry.items())},
         "by_direction": {k: _summarize(v) for k, v in sorted(by_direction.items())},
         "top_winners": top_winners,
         "top_losers": top_losers,
@@ -230,6 +282,8 @@ def build_report(rows: Iterable[dict], top_n: int = 15) -> dict:
             "Archetypes are deterministic first-pass buckets; MAE/MFE candle reconstruction is a separate next step.",
         ],
     }
+    report["actionable_findings"] = _actionable_findings(report)
+    return report
 
 
 def main() -> int:

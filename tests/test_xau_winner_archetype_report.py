@@ -5,6 +5,7 @@ from ops.xau_winner_archetype_report import (
     build_report,
     classify_archetype,
     classify_family,
+    classify_risk_geometry,
     load_positions,
 )
 
@@ -64,7 +65,14 @@ def test_classify_archetype_separates_clean_fast_runner_and_ugly_winners():
     assert classify_archetype(loser) == "loser"
 
 
-def test_build_report_groups_winners_by_family_session_and_archetype():
+def test_classify_risk_geometry_flags_tiny_stop_and_rr_buckets():
+    assert classify_risk_geometry(_position(entry=3300, stop=3299.5, tp=3330)) == "tiny_stop"
+    assert classify_risk_geometry(_position(entry=3300, stop=3290, tp=3305)) == "sub_1r_target"
+    assert classify_risk_geometry(_position(entry=3300, stop=3290, tp=3330)) == "healthy_2r_to_5r"
+    assert classify_risk_geometry(_position(entry=3300, stop=3290, tp=3370)) == "wide_runner_target"
+
+
+def test_build_report_groups_winners_by_family_session_archetype_and_risk_geometry():
     rows = [
         _position(position_id=1, family="fibo_xauusd", pnl_usd=20, first_seen="2026-05-12T08:00:00Z"),
         _position(position_id=2, family="fibo_xauusd", pnl_usd=-7, first_seen="2026-05-12T14:00:00Z"),
@@ -81,7 +89,11 @@ def test_build_report_groups_winners_by_family_session_and_archetype():
     assert report["by_session"]["london"]["positions"] == 1
     assert report["by_session"]["asia"]["positions"] == 1
     assert report["by_archetype"]["clean_fast_winner"]["winners"] == 2
+    assert report["by_family_archetype"]["fibo_xauusd|clean_fast_winner"]["winners"] == 1
+    assert report["by_family_archetype"]["fibo_xauusd|loser"]["losers"] == 1
+    assert report["by_risk_geometry"]["healthy_2r_to_5r"]["positions"] == 3
     assert report["top_winners"][0]["pnl_usd"] == 20.0
+    assert report["actionable_findings"][0]["kind"] in {"best_family", "worst_family", "best_session"}
     assert report["notes"][0].startswith("Read-only")
 
 
