@@ -155,8 +155,8 @@ def _execution_anchor_payload(spec: FiboMtfSpec, df) -> dict:
     """
     tf = normalize_tf(spec.tf_label)
     try:
-        lookback = max(5, min(20, len(df)))
-        tail = df.tail(lookback)
+        lookback = max(5, min(20, max(0, len(df) - 1)))
+        tail = df.iloc[-(lookback + 1) : -1]
         lows = _series_values(tail["low"].astype(float))
         highs = _series_values(tail["high"].astype(float))
         if not lows or not highs:
@@ -178,6 +178,7 @@ def _execution_anchor_payload(spec: FiboMtfSpec, df) -> dict:
         "local_swing_low": round(swing_low, 5),
         "local_swing_high": round(swing_high, 5),
         "execution_anchor_lookback_bars": lookback,
+        "execution_anchor_window": "pre_signal",
     }
 
 

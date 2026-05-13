@@ -25,6 +25,7 @@ sys.modules.setdefault("market.data_fetcher", fake_market)
 from scanners.fibo_mtf_shadow import (
     FiboMtfShadowScanner,
     FiboMtfSpec,
+    _execution_anchor_payload,
     apply_alignment_boosters,
     dedupe_by_parent_impulse,
     parent_chain_for_tf,
@@ -52,10 +53,20 @@ class SimpleRow(dict):
     pass
 
 
+class SimpleILoc:
+    def __init__(self, df):
+        self.df = df
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return SimpleDF(self.df.rows[idx])
+        return SimpleRow(self.df.rows[idx])
+
+
 class SimpleDF:
     def __init__(self, rows):
         self.rows = list(rows)
         self.empty = not self.rows
+        self.iloc = SimpleILoc(self)
     def __len__(self):
         return len(self.rows)
     def __getitem__(self, key):
@@ -135,6 +146,21 @@ def _sig(pid, conf):
         timeframe="M1", session="", trend="", rsi=0, atr=1, pattern="x",
         raw_scores={"parent_impulse_id": pid, "impulse_state_confidence": conf / 100.0},
     )
+
+
+def test_execution_anchor_payload_excludes_signal_bar_to_avoid_lookahead():
+    rows = []
+    for i in range(30):
+        rows.append({"open": 2300 + i, "high": 2310 + i, "low": 2290 + i, "close": 2305 + i, "volume": 100})
+    rows[-1]["high"] = 9999.0
+    rows[-1]["low"] = 100.0
+
+    payload = _execution_anchor_payload(FiboMtfSpec("M1", "1m", "M1", "M5", 90), SimpleDF(rows))
+
+    assert payload["execution_anchor_source"] == "recent_M1_structure"
+    assert payload["execution_swing_high"] < 9999.0
+    assert payload["execution_swing_low"] > 100.0
+    assert payload["execution_anchor_window"] == "pre_signal"
 
 
 def test_parent_grouping_does_not_suppress_same_parent_impulse_opportunities():
