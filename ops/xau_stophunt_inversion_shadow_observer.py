@@ -52,6 +52,42 @@ def _loss_matches_cluster(loss: dict, cluster: dict) -> bool:
     return _loss_key(loss, str(cluster.get("bucket_level") or "family_session_dir")) == list(cluster.get("bucket_key") or [])
 
 
+def _loss_diagnostic(loss: dict, diamonds: list[dict], current: datetime) -> dict:
+    """Explain why a recent loss did or did not match a mined diamond."""
+    closed = _parse_dt(loss.get("close_utc")) or _parse_dt(loss.get("last_seen_utc"))
+    age_min = None if closed is None else (current - closed).total_seconds() / 60.0
+    checked: list[dict] = []
+    for cluster in diamonds:
+        bucket_level = str(cluster.get("bucket_level") or "family_session_dir")
+        window = int(cluster.get("window_minutes") or 0)
+        have = _loss_key(loss, bucket_level)
+        need = list(cluster.get("bucket_key") or [])
+        checked.append(
+            {
+                "cluster_id": cluster.get("cluster_id"),
+                "bucket_level": bucket_level,
+                "loss_key": have,
+                "cluster_key": need,
+                "window_minutes": window,
+                "within_window": bool(age_min is not None and age_min >= 0 and window > 0 and age_min <= window),
+                "bucket_match": have == need,
+                "samples": cluster.get("samples"),
+                "profit_factor": cluster.get("profit_factor"),
+            }
+        )
+    return {
+        "position_id": loss.get("position_id"),
+        "family": loss.get("family"),
+        "direction": loss.get("direction"),
+        "session": loss.get("session"),
+        "pnl_usd": loss.get("pnl_usd"),
+        "close_utc": loss.get("close_utc") or loss.get("last_seen_utc"),
+        "age_minutes": None if age_min is None else round(age_min, 2),
+        "matched": any(bool(item.get("within_window")) and bool(item.get("bucket_match")) for item in checked),
+        "checked_diamonds": checked,
+    }
+
+
 def build_shadow_observations(recent_losses: list[dict], diamonds: list[dict], *, now: datetime | None = None) -> list[dict]:
     """Build observe-only inversion candidates from recent losses and mined diamonds."""
     current = now or _now()
@@ -95,6 +131,12 @@ def build_shadow_observations(recent_losses: list[dict], diamonds: list[dict], *
             )
             break
     return observations
+
+
+def build_loss_diagnostics(recent_losses: list[dict], diamonds: list[dict], *, now: datetime | None = None) -> list[dict]:
+    """Return compact explainability for recent losses that did not emit observations."""
+    current = now or _now()
+    return [_loss_diagnostic(loss, diamonds, current) for loss in recent_losses]
 
 
 def load_recent_losses(db_path: Path, symbol: str = "XAUUSD", lookback_minutes: int = 90) -> list[dict]:
@@ -159,6 +201,7 @@ def main() -> int:
     losses = load_recent_losses(Path(args.db), symbol=args.symbol, lookback_minutes=args.lookback_minutes)
     diamonds = load_diamonds(Path(args.diamond_report))
     observations = build_shadow_observations(losses, diamonds)
+    diagnostics = build_loss_diagnostics(losses, diamonds)
     report = {
         "family": "xau_stophunt_inversion_shadow",
         "phase": "A_observe_only",
@@ -167,6 +210,7 @@ def main() -> int:
         "recent_losses": len(losses),
         "diamonds_loaded": len(diamonds),
         "observations": observations,
+        "loss_diagnostics": diagnostics,
         "created_utc": _now().isoformat().replace("+00:00", "Z"),
     }
     out = Path(args.out)

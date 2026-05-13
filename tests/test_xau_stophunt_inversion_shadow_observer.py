@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 
-from ops.xau_stophunt_inversion_shadow_observer import build_shadow_observations
+from ops.xau_stophunt_inversion_shadow_observer import (
+    build_loss_diagnostics,
+    build_shadow_observations,
+)
 
 
 def test_build_shadow_observations_emits_safe_candidate_for_matching_recent_loss():
@@ -62,3 +65,37 @@ def test_build_shadow_observations_skips_expired_window():
     observations = build_shadow_observations([loss], diamonds, now=datetime(2026, 5, 13, 2, 40, tzinfo=timezone.utc))
 
     assert observations == []
+
+
+def test_loss_diagnostics_explain_unmatched_bucket_without_promoting():
+    loss = {
+        "position_id": 99,
+        "family": "scalp_xauusd",
+        "session": "asia",
+        "direction": "long",
+        "pnl_usd": -2.85,
+        "close_utc": "2026-05-13T04:36:17Z",
+    }
+    diamonds = [
+        {
+            "cluster_id": "stophunt_inversion|fibo_xauusd|short|15m",
+            "bucket_level": "family_dir",
+            "bucket_key": ["fibo_xauusd", "short"],
+            "window_minutes": 15,
+            "samples": 46,
+            "profit_factor": 1.7562,
+            "phase_a_shadow_candidate": True,
+        }
+    ]
+
+    diagnostics = build_loss_diagnostics(
+        [loss],
+        diamonds,
+        now=datetime(2026, 5, 13, 4, 47, tzinfo=timezone.utc),
+    )
+
+    assert diagnostics[0]["matched"] is False
+    assert diagnostics[0]["checked_diamonds"][0]["within_window"] is True
+    assert diagnostics[0]["checked_diamonds"][0]["bucket_match"] is False
+    assert diagnostics[0]["checked_diamonds"][0]["loss_key"] == ["scalp_xauusd", "long"]
+    assert diagnostics[0]["checked_diamonds"][0]["cluster_key"] == ["fibo_xauusd", "short"]
