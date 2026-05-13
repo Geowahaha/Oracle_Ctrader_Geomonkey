@@ -251,16 +251,23 @@ def select_live_uses(edges: Iterable[dict]) -> list[dict]:
             and int(forward.get("samples") or 0) >= 8
             and float(edge.get("net_usd") or 0.0) > 0
             and float(forward.get("net_usd") or 0.0) > 0
-            and float(edge.get("profit_factor") or 0.0) >= 1.4
+        )
+        wr_ok = (
+            float(edge.get("profit_factor") or 0.0) >= 1.2
+            and float(forward.get("profit_factor") or 0.0) >= 1.05
+            and float(edge.get("winrate") or 0.0) >= 0.50
+            and float(forward.get("winrate") or 0.0) >= 0.50
+        )
+        max_profit_ok = (
+            str(edge.get("edge_type") or "") == "max_profit"
+            and float(edge.get("profit_factor") or 0.0) >= 1.2
             and float(forward.get("profit_factor") or 0.0) >= 1.2
         )
-        wr_ok = float(edge.get("winrate") or 0.0) >= 0.55 and float(forward.get("winrate") or 0.0) >= 0.50
-        max_profit_ok = str(edge.get("edge_type") or "") == "max_profit" and float(forward.get("profit_factor") or 0.0) >= 1.4
         if not base_ok or not (wr_ok or max_profit_ok):
             continue
         base_risk = 0.5 if symbol == "XAUUSD" else 0.35 if symbol == "ETHUSD" else 0.65 if symbol == "BTCUSD" else 0.25
-        max_risk = base_risk if wr_ok else round(base_risk * 0.5, 4)
-        action = "canary_allow_or_boost_existing_lane" if wr_ok else "canary_exit_or_micro_risk_only"
+        max_risk = base_risk if wr_ok else round(base_risk * 0.30, 4)
+        action = "canary_allow_or_boost_existing_lane" if wr_ok else "canary_pm_bias_or_micro_risk_only"
         uses.append(
             {
                 "edge_cluster_id": edge.get("cluster_id"),

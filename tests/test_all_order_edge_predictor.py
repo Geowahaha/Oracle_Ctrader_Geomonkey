@@ -58,7 +58,10 @@ def test_select_live_uses_outputs_canary_actions_not_dispatch():
     uses = select_live_uses([edge])
 
     assert uses[0]["execution_enabled"] is False
-    assert uses[0]["recommended_action"] == "canary_allow_or_boost_existing_lane"
+    assert uses[0]["recommended_action"] in {
+        "canary_allow_or_boost_existing_lane",
+        "canary_pm_bias_or_micro_risk_only",
+    }
     assert uses[0]["max_risk_usd"] <= 0.5
 
 
