@@ -96,7 +96,15 @@ class FakeProvider:
 
 class FakeAnalyzer:
     def analyze(self, *, df_structure, df_entry, current_price, atr, smc_context=None):
-        fib = SimpleNamespace(direction="bullish", swing_start=current_price - 12.0, swing_end=current_price + 8.0, impulse_strength=0.72)
+        fib = SimpleNamespace(
+            direction="bullish",
+            swing_start=current_price - 12.0,
+            swing_end=current_price + 8.0,
+            impulse_strength=0.72,
+            levels={0.382: current_price - 1.5, 0.5: current_price - 0.6, 0.618: current_price + 0.4},
+            golden_pocket_low=current_price - 0.2,
+            golden_pocket_high=current_price + 0.8,
+        )
         return SimpleNamespace(
             fib_levels=fib,
             nearest_level_price=current_price - 2.0,
@@ -138,6 +146,10 @@ def test_mtf_shadow_scanner_emits_shadow_only_tf_payload():
     assert raw["execution_swing_high"] > raw["execution_swing_low"]
     assert raw["execution_anchor_tf"] == "M1"
     assert raw["execution_anchor_is_live_plan"] is False
+    assert raw["fibo_reclaim_is_live_plan"] is False
+    assert raw["dema_14"] > 0
+    assert raw["fibo_cluster_count"] >= 3
+    assert isinstance(raw["fibo_reclaim_score"], float)
 
 
 def _sig(pid, conf):

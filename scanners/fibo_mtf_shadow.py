@@ -11,6 +11,7 @@ from typing import Iterable
 
 from analysis.fibonacci import FibonacciAnalyzer
 from analysis.fibo_tf_telemetry import fibo_telemetry_payload, normalize_tf
+from analysis.fibo_confluence_reclaim import evaluate_fibo_confluence_reclaim
 from analysis.impulse_state import compute_impulse_state
 from analysis.signals import TradeSignal
 from market.data_fetcher import xauusd_provider, session_manager
@@ -139,6 +140,64 @@ def _safe_atr(df) -> float:
         return 0.0
 
 
+def _ema(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (max(1, int(period)) + 1.0)
+    out = [float(values[0])]
+    for value in values[1:]:
+        out.append(alpha * float(value) + (1.0 - alpha) * out[-1])
+    return out
+
+
+def _dema_pair(df, period: int = 14) -> tuple[float, float]:
+    try:
+        closes = _series_values(df["close"].astype(float))
+    except Exception:
+        return (0.0, 0.0)
+    if len(closes) < 3:
+        return (0.0, 0.0)
+    ema1 = _ema(closes, period)
+    ema2 = _ema(ema1, period)
+    dema = [2.0 * a - b for a, b in zip(ema1, ema2)]
+    if len(dema) < 2:
+        return (0.0, 0.0)
+    return (float(dema[-1]), float(dema[-2]))
+
+
+def _recent_bar_dicts(df, n: int = 3) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for _, row in df.tail(max(1, int(n))).iterrows():
+            rows.append({
+                "open": float(row.get("open", 0.0) or 0.0),
+                "high": float(row.get("high", 0.0) or 0.0),
+                "low": float(row.get("low", 0.0) or 0.0),
+                "close": float(row.get("close", 0.0) or 0.0),
+            })
+    except Exception:
+        return []
+    return rows
+
+
+def _fib_level_prices(fib) -> list[float]:
+    out: list[float] = []
+    try:
+        levels = getattr(fib, "levels", {}) or {}
+        if isinstance(levels, dict):
+            out.extend(float(v) for v in levels.values() if float(v) > 0)
+    except Exception:
+        pass
+    for attr in ("golden_pocket_low", "golden_pocket_high", "swing_start", "swing_end"):
+        try:
+            value = float(getattr(fib, attr, 0.0) or 0.0)
+            if value > 0:
+                out.append(value)
+        except Exception:
+            continue
+    return out
+
+
 def _series_values(series) -> list[float]:
     try:
         values = getattr(series, "values", None)
@@ -215,6 +274,16 @@ def _candidate_from_context(spec: FiboMtfSpec, df, fibo: FibonacciAnalyzer) -> T
         risk = max(stop_loss - entry, atr * 0.25)
         tp1, tp2, tp3 = entry - risk, entry - risk * 2.0, entry - risk * 3.0
     impulse = compute_impulse_state(_bars_for_impulse_state(df), current_direction=direction)
+    dema, dema_prev = _dema_pair(df)
+    reclaim = evaluate_fibo_confluence_reclaim(
+        direction=direction,
+        current_price=current_price,
+        atr=atr,
+        fib_level_prices=[*(_fib_level_prices(fib)), float(getattr(ctx, "nearest_level_price", 0.0) or 0.0)],
+        dema=dema,
+        dema_previous=dema_prev,
+        recent_bars=_recent_bar_dicts(df, 3),
+    )
     telemetry = fibo_telemetry_payload(
         entry_tf=spec.tf_label,
         setup_tf=spec.setup_tf,
@@ -255,6 +324,18 @@ def _candidate_from_context(spec: FiboMtfSpec, df, fibo: FibonacciAnalyzer) -> T
         "impulse_state_direction": str(impulse.direction or ""),
         "impulse_state_confidence": round(float(impulse.confidence or 0.0), 3),
         "impulse_state_reasons": list(impulse.reasons),
+        "fibo_reclaim_setup": reclaim.setup,
+        "fibo_reclaim_score": reclaim.score,
+        "fibo_reclaim_reasons": list(reclaim.reasons),
+        "fibo_reclaim_risks": list(reclaim.risks),
+        "fibo_reclaim_confirmed": bool(reclaim.reclaim_confirmed),
+        "dema_reclaim_confirmed": bool(reclaim.dema_aligned),
+        "dema_14": round(float(dema or 0.0), 5),
+        "dema_14_previous": round(float(dema_prev or 0.0), 5),
+        "fibo_cluster_count": int(reclaim.cluster_count),
+        "fibo_cluster_nearest_distance": float(reclaim.nearest_cluster_distance),
+        "fibo_cluster_levels": list((reclaim.metadata or {}).get("cluster_levels") or []),
+        "fibo_reclaim_is_live_plan": False,
         "suppressed_duplicate": False,
         **_execution_anchor_payload(spec, df),
     }

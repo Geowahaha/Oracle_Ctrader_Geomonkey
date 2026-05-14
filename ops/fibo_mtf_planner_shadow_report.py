@@ -188,18 +188,26 @@ def summarize_rows(rows: Iterable[dict]) -> dict:
     by_route: dict[str, list[dict]] = defaultdict(list)
     by_route_tf: dict[str, list[dict]] = defaultdict(list)
     by_route_zone: dict[str, list[dict]] = defaultdict(list)
+    by_reclaim_setup: dict[str, list[dict]] = defaultdict(list)
+    by_route_reclaim_setup: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         route = str(row.get("route") or "unknown")
         tf = str(row.get("tf") or "unknown")
         zone = str(row.get("ratio_zone") or "unknown")
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        reclaim_setup = str(raw.get("fibo_reclaim_setup") or row.get("fibo_reclaim_setup") or "unknown")
         by_route[route].append(row)
         by_route_tf[f"{route}|{tf}"].append(row)
         by_route_zone[f"{route}|{zone}"].append(row)
+        by_reclaim_setup[reclaim_setup].append(row)
+        by_route_reclaim_setup[f"{route}|{reclaim_setup}"].append(row)
     report = {
         "summary": summarize_group(rows),
         "by_route": {k: summarize_group(v) for k, v in sorted(by_route.items())},
         "by_route_tf": {k: summarize_group(v) for k, v in sorted(by_route_tf.items())},
         "by_route_ratio_zone": {k: summarize_group(v) for k, v in sorted(by_route_zone.items())},
+        "by_reclaim_setup": {k: summarize_group(v) for k, v in sorted(by_reclaim_setup.items())},
+        "by_route_reclaim_setup": {k: summarize_group(v) for k, v in sorted(by_route_reclaim_setup.items())},
     }
     report["micro_live_probe_gate"] = evaluate_probe_gate(report["by_route"].get(PROMOTION_ROUTE, summarize_group([])))
     return report

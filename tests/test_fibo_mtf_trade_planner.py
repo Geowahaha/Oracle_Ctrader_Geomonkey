@@ -134,6 +134,35 @@ class FiboMtfTradePlannerTests(unittest.TestCase):
         self.assertIn("execution_anchor_missing", decision.reasons)
 
 
+    def test_fibo_confluence_reclaim_turns_idle_other_zone_into_probe_not_broad_live(self):
+        planner = FiboMtfTradePlanner()
+        decision = planner.plan(
+            FiboMtfPlannerInput(
+                symbol="XAUUSD",
+                direction="long",
+                timeframe="H1",
+                current_price=4691.60,
+                nearest_level_price=4692.0,
+                raw_stop_loss=4679.0,
+                atr=4.0,
+                ratio_zone="other",
+                impulse_state="idle",
+                correction_end_confirmed=False,
+                confidence=38.0,
+                execution_swing_low=4684.0,
+                fibo_reclaim_setup="fibo_reclaim_long",
+                fibo_reclaim_score=75.0,
+                fibo_cluster_count=4,
+                dema_reclaim_confirmed=True,
+            )
+        )
+
+        self.assertEqual(decision.route, "probe")
+        self.assertIn("fibo_reclaim_confluence_probe", decision.reasons)
+        self.assertEqual(decision.metadata["fibo_reclaim_setup"], "fibo_reclaim_long")
+        self.assertIsNotNone(decision.trade_plan)
+        self.assertEqual(decision.trade_plan.size_multiplier, 0.30)
+
     def test_annotate_shadow_signal_keeps_shadow_only_and_writes_route_metadata(self):
         from types import SimpleNamespace
         from analysis.fibo_mtf_trade_planner import annotate_signal_with_fibo_mtf_plan

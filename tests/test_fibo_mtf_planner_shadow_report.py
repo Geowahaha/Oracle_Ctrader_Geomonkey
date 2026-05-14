@@ -3,12 +3,16 @@ from datetime import datetime, timezone
 from ops.fibo_mtf_planner_shadow_report import summarize_rows
 
 
-def _row(route="probe", tf="M5", zone="near_0.618", rr=None, anchor=True, mae=1.0, day=1, hour=14):
+def _row(route="probe", tf="M5", zone="near_0.618", rr=None, anchor=True, mae=1.0, day=1, hour=14, reclaim_setup=""):
     raw = {
         "fibo_mtf_route": route,
         "tf_label": tf,
         "ratio_zone": zone,
     }
+    if reclaim_setup:
+        raw["fibo_reclaim_setup"] = reclaim_setup
+        raw["fibo_reclaim_score"] = 78.0
+        raw["fibo_cluster_count"] = 4
     if anchor:
         raw["execution_swing_low"] = 3300.0
     if mae is not None:
@@ -39,6 +43,18 @@ def test_planner_shadow_report_groups_by_route_tf_zone():
     assert report["by_route_tf"]["probe|M5"]["decisions"] == 2
     assert report["by_route_ratio_zone"]["observe_only|other"]["real_anchor_rate"] == 0.0
     assert report["micro_live_probe_gate"]["eligible_for_opus_micro_live_review"] is False
+
+
+def test_planner_shadow_report_groups_by_reclaim_setup_for_scheduler_evidence():
+    rows = [
+        _row("probe", "H1", "other", rr=1.2, reclaim_setup="fibo_reclaim_long"),
+        _row("probe", "M15", "near_0.618", rr=-0.3, reclaim_setup="fibo_reclaim_long"),
+        _row("observe_only", "H4", "other", rr=None, reclaim_setup="failed_reclaim"),
+    ]
+    report = summarize_rows(rows)
+    assert report["by_reclaim_setup"]["fibo_reclaim_long"]["decisions"] == 2
+    assert report["by_route_reclaim_setup"]["probe|fibo_reclaim_long"]["resolved"] == 2
+    assert report["by_route_reclaim_setup"]["observe_only|failed_reclaim"]["decisions"] == 1
 
 
 def test_probe_gate_can_pass_when_opus_requirements_are_met():

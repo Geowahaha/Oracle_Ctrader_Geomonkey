@@ -69,6 +69,10 @@ class FiboMtfPlannerInput:
     regime: str = "transition"
     winner_basket_aligned: bool = False
     broker_min_stop_distance: float = 0.0
+    fibo_reclaim_setup: str = ""
+    fibo_reclaim_score: float = 0.0
+    fibo_cluster_count: int = 0
+    dema_reclaim_confirmed: bool = False
 
 
 class FiboMtfTradePlanner:
@@ -108,6 +112,15 @@ class FiboMtfTradePlanner:
             or candidate.sweep_confirmed
             or candidate.impulse_birth_confirmed
         )
+        fibo_reclaim_setup = str(candidate.fibo_reclaim_setup or "").strip().lower()
+        fibo_reclaim_score = float(candidate.fibo_reclaim_score or 0.0)
+        fibo_reclaim_trigger = bool(
+            fibo_reclaim_score >= 70.0
+            and int(candidate.fibo_cluster_count or 0) >= 2
+            and candidate.dema_reclaim_confirmed
+            and fibo_reclaim_setup in {"fibo_reclaim_long", "fibo_reclaim_short"}
+        )
+        has_trigger = bool(has_trigger or fibo_reclaim_trigger)
         impulse_active = impulse_state in IMPULSE_ACTIVE_STATES
         ratio_quality = ratio_zone in GOLDEN_RATIO_ZONES
         reasons: list[str] = []
@@ -143,6 +156,8 @@ class FiboMtfTradePlanner:
             route = "base_live"
         elif has_trigger:
             route = "probe"
+            if fibo_reclaim_trigger:
+                reasons.append("fibo_reclaim_confluence_probe")
             if ratio_zone == "other":
                 reasons.append("other_zone_triggered_probe")
             if impulse_state == "idle":
@@ -158,7 +173,14 @@ class FiboMtfTradePlanner:
             intent="execute_tactical_plan",
             reasons=reasons or [f"{route}_criteria_met"],
             trade_plan=plan,
-            metadata={"ratio_zone": ratio_zone, "impulse_state": impulse_state, "timeframe": tf},
+            metadata={
+                "ratio_zone": ratio_zone,
+                "impulse_state": impulse_state,
+                "timeframe": tf,
+                "fibo_reclaim_setup": fibo_reclaim_setup,
+                "fibo_reclaim_score": round(fibo_reclaim_score, 2),
+                "fibo_cluster_count": int(candidate.fibo_cluster_count or 0),
+            },
         )
 
     def _build_trade_plan(self, candidate: FiboMtfPlannerInput, *, side: str, route: str, entry: float, atr: float) -> FiboMtfTradePlan | None:
@@ -342,6 +364,10 @@ def planner_input_from_signal(signal: Any) -> FiboMtfPlannerInput:
         regime=str(raw.get("regime") or raw.get("market_regime") or raw.get("trend_regime") or "transition"),
         winner_basket_aligned=_truthy(raw.get("winner_basket_aligned") or raw.get("basket_trend_aligned")),
         broker_min_stop_distance=_safe_float(raw.get("broker_min_stop_distance"), 0.0),
+        fibo_reclaim_setup=str(raw.get("fibo_reclaim_setup") or ""),
+        fibo_reclaim_score=_safe_float(raw.get("fibo_reclaim_score"), 0.0),
+        fibo_cluster_count=int(_safe_float(raw.get("fibo_cluster_count"), 0.0)),
+        dema_reclaim_confirmed=_truthy(raw.get("dema_reclaim_confirmed") or raw.get("fibo_reclaim_confirmed")),
     )
 
 
