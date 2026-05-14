@@ -1906,6 +1906,39 @@ class CTraderExecutor:
         return sl > entry
 
     @staticmethod
+    def _post_fill_missing_sl_target(
+        *,
+        direction: str,
+        planned_entry: float,
+        planned_stop_loss: float,
+        live_entry: float,
+        candidate_stop_loss: float,
+        missing_stop_loss: bool,
+    ) -> float:
+        """Return a broker-valid SL for a just-filled position.
+
+        Limit/stop orders can fill far away from the planned entry. If the
+        planned SL is no longer valid against the live fill, preserve the
+        originally planned risk distance from the actual fill entry instead of
+        attempting an invalid broker amend that leaves the position naked.
+        """
+        candidate = _safe_float(candidate_stop_loss, 0.0)
+        if not bool(missing_stop_loss):
+            return candidate
+        side = str(direction or "").strip().lower()
+        live = _safe_float(live_entry, 0.0)
+        if CTraderExecutor._stop_valid_for_position(side, live, candidate):
+            return candidate
+        planned = _safe_float(planned_entry, 0.0)
+        planned_sl = _safe_float(planned_stop_loss, 0.0)
+        planned_risk = abs(planned - planned_sl)
+        if live <= 0 or planned_risk <= 0 or side not in {"long", "short"}:
+            return candidate
+        if side == "long":
+            return live - planned_risk
+        return live + planned_risk
+
+    @staticmethod
     def _stop_valid_for_management(direction: str, current_price: float, stop_loss: float) -> bool:
         px = _safe_float(current_price, 0.0)
         sl = _safe_float(stop_loss, 0.0)
@@ -5636,6 +5669,14 @@ class CTraderExecutor:
                 target_sl = planned_sl if missing_sl else pos_sl
                 if bool(clamp_plan.get("active")):
                     target_sl = _safe_float(clamp_plan.get("new_stop_loss"), target_sl)
+                target_sl = self._post_fill_missing_sl_target(
+                    direction=direction,
+                    planned_entry=planned_entry,
+                    planned_stop_loss=planned_sl,
+                    live_entry=pos_entry or planned_entry,
+                    candidate_stop_loss=target_sl,
+                    missing_stop_loss=missing_sl,
+                )
                 target_tp = planned_tp if (missing_tp and self._target_valid_for_position(direction, pos_entry or planned_entry, planned_tp)) else pos_tp
                 amend_res = self.amend_position_sltp(
                     position_id=int(getattr(result, "position_id", 0) or 0),
