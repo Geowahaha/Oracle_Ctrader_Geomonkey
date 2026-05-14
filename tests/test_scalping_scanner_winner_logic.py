@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 from analysis.signals import TradeSignal
 from scanners.scalping_scanner import ScalpingScanner
 
@@ -42,6 +44,37 @@ class ScalpingScannerWinnerLogicTests(unittest.TestCase):
 
     def tearDown(self):
         self._td.cleanup()
+
+    def test_forced_xau_scalp_follows_bullish_h1_unless_reversal_is_confirmed(self):
+        idx = pd.date_range("2026-05-14 00:00:00", periods=90, freq="5min", tz="UTC")
+        closes = [4708.0] * 88 + [4707.2, 4706.8]
+        m5 = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.4 for c in closes],
+                "low": [c - 0.4 for c in closes],
+                "close": closes,
+                "ema_9": [4708.5] * 90,
+                "ema_21": [4709.0] * 90,
+                "rsi_14": [47.0] * 90,
+                "atr_14": [6.0] * 90,
+            },
+            index=idx,
+        )
+        h1 = m5.copy()
+        with patch("scanners.scalping_scanner.xauusd_provider.fetch", side_effect=[m5, h1]), \
+             patch.object(self.scanner.ta, "add_all", side_effect=lambda df: df), \
+             patch.object(self.scanner.ta, "determine_trend", return_value="bullish"), \
+             patch.object(self.scanner, "_xau_m1_micro_snapshot", return_value={"available": False}), \
+             patch("scanners.scalping_scanner.session_manager.current_sessions", return_value=["asian"]):
+            sig = self.scanner._build_xau_forced_signal()
+
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.direction, "long")
+        raw = dict(sig.raw_scores or {})
+        self.assertEqual(raw.get("scalp_force_direction_pre_guard"), "short")
+        self.assertTrue(bool(raw.get("scalp_force_trend_follow_override")))
+        self.assertEqual(raw.get("scalp_force_countertrend_reason"), "blocked_short_against_bullish_h1")
 
     @staticmethod
     def _seed_db(path: Path) -> None:

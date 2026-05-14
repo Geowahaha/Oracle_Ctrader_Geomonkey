@@ -1382,7 +1382,41 @@ class ScalpingScanner:
             elif base_dir == "short":
                 short_score += 0.45
 
-        direction = "long" if long_score >= short_score else "short"
+        preliminary_direction = "long" if long_score >= short_score else "short"
+        trend_follow_override = False
+        countertrend_allowed = False
+        countertrend_reason = ""
+        min_counter_edge = max(0.5, self._as_float(getattr(config, "SCALPING_XAU_FORCE_COUNTERTREND_MIN_EDGE", 2.0), 2.0))
+        min_reversal_momentum_atr = max(0.05, self._as_float(getattr(config, "SCALPING_XAU_FORCE_REVERSAL_MIN_MOMENTUM_ATR", 0.20), 0.20))
+        if trend_label == "bullish" and preliminary_direction == "short":
+            score_edge = short_score - long_score
+            countertrend_allowed = (
+                score_edge >= min_counter_edge
+                and momentum <= -(atr * min_reversal_momentum_atr)
+                and rsi14 <= 46.0
+                and close < min(ema9, ema21)
+            )
+            if countertrend_allowed:
+                countertrend_reason = "bullish_h1_reversal_confirmed"
+            else:
+                preliminary_direction = "long"
+                trend_follow_override = True
+                countertrend_reason = "blocked_short_against_bullish_h1"
+        elif trend_label == "bearish" and preliminary_direction == "long":
+            score_edge = long_score - short_score
+            countertrend_allowed = (
+                score_edge >= min_counter_edge
+                and momentum >= (atr * min_reversal_momentum_atr)
+                and rsi14 >= 54.0
+                and close > max(ema9, ema21)
+            )
+            if countertrend_allowed:
+                countertrend_reason = "bearish_h1_reversal_confirmed"
+            else:
+                preliminary_direction = "short"
+                trend_follow_override = True
+                countertrend_reason = "blocked_long_against_bearish_h1"
+        direction = preliminary_direction
         edge = abs(long_score - short_score)
         conf_base = float(getattr(config, "SCALPING_XAU_FORCE_CONFIDENCE_BASE", 58.0) or 58.0)
         min_conf = float(getattr(config, "SCALPING_XAU_FORCE_MIN_CONFIDENCE", 56.0) or 56.0)
@@ -1415,9 +1449,19 @@ class ScalpingScanner:
             f"H1 bias={trend_label} | M5 momentum={momentum:+.2f}",
             "Quick-exit profile active (low-risk micro TP/SL)",
         ]
+        if trend_follow_override:
+            reasons.append(f"Trend-follow guard: {countertrend_reason}")
+        elif countertrend_allowed:
+            reasons.append(f"Countertrend allowed: {countertrend_reason}")
         warnings = ["Use reduced risk: fallback scalping flow"]
         raw = {
             "scalp_force_mode": True,
+            "scalp_force_direction_pre_guard": "long" if long_score >= short_score else "short",
+            "scalp_force_trend_follow_override": bool(trend_follow_override),
+            "scalp_force_countertrend_allowed": bool(countertrend_allowed),
+            "scalp_force_countertrend_reason": str(countertrend_reason or ""),
+            "scalp_force_countertrend_min_edge": round(min_counter_edge, 4),
+            "scalp_force_reversal_min_momentum_atr": round(min_reversal_momentum_atr, 4),
             "scalp_force_long_score": round(long_score, 4),
             "scalp_force_short_score": round(short_score, 4),
             "scalp_force_edge": round(edge, 4),

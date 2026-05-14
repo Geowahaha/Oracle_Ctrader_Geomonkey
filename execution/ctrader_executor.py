@@ -5617,7 +5617,8 @@ class CTraderExecutor:
 
         order_type = str(payload.get("order_type", "") or "").strip().lower()
         order = dict(raw_execution.get("order") or {})
-        if status == "accepted" and order_type in {"limit", "stop"} and int(getattr(result, "order_id", 0) or 0) > 0:
+        position = dict(raw_execution.get("position") or {})
+        if status == "accepted" and order_type in {"limit", "stop"} and not position and int(getattr(result, "order_id", 0) or 0) > 0:
             order_sl = _safe_float(order.get("stopLoss"), 0.0)
             order_tp = _safe_float(order.get("takeProfit"), 0.0)
             missing_sl = planned_sl > 0 and order_sl <= 0
@@ -5643,10 +5644,18 @@ class CTraderExecutor:
                 }
 
         execution_type = str(execution_meta.get("execution_type") or "").strip().upper()
-        position = dict(raw_execution.get("position") or {})
         if (
             int(getattr(result, "position_id", 0) or 0) > 0
-            and (status == "filled" or execution_type in {"ORDER_FILLED", "ORDER_PARTIAL_FILL"})
+            and (
+                status == "filled"
+                or execution_type in {"ORDER_FILLED", "ORDER_PARTIAL_FILL"}
+                # cTrader can return ORDER_ACCEPTED with an already-open position
+                # on fast market/IOC paths.  That position may arrive without SL/TP
+                # even though the planned order carried them; treat raw position
+                # payload as an open-position protection repair opportunity instead
+                # of waiting for the next reconcile cycle.
+                or bool(position)
+            )
         ):
             direction = str(payload.get("direction", "") or "").strip().lower()
             symbol = str(payload.get("market_symbol", getattr(result, "signal_symbol", "")) or getattr(result, "signal_symbol", "") or "").strip().upper()
