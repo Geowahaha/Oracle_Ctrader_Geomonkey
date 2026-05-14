@@ -5687,24 +5687,55 @@ class CTraderExecutor:
                     missing_stop_loss=missing_sl,
                 )
                 target_tp = planned_tp if (missing_tp and self._target_valid_for_position(direction, pos_entry or planned_entry, planned_tp)) else pos_tp
+                position_id = int(getattr(result, "position_id", 0) or 0)
+                action_name = "clamp_position_stop_after_fill" if bool(clamp_plan.get("active")) else "repair_position_protection"
+                ref_px = 0.0
+                if missing_sl:
+                    try:
+                        ref_px = _safe_float(self._reference_price(symbol), 0.0)
+                    except Exception:
+                        ref_px = 0.0
+                    if ref_px > 0 and not self._stop_valid_for_management(direction, ref_px, target_sl):
+                        close_res = self.close_position(position_id=position_id, volume=0)
+                        return {
+                            "attempted": True,
+                            "action": "emergency_close_missing_sl_breached_after_fill",
+                            "position_id": position_id,
+                            "missing_stop_loss": bool(missing_sl),
+                            "missing_take_profit": bool(missing_tp),
+                            "clamped_stop_loss": bool(clamp_plan.get("active")),
+                            "new_stop_loss": _safe_float(target_sl, 0.0),
+                            "reference_price": round(ref_px, 4),
+                            "details": dict(clamp_plan.get("details") or {}),
+                            "ok": bool(close_res.ok),
+                            "status": str(close_res.status or ""),
+                            "message": str(close_res.message or ""),
+                        }
                 amend_res = self.amend_position_sltp(
-                    position_id=int(getattr(result, "position_id", 0) or 0),
+                    position_id=position_id,
                     stop_loss=target_sl,
                     take_profit=target_tp if self._target_valid_for_position(direction, pos_entry or planned_entry, target_tp) else 0.0,
                     trailing_stop_loss=False,
                 )
+                repair_ok = bool(amend_res.ok)
+                close_res = None
+                if missing_sl and not repair_ok:
+                    close_res = self.close_position(position_id=position_id, volume=0)
+                    action_name = "emergency_close_missing_sl_repair_failed"
                 return {
                     "attempted": True,
-                    "action": "clamp_position_stop_after_fill" if bool(clamp_plan.get("active")) else "repair_position_protection",
-                    "position_id": int(getattr(result, "position_id", 0) or 0),
+                    "action": action_name,
+                    "position_id": position_id,
                     "missing_stop_loss": bool(missing_sl),
                     "missing_take_profit": bool(missing_tp),
                     "clamped_stop_loss": bool(clamp_plan.get("active")),
                     "new_stop_loss": _safe_float(target_sl, 0.0),
+                    "reference_price": round(ref_px, 4) if ref_px > 0 else 0.0,
                     "details": dict(clamp_plan.get("details") or {}),
-                    "ok": bool(amend_res.ok),
-                    "status": str(amend_res.status or ""),
-                    "message": str(amend_res.message or ""),
+                    "ok": repair_ok if close_res is None else bool(close_res.ok),
+                    "status": str(amend_res.status or "") if close_res is None else str(close_res.status or ""),
+                    "message": str(amend_res.message or "") if close_res is None else str(close_res.message or ""),
+                    "repair_ok": repair_ok,
                 }
         return {}
 
@@ -6855,6 +6886,18 @@ class CTraderExecutor:
                                 "new_stop_loss": round(target_sl, 4),
                                 "new_take_profit": round(take_profit_final, 4),
                             })
+                        else:
+                            close_res = self.close_position(position_id=position_id, volume=volume)
+                            if bool(close_res.ok):
+                                report["pm_actions"].append({
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": "emergency_close_missing_sl_no_ref_repair_failed",
+                                    "reference_price": 0.0,
+                                    "repair_stop_loss": round(target_sl, 4),
+                                    "repair_status": str(res.status or ""),
+                                })
                 continue
             report["managed_positions"] += 1
             planned_tp = _safe_float(journal_row["take_profit"], 0.0) if journal_row is not None else 0.0
@@ -7037,6 +7080,18 @@ class CTraderExecutor:
                             "new_stop_loss": round(target_sl, 4),
                             "new_take_profit": round(new_tp, 4) if self._target_valid_for_position(direction, entry, new_tp) else 0.0,
                         })
+                    else:
+                        close_res = self.close_position(position_id=position_id, volume=volume)
+                        if bool(close_res.ok):
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": "emergency_close_missing_sl_repair_failed",
+                                "reference_price": round(ref, 4),
+                                "repair_stop_loss": round(target_sl, 4),
+                                "repair_status": str(res.status or ""),
+                            })
                     continue
             stop_clamp = self._xau_post_fill_stop_clamp_plan(
                 symbol=symbol,
