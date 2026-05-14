@@ -86,12 +86,14 @@ class FiboMtfTradePlanner:
         sl_atr_cap_multiplier: float = 8.0,
         probe_size_multiplier: float = 0.30,
         base_live_min_confidence: float = 35.0,
+        absolute_sl_cap: float = 12.0,
     ) -> None:
         self.sl_atr_min_multiplier = float(sl_atr_min_multiplier)
         self.sl_atr_max_multiplier = float(sl_atr_max_multiplier)
         self.sl_atr_cap_multiplier = float(sl_atr_cap_multiplier)
         self.probe_size_multiplier = float(probe_size_multiplier)
         self.base_live_min_confidence = float(base_live_min_confidence)
+        self.absolute_sl_cap = float(absolute_sl_cap)
 
     def plan(self, candidate: FiboMtfPlannerInput) -> FiboMtfRouteDecision:
         side = str(candidate.direction or "").strip().lower()
@@ -147,6 +149,13 @@ class FiboMtfTradePlanner:
                 "raw_sl_distance": round(raw_sl_distance, 4),
                 "cap_distance": round(cap_distance, 4),
                 "timeframe": tf,
+            })
+
+        if tf in HIGH_CONTEXT_TFS:
+            return self._observe(["htf_context_not_tactical_plan"], intent="learn_context", metadata={
+                "timeframe": tf,
+                "raw_sl_distance": round(raw_sl_distance, 4),
+                "cap_distance": round(min(cap_distance, self.absolute_sl_cap), 4),
             })
 
         if candidate.winner_basket_aligned and impulse_state == "mature" and has_trigger:
@@ -229,7 +238,7 @@ class FiboMtfTradePlanner:
 
     def _execution_stop(self, candidate: FiboMtfPlannerInput, *, side: str, entry: float, atr: float) -> float | None:
         min_dist = max(self.sl_atr_min_multiplier * atr, float(candidate.broker_min_stop_distance or 0.0))
-        max_dist = self.sl_atr_max_multiplier * atr
+        max_dist = min(self.sl_atr_max_multiplier * atr, self.absolute_sl_cap)
         buffer = max(0.25 * atr, 0.01)
         if side == "long":
             anchors = [x for x in (candidate.execution_swing_low, candidate.raw_stop_loss) if x is not None and float(x) < entry]

@@ -11300,6 +11300,52 @@ class DexterScheduler:
             report["reason"] = f"rr_below:{rr:.2f}<{min_rr:.2f}"
             return report
         raw = dict(getattr(signal, "raw_scores", {}) or {})
+        side = str(getattr(signal, "direction", "") or raw.get("direction") or "").strip().lower()
+        side = "long" if side in {"long", "buy"} else "short" if side in {"short", "sell"} else ""
+        tf = str(raw.get("tf_label") or getattr(signal, "timeframe", "") or "").strip().lower()
+        allowed_tfs = {
+            x.strip().lower()
+            for x in str(getattr(config, "FIBO_MTF_MICRO_LIVE_ALLOWED_TFS", "M1,M5,M15,M30,H1") or "").split(",")
+            if x.strip()
+        }
+        if tf not in allowed_tfs:
+            report["reason"] = f"tf_not_tactical:{tf or 'unknown'}"
+            return report
+        impulse_state = str(raw.get("impulse_state_name") or raw.get("impulse_state") or "").strip().lower()
+        impulse_dir = str(raw.get("impulse_state_direction") or "").strip().lower()
+        impulse_dir = "long" if impulse_dir in {"long", "buy", "bullish"} else "short" if impulse_dir in {"short", "sell", "bearish"} else ""
+        if bool(getattr(config, "FIBO_MTF_MICRO_LIVE_REQUIRE_IMPULSE_FOLLOW", True)):
+            if impulse_state in {"", "idle", "unknown", "none"} or not impulse_dir:
+                report["reason"] = "impulse_context_missing_or_idle"
+                return report
+            if side and impulse_dir and side != impulse_dir:
+                report["reason"] = f"counter_impulse:{side}!={impulse_dir}"
+                return report
+        try:
+            entry = float(getattr(signal, "entry", 0.0) or raw.get("entry") or 0.0)
+            stop = float(getattr(signal, "stop_loss", 0.0) or raw.get("stop_loss") or 0.0)
+            tp = float(getattr(signal, "take_profit_1", 0.0) or raw.get("take_profit") or raw.get("take_profit_1") or 0.0)
+        except Exception:
+            entry = stop = tp = 0.0
+        max_sl = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_SL_DISTANCE", 12.0) or 12.0)
+        max_tp = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_TP_DISTANCE", 36.0) or 36.0)
+        if entry <= 0 or stop <= 0 or tp <= 0:
+            report["reason"] = "invalid_trade_geometry"
+            return report
+        sl_dist = abs(entry - stop)
+        tp_dist = abs(tp - entry)
+        if sl_dist > max_sl:
+            report["reason"] = f"sl_distance_too_wide:{sl_dist:.2f}>{max_sl:.2f}"
+            return report
+        if tp_dist > max_tp:
+            report["reason"] = f"tp_distance_too_wide:{tp_dist:.2f}>{max_tp:.2f}"
+            return report
+        if side == "long" and not (stop < entry < tp):
+            report["reason"] = "long_geometry_wrong_side"
+            return report
+        if side == "short" and not (tp < entry < stop):
+            report["reason"] = "short_geometry_wrong_side"
+            return report
         try:
             reclaim_score = float(raw.get("fibo_reclaim_score") or 0.0)
         except Exception:

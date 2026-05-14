@@ -222,5 +222,33 @@ class FiboMtfTradePlannerTests(unittest.TestCase):
         self.assertIn("sl_distance_over_cap", sig.raw_scores["fibo_mtf_route_reasons"])
 
 
+    def test_real_bad_w1_reclaim_short_stays_observe_not_absurd_micro_live(self):
+        planner = FiboMtfTradePlanner()
+        decision = planner.plan(
+            FiboMtfPlannerInput(
+                symbol="XAUUSD",
+                direction="short",
+                timeframe="W1",
+                current_price=4668.22,
+                nearest_level_price=4668.22,
+                raw_stop_loss=5657.41,
+                atr=284.83,
+                ratio_zone="other",
+                impulse_state="idle",
+                correction_end_confirmed=False,
+                confidence=26.0,
+                execution_swing_high=5657.41,
+                fibo_reclaim_setup="fibo_reclaim_short",
+                fibo_reclaim_score=100.0,
+                fibo_cluster_count=5,
+                dema_reclaim_confirmed=True,
+            )
+        )
+
+        self.assertEqual(decision.route, "observe_only")
+        self.assertIsNone(decision.trade_plan)
+        self.assertIn("htf_context_not_tactical_plan", decision.reasons)
+
+
 if __name__ == "__main__":
     unittest.main()
