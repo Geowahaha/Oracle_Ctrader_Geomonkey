@@ -29,6 +29,7 @@ def _probe_signal() -> TradeSignal:
             "fibo_reclaim_setup": "fibo_reclaim_long",
             "fibo_reclaim_score": 74.0,
             "fibo_cluster_count": 2,
+            "setup_pattern": "FIBO_MTF_SHADOW_RECLAIM",
         },
     )
 
@@ -56,6 +57,7 @@ def test_micro_live_adapter_clones_probe_without_shadow_markers_and_executes_non
     live_sig = captured["signal"]
     assert live_sig is not sig
     assert "FIBO_MTF_SHADOW" not in live_sig.pattern
+    assert "FIBO_MTF_SHADOW" not in str(live_sig.raw_scores)
     assert live_sig.pattern == "Fibo MTF Micro Live Probe"
     assert live_sig.raw_scores["fibo_mtf_micro_live_adapter"] is True
     assert live_sig.raw_scores["fibo_mtf_live_enabled"] is True

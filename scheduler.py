@@ -11322,8 +11322,17 @@ class DexterScheduler:
             return report
 
         source = str(getattr(config, "FIBO_MTF_MICRO_LIVE_SOURCE", "fibo_xauusd") or "fibo_xauusd").strip().lower()
+        def _scrub_shadow_tokens(value):
+            if isinstance(value, str):
+                return value.replace("FIBO_MTF_SHADOW", "FIBO_MTF_MICRO_LIVE").replace("fibo_mtf_shadow", "fibo_mtf_micro_live")
+            if isinstance(value, dict):
+                return {str(k): _scrub_shadow_tokens(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_scrub_shadow_tokens(v) for v in value]
+            return value
+
         live_signal = copy.deepcopy(signal)
-        live_raw = dict(getattr(live_signal, "raw_scores", {}) or {})
+        live_raw = _scrub_shadow_tokens(dict(getattr(live_signal, "raw_scores", {}) or {}))
         live_raw["fibo_mtf_shadow"] = False
         live_raw["shadow_only"] = False
         live_raw["fibo_mtf_planner_shadow_only"] = False
