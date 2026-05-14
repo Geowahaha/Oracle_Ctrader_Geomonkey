@@ -11272,6 +11272,79 @@ class DexterScheduler:
         except Exception as e:
             logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
 
+    def _maybe_execute_fibo_mtf_micro_live_probe(self, signal, decision) -> dict:
+        """Demo-only adapter that turns a strong Fibo MTF planner probe into a tiny live order.
+
+        It deliberately clones and scrubs the shadow signal before dispatch so the permanent
+        FIBO_MTF_SHADOW -> live invariant stays intact.  Calendar-day evidence is not a
+        runtime blocker here; the user explicitly wants demo acceleration, while RR/reclaim
+        quality, demo-only mode, and one-per-cycle caps remain intact.
+        """
+        report = {"attempted": False, "executed": False, "reason": "", "source": ""}
+        if not bool(getattr(config, "FIBO_MTF_MICRO_LIVE_ENABLED", False)):
+            report["reason"] = "disabled"
+            return report
+        if bool(getattr(config, "FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO", True)) and not bool(getattr(config, "CTRADER_USE_DEMO", False)):
+            report["reason"] = "not_demo"
+            return report
+        route = str(getattr(decision, "route", "") or "").strip().lower()
+        if route != "probe":
+            report["reason"] = f"route_not_probe:{route or 'unknown'}"
+            return report
+        try:
+            rr = float(getattr(signal, "risk_reward", 0.0) or 0.0)
+        except Exception:
+            rr = 0.0
+        min_rr = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_RR", 3.0) or 3.0)
+        if rr < min_rr:
+            report["reason"] = f"rr_below:{rr:.2f}<{min_rr:.2f}"
+            return report
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        try:
+            reclaim_score = float(raw.get("fibo_reclaim_score") or 0.0)
+        except Exception:
+            reclaim_score = 0.0
+        try:
+            cluster_count = int(float(raw.get("fibo_cluster_count") or 0))
+        except Exception:
+            cluster_count = 0
+        min_reclaim = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE", 70.0) or 70.0)
+        min_clusters = int(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT", 2) or 2)
+        reclaim_setup = str(raw.get("fibo_reclaim_setup") or "").strip().lower()
+        if reclaim_score < min_reclaim:
+            report["reason"] = f"reclaim_score_below:{reclaim_score:.1f}<{min_reclaim:.1f}"
+            return report
+        if cluster_count < min_clusters:
+            report["reason"] = f"cluster_count_below:{cluster_count}<{min_clusters}"
+            return report
+        if not reclaim_setup.startswith("fibo_reclaim_"):
+            report["reason"] = f"reclaim_setup_not_live:{reclaim_setup or 'unknown'}"
+            return report
+
+        source = str(getattr(config, "FIBO_MTF_MICRO_LIVE_SOURCE", "fibo_xauusd") or "fibo_xauusd").strip().lower()
+        live_signal = copy.deepcopy(signal)
+        live_raw = dict(getattr(live_signal, "raw_scores", {}) or {})
+        live_raw["fibo_mtf_shadow"] = False
+        live_raw["shadow_only"] = False
+        live_raw["fibo_mtf_planner_shadow_only"] = False
+        live_raw["fibo_mtf_live_enabled"] = True
+        live_raw["fibo_mtf_micro_live_adapter"] = True
+        live_raw["fibo_mtf_micro_live_source"] = source
+        live_raw["fibo_mtf_calendar_days_gate_bypassed"] = bool(getattr(config, "FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS", True))
+        live_raw["source"] = source
+        live_raw["requested_source"] = source
+        live_raw["display_source"] = source
+        live_signal.raw_scores = live_raw
+        live_signal.pattern = "Fibo MTF Micro Live Probe"
+        report.update({"attempted": True, "source": source})
+        if self._is_fibo_mtf_shadow_signal(live_signal, source, live_raw):
+            report["reason"] = "shadow_invariant_after_scrub"
+            return report
+        result = self._maybe_execute_ctrader_signal(live_signal, source=source)
+        report["executed"] = bool(result is not None and (getattr(result, "ok", False) or getattr(result, "dry_run", False)))
+        report["reason"] = str(getattr(result, "status", "executed") or "executed") if result is not None else "no_result"
+        return report
+
     def _run_fibo_mtf_shadow_scan(self, source: str = "fibo_mtf_shadow") -> dict:
         """Run Fibo MTF scanner as shadow evidence with route-planner metadata.
 
@@ -11280,7 +11353,7 @@ class DexterScheduler:
         observe/probe/base_live/runner_add route metadata for Opus review and
         later explicit promotion via a non-shadow adapter.
         """
-        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "planned": 0, "planner_errors": 0, "routes": {}, "error": ""}
+        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "planned": 0, "planner_errors": 0, "routes": {}, "micro_live_attempted": 0, "micro_live_executed": 0, "micro_live_last_reason": "", "error": ""}
         if not report["enabled"]:
             report["error"] = "disabled"
             return report
@@ -11301,6 +11374,15 @@ class DexterScheduler:
                     self._ensure_signal_trace(sig, source=source)
                     self._store_shadow_signal(sig, block_reason=f"fibo_mtf_planner:{route}")
                     report["stored"] += 1
+                    max_micro = max(0, int(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE", 1) or 1))
+                    if route == "probe" and int(report.get("micro_live_attempted", 0) or 0) < max_micro:
+                        micro = self._maybe_execute_fibo_mtf_micro_live_probe(sig, decision)
+                        report["micro_live_last_reason"] = str(micro.get("reason") or "")
+                        if bool(micro.get("attempted")):
+                            report["micro_live_attempted"] = int(report.get("micro_live_attempted", 0) or 0) + 1
+                        if bool(micro.get("executed")):
+                            report["micro_live_executed"] = int(report.get("micro_live_executed", 0) or 0) + 1
+                            report["executed"] = int(report.get("executed", 0) or 0) + 1
                 except Exception as exc:
                     report["planner_errors"] = int(report.get("planner_errors", 0) or 0) + 1
                     logger.debug("[FiboMTFShadow:Scheduler] plan/store failed: %s", exc)
@@ -11311,8 +11393,8 @@ class DexterScheduler:
                     tf = str(raw.get("tf_label") or getattr(sig, "timeframe", "") or "?")
                     tf_counts[tf] = int(tf_counts.get(tf, 0)) + 1
                 logger.info(
-                    "[FiboMTFShadow:Scheduler] generated=%s planned=%s planner_errors=%s executed=%s stored=%s routes=%s tf_counts=%s",
-                    report["signals"], report["planned"], report["planner_errors"], report["executed"], report["stored"], report.get("routes"), tf_counts,
+                    "[FiboMTFShadow:Scheduler] generated=%s planned=%s planner_errors=%s executed=%s stored=%s routes=%s micro_live=%s/%s last=%s tf_counts=%s",
+                    report["signals"], report["planned"], report["planner_errors"], report["executed"], report["stored"], report.get("routes"), report.get("micro_live_executed", 0), report.get("micro_live_attempted", 0), report.get("micro_live_last_reason", ""), tf_counts,
                 )
             report["ok"] = True
             return report

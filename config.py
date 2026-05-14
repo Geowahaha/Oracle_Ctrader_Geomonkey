@@ -256,6 +256,16 @@ class Config:
     # Opportunity-first: emit every TF candidate. Alignment is a booster, never a gate/blocker.
     FIBO_MTF_SHADOW_EMIT_ALL: bool = os.getenv("FIBO_MTF_SHADOW_EMIT_ALL", "1").strip().lower() in ("1", "true", "yes", "on")
     FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED: bool = os.getenv("FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Demo-only accelerated micro-live adapter: keeps FIBO_MTF_SHADOW evidence immutable,
+    # but allows a reviewed non-shadow cTrader source to fire one tiny probe per cycle.
+    FIBO_MTF_MICRO_LIVE_ENABLED: bool = os.getenv("FIBO_MTF_MICRO_LIVE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO: bool = os.getenv("FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS: bool = os.getenv("FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_SOURCE: str = os.getenv("FIBO_MTF_MICRO_LIVE_SOURCE", "fibo_xauusd")
+    FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE: int = int(os.getenv("FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE", "1") or 1)
+    FIBO_MTF_MICRO_LIVE_MIN_RR: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_RR", "3.0") or 3.0)
+    FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE", "70.0") or 70.0)
+    FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT: int = int(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT", "2") or 2)
     FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF", "3.0") or 3.0)
     FIBO_MTF_ALIGN_BONUS_MAX: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_MAX", "12.0") or 12.0)
     FIBO_MTF_PARENT_DEPTH: int = int(os.getenv("FIBO_MTF_PARENT_DEPTH", "3") or 3)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -183,7 +184,7 @@ def summarize_group(rows: Iterable[dict]) -> dict:
     }
 
 
-def summarize_rows(rows: Iterable[dict]) -> dict:
+def summarize_rows(rows: Iterable[dict], *, ignore_calendar_days: bool | None = None, gate_mode: str = "opus_standard") -> dict:
     rows = list(rows or [])
     by_route: dict[str, list[dict]] = defaultdict(list)
     by_route_tf: dict[str, list[dict]] = defaultdict(list)
@@ -209,16 +210,25 @@ def summarize_rows(rows: Iterable[dict]) -> dict:
         "by_reclaim_setup": {k: summarize_group(v) for k, v in sorted(by_reclaim_setup.items())},
         "by_route_reclaim_setup": {k: summarize_group(v) for k, v in sorted(by_route_reclaim_setup.items())},
     }
-    report["micro_live_probe_gate"] = evaluate_probe_gate(report["by_route"].get(PROMOTION_ROUTE, summarize_group([])))
+    if ignore_calendar_days is None:
+        ignore_calendar_days = str(os.getenv("FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    if ignore_calendar_days and gate_mode == "opus_standard":
+        gate_mode = "demo_accelerated"
+    report["micro_live_probe_gate"] = evaluate_probe_gate(
+        report["by_route"].get(PROMOTION_ROUTE, summarize_group([])),
+        ignore_calendar_days=bool(ignore_calendar_days),
+        gate_mode=gate_mode,
+    )
     return report
 
 
-def evaluate_probe_gate(probe: dict) -> dict:
+def evaluate_probe_gate(probe: dict, *, ignore_calendar_days: bool = False, gate_mode: str = "opus_standard") -> dict:
     blockers: list[str] = []
     if int(probe.get("decisions") or 0) < MIN_PROBE_DECISIONS:
         blockers.append(f"probe_decisions<{MIN_PROBE_DECISIONS}")
-    if int(probe.get("calendar_days") or 0) < MIN_CALENDAR_DAYS:
-        blockers.append(f"calendar_days<{MIN_CALENDAR_DAYS}")
+    effective_min_calendar_days = 1 if ignore_calendar_days else MIN_CALENDAR_DAYS
+    if int(probe.get("calendar_days") or 0) < effective_min_calendar_days:
+        blockers.append(f"calendar_days<{effective_min_calendar_days}")
     if int(probe.get("sessions") or 0) < MIN_SESSIONS:
         blockers.append(f"sessions<{MIN_SESSIONS}")
     if int(probe.get("resolved") or 0) < MIN_PROBE_DECISIONS:
@@ -236,11 +246,13 @@ def evaluate_probe_gate(probe: dict) -> dict:
         blockers.append(f"real_anchor_rate<{MIN_REAL_ANCHOR_RATE:.0%}")
     return {
         "route": PROMOTION_ROUTE,
+        "gate_mode": str(gate_mode or "opus_standard"),
+        "calendar_days_ignored": bool(ignore_calendar_days),
         "eligible_for_opus_micro_live_review": not blockers,
         "blockers": blockers,
         "requirements": {
             "min_probe_decisions": MIN_PROBE_DECISIONS,
-            "min_calendar_days": MIN_CALENDAR_DAYS,
+            "min_calendar_days": effective_min_calendar_days,
             "min_sessions": MIN_SESSIONS,
             "min_winrate": MIN_WINRATE,
             "min_expectancy_R": MIN_EXPECTANCY_R,

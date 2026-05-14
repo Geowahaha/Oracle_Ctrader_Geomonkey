@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from ops.fibo_mtf_planner_shadow_report import summarize_rows
+from ops.fibo_mtf_planner_shadow_report import summarize_rows, evaluate_probe_gate
 
 
 def _row(route="probe", tf="M5", zone="near_0.618", rr=None, anchor=True, mae=1.0, day=1, hour=14, reclaim_setup=""):
@@ -83,3 +83,23 @@ def test_probe_gate_blocks_missing_mae_and_anchor_rate():
     blockers = report["micro_live_probe_gate"]["blockers"]
     assert "mae_R_missing" in blockers
     assert any("real_anchor_rate" in blocker for blocker in blockers)
+
+
+def test_demo_accelerated_probe_gate_removes_calendar_day_blocker_only():
+    probe = {
+        "decisions": 30,
+        "resolved": 30,
+        "calendar_days": 1,
+        "sessions": 2,
+        "winrate": 0.7,
+        "expectancy_R": 0.55,
+        "max_mae_R": 2.0,
+        "real_anchor_rate": 1.0,
+    }
+    normal = evaluate_probe_gate(probe)
+    accelerated = evaluate_probe_gate(probe, ignore_calendar_days=True, gate_mode="demo_accelerated")
+    assert "calendar_days<14" in normal["blockers"]
+    assert accelerated["eligible_for_opus_micro_live_review"] is True
+    assert accelerated["blockers"] == []
+    assert accelerated["requirements"]["min_calendar_days"] == 1
+    assert accelerated["gate_mode"] == "demo_accelerated"
