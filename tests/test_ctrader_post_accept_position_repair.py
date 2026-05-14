@@ -1,5 +1,6 @@
 import gc
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -164,6 +165,7 @@ class CTraderPostAcceptPositionRepairTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(amend_mock.call_count, 0)
             self.assertEqual(close_mock.call_count, 1)
+            self.assertEqual(int(close_mock.call_args.kwargs.get("volume") or 0), 1000)
             repair = dict(result.execution_meta.get("protection_repair") or {})
             self.assertEqual(str(repair.get("action") or ""), "emergency_close_missing_sl_breached_after_fill")
             self.assertEqual(int(repair.get("position_id") or 0), 620635950)
@@ -232,9 +234,79 @@ class CTraderPostAcceptPositionRepairTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(amend_mock.call_count, 1)
             self.assertEqual(close_mock.call_count, 1)
+            self.assertEqual(int(close_mock.call_args.kwargs.get("volume") or 0), 1000)
             repair = dict(result.execution_meta.get("protection_repair") or {})
             self.assertEqual(str(repair.get("action") or ""), "emergency_close_missing_sl_repair_failed")
             self.assertFalse(bool(repair.get("repair_ok")))
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+    def test_close_position_resolves_volume_from_execution_journal_before_reconcile(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            with patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_LOGIN", "9900897"):
+                executor = ctrader_module.CTraderExecutor()
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO execution_journal (
+                            created_ts, created_utc, source, lane, symbol, direction,
+                            confidence, entry, stop_loss, take_profit, entry_type,
+                            dry_run, account_id, broker_symbol, volume, status,
+                            message, order_id, position_id, deal_id, signal_run_id,
+                            signal_run_no, request_json, response_json, execution_meta_json
+                        ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            1.0,
+                            "scalp_xauusd",
+                            "main",
+                            "XAUUSD",
+                            "long",
+                            69.4,
+                            4710.0,
+                            4706.78,
+                            4713.86,
+                            "limit",
+                            0,
+                            46552794,
+                            "XAUUSD",
+                            1000.0,
+                            "accepted",
+                            "ctrader order_accepted",
+                            971000004,
+                            620635952,
+                            None,
+                            "20260514132609-000040",
+                            40,
+                            "{}",
+                            "{}",
+                            "{}",
+                        ),
+                    )
+                with patch.object(
+                    executor,
+                    "_run_worker",
+                    return_value={
+                        "ok": True,
+                        "status": "closed",
+                        "message": "ok",
+                        "signal_symbol": "XAUUSD",
+                        "broker_symbol": "XAUUSD",
+                    },
+                ) as worker_mock:
+                    result = executor.close_position(position_id=620635952, volume=0)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(worker_mock.call_count, 1)
+            payload = worker_mock.call_args.kwargs.get("payload") or {}
+            self.assertEqual(int(payload.get("position_id") or 0), 620635952)
+            self.assertEqual(int(payload.get("volume") or 0), 1000)
         finally:
             executor = None
             gc.collect()

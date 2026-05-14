@@ -5508,9 +5508,18 @@ class CTraderExecutor:
         if int(position_id or 0) > 0 and resolved_volume <= 0:
             with sqlite3.connect(self.db_path) as conn:
                 row = conn.execute(
-                    "SELECT volume FROM ctrader_positions WHERE position_id=? ORDER BY last_seen_utc DESC LIMIT 1",
+                    "SELECT volume FROM ctrader_positions WHERE position_id=? AND COALESCE(volume,0)>0 ORDER BY last_seen_utc DESC LIMIT 1",
                     (int(position_id),),
                 ).fetchone()
+                if row is None:
+                    # Post-accept emergency closes can happen before reconcile has
+                    # inserted ctrader_positions.  Fall back to the execution
+                    # journal's accepted volume; sending cTrader closeVolume=0 is
+                    # rejected and leaves the naked XAU position alive.
+                    row = conn.execute(
+                        "SELECT volume FROM execution_journal WHERE position_id=? AND COALESCE(volume,0)>0 ORDER BY id DESC LIMIT 1",
+                        (int(position_id),),
+                    ).fetchone()
             if row is not None:
                 resolved_volume = max(0, int(_safe_float(row[0], 0.0)))
         raw = self._run_worker(
@@ -5696,7 +5705,10 @@ class CTraderExecutor:
                     except Exception:
                         ref_px = 0.0
                     if ref_px > 0 and not self._stop_valid_for_management(direction, ref_px, target_sl):
-                        close_res = self.close_position(position_id=position_id, volume=0)
+                        close_res = self.close_position(
+                            position_id=position_id,
+                            volume=max(0, int(_safe_float(getattr(result, "volume", 0.0), 0.0))),
+                        )
                         return {
                             "attempted": True,
                             "action": "emergency_close_missing_sl_breached_after_fill",
@@ -5720,7 +5732,10 @@ class CTraderExecutor:
                 repair_ok = bool(amend_res.ok)
                 close_res = None
                 if missing_sl and not repair_ok:
-                    close_res = self.close_position(position_id=position_id, volume=0)
+                    close_res = self.close_position(
+                        position_id=position_id,
+                        volume=max(0, int(_safe_float(getattr(result, "volume", 0.0), 0.0))),
+                    )
                     action_name = "emergency_close_missing_sl_repair_failed"
                 return {
                     "attempted": True,
