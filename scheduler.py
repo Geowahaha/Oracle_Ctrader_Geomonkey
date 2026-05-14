@@ -1597,6 +1597,90 @@ class DexterScheduler:
         except Exception:
             return dict(meta or {})
 
+    def _scalp_xau_winner_context_guard(self, signal) -> dict:
+        """Final live guard for scalp_xauusd:winner.
+
+        Winner statistics are allowed to amplify only when the immediate M1/M5
+        context agrees.  The bad 2026-05-14 case had historical long stats but
+        the live trigger itself said m1_long_not_confirmed while price was
+        starting a correction/rejection leg; that must be an avoid/sell-study,
+        not a live buy.
+        """
+        out = {"allowed": True, "reason": "context_ok", "features": {}}
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        direction = str(getattr(signal, "direction", "") or raw.get("direction") or "").strip().lower()
+        direction = "long" if direction in {"long", "buy"} else "short" if direction in {"short", "sell"} else direction
+        trigger = raw.get("scalping_trigger") if isinstance(raw.get("scalping_trigger"), dict) else {}
+        checks = trigger.get("checks") if isinstance(trigger.get("checks"), dict) else {}
+        m1 = raw.get("scalp_m1_snapshot") if isinstance(raw.get("scalp_m1_snapshot"), dict) else {}
+        reason = str(trigger.get("reason") or "").strip().lower()
+        forced_from = str(trigger.get("forced_from_reason") or "").strip().lower()
+        try:
+            m1_close = float(m1.get("close") or trigger.get("close") or 0.0)
+            m1_ema9 = float(m1.get("ema9") or trigger.get("ema9") or 0.0)
+            m1_rsi = float(m1.get("rsi14") or trigger.get("rsi14") or 50.0)
+            m1_mom = float(m1.get("momentum") or 0.0)
+        except Exception:
+            m1_close, m1_ema9, m1_rsi, m1_mom = 0.0, 0.0, 50.0, 0.0
+        aligned_short = bool(raw.get("scalp_force_m1_aligned_short"))
+        aligned_long = bool(raw.get("scalp_force_m1_aligned_long"))
+        long_rejected = (
+            reason in {"m1_long_not_confirmed", "m1_not_confirmed"}
+            or forced_from in {"m1_long_not_confirmed", "m1_not_confirmed"}
+            or checks.get("ref_high_break") is False
+            or checks.get("prev_close_hold") is False
+        )
+        long_correction = (
+            aligned_short
+            or (m1_close > 0 and m1_ema9 > 0 and m1_close < m1_ema9)
+            or m1_mom < 0.0
+            or m1_rsi < float(getattr(config, "SCALPING_XAU_FORCE_RSI_LONG_MIN", 51.0) or 51.0)
+        )
+        short_rejected = (
+            reason in {"m1_short_not_confirmed", "m1_not_confirmed"}
+            or forced_from in {"m1_short_not_confirmed", "m1_not_confirmed"}
+            or checks.get("ref_low_break") is False
+            or checks.get("prev_close_hold") is False
+        )
+        short_correction = (
+            aligned_long
+            or (m1_close > 0 and m1_ema9 > 0 and m1_close > m1_ema9)
+            or m1_mom > 0.0
+            or m1_rsi > float(getattr(config, "SCALPING_XAU_FORCE_RSI_SHORT_MAX", 49.0) or 49.0)
+        )
+        features = {
+            "direction": direction,
+            "trigger_ok": bool(trigger.get("ok")),
+            "trigger_reason": reason,
+            "forced_from_reason": forced_from,
+            "m1_close": round(m1_close, 5),
+            "m1_ema9": round(m1_ema9, 5),
+            "m1_rsi14": round(m1_rsi, 3),
+            "m1_momentum": round(m1_mom, 5),
+            "m1_aligned_long": bool(aligned_long),
+            "m1_aligned_short": bool(aligned_short),
+            "m1_long_rejected": bool(long_rejected),
+            "m1_long_correction": bool(long_correction),
+            "m1_short_rejected": bool(short_rejected),
+            "m1_short_correction": bool(short_correction),
+        }
+        out["features"] = features
+        if direction == "long" and bool(getattr(config, "SCALP_XAU_WINNER_BLOCK_LONG_M1_CORRECTION", True)):
+            if long_rejected and (long_correction or bool(getattr(config, "SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED", True))):
+                out.update({
+                    "allowed": False,
+                    "reason": "winner_long_blocked_m1_rejection_correction",
+                    "suggested_action": "avoid_or_study_short",
+                })
+        elif direction == "short":
+            if short_rejected and (short_correction or bool(getattr(config, "SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED", True))):
+                out.update({
+                    "allowed": False,
+                    "reason": "winner_short_blocked_m1_rejection_correction",
+                    "suggested_action": "avoid_or_study_long",
+                })
+        return out
+
     def _allow_scalp_xau_live_mt5(self, signal, source: str) -> tuple[bool, str]:
         src = str(source or "").strip().lower()
         if src in {"scalp_ethusd", "scalp_btcusd"}:
@@ -1655,6 +1739,16 @@ class DexterScheduler:
             pass
         if not bool((mtf_guard or {}).get("allowed")):
             return False, str((mtf_guard or {}).get("reason") or "d1_h4_h1_blocked")
+        if src == "scalp_xauusd:winner" and bool(getattr(config, "SCALP_XAU_WINNER_CONTEXT_GUARD_ENABLED", True)):
+            ctx_guard = self._scalp_xau_winner_context_guard(signal)
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["xau_winner_context_guard"] = dict(ctx_guard or {})
+                signal.raw_scores = raw
+            except Exception:
+                pass
+            if not bool((ctx_guard or {}).get("allowed", True)):
+                return False, str((ctx_guard or {}).get("reason") or "winner_context_block")
         # Winner long in partial 2/3 mode can still catch falling knives when flow is weak.
         # Require flow confirmation for winner longs unless countertrend is explicitly confirmed.
         if src == "scalp_xauusd:winner":
@@ -9957,6 +10051,10 @@ class DexterScheduler:
                     self._feed_fibo_trade_results(rpt)
                 except Exception:
                     logger.debug("[Scheduler] fibo trade result feed failed", exc_info=True)
+                try:
+                    self._feed_xau_winner_mistake_learning(rpt)
+                except Exception:
+                    logger.debug("[Scheduler] xau winner mistake learning feed failed", exc_info=True)
             else:
                 err_msg = str(rpt.get("error") or rpt.get("message") or "")
                 logger.warning("[CTRADER] sync failed: %s", err_msg)
@@ -11231,6 +11329,136 @@ class DexterScheduler:
         except Exception as e:
             logger.warning("[Scheduler] scalping store failed: %s", e)
             return None
+
+    def _feed_xau_winner_mistake_learning(self, sync_report: dict | None = None) -> dict:
+        """Persist closed losing scalp_xauusd:winner context so future tuning can learn.
+
+        Direction truth comes from ctrader_positions.direction.  ctrader_deals.direction
+        may be the closing side and must not be used as entry direction.
+        """
+        report = {"enabled": bool(getattr(config, "SCALP_XAU_WINNER_MISTAKE_LEARNING_ENABLED", True)), "inserted": 0, "seen": 0}
+        if not report["enabled"]:
+            return report
+        db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+        if not db_path.exists():
+            report["reason"] = "db_missing"
+            return report
+        table = str(getattr(config, "SCALP_XAU_WINNER_MISTAKE_LEARNING_TABLE", "xau_winner_mistake_journal") or "xau_winner_mistake_journal")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table):
+            table = "xau_winner_mistake_journal"
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        position_id INTEGER PRIMARY KEY,
+                        journal_id INTEGER,
+                        source TEXT,
+                        symbol TEXT,
+                        entry_direction TEXT,
+                        entry_price REAL,
+                        close_price REAL,
+                        pnl_usd REAL,
+                        outcome INTEGER,
+                        opened_utc TEXT,
+                        closed_utc TEXT,
+                        mistake_type TEXT,
+                        recommended_action TEXT,
+                        features_json TEXT NOT NULL DEFAULT '{{}}',
+                        raw_scores_json TEXT NOT NULL DEFAULT '{{}}',
+                        created_utc TEXT NOT NULL
+                    )
+                """)
+                rows = conn.execute(
+                    """
+                    SELECT p.position_id, p.journal_id, p.source, p.symbol, p.direction AS entry_direction,
+                           p.entry_price, p.first_seen_utc AS opened_utc, p.last_seen_utc AS closed_utc,
+                           COALESCE(SUM(CASE WHEN d.has_close_detail=1 THEN d.pnl_usd ELSE 0 END), 0.0) AS pnl_usd,
+                           MAX(CASE WHEN d.has_close_detail=1 THEN d.execution_price ELSE NULL END) AS close_price,
+                           MIN(CASE WHEN d.has_close_detail=1 THEN d.outcome ELSE NULL END) AS outcome,
+                           ej.request_json
+                      FROM ctrader_positions p
+                      LEFT JOIN ctrader_deals d ON d.position_id = p.position_id
+                      LEFT JOIN execution_journal ej ON ej.id = p.journal_id
+                     WHERE LOWER(COALESCE(p.source,'')) = 'scalp_xauusd:winner'
+                       AND UPPER(COALESCE(p.symbol,'')) = 'XAUUSD'
+                       AND COALESCE(p.is_open,0) = 0
+                     GROUP BY p.position_id
+                    HAVING pnl_usd < 0
+                     ORDER BY COALESCE(p.last_seen_utc, p.first_seen_utc) DESC
+                     LIMIT 200
+                    """
+                ).fetchall()
+                report["seen"] = len(rows)
+                now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                for row in rows:
+                    try:
+                        req = json.loads(row["request_json"] or "{}") if row["request_json"] else {}
+                    except Exception:
+                        req = {}
+                    raw = req.get("raw_scores") if isinstance(req.get("raw_scores"), dict) else {}
+                    trigger = raw.get("scalping_trigger") if isinstance(raw.get("scalping_trigger"), dict) else {}
+                    m1 = raw.get("scalp_m1_snapshot") if isinstance(raw.get("scalp_m1_snapshot"), dict) else {}
+                    entry_dir = str(row["entry_direction"] or req.get("direction") or "").strip().lower()
+                    trigger_reason = str(trigger.get("reason") or "").strip().lower()
+                    aligned_short = bool(raw.get("scalp_force_m1_aligned_short"))
+                    aligned_long = bool(raw.get("scalp_force_m1_aligned_long"))
+                    m1_mom = float(m1.get("momentum") or 0.0) if isinstance(m1, dict) else 0.0
+                    m1_rsi = float(m1.get("rsi14") or trigger.get("rsi14") or 50.0) if isinstance(m1, dict) else 50.0
+                    mistake_type = "losing_winner_trade"
+                    recommended_action = "review_context"
+                    if entry_dir == "long" and (trigger_reason in {"m1_long_not_confirmed", "m1_not_confirmed"} or aligned_short or m1_mom < 0 or m1_rsi < 51.0):
+                        mistake_type = "bought_into_m1_rejection_correction"
+                        recommended_action = "block_long_or_study_short"
+                    elif entry_dir == "short" and (trigger_reason in {"m1_short_not_confirmed", "m1_not_confirmed"} or aligned_long or m1_mom > 0 or m1_rsi > 49.0):
+                        mistake_type = "sold_into_m1_rejection_correction"
+                        recommended_action = "block_short_or_study_long"
+                    features = {
+                        "trigger_reason": trigger_reason,
+                        "m1_momentum": m1_mom,
+                        "m1_rsi14": m1_rsi,
+                        "m1_aligned_long": aligned_long,
+                        "m1_aligned_short": aligned_short,
+                        "h1_trend": raw.get("signal_h1_trend") or raw.get("trend_h1") or raw.get("scalp_force_trend_h1"),
+                        "h4_trend": raw.get("signal_h4_trend") or raw.get("trend_h4") or raw.get("scalp_force_trend_h4"),
+                        "winner_logic_scope": raw.get("winner_logic_scope"),
+                        "winner_logic_win_rate": raw.get("winner_logic_win_rate"),
+                        "winner_logic_avg_pnl": raw.get("winner_logic_avg_pnl"),
+                    }
+                    cur = conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {table}(
+                            position_id, journal_id, source, symbol, entry_direction, entry_price, close_price,
+                            pnl_usd, outcome, opened_utc, closed_utc, mistake_type, recommended_action,
+                            features_json, raw_scores_json, created_utc
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            int(row["position_id"]),
+                            row["journal_id"],
+                            row["source"],
+                            row["symbol"],
+                            entry_dir,
+                            float(row["entry_price"] or 0.0),
+                            float(row["close_price"] or 0.0),
+                            float(row["pnl_usd"] or 0.0),
+                            row["outcome"],
+                            row["opened_utc"],
+                            row["closed_utc"],
+                            mistake_type,
+                            recommended_action,
+                            json.dumps(features, ensure_ascii=False, sort_keys=True),
+                            json.dumps(raw, ensure_ascii=False, sort_keys=True)[:20000],
+                            now,
+                        ),
+                    )
+                    report["inserted"] += int(cur.rowcount or 0)
+                conn.commit()
+        except Exception as exc:
+            report["error"] = str(exc)
+            logger.debug("[Scheduler] _feed_xau_winner_mistake_learning error: %s", exc, exc_info=True)
+        return report
 
     def _feed_fibo_trade_results(self, sync_report: dict) -> None:
         """
