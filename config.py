@@ -74,6 +74,9 @@ class Config:
     CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES: str = os.getenv("CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES", "limit")
     CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED: bool = os.getenv("CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_IMPULSE_GUARD_ENABLED: bool = os.getenv("XAU_IMPULSE_GUARD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Opus 4.7 fake-smart confidence stacking fix foundation. Default OFF means
+    # helper modules/tests can ship without changing live routing behavior.
+    XAU_NEW_ROUTER_ENABLED: bool = os.getenv("XAU_NEW_ROUTER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     # Highest-priority XAU live rule: if a scanner emits an XAUUSD opportunity,
     # route it to cTrader live execution; strategy gates may tag/adjust but must
     # not turn the opportunity into shadow-only or pre-dispatch filtered.
@@ -703,6 +706,26 @@ class Config:
     XAU_OPENAPI_ENTRY_ROUTER_STOP_STOP_LIFT_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_STOP_STOP_LIFT_RATIO", "0.32"))
     XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO", "0.08"))
     XAU_OPENAPI_ENTRY_ROUTER_LIMIT_STOP_PAD_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_LIMIT_STOP_PAD_RATIO", "0.24"))
+    # Signal-now routing: when the scanner/capture stack says momentum is active now,
+    # do not force every XAU scalp lane to wait for a pending limit/stop.
+    # Requires strong continuation, supportive tick direction, stable spread, and a
+    # high chart continuation bias; otherwise the normal stop/limit router still applies.
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED: bool = os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Live entry-advantage guard: do not chase XAU pullback signals at market
+    # unless structure has actually broken. Without this, strong-looking flow can
+    # convert a pullback setup into a disadvantaged now-entry.
+    XAU_ENTRY_ADVANTAGE_GUARD_ENABLED: bool = os.getenv("XAU_ENTRY_ADVANTAGE_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE: int = int(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", "7"))
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", "0.70"))
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT", "0.58"))
+    # Prevent mid-air XAU pullback limits: a limit entry must be anchored by
+    # absorption/rejection, Fibo impulse-zone evidence, or Kronos/forecast path support.
+    # Otherwise the router must promote to a wait-break probe stop instead of killing
+    # the directional opportunity.
+    XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED: bool = os.getenv("XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", "0.35"))
+    XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER: int = int(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER", "2"))
+    XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY", "0.45"))
     XAU_MULTI_TF_ENTRY_GUARD_ENABLED: bool = os.getenv("XAU_MULTI_TF_ENTRY_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MULTI_TF_ENTRY_GUARD_FAMILIES: str = os.getenv(
         "XAU_MULTI_TF_ENTRY_GUARD_FAMILIES",

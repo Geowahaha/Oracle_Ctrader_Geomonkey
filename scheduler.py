@@ -3538,6 +3538,161 @@ class DexterScheduler:
             "gate_reasons": [str(item or "").strip() for item in list(gate.get("reasons") or []) if str(item or "").strip()],
         }
 
+    def _xau_fibo_action_zone(self, signal, *, direction: str, entry_type: str = "", mode: str = "") -> dict:
+        """Map Fibo/DEMA/candle context to an explicit entry/PM action zone."""
+        raw = self._signal_raw_scores(signal)
+        direction = str(direction or "").strip().lower()
+        entry_type = str(entry_type or "").strip().lower()
+        mode = str(mode or "").strip().lower()
+        ratio_raw = str(raw.get("ratio_zone") or raw.get("nearest_level_ratio") or "").strip().lower()
+        ratio_map = {
+            "0.382": "0.382",
+            "38.2": "0.382",
+            "38.20": "0.382",
+            "0.5": "0.500",
+            "0.500": "0.500",
+            "50": "0.500",
+            "50.0": "0.500",
+            "0.618": "0.618",
+            "61.8": "0.618",
+            "61.80": "0.618",
+            "0.650": "0.650",
+            "65": "0.650",
+            "golden": "0.618",
+            "golden_pocket": "0.618",
+        }
+        ratio = ratio_map.get(ratio_raw, ratio_raw)
+        dema_state = str(raw.get("dema_reclaim_state") or raw.get("dema_state") or "").strip().lower()
+        structure_break = bool(raw.get("structure_break") or raw.get("fibo_structure_break") or raw.get("breakdown_confirmed"))
+        candle_rejection = bool(
+            raw.get("candle_rejection_confirmed")
+            or raw.get("m1_rejection_confirmed")
+            or raw.get("xau_rejection_candle_confirmed")
+        )
+        out = {
+            "ratio_zone": ratio,
+            "zone_role": "unknown",
+            "entry_action": "defer",
+            "pm_action": "observe",
+            "block_new_entry": False,
+            "block_reason": "",
+            "evidence": [],
+        }
+        if not ratio:
+            return out
+        if candle_rejection:
+            out["evidence"].append("candle_rejection")
+        if dema_state:
+            out["evidence"].append(f"dema:{dema_state}")
+        if structure_break:
+            out["evidence"].append("structure_break")
+        if direction == "short" and ratio in {"0.618", "0.650"}:
+            out.update(
+                {
+                    "zone_role": "resistance_retest",
+                    "entry_action": "sell_limit" if entry_type == "limit" else ("sell_market" if entry_type == "market" else "sell_stop"),
+                    "pm_action": "runner_preserve_or_add_on_rejection",
+                }
+            )
+        elif direction == "short" and ratio == "0.382":
+            if structure_break or mode in {"signal_market", "promote_to_stop", "fast_stop"} or entry_type in {"sell_stop", "market"}:
+                out.update(
+                    {
+                        "zone_role": "breakdown_continuation",
+                        "entry_action": "sell_market" if entry_type == "market" else "sell_stop",
+                        "pm_action": "trail_runner_after_breakdown",
+                    }
+                )
+            else:
+                out.update(
+                    {
+                        "zone_role": "support_profit_protect",
+                        "entry_action": "wait_breakdown",
+                        "pm_action": "partial_close_lock_profit_or_wait_breakdown",
+                        "block_new_entry": True,
+                        "block_reason": "fibo_382_support_is_pm_protect_not_fresh_short",
+                    }
+                )
+        elif ratio == "0.500":
+            out.update(
+                {
+                    "zone_role": "decision_midpoint",
+                    "entry_action": "wait_confirmation",
+                    "pm_action": "reduce_if_chop_or_hold_runner_if_trend",
+                }
+            )
+        elif direction == "long" and ratio == "0.382":
+            out.update(
+                {
+                    "zone_role": "support_retest",
+                    "entry_action": "buy_limit" if entry_type == "limit" else ("buy_market" if entry_type == "market" else "buy_stop"),
+                    "pm_action": "runner_preserve_or_add_on_reclaim",
+                }
+            )
+        return out
+
+    def _xau_limit_zone_confluence(self, signal, *, direction: str, features: dict | None = None) -> dict:
+        """Return whether a pullback limit has a real structural anchor.
+
+        This is intentionally an execution-router helper, not a Fibo live planner:
+        FIBO_MTF_SHADOW remains telemetry-only. We only consume compact evidence
+        already attached to the signal to avoid placing mid-air limit orders.
+        """
+        raw = self._signal_raw_scores(signal)
+        features = dict(features or {})
+        reasons: list[str] = []
+        direction = str(direction or "").strip().lower()
+        min_cluster = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER", 2) or 2))
+        try:
+            fibo_cluster_count = int(raw.get("fibo_cluster_count", 0) or 0)
+        except Exception:
+            fibo_cluster_count = 0
+        fibo_reclaim = bool(raw.get("fibo_reclaim_confirmed") or raw.get("dema_reclaim_confirmed"))
+        impulse_dir = str(raw.get("impulse_state_direction") or raw.get("aligned_direction") or "").strip().lower()
+        if impulse_dir == "buy":
+            impulse_dir = "long"
+        elif impulse_dir == "sell":
+            impulse_dir = "short"
+        impulse_ok = bool(not impulse_dir or not direction or impulse_dir == direction)
+        if fibo_reclaim and fibo_cluster_count >= min_cluster and impulse_ok:
+            reasons.append(f"fibo_impulse_zone:cluster={fibo_cluster_count}")
+        ratio_zone = str(raw.get("ratio_zone") or raw.get("nearest_level_ratio") or "").strip().lower()
+        if ratio_zone in {"0.382", "0.5", "0.500", "0.618", "0.650", "38.2", "50", "61.8", "golden", "golden_pocket"} and impulse_ok:
+            reasons.append(f"fibo_ratio_zone:{ratio_zone}")
+        candle_keys = (
+            "candle_rejection_confirmed",
+            "m1_rejection_confirmed",
+            "xau_rejection_candle_confirmed",
+            "kronos_candle_rejection_confirmed",
+        )
+        if any(bool(raw.get(k)) for k in candle_keys):
+            reasons.append("candle_rejection")
+        forecast = dict(raw.get("xau_ohlcv_forecast_shadow") or raw.get("kronos_forecast_shadow") or {})
+        if forecast:
+            f_status = str(forecast.get("status") or "").strip().lower()
+            f_dir = str(forecast.get("forecast_direction") or "").strip().lower()
+            f_aligned = bool(forecast.get("aligned_with_signal")) or (f_dir and f_dir == direction)
+            try:
+                uncertainty = float(forecast.get("uncertainty", 1.0) or 1.0)
+            except Exception:
+                uncertainty = 1.0
+            max_unc = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY", 0.45) or 0.45)
+            if f_status == "ok" and f_aligned and uncertainty <= max_unc:
+                reasons.append(f"kronos_path_aligned:unc={uncertainty:.2f}")
+        try:
+            vp = dict((raw.get("xau_openapi_entry_router") or {}).get("volume_profile") or {})
+        except Exception:
+            vp = {}
+        if bool(vp.get("near_value_area_edge") or vp.get("near_poc_rejection") or vp.get("supportive")):
+            reasons.append("volume_profile_zone")
+        try:
+            rejection_ratio = float(features.get("rejection_ratio", 0.0) or 0.0)
+        except Exception:
+            rejection_ratio = 0.0
+        if rejection_ratio >= float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_MIN_REJECTION_RATIO", 0.26) or 0.26):
+            reasons.append("micro_rejection")
+        return {"ok": bool(reasons), "reasons": reasons[:6]}
+
     def _xau_openapi_entry_router(self, signal, *, family: str, preferred_entry_type: str, snapshot: dict | None = None) -> dict:
         if not bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_ENABLED", True)):
             return {}
@@ -3733,6 +3888,32 @@ class DexterScheduler:
                 next_entry_type = stop_target
                 mode = "promote_to_stop"
                 reasons = continuation_reasons[:5]
+                signal_market_enabled = bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED", True))
+                market_min_score = max(stop_min_score, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", 7) or 7))
+                market_min_bias = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", 0.70) or 0.70)
+                market_min_tick = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT", 0.58) or 0.58)
+                continuation_bias = abs(float(chart_state.get("continuation_bias", 0.0) or 0.0))
+                tick_alignment = (1.0 - tick_up_ratio) if direction == "short" else tick_up_ratio
+                signal_now = bool(
+                    signal_market_enabled
+                    and continuation_score >= market_min_score
+                    and continuation_bias >= market_min_bias
+                    and tick_alignment >= market_min_tick
+                    and spread_avg_pct <= max_spread_pct
+                    and spread_expansion <= max_spread_expansion
+                    and sharpness_band != "caution"
+                )
+                if signal_now:
+                    raw_for_entry_advantage = self._signal_raw_scores(signal)
+                    has_structure_break = bool(raw_for_entry_advantage.get("structure_break"))
+                    if bool(getattr(config, "XAU_ENTRY_ADVANTAGE_GUARD_ENABLED", True)) and not has_structure_break:
+                        next_entry_type = stop_target
+                        mode = "entry_advantage_wait_break"
+                        reasons = ["no_structure_break_no_market_chase"] + continuation_reasons[:4]
+                    else:
+                        next_entry_type = "market"
+                        mode = "signal_market"
+                        reasons = ["signal_now"] + continuation_reasons[:4]
             elif continuation_score >= max(1, stop_min_score - 1):
                 mode = "shallow_limit"
                 pull_scale = max(0.50, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SHALLOW_LIMIT_SCALE", 0.78) or 0.78))
@@ -3768,6 +3949,82 @@ class DexterScheduler:
                 next_entry_type = stop_target
                 mode = "sharpness_promote_to_stop"
                 reasons = list(sharpness_result.get("sharpness_reasons") or [])[:4] + continuation_reasons[:2]
+        fibo_action_zone = self._xau_fibo_action_zone(signal, direction=direction, entry_type=next_entry_type, mode=mode)
+        if bool(fibo_action_zone.get("block_new_entry")) and next_entry_type == "limit":
+            return {
+                "blocked": True,
+                "family": family,
+                "preferred_entry_type": preferred,
+                "entry_type": next_entry_type,
+                "mode": "blocked_fibo_pm_zone",
+                "reason": str(fibo_action_zone.get("block_reason") or "fibo_pm_zone_blocks_fresh_entry"),
+                "reasons": [str(fibo_action_zone.get("zone_role") or ""), str(fibo_action_zone.get("pm_action") or "")],
+                "continuation_score": int(continuation_score),
+                "absorption_score": int(absorption_score),
+                "pull_scale": round(float(pull_scale), 4),
+                "trigger_scale": round(float(trigger_scale), 4),
+                "risk_multiplier": round(float(risk_multiplier), 4),
+                "snapshot": {
+                    "run_id": str(snap.get("run_id") or ""),
+                    "last_event_utc": str(snap.get("last_event_utc") or ""),
+                },
+                "chart_state": {
+                    "state_label": state_label,
+                    "day_type": day_type,
+                    "continuation_bias": float(chart_state.get("continuation_bias", 0.0) or 0.0),
+                },
+                "features": {
+                    "spread_avg_pct": round(spread_avg_pct, 6),
+                    "spread_expansion": round(spread_expansion, 4),
+                    "delta_proxy": round(delta_proxy, 4),
+                    "depth_imbalance": round(imbalance, 4),
+                    "depth_refill_shift": round(refill_shift, 4),
+                    "rejection_ratio": round(rejection_ratio, 4),
+                    "bar_volume_proxy": round(bar_volume_proxy, 4),
+                    "tick_up_ratio": round(tick_up_ratio, 4),
+                },
+                "sharpness": dict(sharpness_result) if sharpness_result else {},
+                "fibo_action_zone": dict(fibo_action_zone),
+                "zone_confluence": {},
+            }
+        # A remaining preferred limit with no continuation/absorption/zone evidence is
+        # a mid-air blind order. Do not let the PB lane leave a sell/buy limit waiting
+        # just because geometry produced a price. This preserves opportunity capture:
+        # strong continuation above already promotes to stop; real Fibo/Kronos/candle
+        # zones can still keep a limit; only unanchored limits are converted to
+        # a tiny wait-break probe route.
+        blind_limit_guard: dict = {}
+        if (
+            preferred == "limit"
+            and next_entry_type == "limit"
+            and mode == "keep_preferred"
+            and bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED", True))
+        ):
+            blind_limit_guard = self._xau_limit_zone_confluence(signal, direction=direction, features=features)
+            if not bool(blind_limit_guard.get("ok")):
+                # Opportunity-first: an unanchored pullback limit is a bad entry,
+                # not a reason to kill the directional idea. Convert it to a
+                # tiny wait-break stop so the market must prove continuation
+                # before broker exposure exists. This preserves opportunity while
+                # preventing mid-air limit fills.
+                next_entry_type = stop_target
+                mode = "wait_break_probe_stop"
+                reasons = ["no_midair_limit", "wait_for_break", "probe_risk"]
+                risk_multiplier *= max(
+                    0.10,
+                    min(1.0, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", 0.35) or 0.35)),
+                )
+                blind_limit_guard = {
+                    **dict(blind_limit_guard),
+                    "ok": True,
+                    "converted_to_wait_break": True,
+                    "reasons": list(blind_limit_guard.get("reasons") or []) + reasons,
+                }
+            if bool(blind_limit_guard.get("converted_to_wait_break")):
+                reasons = ["no_midair_limit", "wait_for_break", "probe_risk"]
+            else:
+                reasons = list(blind_limit_guard.get("reasons") or [])[:5]
+                mode = "zone_anchored_limit"
         return {
             "blocked": False,
             "family": family,
@@ -3801,6 +4058,8 @@ class DexterScheduler:
                 "tick_up_ratio": round(tick_up_ratio, 4),
             },
             "sharpness": dict(sharpness_result) if sharpness_result else {},
+            "fibo_action_zone": dict(fibo_action_zone),
+            "zone_confluence": dict(blind_limit_guard) if blind_limit_guard else {},
         }
 
     def _load_xau_microtrend_follow_up_contexts(self) -> list[dict]:
@@ -5078,7 +5337,11 @@ class DexterScheduler:
         route_entry_type = str(entry_router.get("entry_type") or entry_type).strip().lower() or entry_type
         route_mode = str(entry_router.get("mode") or "").strip().lower()
         if family == "xau_scalp_pullback_limit":
-            if route_entry_type in {"buy_stop", "sell_stop"}:
+            if route_entry_type == "market":
+                new_entry = entry
+                new_stop = stop_loss
+                entry_type = "market"
+            elif route_entry_type in {"buy_stop", "sell_stop"}:
                 trigger = max(
                     base_risk * float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_STOP_TRIGGER_RISK_RATIO", 0.10) or 0.10),
                     atr_eff * 0.05,
@@ -5176,6 +5439,8 @@ class DexterScheduler:
                     "chart_state": dict(entry_router.get("chart_state") or {}),
                     "features": dict(entry_router.get("features") or {}),
                     "sharpness": dict(entry_router.get("sharpness") or {}),
+                    "fibo_action_zone": dict(entry_router.get("fibo_action_zone") or {}),
+                    "zone_confluence": dict(entry_router.get("zone_confluence") or {}),
                 }
                 # Attach Volume Profile context if available
                 if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
