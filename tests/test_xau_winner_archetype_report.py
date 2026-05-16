@@ -35,6 +35,9 @@ def _position(
         "close_utc": close_utc,
         "label": f"dexter:XAUUSD:{family}:1",
         "comment": f"dexter|{family}|XAUUSD",
+        "source": family,
+        "lane": "winner" if family == "scalp_xauusd:winner" else "main",
+        "request_json": '{"entry_type":"limit"}',
         "pnl_usd": pnl_usd,
         "deal_count": 2,
     }
@@ -77,21 +80,30 @@ def test_build_report_groups_winners_by_family_session_archetype_and_risk_geomet
         _position(position_id=1, family="fibo_xauusd", pnl_usd=20, first_seen="2026-05-12T08:00:00Z"),
         _position(position_id=2, family="fibo_xauusd", pnl_usd=-7, first_seen="2026-05-12T14:00:00Z"),
         _position(position_id=3, family="xauusd_scheduled", pnl_usd=12, first_seen="2026-05-12T02:00:00Z"),
+        *[
+            _position(position_id=30 + i, family="scalp_xauusd:winner", direction="long", pnl_usd=4, first_seen="2026-05-12T22:10:00Z")
+            for i in range(3)
+        ],
     ]
 
     report = build_report(rows, top_n=2)
 
-    assert report["summary"]["positions"] == 3
-    assert report["summary"]["winners"] == 2
+    assert report["summary"]["positions"] == 6
+    assert report["summary"]["winners"] == 5
     assert report["summary"]["losers"] == 1
     assert report["by_family"]["fibo_xauusd"]["positions"] == 2
     assert report["by_family"]["fibo_xauusd"]["winners"] == 1
+    assert report["by_strategy_source"]["scalp_xauusd:winner"]["positions"] == 3
     assert report["by_session"]["london"]["positions"] == 1
     assert report["by_session"]["asia"]["positions"] == 1
-    assert report["by_archetype"]["clean_fast_winner"]["winners"] == 2
+    assert report["by_hour"]["h22"]["positions"] == 3
+    assert report["by_archetype"]["clean_fast_winner"]["winners"] == 5
     assert report["by_family_archetype"]["fibo_xauusd|clean_fast_winner"]["winners"] == 1
     assert report["by_family_archetype"]["fibo_xauusd|loser"]["losers"] == 1
-    assert report["by_risk_geometry"]["healthy_2r_to_5r"]["positions"] == 3
+    assert report["by_risk_geometry"]["healthy_2r_to_5r"]["positions"] == 6
+    assert report["scalp_winner_long_reservoir"]["by_hour"]["h22"]["net_pnl_usd"] == 12.0
+    assert report["pm_permission_candidates"][0]["recommended_action"] == "pm_let_runner_permission_and_better_entry_confirmation"
+    assert report["pm_permission_candidates"][0]["size_multiplier"] == 1.0
     assert report["top_winners"][0]["pnl_usd"] == 20.0
     assert report["actionable_findings"][0]["kind"] in {"best_family", "worst_family", "best_session"}
     assert report["notes"][0].startswith("Read-only")
@@ -162,6 +174,13 @@ def test_load_positions_uses_positions_direction_and_sums_deals(tmp_path: Path):
             journal_id INTEGER,
             execution_utc TEXT,
             raw_json TEXT
+        );
+        CREATE TABLE execution_journal (
+            id INTEGER PRIMARY KEY,
+            position_id TEXT,
+            source TEXT,
+            request_json TEXT,
+            execution_meta_json TEXT
         );
         """
     )
