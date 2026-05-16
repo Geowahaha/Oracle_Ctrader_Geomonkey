@@ -1331,12 +1331,31 @@ class CTraderExecutor:
                 "current_risk_usd": round(current_risk, 4),
             }
         if remaining < min_risk:
+            probe_risk = round(min(current_risk, min_risk), 4)
+            payload["risk_usd"] = probe_risk
+            raw = dict(payload.get("raw_scores") or {})
+            raw["xau_pair_risk_cap_applied"] = True
+            raw["xau_pair_risk_mode"] = "same_run_probe_floor"
+            raw["xau_pair_risk_existing_risk_usd"] = round(existing_total, 4)
+            raw["xau_pair_risk_requested_usd"] = round(current_risk, 4)
+            raw["xau_pair_risk_final_usd"] = probe_risk
+            raw["xau_pair_risk_max_usd"] = round(max_total, 4)
+            raw["xau_pair_risk_signal_run_id"] = run_id
+            raw["xau_pair_risk_matched_sources"] = [str(item.get("source") or "") for item in matched_rows]
+            payload["raw_scores"] = raw
+            reasons = self._normalized_text_list(payload.get("reasons"))
+            warnings = self._normalized_text_list(payload.get("warnings"))
+            reasons.append(f"Pair-risk cap exhausted: same run {run_id} demoted to probe {probe_risk:.2f}$")
+            warnings.append(f"Pair-risk cap probe floor trimmed from {current_risk:.2f}$ to {probe_risk:.2f}$")
+            payload["reasons"] = self._normalized_text_list(reasons)
+            payload["warnings"] = self._normalized_text_list(warnings)
             return {
                 "active": True,
-                "blocked": True,
-                "reason": "same_run_pair_risk_cap_exhausted",
+                "blocked": False,
+                "reason": "same_run_pair_probe_floor",
                 "existing_risk_usd": round(existing_total, 4),
                 "requested_risk_usd": round(current_risk, 4),
+                "final_risk_usd": probe_risk,
                 "max_total_risk_usd": round(max_total, 4),
                 "matched_rows": matched_rows,
             }
