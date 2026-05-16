@@ -57,6 +57,29 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _parse_csv_set(value: Any) -> set[str]:
+    if isinstance(value, (set, list, tuple)):
+        items = value
+    else:
+        items = str(value or "").replace("|", ",").split(",")
+    return {str(x).strip().lower() for x in items if str(x).strip()}
+
+
+def _utc_hour_token(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "h_unknown"
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return f"h{dt.astimezone(timezone.utc).hour:02d}"
+    except Exception:
+        return "h_unknown"
+
+
 def direction_from_deal_and_position(deal_row: Optional[dict], position_row: Optional[dict]) -> str:
     """Return realized opening direction without trusting deal.direction alone."""
     pos = dict(position_row or {})
@@ -182,6 +205,10 @@ class GuardianConfig:
     micro_live_allow_weak_prune: bool = True
     half_live_allow_partial_harvest: bool = True
     full_live_allow_harvest: bool = True
+    winner_long_reservoir_enabled: bool = True
+    winner_long_reservoir_hours: tuple[str, ...] = ("h12", "h20", "h22")
+    winner_long_reservoir_source: str = "scalp_xauusd:winner"
+    winner_long_reservoir_min_r: float = -0.25
 
     @classmethod
     def from_config(cls, config: Any) -> "GuardianConfig":
@@ -193,6 +220,12 @@ class GuardianConfig:
             max_actions_per_5min=max(1, _si(getattr(config, "XAU_GUARDIAN_MAX_ACTIONS_PER_5MIN", 3), 3)),
             runner_preserve_r=_sf(getattr(config, "XAU_GUARDIAN_RUNNER_PRESERVE_R", 1.5), 1.5),
             stale_tick_max_age_sec=max(30, _si(getattr(config, "XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC", 120), 120)),
+            winner_long_reservoir_enabled=bool(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_ENABLED", True)),
+            winner_long_reservoir_hours=tuple(
+                sorted(f"h{int(x):02d}" if str(x).strip().isdigit() else str(x).strip().lower() for x in _parse_csv_set(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_HOURS", "12,20,22")))
+            ),
+            winner_long_reservoir_source=str(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_SOURCE", "scalp_xauusd:winner") or "scalp_xauusd:winner").strip().lower(),
+            winner_long_reservoir_min_r=_sf(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_MIN_R", -0.25), -0.25),
         )
 
     @property
@@ -210,6 +243,7 @@ class PositionState:
     take_profit: float
     volume: float
     source: str = ""
+    first_seen_utc: str = ""
     mfe: float = 0.0
     mae: float = 0.0
     age_sec: float = 0.0
@@ -242,6 +276,22 @@ class PositionState:
             + 0.8 * max(0.0, 1.0 - distance_sl)
             - 1.2 * (max(0.0, _sf(self.mfe)) / risk)
         )
+
+    def opened_hour(self) -> str:
+        return _utc_hour_token(self.first_seen_utc)
+
+    def is_winner_long_reservoir(self, cfg: GuardianConfig) -> bool:
+        if not cfg.winner_long_reservoir_enabled:
+            return False
+        if _direction(self.direction) != "long":
+            return False
+        if str(self.source or "").strip().lower() != cfg.winner_long_reservoir_source:
+            return False
+        if self.opened_hour() not in set(cfg.winner_long_reservoir_hours):
+            return False
+        # Permission is not a rescue. If already materially adverse, normal PM
+        # can prune. This never changes entry size/risk.
+        return self.r_now() >= cfg.winner_long_reservoir_min_r
 
 
 @dataclass
@@ -369,11 +419,39 @@ class XAUProfitGuardian:
                 continue
         positions = list(basket.positions or [])
         if basket.tier_state in {"T1_PRUNE", "T2_CRYSTALLIZE", "T3_HARVEST"}:
+            reservoir_protected: list[PositionState] = []
+            weak_pool: list[PositionState] = []
+            for p in positions:
+                if _si(p.position_id) <= 0 or p.r_now() >= self.config.runner_preserve_r:
+                    continue
+                if basket.tier_state in {"T1_PRUNE", "T2_CRYSTALLIZE"} and p.is_winner_long_reservoir(self.config):
+                    reservoir_protected.append(p)
+                    continue
+                weak_pool.append(p)
             weak = sorted(
-                [p for p in positions if _si(p.position_id) > 0 and p.r_now() < self.config.runner_preserve_r],
+                weak_pool,
                 key=lambda p: p.weakness_score(basket.trend_phase),
                 reverse=True,
             )
+            for p in reservoir_protected:
+                directives.append(
+                    PMDirective(
+                        action="hold_position",
+                        position_id=int(p.position_id),
+                        volume=0,
+                        reason=f"winner_long_reservoir_runner_permission:{basket.tier_state}",
+                        priority=18,
+                        live_allowed=False,
+                        metadata={
+                            "source": p.source,
+                            "opened_hour": p.opened_hour(),
+                            "r_now": round(p.r_now(), 4),
+                            "size_multiplier": 1.0,
+                            "risk_usd_delta": 0.0,
+                            "execution_enabled": False,
+                        },
+                    )
+                )
             for p in weak[: max(1, self.config.max_prune_positions)]:
                 directives.append(
                     PMDirective(
@@ -585,6 +663,7 @@ class XAUProfitGuardianDB:
                         take_profit=_sf(row["take_profit"]),
                         volume=volume,
                         source=str(row["source"] or ""),
+                        first_seen_utc=str(row["first_seen_utc"] or ""),
                         mfe=max(0.0, pts) if current > 0 else 0.0,
                         mae=max(0.0, -pts) if current > 0 else 0.0,
                         age_sec=0.0,

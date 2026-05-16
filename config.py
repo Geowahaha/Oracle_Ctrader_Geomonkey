@@ -94,6 +94,12 @@ class Config:
     XAU_GUARDIAN_RUNNER_PRESERVE_R: float = float(os.getenv("XAU_GUARDIAN_RUNNER_PRESERVE_R", "1.5"))
     XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC: int = int(os.getenv("XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC", "120"))
     XAU_GUARDIAN_RUNTIME_PATH: str = os.getenv("XAU_GUARDIAN_RUNTIME_PATH", "data/runtime/xau_basket_truth.json")
+    # Historical scalp_xauusd:winner LONG reservoir is PM-only: permit runner
+    # preservation / better-entry confirmation without size/risk increase.
+    XAU_WINNER_LONG_RESERVOIR_PM_ENABLED: bool = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_WINNER_LONG_RESERVOIR_PM_HOURS: str = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_HOURS", "12,20,22")
+    XAU_WINNER_LONG_RESERVOIR_PM_SOURCE: str = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_SOURCE", "scalp_xauusd:winner")
+    XAU_WINNER_LONG_RESERVOIR_PM_MIN_R: float = float(os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_MIN_R", "-0.25"))
     # Guardian v2 stop-bleed governor: preserves opportunity-first scanning while
     # freezing only the currently adverse/crowded XAU side/family.
     XAU_GOVERNOR_V2_ENABLED: bool = os.getenv("XAU_GOVERNOR_V2_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")

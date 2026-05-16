@@ -82,6 +82,58 @@ def test_guardian_prunes_weak_late_cycle_adds_before_runner_core():
     assert all(d.reason.startswith("weak_add_prune") for d in directives if d.action == "close_position")
 
 
+def test_winner_long_reservoir_hour_permissions_preserve_runner_without_size_or_live_risk():
+    guard = XAUProfitGuardian(
+        GuardianConfig(
+            mode="micro_live",
+            max_prune_positions=2,
+            winner_long_reservoir_hours=("h22",),
+            winner_long_reservoir_min_r=-0.25,
+        )
+    )
+    basket = BasketState(
+        symbol="XAUUSD",
+        tier_state="T1_PRUNE",
+        trend_phase="DISTRIBUTION",
+        positions=[
+            PositionState(
+                position_id=22,
+                direction="long",
+                entry=4700,
+                current=4698,
+                stop_loss=4690,
+                take_profit=4730,
+                volume=100,
+                source="scalp_xauusd:winner",
+                first_seen_utc="2026-05-16T22:15:00Z",
+                mae=2,
+                age_sec=1200,
+            ),
+            PositionState(
+                position_id=16,
+                direction="long",
+                entry=4700,
+                current=4698,
+                stop_loss=4690,
+                take_profit=4730,
+                volume=100,
+                source="scalp_xauusd:winner",
+                first_seen_utc="2026-05-16T16:15:00Z",
+                mae=2,
+                age_sec=1200,
+            ),
+        ],
+    )
+    directives = guard.evaluate(basket, orders=[])
+    assert [d.position_id for d in directives if d.action == "hold_position"] == [22]
+    assert [d.position_id for d in directives if d.action == "close_position"] == [16]
+    hold = next(d for d in directives if d.action == "hold_position")
+    assert hold.live_allowed is False
+    assert hold.metadata["size_multiplier"] == 1.0
+    assert hold.metadata["risk_usd_delta"] == 0.0
+    assert hold.metadata["execution_enabled"] is False
+
+
 def test_t3_harvest_does_not_emit_partial_and_full_close_for_same_position():
     guard = XAUProfitGuardian(GuardianConfig(mode="full"))
     basket = BasketState(
