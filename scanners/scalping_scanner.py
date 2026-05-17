@@ -21,6 +21,8 @@ from typing import Optional
 from analysis.technical import TechnicalAnalysis
 from analysis.signals import TradeSignal
 from config import config
+from learning.entry_template_catalog import load_catalog, pick_template_block, session_bucket_for_entry_template
+from learning.reversal_training_dataset import Candle, detect_live_reversal_zone
 from market.data_fetcher import xauusd_provider, crypto_provider, session_manager
 from scanners.xauusd import xauusd_scanner
 from scanners.crypto_sniper import crypto_sniper
@@ -1149,6 +1151,133 @@ class ScalpingScanner:
         }
         signal.raw_scores = raw
 
+    @staticmethod
+    def _xau_m1_ref_close_at_lookback(m1_df, lookback: int) -> tuple[float, str]:
+        if m1_df is None or getattr(m1_df, "empty", True):
+            return 0.0, ""
+        n = len(m1_df)
+        lb = int(lookback)
+        if lb < 1 or n <= lb:
+            return 0.0, ""
+        try:
+            ref = float(m1_df["close"].iloc[-1 - lb])
+        except Exception:
+            return 0.0, ""
+        ts_s = ""
+        try:
+            ts_s = str(m1_df.index[-1 - lb])
+        except Exception:
+            pass
+        return ref, ts_s
+
+    def _apply_xau_entry_template_m1_bias(self, signal: TradeSignal, trigger: Optional[dict] = None) -> None:
+        """
+        Nudge entry + SL + TPs toward the mined 1m template anchor (close N bars ago),
+        preserving risk width. Applies to the shared XAU scalp signal → all scheduler families.
+        """
+        if signal is None:
+            return
+        if not bool(getattr(config, "ENTRY_TEMPLATE_SCANNER_BIAS_ENABLED", False)):
+            return
+        sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+        if sym not in {"XAUUSD", "GOLD"}:
+            return
+        direction = str(getattr(signal, "direction", "") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return
+        catalog = load_catalog()
+        if not catalog:
+            return
+        bucket = session_bucket_for_entry_template(signal)
+        tpl = pick_template_block(catalog, symbol="XAUUSD", session_bucket=bucket, direction=direction)
+        if not tpl:
+            tpl = pick_template_block(catalog, symbol="XAUUSD", session_bucket="global", direction=direction)
+        if not tpl:
+            return
+        lookback = int(tpl.get("best_lookback_bars") or 0)
+        if lookback < 1:
+            return
+        bars_need = max(80, lookback + 25)
+        try:
+            m1_df = xauusd_provider.fetch(str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m")), bars=bars_need)
+        except Exception:
+            m1_df = None
+        if m1_df is None or getattr(m1_df, "empty", True):
+            return
+        ref, ref_ts = self._xau_m1_ref_close_at_lookback(m1_df, lookback)
+        if ref <= 0:
+            return
+        entry = self._as_float(getattr(signal, "entry", 0.0), 0.0)
+        stop = self._as_float(getattr(signal, "stop_loss", 0.0), 0.0)
+        if entry <= 0 or stop <= 0:
+            return
+        risk = abs(entry - stop)
+        if risk <= 1e-9:
+            return
+        sym_round = "XAUUSD"
+        min_off = self._as_float(getattr(config, "ENTRY_TEMPLATE_SCANNER_MIN_OFFSET_RISK_TO_ACT", 0.04), 0.04)
+        offset_risk = (ref - entry) / risk
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        raw["entry_template_scanner_session_bucket"] = bucket
+        raw["entry_template_scanner_lookback_bars"] = lookback
+        raw["entry_template_scanner_ref_close"] = round(ref, 5)
+        raw["entry_template_scanner_ref_bar_ts"] = str(ref_ts or "")[:48]
+        raw["entry_template_scanner_offset_risk_units_pre"] = round(offset_risk, 5)
+        if abs(offset_risk) < min_off:
+            raw["entry_template_scanner_bias_applied"] = False
+            raw["entry_template_scanner_bias_skip_reason"] = "offset_below_min_risk_threshold"
+            signal.raw_scores = raw
+            if trigger is not None:
+                trigger["entry_template_scanner"] = {"applied": False, "reason": "offset_too_small"}
+            return
+        cap = max(0.02, self._as_float(getattr(config, "ENTRY_TEMPLATE_SCANNER_MAX_SHIFT_RISK_RATIO", 0.22), 0.22))
+        max_step = risk * cap
+        delta = ref - entry
+        if delta > max_step:
+            delta = max_step
+        elif delta < -max_step:
+            delta = -max_step
+        if abs(delta) < 1e-6:
+            raw["entry_template_scanner_bias_applied"] = False
+            raw["entry_template_scanner_bias_skip_reason"] = "delta_rounded_zero"
+            signal.raw_scores = raw
+            return
+        entry_n = self._round_price_for_symbol(sym_round, entry + delta)
+        d_applied = float(entry_n - entry)
+        if abs(d_applied) < 1e-6:
+            raw["entry_template_scanner_bias_applied"] = False
+            raw["entry_template_scanner_bias_skip_reason"] = "rounded_no_change"
+            signal.raw_scores = raw
+            return
+        signal.entry = entry_n
+        signal.stop_loss = self._round_price_for_symbol(sym_round, stop + d_applied)
+        for _tp in ("take_profit_1", "take_profit_2", "take_profit_3"):
+            v = self._as_float(getattr(signal, _tp, 0.0), 0.0)
+            if v > 0:
+                setattr(signal, _tp, self._round_price_for_symbol(sym_round, v + d_applied))
+        denom = max(abs(signal.entry - signal.stop_loss), 1e-9)
+        tp2 = self._as_float(getattr(signal, "take_profit_2", 0.0), 0.0)
+        if tp2 > 0:
+            signal.risk_reward = round(abs(tp2 - signal.entry) / denom, 2)
+        raw["entry_template_scanner_bias_applied"] = True
+        raw["entry_template_scanner_shift_price"] = round(d_applied, 5)
+        raw["entry_template_scanner_shift_risk_units"] = round(d_applied / risk, 5) if risk > 1e-9 else 0.0
+        raw["entry_template_scanner_max_shift_risk_ratio"] = round(cap, 4)
+        signal.raw_scores = raw
+        reasons = list(getattr(signal, "reasons", []) or [])
+        reasons.append(
+            f"Entry template M1 bias: LB{lookback} ref={ref:.2f} shift={d_applied:+.2f} ({bucket})"
+        )
+        signal.reasons = reasons[-12:]
+        if trigger is not None:
+            trigger["entry_template_scanner"] = {
+                "applied": True,
+                "lookback": lookback,
+                "ref_close": ref,
+                "shift": d_applied,
+                "bucket": bucket,
+            }
+
     def _build_xau_forced_signal(self, base_signal: Optional[TradeSignal] = None) -> Optional[TradeSignal]:
         """
         Build an always-on micro scalping signal for XAUUSD.
@@ -1253,7 +1382,41 @@ class ScalpingScanner:
             elif base_dir == "short":
                 short_score += 0.45
 
-        direction = "long" if long_score >= short_score else "short"
+        preliminary_direction = "long" if long_score >= short_score else "short"
+        trend_follow_override = False
+        countertrend_allowed = False
+        countertrend_reason = ""
+        min_counter_edge = max(0.5, self._as_float(getattr(config, "SCALPING_XAU_FORCE_COUNTERTREND_MIN_EDGE", 2.0), 2.0))
+        min_reversal_momentum_atr = max(0.05, self._as_float(getattr(config, "SCALPING_XAU_FORCE_REVERSAL_MIN_MOMENTUM_ATR", 0.20), 0.20))
+        if trend_label == "bullish" and preliminary_direction == "short":
+            score_edge = short_score - long_score
+            countertrend_allowed = (
+                score_edge >= min_counter_edge
+                and momentum <= -(atr * min_reversal_momentum_atr)
+                and rsi14 <= 46.0
+                and close < min(ema9, ema21)
+            )
+            if countertrend_allowed:
+                countertrend_reason = "bullish_h1_reversal_confirmed"
+            else:
+                preliminary_direction = "long"
+                trend_follow_override = True
+                countertrend_reason = "blocked_short_against_bullish_h1"
+        elif trend_label == "bearish" and preliminary_direction == "long":
+            score_edge = long_score - short_score
+            countertrend_allowed = (
+                score_edge >= min_counter_edge
+                and momentum >= (atr * min_reversal_momentum_atr)
+                and rsi14 >= 54.0
+                and close > max(ema9, ema21)
+            )
+            if countertrend_allowed:
+                countertrend_reason = "bearish_h1_reversal_confirmed"
+            else:
+                preliminary_direction = "short"
+                trend_follow_override = True
+                countertrend_reason = "blocked_long_against_bearish_h1"
+        direction = preliminary_direction
         edge = abs(long_score - short_score)
         conf_base = float(getattr(config, "SCALPING_XAU_FORCE_CONFIDENCE_BASE", 58.0) or 58.0)
         min_conf = float(getattr(config, "SCALPING_XAU_FORCE_MIN_CONFIDENCE", 56.0) or 56.0)
@@ -1286,9 +1449,19 @@ class ScalpingScanner:
             f"H1 bias={trend_label} | M5 momentum={momentum:+.2f}",
             "Quick-exit profile active (low-risk micro TP/SL)",
         ]
+        if trend_follow_override:
+            reasons.append(f"Trend-follow guard: {countertrend_reason}")
+        elif countertrend_allowed:
+            reasons.append(f"Countertrend allowed: {countertrend_reason}")
         warnings = ["Use reduced risk: fallback scalping flow"]
         raw = {
             "scalp_force_mode": True,
+            "scalp_force_direction_pre_guard": "long" if long_score >= short_score else "short",
+            "scalp_force_trend_follow_override": bool(trend_follow_override),
+            "scalp_force_countertrend_allowed": bool(countertrend_allowed),
+            "scalp_force_countertrend_reason": str(countertrend_reason or ""),
+            "scalp_force_countertrend_min_edge": round(min_counter_edge, 4),
+            "scalp_force_reversal_min_momentum_atr": round(min_reversal_momentum_atr, 4),
             "scalp_force_long_score": round(long_score, 4),
             "scalp_force_short_score": round(short_score, 4),
             "scalp_force_edge": round(edge, 4),
@@ -1382,6 +1555,7 @@ class ScalpingScanner:
             return None
         self._apply_xau_multi_tf_context(forced_signal, trigger=merged_trigger)
         self._tag_signal(forced_signal, source=source, trigger=merged_trigger)
+        self._apply_xau_entry_template_m1_bias(forced_signal, trigger=merged_trigger)
         return ScalpingScanResult(
             source=source,
             symbol="XAUUSD",
@@ -1918,7 +2092,8 @@ class ScalpingScanner:
                 source=source, blocked_status=blocked.status, blocked_reason=blocked.reason, signal=signal, trigger=trigger
             )
             return forced or blocked
-            
+
+        self._apply_xau_entry_template_m1_bias(signal, trigger=trigger)
         return ScalpingScanResult(source=source, symbol="XAUUSD", status="ready", reason="ok", signal=signal, trigger=trigger)
 
     def _mrd_guard_check(self, signal: TradeSignal) -> dict:
@@ -2165,6 +2340,97 @@ class ScalpingScanner:
         logger.info("[ScalpCrypto] %s READY: conf=%.1f dir=%s entry=%.2f sl=%.2f tp1=%.2f",
                      symbol_up, signal.confidence, signal.direction, signal.entry, signal.stop_loss, signal.take_profit_1)
         return ScalpingScanResult(source=src, symbol=symbol_up, status="ready", reason="ok", signal=signal, trigger=trigger)
+
+    @staticmethod
+    def _candles_from_ohlcv_df(df) -> list[Candle]:
+        candles: list[Candle] = []
+        if df is None or getattr(df, "empty", True):
+            return candles
+        for idx, row in df.tail(6).iterrows():
+            try:
+                ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else None
+            except Exception:
+                ts = None
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                ts_utc = ts.astimezone(timezone.utc)
+                ts_ms = int(ts_utc.timestamp() * 1000)
+                minute_utc = ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                ts_ms = len(candles) * 60000
+                minute_utc = ""
+            candles.append(
+                Candle(
+                    minute_bucket=int(ts_ms // 60000),
+                    minute_utc=minute_utc,
+                    start_event_ts=ts_ms,
+                    end_event_ts=ts_ms,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    n_ticks=1,
+                )
+            )
+        return candles
+
+    def detect_xau_sweep_reversal(self) -> dict:
+        """
+        Detect stop hunt sweep + reversal pattern on XAUUSD M1.
+
+        Pattern (LONG):
+          - Bar[-2] (sweep bar): long lower wick (wick_ratio >= min), close near top of bar
+          - Bar[-1] (recovery bar): close above body_top of sweep bar
+
+        Pattern (SHORT):
+          - Bar[-2]: long upper wick, close near bottom of bar
+          - Bar[-1]: close below body_bottom of sweep bar
+
+        Returns dict:
+          confirmed: bool
+          direction: 'long' | 'short'
+          sweep_level: float  (sweep_low for long, sweep_high for short)
+          sweep_wick_ratio: float
+          current_close: float
+          atr: float
+          pattern: str
+          reason: str (when confirmed=False)
+        """
+        if not bool(getattr(config, "POST_SL_REVERSAL_ENABLED", False)):
+            return {"confirmed": False, "reason": "disabled"}
+        tf = str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m") or "1m")
+        bars = 10
+        try:
+            df = xauusd_provider.fetch(tf, bars=bars)
+        except Exception as e:
+            return {"confirmed": False, "reason": f"fetch_error:{e}"}
+        if df is None or getattr(df, "empty", True) or len(df) < 4:
+            return {"confirmed": False, "reason": "no_data"}
+        try:
+            candles = self._candles_from_ohlcv_df(df)
+            zone = detect_live_reversal_zone(
+                candles,
+                confirm_min_wick_ratio=float(getattr(config, "POST_SL_REVERSAL_MIN_WICK_RATIO", 0.55) or 0.55),
+                confirm_min_sweep_pips=float(getattr(config, "POST_SL_REVERSAL_MIN_SWEEP_PIPS", 3.0) or 3.0),
+                atr_bars=10,
+                armed_min_wick_ratio=float(getattr(config, "XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_WICK_RATIO", 0.40) or 0.40),
+                armed_min_sweep_pips=float(getattr(config, "XAU_REVERSAL_ZONE_CAPTURE_MIN_SWEEP_PIPS", 0.50) or 0.50),
+                armed_min_close_pos=float(getattr(config, "XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_CLOSE_POS", 0.45) or 0.45),
+            )
+        except Exception as e:
+            return {"confirmed": False, "armed": False, "reason": f"parse_error:{e}"}
+        if bool(zone.get("confirmed")):
+            zone["sweep_wick_ratio"] = round(float(zone.get("sweep_wick_ratio", 0.0) or 0.0), 3)
+            zone["atr"] = round(float(zone.get("atr", 0.0) or 0.0), 3)
+            zone["current_close"] = float(zone.get("entry_price", zone.get("current_close", 0.0)) or 0.0)
+            zone["pattern"] = str(zone.get("pattern") or f"sweep_reversal_{str(zone.get('direction') or '').lower()}")
+            return zone
+        if bool(zone.get("armed")):
+            zone["sweep_wick_ratio"] = round(float(zone.get("sweep_wick_ratio", 0.0) or 0.0), 3)
+            zone["atr"] = round(float(zone.get("atr", 0.0) or 0.0), 3)
+            return zone
+        return {"confirmed": False, "armed": False, "reason": str(zone.get("reason") or "no_pattern")}
 
 
 scalping_scanner = ScalpingScanner()

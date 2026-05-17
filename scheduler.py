@@ -26,6 +26,10 @@ from scanners.xauusd import xauusd_scanner
 # from scanners.fx_major_scanner import fx_major_scanner
 # from scanners.stock_scanner import stock_scanner
 from scanners.scalping_scanner import scalping_scanner
+from scanners.fibo_advance import FiboAdvanceScanner
+from scanners.fibo_mtf_shadow import FiboMtfShadowScanner
+fibo_advance_scanner = FiboAdvanceScanner()
+fibo_mtf_shadow_scanner = FiboMtfShadowScanner()
 from notifier.telegram_bot import notifier
 from market.data_fetcher import session_manager, xauusd_provider
 from market.economic_calendar import economic_calendar
@@ -33,6 +37,7 @@ from market.macro_news import macro_news
 from market.macro_impact_tracker import macro_impact_tracker
 from execution.mt5_executor import mt5_executor, MT5ExecutionResult
 from execution.ctrader_executor import ctrader_executor
+from execution.xau_profit_guardian import GuardianConfig, XAUProfitGuardianDB
 from learning.neural_brain import neural_brain
 from learning.mt5_autopilot_core import mt5_autopilot_core
 from learning.mt5_orchestrator import mt5_orchestrator
@@ -41,17 +46,41 @@ from learning.mt5_limit_manager import mt5_limit_manager
 from learning.neural_gate_learning_loop import neural_gate_learning_loop
 from learning.scalping_runtime import scalping_timeout_manager
 from learning.scalping_forward import scalping_forward_analyzer
+from learning.entry_template_catalog import apply_entry_template_conf_tailwind, apply_entry_template_hints
 from learning.live_profile_autopilot import (
     live_profile_autopilot,
     _confidence_band as live_profile_confidence_band,
     _classify_chart_state as live_profile_classify_chart_state,
 )
+from learning.adaptive_directional_intelligence import adi as adaptive_di
 from learning.trading_manager_agent import trading_manager_agent
 from learning.strategy_lab_team import strategy_lab_team_agent
 from learning.trading_team import trading_team_agent
 from api.report_store import report_store
 from api.scalp_signal_store import scalp_store, ScalpSignalRecord
 from notifier.access_control import access_manager
+from infra.db_health import run_full_health_check
+from infra.auth_health import check_token_health, log_token_health_summary, refresh_stale_token_if_needed
+from analysis.impulse_shadow_log import annotate_xau_impulse_shadow
+from analysis.fibo_mtf_trade_planner import annotate_signal_with_fibo_mtf_plan
+from analysis.xau_impulse_guard import evaluate_xau_impulse_guard
+from analysis.nonfibo_redesign import (
+    apply_size_multiplier_to_signal,
+    compute_dynamic_confidence_floor,
+    compute_side_throttle,
+    is_nonfibo_xau_source,
+    planned_rr as nonfibo_planned_rr,
+)
+from analysis.xau_reclaim_staircase import (
+    apply_confidence_bonus as apply_xau_reclaim_confidence_bonus,
+    apply_risk_multiplier as apply_xau_reclaim_risk_multiplier,
+    decision_from_signal as xau_reclaim_v3_decision,
+)
+from analysis.crypto_redesign import (
+    decision_for as crypto_redesign_decision,
+    metadata as crypto_redesign_metadata,
+    rr_price_plan as crypto_rr_price_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +106,9 @@ class DexterScheduler:
         self._us_open_mood_weak_cycles: int = 0
         self._us_open_mood_stop_triggered: bool = False
         self._us_open_mood_stop_reason: str = ""
+        # 2026-04-29 surgery: 5-min opportunity health beacon — emits compact
+        # "active blockers + scan cadence" line so silent freezes show up in logs.
+        self._opportunity_health_last_ts: float = 0.0
         self._last_xauusd_alert_ts: float = 0.0
         self._last_xauusd_direction: str = ""
         self._last_xauusd_entry: float = 0.0
@@ -110,6 +142,8 @@ class DexterScheduler:
         self._mt5_repeat_guard_state = {"version": 1, "symbols": {}}
         self._mt5_repeat_guard_last_save_ts: float = 0.0
         self._last_bypass_tp_diag_ts: float = 0.0
+        self._post_sl_reversal_last_fired_ts: float = 0.0
+        self._xau_reversal_zone_capture_seen: dict[str, float] = {}
         self._signal_trace_lock = threading.Lock()
         self._signal_trace_seq: int = 0
         cfg_guard_path = str(getattr(config, "MT5_REPEAT_ERROR_GUARD_PATH", "") or "").strip()
@@ -129,6 +163,181 @@ class DexterScheduler:
     @staticmethod
     def _now_ts() -> float:
         return float(time.time())
+
+    def _run_xau_profit_guardian(self, force: bool = False) -> dict:
+        """Run Opus 4.7 Profit Reservoir guardian for XAU post-fill PM.
+
+        Entry dispatch remains opportunity-first.  In default shadow mode this
+        only records basket truth, equity ratchets, hazard tier, and would-actions.
+        Live PM actions require XAU_GUARDIAN_MODE=micro_live|half_live|full.
+        """
+        if not bool(getattr(config, "XAU_GUARDIAN_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        try:
+            cfg = GuardianConfig.from_config(config)
+            db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+            runtime_path = str(getattr(config, "XAU_GUARDIAN_RUNTIME_PATH", "data/runtime/xau_basket_truth.json") or "data/runtime/xau_basket_truth.json")
+            features = {}
+            try:
+                snap = dict(getattr(self, "_last_xauusd_signal_snapshot", {}) or {})
+                features.update({k: v for k, v in snap.items() if k in {"atr", "atr_percentile", "delta_slope", "volume_z", "hh_hl_streak", "swing_break", "trend_direction", "delta_flip", "dom_imbalance_flip", "news_window", "regime_quality"}})
+            except Exception:
+                pass
+            guardian = XAUProfitGuardianDB(db_path=db_path, runtime_path=runtime_path, config=cfg)
+            report = guardian.run_once(executor=ctrader_executor, features=features)
+            basket = dict(report.get("basket") or {})
+            directives = list(report.get("directives") or [])
+            executed = list(report.get("executed") or [])
+            logger.info(
+                "[XAU_GUARDIAN] mode=%s tier=%s combined=%.2f peak=%.2f floor=%.2f hazard=%.1f directives=%d executed=%d",
+                str(report.get("mode") or cfg.mode),
+                str(basket.get("tier_state") or ""),
+                float(basket.get("combined_pnl") or 0.0),
+                float(basket.get("combined_peak") or 0.0),
+                float(basket.get("ratchet_floor") or 0.0),
+                float(basket.get("hazard_score") or 0.0),
+                len(directives),
+                len(executed),
+            )
+            return report
+        except Exception as exc:
+            logger.warning("[XAU_GUARDIAN] run failed: %s", exc, exc_info=True)
+            return {"ok": False, "status": "error", "error": str(exc)}
+
+    def _capture_xau_reversal_zone(self, sweep: dict, *, stage: str, trigger_source: str) -> dict:
+        stage_token = str(stage or "").strip().lower()
+        if stage_token not in {"armed", "confirmed"}:
+            return {"ok": False, "status": "invalid_stage"}
+        if not bool(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        if stage_token == "armed" and not bool(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED", True)):
+            return {"ok": False, "status": "armed_disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        direction = str((sweep or {}).get("direction") or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return {"ok": False, "status": "direction_missing"}
+        event_key = str((sweep or {}).get("event_key") or f"{stage_token}:{direction}:{str((sweep or {}).get('event_utc') or '')}").strip()
+        if not event_key:
+            return {"ok": False, "status": "event_key_missing"}
+        now_ts = self._now_ts()
+        cooldown = max(15.0, float(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS", 150.0) or 150.0))
+        last_seen = float(self._xau_reversal_zone_capture_seen.get(event_key, 0.0) or 0.0)
+        if (now_ts - last_seen) < cooldown:
+            return {"ok": False, "status": "cooldown", "event_key": event_key}
+        duration_sec = max(
+            3,
+            int(
+                getattr(
+                    config,
+                    "CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC" if stage_token == "confirmed" else "CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC",
+                    30 if stage_token == "confirmed" else 18,
+                )
+                or (30 if stage_token == "confirmed" else 18)
+            ),
+        )
+        capture = dict(
+            ctrader_executor.capture_market_data(
+                symbols=["XAUUSD"],
+                duration_sec=duration_sec,
+                include_depth=True,
+                max_events=max(50, int(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS", 1200) or 1200)),
+                max_depth_levels=max(1, int(getattr(config, "CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS", 8) or 8)),
+            )
+            or {}
+        )
+        self._xau_reversal_zone_capture_seen[event_key] = now_ts
+        run_id = str(((capture.get("storage") or {}).get("run_id") or capture.get("run_id") or "")).strip()
+        snapshot_features: dict = {}
+        chart_state: dict = {}
+        sharpness: dict = {}
+        if run_id:
+            try:
+                lookback_sec = max(duration_sec + 10, int(getattr(config, "XAU_TICK_DEPTH_FILTER_LOOKBACK_SEC", 240) or 240))
+                snapshot = dict(
+                    live_profile_autopilot.latest_capture_feature_snapshot(
+                        symbol="XAUUSD",
+                        lookback_sec=lookback_sec,
+                        direction=direction,
+                        confidence=float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0),
+                    )
+                    or {}
+                )
+                snapshot_features = dict(snapshot.get("features") or (snapshot.get("gate") or {}).get("features") or {})
+                if snapshot_features:
+                    chart_state = dict(
+                        live_profile_classify_chart_state(
+                            direction,
+                            {"pattern": str((sweep or {}).get("pattern") or "")},
+                            capture_features=snapshot_features,
+                        )
+                        or {}
+                    )
+                    try:
+                        from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+
+                        sharpness = dict(
+                            _compute_sharpness(
+                                snapshot_features,
+                                direction,
+                                micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025),
+                                max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20),
+                            )
+                            or {}
+                        )
+                    except Exception:
+                        sharpness = {}
+            except Exception:
+                logger.debug("[ReversalZoneCapture] snapshot enrich failed", exc_info=True)
+        record = {}
+        try:
+            record = dict(
+                ctrader_executor.record_reversal_capture_event(
+                    symbol="XAUUSD",
+                    stage=stage_token,
+                    direction=direction,
+                    trigger_source=trigger_source,
+                    event_key=event_key,
+                    event_utc=str((sweep or {}).get("event_utc") or ""),
+                    capture_run_id=run_id,
+                    capture_status=str(capture.get("status", "") or ""),
+                    sweep_level=float((sweep or {}).get("sweep_level") or 0.0),
+                    sweep_wick_ratio=float((sweep or {}).get("sweep_wick_ratio") or 0.0),
+                    atr=float((sweep or {}).get("atr") or 0.0),
+                    reason=str((sweep or {}).get("reason") or ""),
+                    features=snapshot_features,
+                    context={
+                        **dict(sweep or {}),
+                        "chart_state": chart_state,
+                        "sharpness": sharpness,
+                        "capture_duration_sec": duration_sec,
+                    },
+                )
+                or {}
+            )
+        except Exception:
+            logger.debug("[ReversalZoneCapture] event record failed", exc_info=True)
+        logger.info(
+            "[ReversalZoneCapture] stage=%s dir=%s ok=%s run=%s key=%s",
+            stage_token,
+            direction,
+            bool(capture.get("ok")),
+            run_id or "-",
+            event_key,
+        )
+        return {
+            "ok": bool(capture.get("ok")),
+            "status": str(capture.get("status", "") or ""),
+            "event_key": event_key,
+            "run_id": run_id,
+            "capture": capture,
+            "record": record,
+            "features": snapshot_features,
+            "chart_state": chart_state,
+            "sharpness": sharpness,
+        }
 
     @staticmethod
     def _signal_trace_meta(signal) -> dict:
@@ -191,6 +400,7 @@ class DexterScheduler:
         return self._signal_trace_meta(signal)
 
     def _send_signal_with_trace(self, signal, source: str) -> bool:
+        self._normalize_signal_confidence(signal, stage="send_signal")
         self._ensure_signal_trace(signal, source=source)
         return bool(notifier.send_signal(signal))
 
@@ -222,7 +432,7 @@ class DexterScheduler:
     @staticmethod
     def _signal_confidence_band(signal) -> str:
         try:
-            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+            conf = DexterScheduler._normalize_confidence_value(getattr(signal, "confidence", 0.0))
         except Exception:
             conf = 0.0
         return str(live_profile_confidence_band(conf) or "")
@@ -300,6 +510,203 @@ class DexterScheduler:
             return float(default)
 
     @staticmethod
+    def _normalize_confidence_value(value, default: float = 0.0) -> float:
+        try:
+            conf = float(value)
+        except Exception:
+            conf = float(default)
+        conf = max(0.0, min(99.9, conf))
+        return round(conf, 1)
+
+    def _normalize_signal_confidence(self, signal, *, stage: str = "") -> float:
+        if signal is None:
+            return 0.0
+        try:
+            before = float(getattr(signal, "confidence", 0.0) or 0.0)
+        except Exception:
+            before = 0.0
+        normalized = self._normalize_confidence_value(before)
+        try:
+            signal.confidence = normalized
+        except Exception:
+            return normalized
+        if abs(normalized - before) > 1e-9:
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["confidence_clamped"] = True
+                raw["confidence_clamp_before"] = round(before, 3)
+                raw["confidence_clamp_after"] = round(normalized, 3)
+                raw["confidence_clamp_stage"] = str(stage or raw.get("confidence_clamp_stage") or "")
+                signal.raw_scores = raw
+            except Exception:
+                pass
+            logger.info(
+                "[CONF] clamped stage=%s %s %s conf %.1f->%.1f",
+                str(stage or "-"),
+                str(getattr(signal, "symbol", "") or ""),
+                str(getattr(signal, "direction", "") or "").upper(),
+                before,
+                normalized,
+            )
+        return normalized
+
+    def _apply_adi_modifier(self, signal, source: str) -> dict:
+        """Apply Adaptive Directional Intelligence confidence modifier.
+
+        Evaluates 5 dimensions (empirical, technical, flow, temporal, cross-family)
+        and adjusts signal.confidence.  Never blocks — only modifies confidence
+        so existing gates make the final decision.
+        """
+        if not bool(getattr(config, "ADI_ENABLED", True)):
+            return {}
+        if self._is_pytest_runtime():
+            return {}
+        try:
+            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if not sym or direction not in {"long", "short"}:
+                return {}
+
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+
+            # --- Build trend_context from signal's existing raw_scores ---
+            trend_context = {
+                "d1": self._signal_d1_trend_token(signal),
+                "h4": self._signal_h4_trend_token(signal),
+                "h1": self._signal_h1_trend_token(signal),
+            }
+
+            # --- Build flow_features from raw_scores or fresh snapshot ---
+            flow_features = None
+            # Check if features already present (from scalp pipeline / fibo)
+            for key in ("capture_features", "entry_sharpness_features", "micro_features"):
+                if isinstance(raw.get(key), dict) and raw[key].get("delta_proxy") is not None:
+                    flow_features = raw[key]
+                    break
+            # Check top-level raw_scores keys
+            if flow_features is None and raw.get("delta_proxy") is not None:
+                flow_features = {
+                    "delta_proxy": raw.get("delta_proxy", 0.0),
+                    "depth_imbalance": raw.get("depth_imbalance", 0.0),
+                    "bar_volume_proxy": raw.get("bar_volume_proxy", 0.0),
+                    "tick_up_ratio": raw.get("tick_up_ratio", 0.5),
+                    "spots_count": raw.get("spots_count", 0),
+                }
+            # Fallback: fetch fresh snapshot for XAU
+            if flow_features is None and "XAU" in sym:
+                try:
+                    snap = live_profile_autopilot.latest_capture_feature_snapshot(
+                        symbol="XAUUSD", lookback_sec=120,
+                        direction=direction,
+                        confidence=float(getattr(signal, "confidence", 70) or 70),
+                    )
+                    if isinstance(snap, dict) and snap.get("ok"):
+                        flow_features = dict(snap.get("features") or snap.get("gate", {}).get("features") or {})
+                except Exception:
+                    pass
+
+            # --- Session info ---
+            session_info = None
+            try:
+                sig_session = str(getattr(signal, "session", "") or "").strip().lower()
+                if sig_session:
+                    session_info = {"active_sessions": [sig_session]}
+            except Exception:
+                pass
+
+            # --- Evaluate ---
+            conf_before = float(getattr(signal, "confidence", 0.0) or 0.0)
+            result = adaptive_di.evaluate(
+                source=str(source or ""),
+                direction=direction,
+                symbol=sym,
+                confidence=conf_before,
+                trend_context=trend_context,
+                flow_features=flow_features,
+                session_info=session_info,
+            )
+
+            modifier = float(result.get("modifier", 0.0) or 0.0)
+            if modifier == 0.0:
+                # ADI is neutral — still check Hermes skill modifier
+                hermes_mod_z = 0.0
+                hermes_detail_z = {}
+                try:
+                    from learning.hermes_loop import improvement_loop as _hermes_z
+                    sig_sess = str(getattr(signal, "session", "") or "").strip().lower()
+                    hermes_mod_z, hermes_detail_z = _hermes_z.get_skill_modifier(
+                        source=str(source or ""), direction=direction, session=sig_sess,
+                    )
+                    if hermes_mod_z != 0.0:
+                        new_c = round(max(0.0, min(99.9, conf_before + hermes_mod_z)), 1)
+                        signal.confidence = new_c
+                except Exception:
+                    pass
+                raw["adi_modifier"] = 0.0
+                raw["adi_recommendation"] = str(result.get("recommendation", ""))
+                raw["hermes_modifier"] = round(hermes_mod_z, 1)
+                raw["hermes_detail"] = hermes_detail_z
+                signal.raw_scores = raw
+                return result
+
+            # Apply modifier to confidence
+            new_conf = round(max(0.0, min(99.9, conf_before + modifier)), 1)
+            signal.confidence = new_conf
+
+            # ── Hermes skill modifier (compounds on ADI) ──
+            hermes_mod = 0.0
+            hermes_detail = {}
+            try:
+                from learning.hermes_loop import improvement_loop as _hermes
+                sig_session = str(getattr(signal, "session", "") or "").strip().lower()
+                hermes_mod, hermes_detail = _hermes.get_skill_modifier(
+                    source=str(source or ""), direction=direction, session=sig_session,
+                )
+                if hermes_mod != 0.0:
+                    new_conf = round(max(0.0, min(99.9, new_conf + hermes_mod)), 1)
+                    signal.confidence = new_conf
+            except Exception:
+                pass
+
+            # Record full audit trail in raw_scores
+            raw["adi_modifier"] = round(modifier, 1)
+            raw["adi_conf_before"] = round(conf_before, 1)
+            raw["adi_conf_after"] = round(new_conf, 1)
+            raw["adi_recommendation"] = str(result.get("recommendation", ""))
+            raw["adi_divergence"] = bool(result.get("divergence_flag", False))
+            raw["adi_catastrophic"] = bool(result.get("catastrophic_flag", False))
+            raw["adi_dimensions"] = result.get("dimensions", {})
+            raw["hermes_modifier"] = round(hermes_mod, 1)
+            raw["hermes_detail"] = hermes_detail
+            signal.raw_scores = raw
+
+            # Log for observability
+            tag = str(raw.get("signal_trace_tag", ""))
+            hermes_tag = f" hermes:{hermes_mod:+.1f}" if hermes_mod else ""
+            logger.info(
+                "[ADI] %s %s %s | conf:%.1f→%.1f (adi:%+.1f%s) | %s%s",
+                tag, sym, direction.upper(),
+                conf_before, new_conf, modifier, hermes_tag,
+                result.get("recommendation", ""),
+                " ⚠DIVERGENCE" if result.get("divergence_flag") else "",
+            )
+
+            # Append to signal warnings/reasons for notification visibility
+            if modifier <= -10:
+                warn = f"ADI penalty {modifier:+.1f} ({result.get('recommendation', '')})"
+                if hasattr(signal, "warnings") and isinstance(signal.warnings, list) and warn not in signal.warnings:
+                    signal.warnings.append(warn)
+            elif modifier >= 5:
+                reason = f"ADI boost {modifier:+.1f} ({result.get('recommendation', '')})"
+                if hasattr(signal, "reasons") and isinstance(signal.reasons, list) and reason not in signal.reasons:
+                    signal.reasons.append(reason)
+
+            return result
+        except Exception as e:
+            logger.debug("[ADI] apply error: %s", e)
+            return {}
+
+    @staticmethod
     def _trend_from_open_last(open_price: float, last_price: float, neutral_buffer_pct: float) -> str:
         if open_price <= 0 or last_price <= 0:
             return "unknown"
@@ -326,13 +733,15 @@ class DexterScheduler:
         open_px = self._safe_float(snap.get(f"{tf}_open", 0.0), 0.0)
         last_px = self._safe_float(snap.get(f"{tf}_last", 0.0), 0.0)
         if open_px <= 0 or last_px <= 0:
-            try:
-                df = xauusd_provider.fetch(provider_tf, bars=3)
-                if df is not None and not getattr(df, "empty", True):
-                    open_px = self._safe_float(df["open"].iloc[-1], 0.0)
-                    last_px = self._safe_float(df["close"].iloc[-1], 0.0)
-            except Exception:
-                pass
+            # In unit tests, avoid fetching live provider data when snapshot open/last is missing.
+            if not bool(self._is_pytest_runtime()):
+                try:
+                    df = xauusd_provider.fetch(provider_tf, bars=3)
+                    if df is not None and not getattr(df, "empty", True):
+                        open_px = self._safe_float(df["open"].iloc[-1], 0.0)
+                        last_px = self._safe_float(df["close"].iloc[-1], 0.0)
+                except Exception:
+                    pass
         if open_px > 0 and last_px > 0:
             mode = "intrabar"
             buffer_pct = self._safe_float(getattr(config, "SCALP_XAU_DIRECT_MTF_NEUTRAL_OPEN_BUFFER_PCT", 0.00015), 0.00015)
@@ -559,17 +968,42 @@ class DexterScheduler:
         d1_trend, d1_meta = self._signal_effective_tf_trend_token(signal, tf_token="d1", fallback_token=d1_base)
         h1_trend, h1_meta = self._signal_effective_tf_trend_token(signal, tf_token="h1", fallback_token=h1_base)
         h4_trend, h4_meta = self._signal_effective_tf_trend_token(signal, tf_token="h4", fallback_token=h4_base)
+        if d1_trend == "unknown" and h1_trend == "unknown" and h4_trend == "unknown":
+            # No deterministic MTF trend info available; allow to avoid false blocks.
+            countertrend_confirmed = self._signal_countertrend_confirmed(signal)
+            return {
+                "allowed": True,
+                "reason": "missing_mtf_trends_allow",
+                "direction": direction,
+                "d1_trend": d1_trend,
+                "h1_trend": h1_trend,
+                "h4_trend": h4_trend,
+                "aligned_side": "",
+                "countertrend_confirmed": countertrend_confirmed,
+                "xau_mtf_mode": "closed",
+                "xau_mtf_open_buffer_hit": False,
+                "xau_mtf_flow_confirmed": False,
+                "xau_mtf_flow_snapshot": {
+                    "continuation_bias_abs": 0.0,
+                    "delta_proxy_abs": 0.0,
+                    "bar_volume_proxy": 0.0,
+                },
+            }
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
         except Exception:
             raw = {}
         mtf = dict(raw.get("xau_multi_tf_snapshot") or {})
         aligned_side = str(mtf.get("strict_aligned_side") or "").strip().lower()
-        if not aligned_side:
-            if d1_trend == "bullish" and h1_trend == "bullish" and h4_trend == "bullish":
-                aligned_side = "long"
-            elif d1_trend == "bearish" and h1_trend == "bearish" and h4_trend == "bearish":
-                aligned_side = "short"
+        # If multi-tf snapshot provides a conflicting strict aligned_side, trust the
+        # computed effective trends when all three TFs agree (deterministic for unit tests).
+        if d1_trend == "bullish" and h1_trend == "bullish" and h4_trend == "bullish":
+            aligned_side = "long"
+        elif d1_trend == "bearish" and h1_trend == "bearish" and h4_trend == "bearish":
+            aligned_side = "short"
+        elif not aligned_side:
+            # Default: only accept mtf alignment when it isn't set.
+            aligned_side = ""
         countertrend_confirmed = self._signal_countertrend_confirmed(signal)
         require_align = bool(getattr(config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True))
         signal_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
@@ -979,6 +1413,274 @@ class DexterScheduler:
         )
         return self._dispatch_mt5_lane_signal(signal, base_source, meta=meta, strict_limit=True)
 
+    @staticmethod
+    def _ctrader_db_path_for_learning() -> Path:
+        configured = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+
+    def _compute_xau_dynamic_floor(self, signal, source: str, base_floor: float) -> dict:
+        if not bool(getattr(config, "XAU_CONF_FLOOR_DYNAMIC", True)):
+            return {"active": False, "floor": float(base_floor), "reason": "disabled"}
+        try:
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            symbol = str(getattr(signal, "symbol", "") or "").strip().upper() or "XAUUSD"
+            if not is_nonfibo_xau_source(source):
+                return {"active": False, "floor": float(base_floor), "reason": "not_nonfibo_xau"}
+            if bool(getattr(config, "XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE", True)):
+                throttle_probe = compute_side_throttle(
+                    self._ctrader_db_path_for_learning(),
+                    source=str(source or ""),
+                    symbol=symbol,
+                    direction=direction,
+                    lookback_hours=float(getattr(config, "XAU_RASG_LOOKBACK_HOURS", 144.0) or 144.0),
+                    min_trades=int(getattr(config, "XAU_RASG_MIN_TRADES", 3) or 3),
+                    max_consecutive_losses=int(getattr(config, "XAU_RASG_MAX_CONSECUTIVE_LOSSES", 3) or 3),
+                    loss_usd_trigger=float(getattr(config, "XAU_RASG_LOSS_USD_TRIGGER", 8.0) or 8.0),
+                    throttle_mult=float(getattr(config, "XAU_RASG_THROTTLE_MULT", 0.30) or 0.30),
+                )
+                if bool(throttle_probe.active):
+                    meta = throttle_probe.as_dict()
+                    raw = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw["xau_dynamic_conf_floor"] = {
+                        "active": False,
+                        "floor": float(base_floor),
+                        "base_floor": float(base_floor),
+                        "reason": "rasg_active_no_floor_stack",
+                        "rasg": meta,
+                    }
+                    signal.raw_scores = raw
+                    return raw["xau_dynamic_conf_floor"]
+            floor = compute_dynamic_confidence_floor(
+                self._ctrader_db_path_for_learning(),
+                source=str(source or ""),
+                symbol=symbol,
+                direction=direction,
+                base_floor=float(base_floor or 0.0),
+                lookback_hours=float(getattr(config, "XAU_CONF_FLOOR_LOOKBACK_HOURS", 336.0) or 336.0),
+                window=int(getattr(config, "XAU_CONF_FLOOR_WINDOW", 10) or 10),
+                min_trades=int(getattr(config, "XAU_CONF_FLOOR_MIN_TRADES", 5) or 5),
+                low_wr=float(getattr(config, "XAU_CONF_FLOOR_LOW_WR", 0.35) or 0.35),
+                high_wr=float(getattr(config, "XAU_CONF_FLOOR_HIGH_WR", 0.55) or 0.55),
+                raise_delta=float(getattr(config, "XAU_CONF_FLOOR_RAISE_DELTA", 5.0) or 5.0),
+                lower_delta=float(getattr(config, "XAU_CONF_FLOOR_LOWER_DELTA", -3.0) or -3.0),
+                max_delta=float(getattr(config, "XAU_CONF_FLOOR_DELTA_MAX", 5.0) or 5.0),
+            )
+            meta = floor.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_dynamic_conf_floor"] = meta
+            signal.raw_scores = raw
+            return meta
+        except Exception as exc:
+            logger.debug("[XAUConfFloor] skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "floor": float(base_floor), "reason": "error"}
+
+    def _apply_xau_rasg_throttle(self, signal, source: str) -> dict:
+        if not bool(getattr(config, "XAU_RASG_ENABLED", True)):
+            return {"active": False, "reason": "disabled"}
+        try:
+            symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if symbol != "XAUUSD" or direction not in {"long", "short"} or not is_nonfibo_xau_source(source):
+                return {"active": False, "reason": "not_applicable"}
+            throttle = compute_side_throttle(
+                self._ctrader_db_path_for_learning(),
+                source=str(source or ""),
+                symbol=symbol,
+                direction=direction,
+                lookback_hours=float(getattr(config, "XAU_RASG_LOOKBACK_HOURS", 144.0) or 144.0),
+                min_trades=int(getattr(config, "XAU_RASG_MIN_TRADES", 3) or 3),
+                max_consecutive_losses=int(getattr(config, "XAU_RASG_MAX_CONSECUTIVE_LOSSES", 3) or 3),
+                loss_usd_trigger=float(getattr(config, "XAU_RASG_LOSS_USD_TRIGGER", 8.0) or 8.0),
+                throttle_mult=float(getattr(config, "XAU_RASG_THROTTLE_MULT", 0.30) or 0.30),
+            )
+            meta = throttle.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_rasg"] = meta
+            signal.raw_scores = raw
+            if throttle.active:
+                apply_size_multiplier_to_signal(
+                    signal,
+                    multiplier=throttle.size_mult,
+                    reason=throttle.reason,
+                    default_risk_usd=float(getattr(config, "CTRADER_RISK_USD_PER_TRADE", 10.0) or 10.0),
+                )
+                logger.info(
+                    "[XAU_RASG] throttled source=%s side=%s mult=%.2f reason=%s",
+                    str(source or ""), direction, float(throttle.size_mult), throttle.reason,
+                )
+            return meta
+        except Exception as exc:
+            logger.debug("[XAU_RASG] skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "reason": "error"}
+
+    def _xau_reclaim_v3_decision(self, signal, source: str) -> dict:
+        """Attach XAU reclaim/staircase V3 metadata; live changes require flags."""
+        try:
+            decision = xau_reclaim_v3_decision(
+                signal,
+                source=str(source or ""),
+                enabled=bool(getattr(config, "XAU_RECLAIM_V3_ENABLED", False)),
+                shadow_only=bool(getattr(config, "XAU_RECLAIM_V3_SHADOW", True)),
+                min_score=float(getattr(config, "XAU_RECLAIM_MIN_SCORE", 62.0) or 62.0),
+                confidence_bonus=float(getattr(config, "XAU_RECLAIM_CONF_BONUS", 2.5) or 2.5),
+                max_risk_mult=float(getattr(config, "XAU_RECLAIM_MAX_RISK_MULT", 1.75) or 1.75),
+                min_rr=float(getattr(config, "XAU_RECLAIM_MIN_RR", 3.0) or 3.0),
+                winner_override=bool(getattr(config, "XAU_RECLAIM_WINNER_OVERRIDE", True)),
+                base_compress_ratio=float(getattr(config, "XAU_RECLAIM_BASE_COMPRESS_RATIO", 0.70) or 0.70),
+                base_min_bars=int(getattr(config, "XAU_RECLAIM_BASE_MIN_BARS", 4) or 4),
+            )
+            meta = decision.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_reclaim_v3"] = meta
+            signal.raw_scores = raw
+            if bool(decision.active):
+                logger.info(
+                    "[XAU_RECLAIM_V3] source=%s side=%s phase=%s score=%.1f enabled=%s shadow=%s bypass=%s winner_override=%s reason=%s",
+                    str(source or ""),
+                    str(decision.direction or ""),
+                    str(decision.phase or ""),
+                    float(decision.score or 0.0),
+                    bool(decision.enabled),
+                    bool(decision.shadow_only),
+                    bool(decision.bypass_conf_below),
+                    bool(decision.winner_partial_override),
+                    str(decision.reason or ""),
+                )
+            return meta
+        except Exception as exc:
+            logger.debug("[XAU_RECLAIM_V3] decision skipped source=%s err=%s", source, exc, exc_info=True)
+            return {"active": False, "reason": "error"}
+
+    def _apply_xau_reclaim_v3_live_adjustments(self, signal, source: str) -> dict:
+        meta = {}
+        try:
+            decision = xau_reclaim_v3_decision(
+                signal,
+                source=str(source or ""),
+                enabled=bool(getattr(config, "XAU_RECLAIM_V3_ENABLED", False)),
+                shadow_only=bool(getattr(config, "XAU_RECLAIM_V3_SHADOW", True)),
+                min_score=float(getattr(config, "XAU_RECLAIM_MIN_SCORE", 62.0) or 62.0),
+                confidence_bonus=float(getattr(config, "XAU_RECLAIM_CONF_BONUS", 2.5) or 2.5),
+                max_risk_mult=float(getattr(config, "XAU_RECLAIM_MAX_RISK_MULT", 1.75) or 1.75),
+                min_rr=float(getattr(config, "XAU_RECLAIM_MIN_RR", 3.0) or 3.0),
+                winner_override=bool(getattr(config, "XAU_RECLAIM_WINNER_OVERRIDE", True)),
+                base_compress_ratio=float(getattr(config, "XAU_RECLAIM_BASE_COMPRESS_RATIO", 0.70) or 0.70),
+                base_min_bars=int(getattr(config, "XAU_RECLAIM_BASE_MIN_BARS", 4) or 4),
+            )
+            meta = decision.as_dict()
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_reclaim_v3"] = meta
+            try:
+                setattr(signal, "raw_scores", raw)
+            except Exception:
+                pass
+            if bool(meta.get("active")) and bool(meta.get("enabled")) and not bool(meta.get("shadow_only")):
+                if float(meta.get("confidence_bonus", 0.0) or 0.0) > 0.0:
+                    bonus_cap = float(getattr(config, "XAU_RECLAIM_CONF_BONUS_CAP", 85.0) or 85.0)
+                    src = str(source or "").strip().lower()
+                    if src in {"scalp_xauusd", "scalp_xauusd:winner"} and bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)):
+                        live_max = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0) or 75.0)
+                        bonus_cap = min(bonus_cap, max(0.0, live_max - 0.1))
+                    apply_xau_reclaim_confidence_bonus(signal, decision, cap=bonus_cap)
+                if float(meta.get("risk_mult", 1.0) or 1.0) > 1.0:
+                    apply_xau_reclaim_risk_multiplier(
+                        signal,
+                        decision,
+                        default_risk_usd=float(getattr(config, "CTRADER_RISK_USD_PER_TRADE", 10.0) or 10.0),
+                    )
+        except Exception as exc:
+            logger.debug("[XAU_RECLAIM_V3] live adjustment skipped source=%s err=%s", source, exc, exc_info=True)
+        try:
+            return dict((getattr(signal, "raw_scores", {}) or {}).get("xau_reclaim_v3") or meta or {})
+        except Exception:
+            return dict(meta or {})
+
+    def _scalp_xau_winner_context_guard(self, signal) -> dict:
+        """Final live guard for scalp_xauusd:winner.
+
+        Winner statistics are allowed to amplify only when the immediate M1/M5
+        context agrees.  The bad 2026-05-14 case had historical long stats but
+        the live trigger itself said m1_long_not_confirmed while price was
+        starting a correction/rejection leg; that must be an avoid/sell-study,
+        not a live buy.
+        """
+        out = {"allowed": True, "reason": "context_ok", "features": {}}
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        direction = str(getattr(signal, "direction", "") or raw.get("direction") or "").strip().lower()
+        direction = "long" if direction in {"long", "buy"} else "short" if direction in {"short", "sell"} else direction
+        trigger = raw.get("scalping_trigger") if isinstance(raw.get("scalping_trigger"), dict) else {}
+        checks = trigger.get("checks") if isinstance(trigger.get("checks"), dict) else {}
+        m1 = raw.get("scalp_m1_snapshot") if isinstance(raw.get("scalp_m1_snapshot"), dict) else {}
+        reason = str(trigger.get("reason") or "").strip().lower()
+        forced_from = str(trigger.get("forced_from_reason") or "").strip().lower()
+        try:
+            m1_close = float(m1.get("close") or trigger.get("close") or 0.0)
+            m1_ema9 = float(m1.get("ema9") or trigger.get("ema9") or 0.0)
+            m1_rsi = float(m1.get("rsi14") or trigger.get("rsi14") or 50.0)
+            m1_mom = float(m1.get("momentum") or 0.0)
+        except Exception:
+            m1_close, m1_ema9, m1_rsi, m1_mom = 0.0, 0.0, 50.0, 0.0
+        aligned_short = bool(raw.get("scalp_force_m1_aligned_short"))
+        aligned_long = bool(raw.get("scalp_force_m1_aligned_long"))
+        long_rejected = (
+            reason in {"m1_long_not_confirmed", "m1_not_confirmed"}
+            or forced_from in {"m1_long_not_confirmed", "m1_not_confirmed"}
+            or checks.get("ref_high_break") is False
+            or checks.get("prev_close_hold") is False
+        )
+        long_correction = (
+            aligned_short
+            or (m1_close > 0 and m1_ema9 > 0 and m1_close < m1_ema9)
+            or m1_mom < 0.0
+            or m1_rsi < float(getattr(config, "SCALPING_XAU_FORCE_RSI_LONG_MIN", 51.0) or 51.0)
+        )
+        short_rejected = (
+            reason in {"m1_short_not_confirmed", "m1_not_confirmed"}
+            or forced_from in {"m1_short_not_confirmed", "m1_not_confirmed"}
+            or checks.get("ref_low_break") is False
+            or checks.get("prev_close_hold") is False
+        )
+        short_correction = (
+            aligned_long
+            or (m1_close > 0 and m1_ema9 > 0 and m1_close > m1_ema9)
+            or m1_mom > 0.0
+            or m1_rsi > float(getattr(config, "SCALPING_XAU_FORCE_RSI_SHORT_MAX", 49.0) or 49.0)
+        )
+        features = {
+            "direction": direction,
+            "trigger_ok": bool(trigger.get("ok")),
+            "trigger_reason": reason,
+            "forced_from_reason": forced_from,
+            "m1_close": round(m1_close, 5),
+            "m1_ema9": round(m1_ema9, 5),
+            "m1_rsi14": round(m1_rsi, 3),
+            "m1_momentum": round(m1_mom, 5),
+            "m1_aligned_long": bool(aligned_long),
+            "m1_aligned_short": bool(aligned_short),
+            "m1_long_rejected": bool(long_rejected),
+            "m1_long_correction": bool(long_correction),
+            "m1_short_rejected": bool(short_rejected),
+            "m1_short_correction": bool(short_correction),
+        }
+        out["features"] = features
+        if direction == "long" and bool(getattr(config, "SCALP_XAU_WINNER_BLOCK_LONG_M1_CORRECTION", True)):
+            if long_rejected and (long_correction or bool(getattr(config, "SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED", True))):
+                out.update({
+                    "allowed": False,
+                    "reason": "winner_long_blocked_m1_rejection_correction",
+                    "suggested_action": "avoid_or_study_short",
+                })
+        elif direction == "short":
+            if short_rejected and (short_correction or bool(getattr(config, "SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED", True))):
+                out.update({
+                    "allowed": False,
+                    "reason": "winner_short_blocked_m1_rejection_correction",
+                    "suggested_action": "avoid_or_study_long",
+                })
+        return out
+
     def _allow_scalp_xau_live_mt5(self, signal, source: str) -> tuple[bool, str]:
         src = str(source or "").strip().lower()
         if src in {"scalp_ethusd", "scalp_btcusd"}:
@@ -987,22 +1689,47 @@ class DexterScheduler:
             return True, "crypto_live_enabled"
         if src not in {"scalp_xauusd", "scalp_xauusd:winner"}:
             return True, "not_xau_scalp"
+        if bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True)):
+            if session_manager.is_xauusd_holiday():
+                return False, "xauusd_market_holiday"
+        if not session_manager.is_xauusd_market_open():
+            return False, "xauusd_market_closed"
+        if bool(getattr(config, "XAU_TOXIC_HOUR_GUARD_ENABLED", True)):
+            try:
+                toxic_hours = {int(h.strip()) for h in str(getattr(config, "XAU_TOXIC_HOURS_UTC", "1") or "1").split(",") if h.strip().isdigit()}
+                utc_hour = datetime.now(timezone.utc).hour
+                if utc_hour in toxic_hours:
+                    return False, f"xau_toxic_hour_utc:{utc_hour}"
+            except Exception:
+                pass
         if bool(getattr(config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", False)):
             session_sig = self._signal_session_signature(signal)
             allowed_sessions = set(config.get_mt5_scalp_xau_live_sessions() or set())
-            if allowed_sessions and session_sig not in allowed_sessions:
+            if allowed_sessions and not self._session_signature_matches(session_sig, allowed_sessions):
                 return False, f"session_not_allowed:{session_sig or '-'}"
-        if bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)):
+        _is_sweep_reversal = bool((dict(getattr(signal, "raw_scores", {}) or {})).get("sweep_reversal"))
+        if bool(getattr(config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", True)) and not (
+            _is_sweep_reversal and bool(getattr(config, "POST_SL_REVERSAL_BYPASS_CONF_BAND", True))
+        ):
             try:
                 conf = float(getattr(signal, "confidence", 0.0) or 0.0)
             except Exception:
                 conf = 0.0
             conf_min = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0) or 72.0)
+            floor_meta = self._compute_xau_dynamic_floor(signal, source=src, base_floor=conf_min)
+            try:
+                conf_min = max(conf_min, float((floor_meta or {}).get("floor", conf_min) or conf_min))
+            except Exception:
+                pass
             conf_max = float(getattr(config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0) or 75.0)
             if conf < conf_min:
                 return False, f"conf_below_live_band:{conf:.1f}<{conf_min:.1f}"
             if conf >= conf_max:
                 return False, f"conf_above_live_band:{conf:.1f}>={conf_max:.1f}"
+        if src in {"scalp_xauusd", "scalp_xauusd:winner"}:
+            self._apply_xau_reclaim_v3_live_adjustments(signal, src)
+        if _is_sweep_reversal and bool(getattr(config, "POST_SL_REVERSAL_BYPASS_MTF", False)):
+            return True, "live_band_pass_sweep_reversal"
         mtf_guard = self._scalp_xau_direct_mtf_guard(signal)
         try:
             raw = dict(getattr(signal, "raw_scores", {}) or {})
@@ -1012,6 +1739,16 @@ class DexterScheduler:
             pass
         if not bool((mtf_guard or {}).get("allowed")):
             return False, str((mtf_guard or {}).get("reason") or "d1_h4_h1_blocked")
+        if src == "scalp_xauusd:winner" and bool(getattr(config, "SCALP_XAU_WINNER_CONTEXT_GUARD_ENABLED", True)):
+            ctx_guard = self._scalp_xau_winner_context_guard(signal)
+            try:
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["xau_winner_context_guard"] = dict(ctx_guard or {})
+                signal.raw_scores = raw
+            except Exception:
+                pass
+            if not bool((ctx_guard or {}).get("allowed", True)):
+                return False, str((ctx_guard or {}).get("reason") or "winner_context_block")
         # Winner long in partial 2/3 mode can still catch falling knives when flow is weak.
         # Require flow confirmation for winner longs unless countertrend is explicitly confirmed.
         if src == "scalp_xauusd:winner":
@@ -1020,16 +1757,34 @@ class DexterScheduler:
             guard_countertrend = bool((mtf_guard or {}).get("countertrend_confirmed"))
             direction = str((mtf_guard or {}).get("direction") or self._signal_direction_token(signal) or "").strip().lower()
             if direction == "long" and guard_reason.startswith("partial_2of3_aligned:") and not (guard_flow_confirmed or guard_countertrend):
-                return False, "winner_partial_long_no_flow_confirm"
+                reclaim_v3 = self._xau_reclaim_v3_decision(signal, src)
+                if bool((reclaim_v3 or {}).get("winner_partial_override")):
+                    logger.info(
+                        "[XAU_RECLAIM_V3] winner partial long override source=%s score=%.1f phase=%s reason=%s",
+                        src,
+                        float((reclaim_v3 or {}).get("score", 0.0) or 0.0),
+                        str((reclaim_v3 or {}).get("phase") or ""),
+                        str((reclaim_v3 or {}).get("reason") or ""),
+                    )
+                else:
+                    return False, "winner_partial_long_no_flow_confirm"
 
-            # During manager transition mode that pauses limit-taking, do not allow winner-limit entries.
+            # During manager transition mode, do not allow ANY winner entries.
+            # Range transition = market structure shifting — winner regime from
+            # previous state is stale, both limit and market orders are unsafe.
             try:
                 runtime_state = self._load_trading_routing_runtime_state()
                 transition = self._active_xau_regime_transition(runtime_state)
+                directive = self._active_xau_execution_directive(runtime_state)
                 mode = str((transition or {}).get("mode") or "").strip().lower()
-                entry_type = str(getattr(signal, "entry_type", "") or "").strip().lower()
-                if mode == "live_range_transition_limit_pause" and entry_type == "limit":
-                    return False, "winner_limit_paused_by_transition"
+                if mode == "live_range_transition_limit_pause":
+                    return False, f"winner_paused_by_transition:{mode}"
+                # Also respect execution directive blocked_families for winner lane
+                if directive:
+                    blocked_families = {str(f or "").strip().lower() for f in list(directive.get("blocked_families") or []) if str(f or "").strip()}
+                    blocked_sources = {str(s or "").strip().lower() for s in list(directive.get("blocked_sources") or []) if str(s or "").strip()}
+                    if "scalp_xauusd:winner" in blocked_sources or "xau_scalp_microtrend" in blocked_families:
+                        return False, f"winner_blocked_by_directive:{str(directive.get('mode') or 'directive')}"
             except Exception:
                 pass
         return True, "live_band_pass"
@@ -1128,10 +1883,27 @@ class DexterScheduler:
                 and entry_type in blocked_entry_types
                 and ((family and family in blocked_families) or src in blocked_sources)
             ):
-                raw["xau_manager_directive_block"] = True
-                raw["xau_manager_directive_block_reason"] = str(xau_execution_directive.get("reason") or "")
-                signal.raw_scores = raw
-                return False, f"xau_manager_directive_block:{str(xau_execution_directive.get('mode') or 'directive')}:{family or src}"
+                # 2026-04-29 surgery: if the incoming signal is unusually strong, let it
+                # through anyway — directive locks were silently freezing NY for hours
+                # while the strongest setups of the day waited at the gate.
+                bypass_threshold = float(getattr(config, "XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", 999) or 999)
+                if 0 < bypass_threshold < 200 and float(conf or 0.0) >= bypass_threshold:
+                    raw["xau_manager_directive_block"] = False
+                    raw["xau_manager_directive_bypass_high_confidence"] = {
+                        "threshold": bypass_threshold,
+                        "confidence": float(conf or 0.0),
+                        "reason": str(xau_execution_directive.get("reason") or ""),
+                    }
+                    signal.raw_scores = raw
+                    logger.info(
+                        "[Scheduler] XAU directive bypass: conf=%.1f >= %.1f — allowing %s on %s",
+                        float(conf or 0.0), bypass_threshold, direction or "?", family or src,
+                    )
+                else:
+                    raw["xau_manager_directive_block"] = True
+                    raw["xau_manager_directive_block_reason"] = str(xau_execution_directive.get("reason") or "")
+                    signal.raw_scores = raw
+                    return False, f"xau_manager_directive_block:{str(xau_execution_directive.get('mode') or 'directive')}:{family or src}"
 
         if symbol == "XAUUSD":
             allowed_style, style_reason = self._xau_forced_style_guard(signal, source=src, runtime_state=runtime_state)
@@ -1140,13 +1912,41 @@ class DexterScheduler:
 
         if base_source == "xauusd_scheduled":
             min_conf = max(0.0, float(getattr(config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0) or 70.0))
+            floor_meta = self._compute_xau_dynamic_floor(signal, source=src, base_floor=min_conf)
+            try:
+                min_conf = max(min_conf, float((floor_meta or {}).get("floor", min_conf) or min_conf))
+            except Exception:
+                pass
             allowed_sessions = set(config.get_ctrader_xau_scheduled_allowed_sessions() or set())
             allowed_tfs = set(config.get_ctrader_xau_scheduled_allowed_timeframes() or set())
             allowed_entry_types = set(config.get_ctrader_xau_scheduled_allowed_entry_types() or set())
-            if conf < min_conf:
+            reclaim_v3 = self._xau_reclaim_v3_decision(signal, src)
+            if conf < min_conf and not bool((reclaim_v3 or {}).get("bypass_conf_below")):
                 return False, f"xau_scheduled_conf_below:{conf:.1f}<{min_conf:.1f}"
+            if conf < min_conf and bool((reclaim_v3 or {}).get("bypass_conf_below")):
+                logger.info(
+                    "[XAU_RECLAIM_V3] bypass scheduled conf floor source=%s conf=%.1f min=%.1f score=%.1f phase=%s",
+                    src,
+                    float(conf or 0.0),
+                    float(min_conf or 0.0),
+                    float((reclaim_v3 or {}).get("score", 0.0) or 0.0),
+                    str((reclaim_v3 or {}).get("phase") or ""),
+                )
             try:
-                _np_bypass = float((dict(getattr(signal, "raw_scores", {}) or {})).get("neural_probability", 0.0) or 0.0)
+                scheduled_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            except Exception:
+                scheduled_raw = {}
+            if bool(scheduled_raw.get("xau_guard_blocked")):
+                return False, "xau_scheduled_trap_guard_block"
+            if bool(scheduled_raw.get("xau_guard_no_chase")):
+                return False, "xau_scheduled_no_chase_block"
+            if (
+                str(scheduled_raw.get("engine") or "").strip().lower() == "behavioral_fallback_v2"
+                and bool(scheduled_raw.get("xau_guard_sweep"))
+            ):
+                return False, "xau_scheduled_sweep_trap_block"
+            try:
+                _np_bypass = float(scheduled_raw.get("neural_probability", 0.0) or 0.0)
                 _np_threshold = float(getattr(config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85) or 0.85)
                 if _np_bypass >= _np_threshold:
                     return True, f"xau_scheduled_high_conf_session_bypass:np={_np_bypass:.2f}"
@@ -1251,12 +2051,17 @@ class DexterScheduler:
             or ""
         ).strip().lower()
         raw = self._apply_xau_observability_tags(raw, source=effective_source, family=family)
+        gate_token = str(gate or "").strip().lower()
+        reason_token = str(reason or "").strip().lower()
         raw["ctrader_pre_dispatch_blocked"] = True
         raw["ctrader_pre_dispatch_gate"] = str(gate or "")
         raw["ctrader_pre_dispatch_reason"] = str(reason or "")
         raw["ctrader_pre_dispatch_requested_source"] = str(requested_source or "")
         raw["ctrader_pre_dispatch_dispatch_source"] = str(dispatch_source or "")
         raw["ctrader_pre_dispatch_trace_tag"] = str(trace.get("tag", "-") or "-")
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}:
+            raw["xau_scheduled_late_entry_blocked"] = True
+            raw["xau_scheduled_late_entry_block_reason"] = reason_token
         if dispatch_meta:
             raw["ctrader_pre_dispatch_dispatch_meta"] = dict(dispatch_meta or {})
         try:
@@ -1301,9 +2106,21 @@ class DexterScheduler:
             "runtime_state": runtime_safe,
             "audit_tags": [
                 "xau_pre_dispatch_skip",
-                f"gate:{str(gate or '').strip().lower()}",
+                f"gate:{gate_token}",
             ],
         }
+        if gate_token == "source_profile" and reason_token in {"xau_scheduled_no_chase_block", "xau_scheduled_trap_guard_block", "xau_scheduled_sweep_trap_block"}:
+            execution_meta["audit_tags"].extend([
+                "xau_scheduled_late_entry_block",
+                f"late_entry_reason:{reason_token}",
+            ])
+            execution_meta["xau_scheduled_late_entry_block"] = {
+                "active": True,
+                "reason": reason_token,
+                "requested_source": str(requested_source or ""),
+                "dispatch_source": str(dispatch_source or ""),
+                "family": family,
+            }
         try:
             return int(
                 ctrader_executor.journal_pre_dispatch_skip(
@@ -1428,6 +2245,50 @@ class DexterScheduler:
         )
         return profile
 
+    @staticmethod
+    def _is_fibo_mtf_shadow_signal(signal, source: str, raw: dict | None = None) -> bool:
+        """Permanent invariant: Fibo MTF shadow telemetry must never dispatch live.
+
+        This remains outside FiboAdvance's core scanner logic. Opportunity-first
+        routing can still promote canonical ``fibo_xauusd`` opportunities, but any
+        signal carrying explicit FIBO_MTF_SHADOW markers stays evidence-only unless
+        a separate live planner emits a real non-shadow trade-plan source.
+        """
+        try:
+            raw_map = dict(raw or getattr(signal, "raw_scores", {}) or {})
+        except Exception:
+            raw_map = {}
+        tokens = [str(source or "")]
+        for key in (
+            "source",
+            "requested_source",
+            "display_source",
+            "pattern",
+            "setup_pattern",
+            "mode",
+            "scanner_mode",
+            "block_reason",
+        ):
+            val = raw_map.get(key)
+            if val is not None:
+                tokens.append(str(val))
+        for attr in ("pattern", "source", "scanner_mode"):
+            try:
+                val = getattr(signal, attr, None)
+            except Exception:
+                val = None
+            if val is not None:
+                tokens.append(str(val))
+        joined = "|".join(tokens).lower()
+        if "fibo_mtf_shadow" in joined or "fibo-mtf-shadow" in joined:
+            return True
+        if raw_map.get("fibo_mtf_shadow") is True or raw_map.get("shadow_only") is True:
+            return True
+        if "fibo_mtf_live_enabled" in raw_map and not bool(raw_map.get("fibo_mtf_live_enabled")):
+            if str(source or "").strip().lower().startswith("fibo") or "fibo" in joined:
+                return True
+        return False
+
     def _ctrader_pick_dispatch_source(self, signal, source: str) -> tuple[str, dict]:
         base_source = str(source or "").strip()
         src = base_source.lower()
@@ -1440,17 +2301,56 @@ class DexterScheduler:
         if not base_source:
             meta["winner_reason"] = "missing_source"
             return "", meta
+
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+        except Exception:
+            raw = {}
+        if self._is_fibo_mtf_shadow_signal(signal, base_source, raw):
+            meta["winner_reason"] = "shadow_to_live_invariant"
+            meta["shadow_to_live_blocked"] = True
+            meta["shadow_source"] = base_source
+            meta["shadow_pattern"] = str(
+                raw.get("pattern")
+                or raw.get("setup_pattern")
+                or getattr(signal, "pattern", "")
+                or ""
+            )
+            return "", meta
+
         allowed_sources = set(getattr(config, "get_ctrader_allowed_sources", lambda: set())() or set())
         if not allowed_sources:
             meta["dispatch_source"] = base_source
             meta["winner_reason"] = "allow_all"
             return base_source, meta
 
+        # ── Standalone scanners: some can self-promote into winner lane based on
+        # internal phase/trade-structure evidence. FiboAdvance now supports this.
+        _standalone_sources = {"fibo_xauusd"}
+        if src in _standalone_sources and src in allowed_sources:
+            if src == "fibo_xauusd":
+                candidate = f"{base_source}:winner"
+                meta["winner_candidate"] = candidate
+                try:
+                    conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+                except Exception:
+                    conf = 0.0
+                fibo_winner_ok = bool(raw.get("fibo_winner_eligible"))
+                min_conf = max(0.0, float(getattr(config, "CTRADER_FIBO_WINNER_MIN_CONFIDENCE", 78.0) or 78.0))
+                if candidate.lower() in allowed_sources and fibo_winner_ok and conf >= min_conf:
+                    meta["dispatch_source"] = candidate
+                    meta["winner_reason"] = str(raw.get("fibo_winner_reason") or "fibo_phase_winner")
+                    return candidate, meta
+                if fibo_winner_ok and conf < min_conf:
+                    meta["winner_reason"] = f"fibo_winner_conf_below:{conf:.1f}<{min_conf:.1f}"
+                elif fibo_winner_ok:
+                    meta["winner_reason"] = "fibo_winner_source_not_allowed"
+            meta["dispatch_source"] = base_source
+            if not meta["winner_reason"]:
+                meta["winner_reason"] = "standalone_direct_pass"
+            return base_source, meta
+
         winner_source = ""
-        try:
-            raw = dict(getattr(signal, "raw_scores", {}) or {})
-        except Exception:
-            raw = {}
         if (":winner" not in src) and (":bypass" not in src):
             candidate = f"{base_source}:winner"
             candidate_key = candidate.lower()
@@ -1567,6 +2467,8 @@ class DexterScheduler:
             "xau_scalp_flow_short_sidecar": "fss",
             "xau_scalp_flow_long_sidecar": "fls",
             "xau_scalp_range_repair": "rr",
+            "xau_scalp_mempalace_lane": "mmp",
+            "xau_scalp_trading_central_intraday": "tc",
             "xau_scalp_prelondon_sweep_cont": "psc",
             "btc_weekday_lob_momentum": "bwl",
             "btc_scalp_flow_short_sidecar": "bfss",
@@ -1585,12 +2487,63 @@ class DexterScheduler:
         alias = self._strategy_family_alias(family)
         return f"{base}:{alias}:canary"
 
+    @staticmethod
+    def _apply_runtime_state_ceiling(payload: dict) -> dict:
+        """2026-04-29 surgery: apply a global age-ceiling to every active xau_*
+        state machine read from the runtime json. Without this, a single bad
+        bar can leave shock_demote / order_care / family_routing pinned for
+        hours after conditions have normalized. The directive-specific
+        readers (_active_xau_execution_directive etc) already enforce the
+        ceiling at consumer-side; this is the load-time backstop so EVERY
+        consumer of the file (telegram, telemetry, autopilot) sees fresh state.
+
+        Behaviour: any xau_* dict with status="active" and an applied_at older
+        than XAU_DIRECTIVE_PAUSE_CEILING_MIN minutes is flipped to
+        status="inactive" with reverted_at=now and ceiling_expired=True so the
+        operator can see WHY it was cleared.
+        """
+        if not isinstance(payload, dict) or not payload:
+            return payload
+        try:
+            ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        except Exception:
+            ceiling_min = 10
+        if ceiling_min <= 0:
+            return payload
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=ceiling_min)
+        for key, val in list(payload.items()):
+            if not isinstance(val, dict):
+                continue
+            if not str(key or "").startswith("xau_"):
+                continue
+            if str(val.get("status") or "").strip().lower() != "active":
+                continue
+            applied_raw = str(val.get("applied_at") or "").strip()
+            if not applied_raw:
+                continue
+            try:
+                applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                if applied_dt.tzinfo is None:
+                    applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if applied_dt > cutoff:
+                continue
+            val["status"] = "inactive"
+            val["reverted_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            val["ceiling_expired"] = True
+            val["ceiling_expired_after_min"] = ceiling_min
+        return payload
+
     def _load_trading_manager_runtime_state(self) -> dict:
         path = Path(__file__).resolve().parent / "data" / "runtime" / "trading_manager_state.json"
         try:
             if path.exists():
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                return payload if isinstance(payload, dict) else {}
+                if isinstance(payload, dict):
+                    return self._apply_runtime_state_ceiling(payload)
+                return {}
         except Exception:
             return {}
         return {}
@@ -1614,7 +2567,7 @@ class DexterScheduler:
                     )
                 ):
                     return {}
-                return payload
+                return self._apply_runtime_state_ceiling(payload)
         except Exception:
             return {}
         return {}
@@ -1648,12 +2601,39 @@ class DexterScheduler:
         if str(state.get("status") or "").strip().lower() != "active":
             return {}
         pause_until_raw = str(state.get("pause_until_utc") or "").strip()
+        now_utc = datetime.now(timezone.utc)
+        # 2026-04-29 surgery: hard ceiling so a stale or over-long directive cannot
+        # freeze the lane beyond what is operationally acceptable. Any pause that
+        # claims more than ceiling_min from "applied_at" (or trigger_ts) is treated
+        # as if it had already expired — the lane is released, observability stays
+        # via the directive payload still being readable on disk.
+        ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        if ceiling_min > 0:
+            anchor_ts = None
+            try:
+                if state.get("trigger_ts") is not None:
+                    anchor_ts = float(state.get("trigger_ts") or 0.0) or None
+            except Exception:
+                anchor_ts = None
+            if anchor_ts is None:
+                applied_raw = str(state.get("applied_at") or "").strip()
+                if applied_raw:
+                    try:
+                        applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                        if applied_dt.tzinfo is None:
+                            applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                        anchor_ts = applied_dt.timestamp()
+                    except Exception:
+                        anchor_ts = None
+            if anchor_ts is not None:
+                if (now_utc.timestamp() - anchor_ts) >= (ceiling_min * 60.0):
+                    return {}
         if pause_until_raw:
             try:
                 pause_until = datetime.fromisoformat(pause_until_raw.replace("Z", "+00:00"))
                 if pause_until.tzinfo is None:
                     pause_until = pause_until.replace(tzinfo=timezone.utc)
-                if pause_until.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                if pause_until.astimezone(timezone.utc) <= now_utc:
                     return {}
             except Exception:
                 pass
@@ -1665,12 +2645,27 @@ class DexterScheduler:
         if str(state.get("status") or "").strip().lower() != "active":
             return {}
         hold_until_raw = str(state.get("hold_until_utc") or "").strip()
+        now_utc = datetime.now(timezone.utc)
+        # 2026-04-29 surgery: same ceiling as execution_directive so regime transitions
+        # cannot wedge the lane indefinitely after a single bad bar.
+        ceiling_min = max(0, int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 0))
+        if ceiling_min > 0:
+            applied_raw = str(state.get("applied_at") or "").strip()
+            if applied_raw:
+                try:
+                    applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                    if applied_dt.tzinfo is None:
+                        applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                    if (now_utc - applied_dt).total_seconds() >= (ceiling_min * 60.0):
+                        return {}
+                except Exception:
+                    pass
         if hold_until_raw:
             try:
                 hold_until = datetime.fromisoformat(hold_until_raw.replace("Z", "+00:00"))
                 if hold_until.tzinfo is None:
                     hold_until = hold_until.replace(tzinfo=timezone.utc)
-                if hold_until.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                if hold_until.astimezone(timezone.utc) <= now_utc:
                     return {}
             except Exception:
                 pass
@@ -1683,6 +2678,14 @@ class DexterScheduler:
             return []
         allowed_families = set(getattr(config, "get_persistent_canary_strategy_families", lambda: set())() or set()) if family_enabled else set()
         experimental_families = set(getattr(config, "get_persistent_canary_experimental_families", lambda: set())() or set()) if experimental_enabled else set()
+        mempalace_family = self._mempalace_family_name()
+        mempalace_enabled = bool(getattr(config, "MEMPALACE_FAMILY_ENABLED", False))
+        trading_central_family = self._trading_central_family_name()
+        trading_central_enabled = bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False))
+        if mempalace_enabled and experimental_enabled:
+            experimental_families.add(mempalace_family)
+        if trading_central_enabled and experimental_enabled:
+            experimental_families.add(trading_central_family)
         standard_limit = max(0, int(getattr(config, "PERSISTENT_CANARY_FAMILY_MAX_VARIANTS", 2) or 2))
         experimental_limit = max(0, int(getattr(config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 1) or 1))
         xau_opportunity_sidecar_active = False
@@ -1871,6 +2874,14 @@ class DexterScheduler:
             "BTCUSD": "scalp_btcusd",
             "ETHUSD": "scalp_ethusd",
         }.get(symbol_token, "")
+        mempalace_payload = self._load_mempalace_lane_payload(
+            symbol=symbol_token,
+            base_source=base_token,
+        )
+        trading_central_payload = self._load_trading_central_lane_payload(
+            symbol=symbol_token,
+            base_source=base_token,
+        )
         for row in list((payload.get("candidates") if isinstance(payload, dict) else []) or []):
             if not isinstance(row, dict):
                 continue
@@ -1899,6 +2910,66 @@ class DexterScheduler:
                 experimental_candidates.append(dict(row))
             else:
                 standard_candidates.append(dict(row))
+        if (
+            mempalace_enabled
+            and bool(mempalace_payload)
+            and symbol_token == "XAUUSD"
+            and base_token == "scalp_xauusd"
+            and mempalace_family in experimental_families
+            and _strategy_lab_family_allowed(mempalace_family)
+        ):
+            present_families = {
+                str(item.get("family") or "").strip().lower()
+                for item in [*list(standard_candidates or []), *list(experimental_candidates or [])]
+                if isinstance(item, dict)
+            }
+            if mempalace_family not in present_families:
+                experimental_candidates.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": mempalace_family,
+                        "strategy_id": str(
+                            getattr(config, "MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1")
+                            or "xau_scalp_mempalace_lane_v1"
+                        ).strip(),
+                        "priority": int(getattr(config, "MEMPALACE_FAMILY_PRIORITY", 165) or 165),
+                        "execution_ready": True,
+                        "experimental": True,
+                        "source": "mempalace_payload",
+                    }
+                )
+        if (
+            trading_central_enabled
+            and bool(trading_central_payload)
+            and symbol_token == "XAUUSD"
+            and base_token == "scalp_xauusd"
+            and trading_central_family in experimental_families
+            and _strategy_lab_family_allowed(trading_central_family)
+        ):
+            present_families = {
+                str(item.get("family") or "").strip().lower()
+                for item in [*list(standard_candidates or []), *list(experimental_candidates or [])]
+                if isinstance(item, dict)
+            }
+            if trading_central_family not in present_families:
+                experimental_candidates.append(
+                    {
+                        "symbol": "XAUUSD",
+                        "family": trading_central_family,
+                        "strategy_id": str(
+                            getattr(
+                                config,
+                                "TRADING_CENTRAL_FAMILY_STRATEGY_ID",
+                                "xau_scalp_trading_central_intraday_v1",
+                            )
+                            or "xau_scalp_trading_central_intraday_v1"
+                        ).strip(),
+                        "priority": int(getattr(config, "TRADING_CENTRAL_FAMILY_PRIORITY", 166) or 166),
+                        "execution_ready": True,
+                        "experimental": True,
+                        "source": "trading_central_payload",
+                    }
+                )
         if symbol_token == "XAUUSD" and base_token == "scalp_xauusd":
             fallback_experimental = []
             if "xau_scalp_tick_depth_filter" in experimental_families and _strategy_lab_family_allowed("xau_scalp_tick_depth_filter"):
@@ -2425,9 +3496,21 @@ class DexterScheduler:
         low_rejection = rejection_ratio <= float(getattr(config, "XAU_PB_FALLING_KNIFE_BLOCK_MAX_REJECTION_RATIO", 0.18) or 0.18)
         state_block = state_label in blocked_states
         flow_block = day_type in blocked_day_types and adverse_delta and adverse_refill and high_volume and low_rejection
-        if not state_block and not flow_block:
+        # Sharpness-based supplementary knife detection
+        sharpness_block = False
+        pb_sharpness: dict = {}
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                pb_sharpness = _compute_sharpness(features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                sharpness_block = int(pb_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_PB_KNIFE_THRESHOLD", 35) or 35))
+            except Exception:
+                pass
+        if not state_block and not flow_block and not sharpness_block:
             return {}
         reasons: list[str] = []
+        if sharpness_block:
+            reasons.append(f"sharpness_knife:{pb_sharpness.get('sharpness_score', 0)}")
         if state_block:
             reasons.append(f"state:{state_label}")
         if flow_block:
@@ -2451,8 +3534,164 @@ class DexterScheduler:
                 "rejection_ratio": round(rejection_ratio, 4),
                 "bar_volume_proxy": round(bar_volume_proxy, 4),
             },
+            "sharpness": dict(pb_sharpness) if pb_sharpness else {},
             "gate_reasons": [str(item or "").strip() for item in list(gate.get("reasons") or []) if str(item or "").strip()],
         }
+
+    def _xau_fibo_action_zone(self, signal, *, direction: str, entry_type: str = "", mode: str = "") -> dict:
+        """Map Fibo/DEMA/candle context to an explicit entry/PM action zone."""
+        raw = self._signal_raw_scores(signal)
+        direction = str(direction or "").strip().lower()
+        entry_type = str(entry_type or "").strip().lower()
+        mode = str(mode or "").strip().lower()
+        ratio_raw = str(raw.get("ratio_zone") or raw.get("nearest_level_ratio") or "").strip().lower()
+        ratio_map = {
+            "0.382": "0.382",
+            "38.2": "0.382",
+            "38.20": "0.382",
+            "0.5": "0.500",
+            "0.500": "0.500",
+            "50": "0.500",
+            "50.0": "0.500",
+            "0.618": "0.618",
+            "61.8": "0.618",
+            "61.80": "0.618",
+            "0.650": "0.650",
+            "65": "0.650",
+            "golden": "0.618",
+            "golden_pocket": "0.618",
+        }
+        ratio = ratio_map.get(ratio_raw, ratio_raw)
+        dema_state = str(raw.get("dema_reclaim_state") or raw.get("dema_state") or "").strip().lower()
+        structure_break = bool(raw.get("structure_break") or raw.get("fibo_structure_break") or raw.get("breakdown_confirmed"))
+        candle_rejection = bool(
+            raw.get("candle_rejection_confirmed")
+            or raw.get("m1_rejection_confirmed")
+            or raw.get("xau_rejection_candle_confirmed")
+        )
+        out = {
+            "ratio_zone": ratio,
+            "zone_role": "unknown",
+            "entry_action": "defer",
+            "pm_action": "observe",
+            "block_new_entry": False,
+            "block_reason": "",
+            "evidence": [],
+        }
+        if not ratio:
+            return out
+        if candle_rejection:
+            out["evidence"].append("candle_rejection")
+        if dema_state:
+            out["evidence"].append(f"dema:{dema_state}")
+        if structure_break:
+            out["evidence"].append("structure_break")
+        if direction == "short" and ratio in {"0.618", "0.650"}:
+            out.update(
+                {
+                    "zone_role": "resistance_retest",
+                    "entry_action": "sell_limit" if entry_type == "limit" else ("sell_market" if entry_type == "market" else "sell_stop"),
+                    "pm_action": "runner_preserve_or_add_on_rejection",
+                }
+            )
+        elif direction == "short" and ratio == "0.382":
+            if structure_break or mode in {"signal_market", "promote_to_stop", "fast_stop"} or entry_type in {"sell_stop", "market"}:
+                out.update(
+                    {
+                        "zone_role": "breakdown_continuation",
+                        "entry_action": "sell_market" if entry_type == "market" else "sell_stop",
+                        "pm_action": "trail_runner_after_breakdown",
+                    }
+                )
+            else:
+                out.update(
+                    {
+                        "zone_role": "support_profit_protect",
+                        "entry_action": "wait_breakdown",
+                        "pm_action": "partial_close_lock_profit_or_wait_breakdown",
+                        "block_new_entry": True,
+                        "block_reason": "fibo_382_support_is_pm_protect_not_fresh_short",
+                    }
+                )
+        elif ratio == "0.500":
+            out.update(
+                {
+                    "zone_role": "decision_midpoint",
+                    "entry_action": "wait_confirmation",
+                    "pm_action": "reduce_if_chop_or_hold_runner_if_trend",
+                }
+            )
+        elif direction == "long" and ratio == "0.382":
+            out.update(
+                {
+                    "zone_role": "support_retest",
+                    "entry_action": "buy_limit" if entry_type == "limit" else ("buy_market" if entry_type == "market" else "buy_stop"),
+                    "pm_action": "runner_preserve_or_add_on_reclaim",
+                }
+            )
+        return out
+
+    def _xau_limit_zone_confluence(self, signal, *, direction: str, features: dict | None = None) -> dict:
+        """Return whether a pullback limit has a real structural anchor.
+
+        This is intentionally an execution-router helper, not a Fibo live planner:
+        FIBO_MTF_SHADOW remains telemetry-only. We only consume compact evidence
+        already attached to the signal to avoid placing mid-air limit orders.
+        """
+        raw = self._signal_raw_scores(signal)
+        features = dict(features or {})
+        reasons: list[str] = []
+        direction = str(direction or "").strip().lower()
+        min_cluster = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER", 2) or 2))
+        try:
+            fibo_cluster_count = int(raw.get("fibo_cluster_count", 0) or 0)
+        except Exception:
+            fibo_cluster_count = 0
+        fibo_reclaim = bool(raw.get("fibo_reclaim_confirmed") or raw.get("dema_reclaim_confirmed"))
+        impulse_dir = str(raw.get("impulse_state_direction") or raw.get("aligned_direction") or "").strip().lower()
+        if impulse_dir == "buy":
+            impulse_dir = "long"
+        elif impulse_dir == "sell":
+            impulse_dir = "short"
+        impulse_ok = bool(not impulse_dir or not direction or impulse_dir == direction)
+        if fibo_reclaim and fibo_cluster_count >= min_cluster and impulse_ok:
+            reasons.append(f"fibo_impulse_zone:cluster={fibo_cluster_count}")
+        ratio_zone = str(raw.get("ratio_zone") or raw.get("nearest_level_ratio") or "").strip().lower()
+        if ratio_zone in {"0.382", "0.5", "0.500", "0.618", "0.650", "38.2", "50", "61.8", "golden", "golden_pocket"} and impulse_ok:
+            reasons.append(f"fibo_ratio_zone:{ratio_zone}")
+        candle_keys = (
+            "candle_rejection_confirmed",
+            "m1_rejection_confirmed",
+            "xau_rejection_candle_confirmed",
+            "kronos_candle_rejection_confirmed",
+        )
+        if any(bool(raw.get(k)) for k in candle_keys):
+            reasons.append("candle_rejection")
+        forecast = dict(raw.get("xau_ohlcv_forecast_shadow") or raw.get("kronos_forecast_shadow") or {})
+        if forecast:
+            f_status = str(forecast.get("status") or "").strip().lower()
+            f_dir = str(forecast.get("forecast_direction") or "").strip().lower()
+            f_aligned = bool(forecast.get("aligned_with_signal")) or (f_dir and f_dir == direction)
+            try:
+                uncertainty = float(forecast.get("uncertainty", 1.0) or 1.0)
+            except Exception:
+                uncertainty = 1.0
+            max_unc = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY", 0.45) or 0.45)
+            if f_status == "ok" and f_aligned and uncertainty <= max_unc:
+                reasons.append(f"kronos_path_aligned:unc={uncertainty:.2f}")
+        try:
+            vp = dict((raw.get("xau_openapi_entry_router") or {}).get("volume_profile") or {})
+        except Exception:
+            vp = {}
+        if bool(vp.get("near_value_area_edge") or vp.get("near_poc_rejection") or vp.get("supportive")):
+            reasons.append("volume_profile_zone")
+        try:
+            rejection_ratio = float(features.get("rejection_ratio", 0.0) or 0.0)
+        except Exception:
+            rejection_ratio = 0.0
+        if rejection_ratio >= float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_MIN_REJECTION_RATIO", 0.26) or 0.26):
+            reasons.append("micro_rejection")
+        return {"ok": bool(reasons), "reasons": reasons[:6]}
 
     def _xau_openapi_entry_router(self, signal, *, family: str, preferred_entry_type: str, snapshot: dict | None = None) -> dict:
         if not bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_ENABLED", True)):
@@ -2493,6 +3732,19 @@ class DexterScheduler:
         state_label = str(chart_state.get("state_label") or "").strip().lower()
         day_type = str(chart_state.get("day_type") or features.get("day_type") or "trend").strip().lower() or "trend"
         sign = 1.0 if direction == "long" else -1.0
+        # ── Entry Sharpness Score (deep data analytics) ──────────────────
+        sharpness_result: dict = {}
+        sharpness_score: int = 50
+        sharpness_band: str = "normal"
+        _sharpness_has_data = bool(features.get("spots_count") or (features.get("delta_proxy") is not None and features.get("bar_volume_proxy") is not None))
+        if _sharpness_has_data and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                sharpness_result = _compute_sharpness(features, direction, weights={"momentum": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0), "flow": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0), "absorption": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0), "stability": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0), "positioning": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0)}, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                sharpness_score = int(sharpness_result.get("sharpness_score", 50) or 50)
+                sharpness_band = str(sharpness_result.get("sharpness_band", "normal") or "normal")
+            except Exception:
+                pass
         spread_avg_pct = float(features.get("spread_avg_pct", 0.0) or 0.0)
         spread_expansion = float(features.get("spread_expansion", 1.0) or 1.0)
         delta_proxy = float(features.get("delta_proxy", 0.0) or 0.0)
@@ -2559,8 +3811,11 @@ class DexterScheduler:
         if state_label in limit_states:
             absorption_score += 1
             absorption_reasons.append(f"state:{state_label}")
+        # Sharpness-based knife block (composite deep analytics)
+        sharpness_knife = bool(sharpness_band == "knife" and sharpness_score < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD", 30) or 30)))
         hostile_flow = bool(
-            day_type in hostile_day_types
+            sharpness_knife
+            or day_type in hostile_day_types
             or state_label in hostile_states
             or spread_avg_pct > (max_spread_pct * 1.12)
             or spread_expansion > (max_spread_expansion * 1.08)
@@ -2579,6 +3834,8 @@ class DexterScheduler:
         trigger_scale = 1.0
         risk_multiplier = 1.0
         if hostile_flow:
+            if sharpness_knife:
+                reasons.append(f"sharpness_knife:{sharpness_score}")
             if day_type in hostile_day_types:
                 reasons.append(f"day_type:{day_type}")
             if state_label in hostile_states:
@@ -2621,6 +3878,7 @@ class DexterScheduler:
                     "bar_volume_proxy": round(bar_volume_proxy, 4),
                     "tick_up_ratio": round(tick_up_ratio, 4),
                 },
+                "sharpness": dict(sharpness_result) if sharpness_result else {},
             }
         stop_min_score = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_STOP_MIN_SCORE", 5) or 5))
         limit_min_score = max(1, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_MIN_SCORE", 4) or 4))
@@ -2630,6 +3888,32 @@ class DexterScheduler:
                 next_entry_type = stop_target
                 mode = "promote_to_stop"
                 reasons = continuation_reasons[:5]
+                signal_market_enabled = bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED", True))
+                market_min_score = max(stop_min_score, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", 7) or 7))
+                market_min_bias = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", 0.70) or 0.70)
+                market_min_tick = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT", 0.58) or 0.58)
+                continuation_bias = abs(float(chart_state.get("continuation_bias", 0.0) or 0.0))
+                tick_alignment = (1.0 - tick_up_ratio) if direction == "short" else tick_up_ratio
+                signal_now = bool(
+                    signal_market_enabled
+                    and continuation_score >= market_min_score
+                    and continuation_bias >= market_min_bias
+                    and tick_alignment >= market_min_tick
+                    and spread_avg_pct <= max_spread_pct
+                    and spread_expansion <= max_spread_expansion
+                    and sharpness_band != "caution"
+                )
+                if signal_now:
+                    raw_for_entry_advantage = self._signal_raw_scores(signal)
+                    has_structure_break = bool(raw_for_entry_advantage.get("structure_break"))
+                    if bool(getattr(config, "XAU_ENTRY_ADVANTAGE_GUARD_ENABLED", True)) and not has_structure_break:
+                        next_entry_type = stop_target
+                        mode = "entry_advantage_wait_break"
+                        reasons = ["no_structure_break_no_market_chase"] + continuation_reasons[:4]
+                    else:
+                        next_entry_type = "market"
+                        mode = "signal_market"
+                        reasons = ["signal_now"] + continuation_reasons[:4]
             elif continuation_score >= max(1, stop_min_score - 1):
                 mode = "shallow_limit"
                 pull_scale = max(0.50, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SHALLOW_LIMIT_SCALE", 0.78) or 0.78))
@@ -2652,6 +3936,95 @@ class DexterScheduler:
                 mode = "fast_stop"
                 trigger_scale = max(0.50, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_FAST_STOP_TRIGGER_SCALE", 0.82) or 0.82))
                 reasons = continuation_reasons[:5]
+        # ── Sharpness-based adjustments (caution / sharp) ────────────────
+        if sharpness_band == "caution" and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            if next_entry_type in {"buy_stop", "sell_stop"}:
+                next_entry_type = "limit"
+                mode = "sharpness_downgrade_to_limit"
+                reasons = list(sharpness_result.get("sharpness_reasons") or [])[:4]
+            risk_multiplier *= max(0.25, float(getattr(config, "XAU_ENTRY_SHARPNESS_CAUTION_RISK_MULT", 0.75) or 0.75))
+        elif sharpness_band == "sharp" and bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            sharp_min_cont = max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_SHARP_PROMOTE_MIN_CONT_SCORE", 4) or 4))
+            if next_entry_type == "limit" and continuation_score >= sharp_min_cont:
+                next_entry_type = stop_target
+                mode = "sharpness_promote_to_stop"
+                reasons = list(sharpness_result.get("sharpness_reasons") or [])[:4] + continuation_reasons[:2]
+        fibo_action_zone = self._xau_fibo_action_zone(signal, direction=direction, entry_type=next_entry_type, mode=mode)
+        if bool(fibo_action_zone.get("block_new_entry")) and next_entry_type == "limit":
+            return {
+                "blocked": True,
+                "family": family,
+                "preferred_entry_type": preferred,
+                "entry_type": next_entry_type,
+                "mode": "blocked_fibo_pm_zone",
+                "reason": str(fibo_action_zone.get("block_reason") or "fibo_pm_zone_blocks_fresh_entry"),
+                "reasons": [str(fibo_action_zone.get("zone_role") or ""), str(fibo_action_zone.get("pm_action") or "")],
+                "continuation_score": int(continuation_score),
+                "absorption_score": int(absorption_score),
+                "pull_scale": round(float(pull_scale), 4),
+                "trigger_scale": round(float(trigger_scale), 4),
+                "risk_multiplier": round(float(risk_multiplier), 4),
+                "snapshot": {
+                    "run_id": str(snap.get("run_id") or ""),
+                    "last_event_utc": str(snap.get("last_event_utc") or ""),
+                },
+                "chart_state": {
+                    "state_label": state_label,
+                    "day_type": day_type,
+                    "continuation_bias": float(chart_state.get("continuation_bias", 0.0) or 0.0),
+                },
+                "features": {
+                    "spread_avg_pct": round(spread_avg_pct, 6),
+                    "spread_expansion": round(spread_expansion, 4),
+                    "delta_proxy": round(delta_proxy, 4),
+                    "depth_imbalance": round(imbalance, 4),
+                    "depth_refill_shift": round(refill_shift, 4),
+                    "rejection_ratio": round(rejection_ratio, 4),
+                    "bar_volume_proxy": round(bar_volume_proxy, 4),
+                    "tick_up_ratio": round(tick_up_ratio, 4),
+                },
+                "sharpness": dict(sharpness_result) if sharpness_result else {},
+                "fibo_action_zone": dict(fibo_action_zone),
+                "zone_confluence": {},
+            }
+        # A remaining preferred limit with no continuation/absorption/zone evidence is
+        # a mid-air blind order. Do not let the PB lane leave a sell/buy limit waiting
+        # just because geometry produced a price. This preserves opportunity capture:
+        # strong continuation above already promotes to stop; real Fibo/Kronos/candle
+        # zones can still keep a limit; only unanchored limits are converted to
+        # a tiny wait-break probe route.
+        blind_limit_guard: dict = {}
+        if (
+            preferred == "limit"
+            and next_entry_type == "limit"
+            and mode == "keep_preferred"
+            and bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED", True))
+        ):
+            blind_limit_guard = self._xau_limit_zone_confluence(signal, direction=direction, features=features)
+            if not bool(blind_limit_guard.get("ok")):
+                # Opportunity-first: an unanchored pullback limit is a bad entry,
+                # not a reason to kill the directional idea. Convert it to a
+                # tiny wait-break stop so the market must prove continuation
+                # before broker exposure exists. This preserves opportunity while
+                # preventing mid-air limit fills.
+                next_entry_type = stop_target
+                mode = "wait_break_probe_stop"
+                reasons = ["no_midair_limit", "wait_for_break", "probe_risk"]
+                risk_multiplier *= max(
+                    0.10,
+                    min(1.0, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", 0.35) or 0.35)),
+                )
+                blind_limit_guard = {
+                    **dict(blind_limit_guard),
+                    "ok": True,
+                    "converted_to_wait_break": True,
+                    "reasons": list(blind_limit_guard.get("reasons") or []) + reasons,
+                }
+            if bool(blind_limit_guard.get("converted_to_wait_break")):
+                reasons = ["no_midair_limit", "wait_for_break", "probe_risk"]
+            else:
+                reasons = list(blind_limit_guard.get("reasons") or [])[:5]
+                mode = "zone_anchored_limit"
         return {
             "blocked": False,
             "family": family,
@@ -2684,6 +4057,9 @@ class DexterScheduler:
                 "bar_volume_proxy": round(bar_volume_proxy, 4),
                 "tick_up_ratio": round(tick_up_ratio, 4),
             },
+            "sharpness": dict(sharpness_result) if sharpness_result else {},
+            "fibo_action_zone": dict(fibo_action_zone),
+            "zone_confluence": dict(blind_limit_guard) if blind_limit_guard else {},
         }
 
     def _load_xau_microtrend_follow_up_contexts(self) -> list[dict]:
@@ -3207,11 +4583,566 @@ class DexterScheduler:
             pass
         return lane_signal
 
+    @staticmethod
+    def _mempalace_family_name() -> str:
+        return "xau_scalp_mempalace_lane"
+
+    @staticmethod
+    def _trading_central_family_name() -> str:
+        return "xau_scalp_trading_central_intraday"
+
+    @staticmethod
+    def _mempalace_parse_direction(value: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"long", "buy"}:
+            return "long"
+        if token in {"short", "sell"}:
+            return "short"
+        return ""
+
+    @staticmethod
+    def _trading_central_parse_direction(value: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"long", "buy"}:
+            return "long"
+        if token in {"short", "sell"}:
+            return "short"
+        return ""
+
+    @staticmethod
+    def _mempalace_parse_entry_type(value: str, *, direction: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"buy_stop", "sell_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"stop", "break_stop", "market_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"market", "limit"}:
+            return token
+        return "limit"
+
+    @staticmethod
+    def _trading_central_parse_entry_type(value: str, *, direction: str) -> str:
+        token = str(value or "").strip().lower()
+        if token in {"buy_stop", "sell_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"stop", "break_stop", "market_stop"}:
+            return "buy_stop" if direction == "long" else "sell_stop"
+        if token in {"market", "limit"}:
+            return token
+        return "limit"
+
+    def _load_trading_central_lane_payload(self, *, symbol: str, base_source: str) -> dict:
+        if not bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False)):
+            return {}
+        symbol_token = str(symbol or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        allowed_symbols = {
+            str(part or "").strip().upper()
+            for part in str(getattr(config, "TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS", "XAUUSD") or "").split(",")
+            if str(part or "").strip()
+        }
+        if allowed_symbols and symbol_token not in allowed_symbols:
+            return {}
+        allowed_sources = self._parse_lower_csv(
+            str(getattr(config, "TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd") or "")
+        )
+        if allowed_sources and base_token not in allowed_sources:
+            return {}
+        raw_path = str(
+            getattr(config, "TRADING_CENTRAL_FAMILY_SIGNAL_PATH", "data/runtime/trading_central_intraday_signal.json")
+            or ""
+        ).strip()
+        if not raw_path:
+            return {}
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        payload_symbol = str(payload.get("symbol") or symbol_token).strip().upper()
+        if payload_symbol and payload_symbol != symbol_token:
+            return {}
+        payload_base = str(payload.get("base_source") or payload.get("source") or base_token).strip().lower().split(":", 1)[0]
+        if payload_base and payload_base != base_token:
+            return {}
+        direction = self._trading_central_parse_direction(
+            payload.get("direction") or payload.get("side") or payload.get("action") or payload.get("bias")
+        )
+        if direction not in {"long", "short"}:
+            return {}
+        entry_raw = payload.get("entry")
+        if entry_raw is None:
+            entry_raw = payload.get("entry_price")
+        if entry_raw is None:
+            entry_raw = payload.get("current_price")
+        if entry_raw is None:
+            entry_raw = payload.get("price")
+        stop_raw = payload.get("stop_loss")
+        if stop_raw is None:
+            stop_raw = payload.get("sl")
+        if stop_raw is None:
+            stop_raw = payload.get("stop")
+        entry: float | None = None
+        stop_loss: float | None = None
+        if (entry_raw is not None) and (stop_raw is not None):
+            try:
+                entry = float(entry_raw or 0.0)
+                stop_loss = float(stop_raw or 0.0)
+            except Exception:
+                return {}
+            if entry <= 0.0 or stop_loss <= 0.0:
+                return {}
+            if direction == "long" and stop_loss >= entry:
+                return {}
+            if direction == "short" and stop_loss <= entry:
+                return {}
+        elif (entry_raw is not None) or (stop_raw is not None):
+            return {}
+        confidence = None
+        try:
+            if payload.get("confidence") is not None:
+                confidence = float(payload.get("confidence") or 0.0)
+        except Exception:
+            confidence = None
+        min_conf = float(getattr(config, "TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE", 0.0) or 0.0)
+        if confidence is not None and confidence < min_conf:
+            return {}
+        max_age = max(60, int(getattr(config, "TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC", 7200) or 7200))
+        now_utc = datetime.now(timezone.utc)
+        updated_text = str(
+            payload.get("updated_at")
+            or payload.get("timestamp")
+            or payload.get("generated_at")
+            or ""
+        ).strip()
+        if updated_text:
+            try:
+                updated_dt = datetime.fromisoformat(updated_text.replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_sec = (now_utc - updated_dt.astimezone(timezone.utc)).total_seconds()
+                if age_sec > float(max_age):
+                    return {}
+            except Exception:
+                return {}
+        else:
+            try:
+                age_sec = now_utc.timestamp() - float(path.stat().st_mtime)
+            except Exception:
+                age_sec = float(max_age + 1)
+            if age_sec > float(max_age):
+                return {}
+        target = None
+        target_raw = payload.get("target")
+        if target_raw is None:
+            target_raw = payload.get("take_profit")
+        if target_raw is None:
+            target_raw = payload.get("tp")
+        if target_raw is not None:
+            try:
+                target = float(target_raw or 0.0)
+            except Exception:
+                target = None
+            if target is not None and target <= 0.0:
+                target = None
+        pivot = None
+        if payload.get("pivot") is not None:
+            try:
+                pivot = float(payload.get("pivot") or 0.0)
+            except Exception:
+                pivot = None
+            if pivot is not None and pivot <= 0.0:
+                pivot = None
+        entry_type = self._trading_central_parse_entry_type(
+            payload.get("entry_type") or payload.get("order_type"),
+            direction=direction,
+        )
+        provider = str(
+            payload.get("provider")
+            or payload.get("source_name")
+            or payload.get("publisher")
+            or "Trading Central"
+        ).strip()
+        analysis_type = str(payload.get("analysis_type") or payload.get("idea_type") or "intraday").strip().lower()
+        timeframe = str(payload.get("timeframe") or payload.get("horizon") or analysis_type or "").strip().lower()
+        return {
+            "symbol": payload_symbol,
+            "base_source": payload_base or base_token,
+            "direction": direction,
+            "entry": None if entry is None else round(float(entry), 6),
+            "stop_loss": None if stop_loss is None else round(float(stop_loss), 6),
+            "target": None if target is None else round(float(target), 6),
+            "pivot": None if pivot is None else round(float(pivot), 6),
+            "entry_type": entry_type,
+            "confidence": confidence,
+            "updated_at": updated_text,
+            "signal_id": str(payload.get("signal_id") or payload.get("id") or "").strip(),
+            "provider": provider,
+            "analysis_type": analysis_type,
+            "timeframe": timeframe,
+            "path": str(path),
+            "raw": dict(payload),
+        }
+
+    def _load_mempalace_lane_payload(self, *, symbol: str, base_source: str) -> dict:
+        if not bool(getattr(config, "MEMPALACE_FAMILY_ENABLED", False)):
+            return {}
+        symbol_token = str(symbol or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        allowed_symbols = {
+            str(part or "").strip().upper()
+            for part in str(getattr(config, "MEMPALACE_FAMILY_ALLOWED_SYMBOLS", "XAUUSD") or "").split(",")
+            if str(part or "").strip()
+        }
+        if allowed_symbols and symbol_token not in allowed_symbols:
+            return {}
+        allowed_sources = self._parse_lower_csv(
+            str(getattr(config, "MEMPALACE_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd") or "")
+        )
+        if allowed_sources and base_token not in allowed_sources:
+            return {}
+        raw_path = str(getattr(config, "MEMPALACE_FAMILY_SIGNAL_PATH", "data/runtime/mempalace_family_signal.json") or "").strip()
+        if not raw_path:
+            return {}
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        payload_symbol = str(payload.get("symbol") or symbol_token).strip().upper()
+        if payload_symbol and payload_symbol != symbol_token:
+            return {}
+        payload_base = str(payload.get("base_source") or payload.get("source") or base_token).strip().lower().split(":", 1)[0]
+        if payload_base and payload_base != base_token:
+            return {}
+        direction = self._mempalace_parse_direction(
+            payload.get("direction") or payload.get("side") or payload.get("action")
+        )
+        if direction not in {"long", "short"}:
+            return {}
+        entry_raw = payload.get("entry")
+        if entry_raw is None:
+            entry_raw = payload.get("entry_price")
+        stop_raw = payload.get("stop_loss")
+        if stop_raw is None:
+            stop_raw = payload.get("sl")
+        entry: float | None = None
+        stop_loss: float | None = None
+        if (entry_raw is not None) and (stop_raw is not None):
+            try:
+                entry = float(entry_raw or 0.0)
+                stop_loss = float(stop_raw or 0.0)
+            except Exception:
+                return {}
+            if entry <= 0.0 or stop_loss <= 0.0:
+                return {}
+            if direction == "long" and stop_loss >= entry:
+                return {}
+            if direction == "short" and stop_loss <= entry:
+                return {}
+        elif (entry_raw is not None) or (stop_raw is not None):
+            return {}
+        confidence = None
+        try:
+            if payload.get("confidence") is not None:
+                confidence = float(payload.get("confidence") or 0.0)
+        except Exception:
+            confidence = None
+        min_conf = float(getattr(config, "MEMPALACE_FAMILY_MIN_CONFIDENCE", 68.0) or 68.0)
+        if confidence is not None and confidence < min_conf:
+            return {}
+        max_age = max(5, int(getattr(config, "MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC", 180) or 180))
+        now_utc = datetime.now(timezone.utc)
+        updated_text = str(
+            payload.get("updated_at")
+            or payload.get("timestamp")
+            or payload.get("generated_at")
+            or ""
+        ).strip()
+        if updated_text:
+            try:
+                updated_dt = datetime.fromisoformat(updated_text.replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_sec = (now_utc - updated_dt.astimezone(timezone.utc)).total_seconds()
+                if age_sec > float(max_age):
+                    return {}
+            except Exception:
+                return {}
+        else:
+            try:
+                age_sec = now_utc.timestamp() - float(path.stat().st_mtime)
+            except Exception:
+                age_sec = float(max_age + 1)
+            if age_sec > float(max_age):
+                return {}
+        entry_type = self._mempalace_parse_entry_type(
+            payload.get("entry_type") or payload.get("order_type"),
+            direction=direction,
+        )
+        return {
+            "symbol": payload_symbol,
+            "base_source": payload_base or base_token,
+            "direction": direction,
+            "entry": None if entry is None else round(float(entry), 6),
+            "stop_loss": None if stop_loss is None else round(float(stop_loss), 6),
+            "entry_type": entry_type,
+            "confidence": confidence,
+            "updated_at": updated_text,
+            "signal_id": str(payload.get("signal_id") or payload.get("id") or "").strip(),
+            "path": str(path),
+            "raw": dict(payload),
+        }
+
+    def _build_mempalace_family_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        family = str((candidate or {}).get("family") or self._mempalace_family_name()).strip().lower()
+        if not bool(getattr(config, "MEMPALACE_FAMILY_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="family_disabled",
+                reason="MEMPALACE_FAMILY_ENABLED=0",
+            )
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        payload = self._load_mempalace_lane_payload(symbol=symbol, base_source=base_token)
+        if not payload:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="external_payload",
+                reason="mempalace_payload_missing_or_stale",
+            )
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        direction = str(payload.get("direction") or "").strip().lower()
+        entry_type = str(payload.get("entry_type") or "limit").strip().lower() or "limit"
+        payload_entry = payload.get("entry")
+        payload_stop = payload.get("stop_loss")
+        if payload_entry is None or payload_stop is None:
+            base_direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
+            if direction and base_direction and direction != base_direction:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="external_payload",
+                    reason="mempalace_direction_mismatch_without_price_plan",
+                )
+                return None, ""
+            direction = base_direction or direction
+            try:
+                payload_entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
+                payload_stop = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
+            except Exception:
+                payload_entry = 0.0
+                payload_stop = 0.0
+            if payload_entry <= 0.0 or payload_stop <= 0.0:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="signal_geometry",
+                    reason="mempalace_missing_price_plan_and_base_geometry",
+                )
+                return None, ""
+        try:
+            lane_signal.direction = direction
+        except Exception:
+            pass
+        confidence = payload.get("confidence")
+        if confidence is not None:
+            try:
+                lane_signal.confidence = self._normalize_confidence_value(confidence)
+            except Exception:
+                pass
+        shaped = self._apply_family_price_plan(
+            lane_signal,
+            family=family,
+            entry=float(payload_entry or 0.0),
+            stop_loss=float(payload_stop or 0.0),
+            entry_type=entry_type,
+        )
+        if shaped is None:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="price_plan",
+                reason="mempalace_apply_family_price_plan_returned_none",
+            )
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = base_token
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str((candidate or {}).get("strategy_id") or getattr(config, "MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1") or "")
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_family_mempalace"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["experimental_family"] = bool((candidate or {}).get("experimental"))
+            raw["mempalace_family_payload"] = {
+                "updated_at": str(payload.get("updated_at") or ""),
+                "signal_id": str(payload.get("signal_id") or ""),
+                "path": str(payload.get("path") or ""),
+                "entry_type": entry_type,
+                "entry": float(payload_entry or 0.0),
+                "stop_loss": float(payload_stop or 0.0),
+                "used_base_signal_geometry": bool(payload.get("entry") is None or payload.get("stop_loss") is None),
+            }
+            risk_override = float(getattr(config, "MEMPALACE_FAMILY_CTRADER_RISK_USD", 0.0) or 0.0)
+            if risk_override > 0.0:
+                raw["ctrader_risk_usd_override"] = risk_override
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
+    def _build_trading_central_family_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
+        family = str((candidate or {}).get("family") or self._trading_central_family_name()).strip().lower()
+        if not bool(getattr(config, "TRADING_CENTRAL_FAMILY_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="family_disabled",
+                reason="TRADING_CENTRAL_FAMILY_ENABLED=0",
+            )
+            return None, ""
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        base_token = str(base_source or "").strip().lower().split(":", 1)[0]
+        payload = self._load_trading_central_lane_payload(symbol=symbol, base_source=base_token)
+        if not payload:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="external_payload",
+                reason="trading_central_payload_missing_or_stale",
+            )
+            return None, ""
+        lane_signal = copy.deepcopy(signal)
+        direction = str(payload.get("direction") or "").strip().lower()
+        entry_type = str(payload.get("entry_type") or "limit").strip().lower() or "limit"
+        payload_entry = payload.get("entry")
+        payload_stop = payload.get("stop_loss")
+        if payload_entry is None or payload_stop is None:
+            base_direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
+            if direction and base_direction and direction != base_direction:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="external_payload",
+                    reason="trading_central_direction_mismatch_without_price_plan",
+                )
+                return None, ""
+            direction = base_direction or direction
+            try:
+                payload_entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
+                payload_stop = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
+            except Exception:
+                payload_entry = 0.0
+                payload_stop = 0.0
+            if payload_entry <= 0.0 or payload_stop <= 0.0:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="signal_geometry",
+                    reason="trading_central_missing_price_plan_and_base_geometry",
+                )
+                return None, ""
+        try:
+            lane_signal.direction = direction
+        except Exception:
+            pass
+        confidence = payload.get("confidence")
+        if confidence is not None:
+            try:
+                lane_signal.confidence = self._normalize_confidence_value(confidence)
+            except Exception:
+                pass
+        shaped = self._apply_family_price_plan(
+            lane_signal,
+            family=family,
+            entry=float(payload_entry or 0.0),
+            stop_loss=float(payload_stop or 0.0),
+            entry_type=entry_type,
+        )
+        if shaped is None:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="price_plan",
+                reason="trading_central_apply_family_price_plan_returned_none",
+            )
+            return None, ""
+        lane_source = self._strategy_family_lane_source(base_source, family)
+        self._ensure_signal_trace(shaped, source=lane_source)
+        try:
+            raw = dict(getattr(shaped, "raw_scores", {}) or {})
+            raw["persistent_canary_enabled"] = True
+            raw["persistent_canary_family_enabled"] = True
+            raw["persistent_canary_source"] = lane_source
+            raw["persistent_canary_base_source"] = base_token
+            raw["mt5_canary_mode"] = True
+            raw["strategy_family"] = family
+            raw["strategy_id"] = str(
+                (candidate or {}).get("strategy_id")
+                or getattr(config, "TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1")
+                or ""
+            )
+            raw["strategy_family_priority"] = int((candidate or {}).get("priority", 0) or 0)
+            raw["strategy_family_executor"] = "scheduler_canary_family_trading_central"
+            raw["strategy_family_alias"] = self._strategy_family_alias(family)
+            raw["experimental_family"] = bool((candidate or {}).get("experimental"))
+            raw["xau_multi_tf_guard_bypass"] = True
+            raw["xau_multi_tf_guard_bypass_reason"] = "trading_central_intraday_bias_override"
+            raw["trading_central_payload"] = {
+                "provider": str(payload.get("provider") or ""),
+                "analysis_type": str(payload.get("analysis_type") or ""),
+                "timeframe": str(payload.get("timeframe") or ""),
+                "updated_at": str(payload.get("updated_at") or ""),
+                "signal_id": str(payload.get("signal_id") or ""),
+                "path": str(payload.get("path") or ""),
+                "entry_type": entry_type,
+                "entry": float(payload_entry or 0.0),
+                "stop_loss": float(payload_stop or 0.0),
+                "target": payload.get("target"),
+                "pivot": payload.get("pivot"),
+                "used_base_signal_geometry": bool(payload.get("entry") is None or payload.get("stop_loss") is None),
+            }
+            risk_override = float(getattr(config, "TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", 0.0) or 0.0)
+            if risk_override > 0.0:
+                raw["ctrader_risk_usd_override"] = risk_override
+            shaped.raw_scores = raw
+        except Exception:
+            pass
+        return shaped, lane_source
+
     def _build_family_canary_signal(self, signal, *, base_source: str, candidate: dict) -> tuple[object | None, str]:
         family = str((candidate or {}).get("family") or "").strip().lower()
         if signal is None:
             return None, ""
-        xau_mtf_guard = self._xau_multi_tf_entry_guard(signal, family=family) if family.startswith("xau_scalp_") else {}
+        skip_xau_mtf_guard = family == self._trading_central_family_name()
+        xau_mtf_guard = (
+            self._xau_multi_tf_entry_guard(signal, family=family)
+            if family.startswith("xau_scalp_") and not skip_xau_mtf_guard
+            else {}
+        )
         if bool(xau_mtf_guard.get("blocked")):
             try:
                 raw = dict(getattr(signal, "raw_scores", {}) or {})
@@ -3308,6 +5239,32 @@ class DexterScheduler:
             return self._build_crypto_winner_confirmed_signal(signal, base_source=base_source, candidate=candidate)
         if family == "crypto_behavioral_retest":
             return self._build_crypto_behavioral_retest_signal(signal, base_source=base_source, candidate=candidate)
+        if family == "xau_scalp_failed_fade_follow_stop":
+            # FF orders are spawned from cTrader follow-stop logic, not cloned here from the scanner signal.
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="family_builder",
+                reason="ff_follow_stop_executor_spawned_not_scheduler_clone",
+            )
+            return None, ""
+        if family == self._mempalace_family_name():
+            return self._build_mempalace_family_signal(signal, base_source=base_source, candidate=candidate)
+        if family == self._trading_central_family_name():
+            lane_signal, lane_source = self._build_trading_central_family_signal(signal, base_source=base_source, candidate=candidate)
+            if lane_signal is not None:
+                try:
+                    raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+                    raw["xau_multi_tf_guard"] = {
+                        "blocked": False,
+                        "allowed": True,
+                        "family": family,
+                        "reason": "trading_central_intraday_bias_override",
+                    }
+                    lane_signal.raw_scores = raw
+                except Exception:
+                    pass
+            return lane_signal, lane_source
         if family not in {"xau_scalp_pullback_limit", "xau_scalp_breakout_stop"}:
             return None, ""
         lane_signal = copy.deepcopy(signal)
@@ -3318,6 +5275,9 @@ class DexterScheduler:
         if family == "xau_scalp_pullback_limit" and bool(getattr(config, "XAU_PB_NARROW_CONTEXT_ENABLED", False)):
             matched, matched_context = self._signal_matches_xau_pb_narrow_context(lane_signal)
             if not matched:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="pattern_context", reason="pb_narrow_context_no_match"
+                )
                 return None, ""
             pb_flow_guard = self._pb_capture_falling_knife_guard(lane_signal)
             if bool(pb_flow_guard.get("blocked")):
@@ -3328,6 +5288,7 @@ class DexterScheduler:
                     raw["pb_falling_knife_block_snapshot"] = dict(pb_flow_guard.get("snapshot") or {})
                     raw["pb_falling_knife_block_chart_state"] = dict(pb_flow_guard.get("chart_state") or {})
                     raw["pb_falling_knife_block_features"] = dict(pb_flow_guard.get("features") or {})
+                    raw["pb_falling_knife_block_sharpness"] = dict(pb_flow_guard.get("sharpness") or {})
                     signal.raw_scores = raw
                 except Exception:
                     pass
@@ -3339,6 +5300,9 @@ class DexterScheduler:
         atr = abs(float(getattr(lane_signal, "atr", 0.0) or 0.0))
         base_risk = abs(entry - stop_loss)
         if direction not in {"long", "short"} or entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="signal_geometry", reason="pb_bs_invalid_entry_stop_risk"
+            )
             return None, ""
         atr_eff = max(base_risk, atr, entry * 0.0003)
         sign = 1.0 if direction == "long" else -1.0
@@ -3373,7 +5337,11 @@ class DexterScheduler:
         route_entry_type = str(entry_router.get("entry_type") or entry_type).strip().lower() or entry_type
         route_mode = str(entry_router.get("mode") or "").strip().lower()
         if family == "xau_scalp_pullback_limit":
-            if route_entry_type in {"buy_stop", "sell_stop"}:
+            if route_entry_type == "market":
+                new_entry = entry
+                new_stop = stop_loss
+                entry_type = "market"
+            elif route_entry_type in {"buy_stop", "sell_stop"}:
                 trigger = max(
                     base_risk * float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_STOP_TRIGGER_RISK_RATIO", 0.10) or 0.10),
                     atr_eff * 0.05,
@@ -3408,6 +5376,9 @@ class DexterScheduler:
                 new_stop = stop_loss + (stop_lift * sign)
         shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type=entry_type)
         if shaped is None:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="price_plan", reason="pb_bs_apply_family_price_plan_returned_none"
+            )
             return None, ""
         lane_source = self._strategy_family_lane_source(base_source, family)
         self._ensure_signal_trace(shaped, source=lane_source)
@@ -3467,7 +5438,26 @@ class DexterScheduler:
                     "snapshot": dict(entry_router.get("snapshot") or {}),
                     "chart_state": dict(entry_router.get("chart_state") or {}),
                     "features": dict(entry_router.get("features") or {}),
+                    "sharpness": dict(entry_router.get("sharpness") or {}),
+                    "fibo_action_zone": dict(entry_router.get("fibo_action_zone") or {}),
+                    "zone_confluence": dict(entry_router.get("zone_confluence") or {}),
                 }
+                # Attach Volume Profile context if available
+                if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+                    try:
+                        _vp_sym = str(getattr(signal, "symbol", "XAUUSD") or "XAUUSD").strip().upper()
+                        vp_report = dict(report_store.get_report(f"volume_profile_{_vp_sym.lower()}") or report_store.get_report("volume_profile") or {})
+                        vp_data = dict(vp_report.get("vp") or {})
+                        if vp_data.get("poc"):
+                            from analysis.volume_profile import check_entry_vs_profile, get_tick_config
+                            entry_price = float(getattr(signal, "entry", 0.0) or 0.0)
+                            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+                            if entry_price > 0 and direction:
+                                _tc = get_tick_config(_vp_sym)
+                                vp_check = check_entry_vs_profile(entry_price, direction, vp_data, tick_size=float(_tc.get("tick_size", 0.01)), bucket_ticks=int(_tc.get("bucket_ticks", 10)))
+                                raw["xau_openapi_entry_router"]["volume_profile"] = {"poc": float(vp_data.get("poc", 0) or 0), "va_high": float(vp_data.get("va_high", 0) or 0), "va_low": float(vp_data.get("va_low", 0) or 0), **vp_check}
+                    except Exception:
+                        pass
                 router_risk_mult = max(0.25, float(entry_router.get("risk_multiplier", 1.0) or 1.0))
                 if abs(router_risk_mult - 1.0) > 1e-9:
                     raw["ctrader_risk_usd_override"] = round(
@@ -3655,6 +5645,17 @@ class DexterScheduler:
                     "first_sample_mode": True,
                 }
                 first_sample_mode = True
+        if not matched_context and _behavioral_trigger:
+            _fss_min_conf = float(getattr(config, "XAU_FLOW_SHORT_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 69.0) or 69.0)
+            _fss_sig_conf = float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            if _fss_sig_conf < _fss_min_conf:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="pattern_context",
+                    reason=f"fss_behavioral_bypass_conf_below_min:{_fss_sig_conf:.1f}<{_fss_min_conf:.1f}",
+                )
+                return None, ""
         if not matched_context:
             self._stamp_family_canary_skip(
                 signal, family=family, stage="pattern_context", reason="fss_context_no_match"
@@ -3954,10 +5955,16 @@ class DexterScheduler:
         if signal is None or family != "xau_scalp_flow_long_sidecar":
             return None, ""
         if not bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_ENABLED", False)):
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="family_disabled", reason="XAU_FLOW_LONG_SIDECAR_ENABLED=0"
+            )
             return None, ""
         lane_signal = copy.deepcopy(signal)
         direction = str(getattr(lane_signal, "direction", "") or "").strip().lower()
         if direction != "long":
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="direction_gate", reason="fls_requires_long_direction"
+            )
             return None, ""
         # Check if behavioral_trigger pre-qualifies this signal (Priority #3)
         try:
@@ -3971,6 +5978,9 @@ class DexterScheduler:
             allowed_patterns,
         )
         if not pattern_ok and not _behavioral_trigger:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="pattern_gate", reason="fls_pattern_token_not_allowed"
+            )
             return None, ""
         contexts = self._load_xau_flow_long_sidecar_contexts()
         session_sig = self._signal_session_signature(lane_signal)
@@ -4092,7 +6102,24 @@ class DexterScheduler:
                     "first_sample_mode": True,
                 }
                 first_sample_mode = True
+        if not matched_context and _behavioral_trigger:
+            _fls_min_conf = float(getattr(config, "XAU_FLOW_LONG_SIDECAR_FIRST_SAMPLE_MIN_CONFIDENCE", 69.0) or 69.0)
+            _fls_sig_conf = float(getattr(lane_signal, "confidence", 0.0) or 0.0)
+            if _fls_sig_conf < _fls_min_conf:
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="pattern_context",
+                    reason=f"fls_behavioral_bypass_conf_below_min:{_fls_sig_conf:.1f}<{_fls_min_conf:.1f}",
+                )
+                return None, ""
         if not matched_context:
+            self._stamp_family_canary_skip(
+                signal,
+                family=family,
+                stage="pattern_context",
+                reason="fls_no_chart_contexts_and_no_behavioral_bypass",
+            )
             return None, ""
         snapshot = dict(
             live_profile_autopilot.latest_capture_feature_snapshot(
@@ -4104,6 +6131,9 @@ class DexterScheduler:
             or {}
         )
         if not bool(snapshot.get("ok")) or not bool(snapshot.get("run_id")):
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="feature_snapshot", reason="fls_tick_capture_snapshot_unavailable"
+            )
             return None, ""
         capture_features = dict((snapshot.get("features") or ((snapshot.get("gate") or {}).get("features") or {})) or {})
         continuation_bias = float(((matched_context.get("continuation_bias") or chart_state.get("continuation_bias") or 0.0) or 0.0))
@@ -4114,6 +6144,9 @@ class DexterScheduler:
         # Guard B+C: behavioral_trigger bypass — require POSITIVE delta_proxy (real buying flow)
         # negative/zero delta_proxy = sellers dominating = long exhaustion = end-of-long-trend → block FLS
         if _behavioral_trigger and delta_proxy <= 0:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="flow_guard", reason="fls_behavioral_requires_positive_delta_proxy"
+            )
             return None, ""
         follow_plan = str(matched_context.get("follow_up_plan") or "").strip().lower()
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
@@ -4121,6 +6154,9 @@ class DexterScheduler:
         atr = abs(float(getattr(lane_signal, "atr", 0.0) or 0.0))
         base_risk = abs(entry - stop_loss)
         if entry <= 0 or stop_loss <= 0 or base_risk <= 0:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="signal_geometry", reason="fls_invalid_entry_stop_geometry"
+            )
             return None, ""
         atr_eff = max(base_risk, atr, entry * 0.0003)
         use_break_stop = bool(
@@ -4179,6 +6215,9 @@ class DexterScheduler:
             next_entry_type = "buy_stop"
         else:
             if bool(getattr(config, "XAU_FLOW_LONG_SIDECAR_FORCE_STOP_ONLY", True)):
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="price_plan", reason="fls_force_stop_only_break_thresholds_not_met"
+                )
                 return None, ""
             retest = max(
                 base_risk * float(getattr(config, "XAU_FLOW_LONG_SIDECAR_SHALLOW_RETEST_RISK_RATIO", 0.10) or 0.10),
@@ -4190,6 +6229,9 @@ class DexterScheduler:
             next_entry_type = "limit"
         shaped = self._apply_family_price_plan(lane_signal, family=family, entry=new_entry, stop_loss=new_stop, entry_type=next_entry_type)
         if shaped is None:
+            self._stamp_family_canary_skip(
+                signal, family=family, stage="price_plan", reason="fls_apply_family_price_plan_returned_none"
+            )
             return None, ""
         lane_source = self._strategy_family_lane_source(base_source, family)
         self._ensure_signal_trace(shaped, source=lane_source)
@@ -4474,6 +6516,15 @@ class DexterScheduler:
             tick_falling = (direction == "long" and tick_up < min_tick_up) or (direction == "short" and (1.0 - tick_up) < min_tick_up)
             if adverse_delta or tick_falling:
                 return None, ""
+        # ── Sharpness composite knife guard (catches edge cases binary checks miss) ─
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                rr_sharpness = _compute_sharpness(capture_features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                if int(rr_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_RR_KNIFE_THRESHOLD", 30) or 30)):
+                    return None, ""
+            except Exception:
+                pass
         lane_signal = copy.deepcopy(signal)
         entry = float(getattr(lane_signal, "entry", 0.0) or 0.0)
         stop_loss = float(getattr(lane_signal, "stop_loss", 0.0) or 0.0)
@@ -4571,9 +6622,11 @@ class DexterScheduler:
         if signal is None or family != "xau_scalp_prelondon_sweep_cont":
             return None, ""
         if not bool(getattr(config, "XAU_PSC_ENABLED", False)):
+            self._stamp_family_canary_skip(signal, family=family, stage="family_disabled", reason="XAU_PSC_ENABLED=0")
             return None, ""
         direction = str(getattr(signal, "direction", "") or "").strip().lower()
         if direction not in {"long", "short"}:
+            self._stamp_family_canary_skip(signal, family=family, stage="signal_geometry", reason="psc_invalid_direction")
             return None, ""
         try:
             # ── 1. Session window guard ──────────────────────────────────────
@@ -4584,10 +6637,16 @@ class DexterScheduler:
             # Window wraps midnight: valid if h >= 22.0 OR h <= 2.5
             in_window = (h >= pre_start) or (h <= pre_end)
             if not in_window:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="session_window", reason="psc_outside_pre_london_window"
+                )
                 return None, ""
             # ── 2. Fetch M5 bars (120 bars = 10h, enough for full Asian range) ──
             df_raw = xauusd_provider.fetch("5m", bars=120)
             if df_raw is None or df_raw.empty or len(df_raw) < 30:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="feature_snapshot", reason="psc_m5_bars_unavailable_or_short"
+                )
                 return None, ""
             df = df_raw.copy()
             if df.index.tz is None:
@@ -4603,6 +6662,9 @@ class DexterScheduler:
             asian_start = asian_end - timedelta(hours=5)   # 17:00 UTC
             asian_bars = df[(df.index >= asian_start) & (df.index < asian_end)]
             if len(asian_bars) < 8:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="pattern_context", reason="psc_asian_session_bars_insufficient"
+                )
                 return None, ""
             asian_high = float(asian_bars["high"].max())
             asian_low = float(asian_bars["low"].min())
@@ -4610,10 +6672,19 @@ class DexterScheduler:
             rng_min = float(getattr(config, "XAU_PSC_ASIAN_RANGE_MIN", 8.0) or 8.0)
             rng_max = float(getattr(config, "XAU_PSC_ASIAN_RANGE_MAX", 45.0) or 45.0)
             if not (rng_min <= asian_range <= rng_max):
+                self._stamp_family_canary_skip(
+                    signal,
+                    family=family,
+                    stage="pattern_context",
+                    reason=f"psc_asian_range_out_of_band:{asian_range:.2f}not_in[{rng_min},{rng_max}]",
+                )
                 return None, ""
             # ── 4. Sweep detection (bars since boundary_22h) ─────────────────
             sweep_bars_df = df[df.index >= boundary_22h]
             if len(sweep_bars_df) < 3:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="pattern_context", reason="psc_sweep_window_bars_insufficient"
+                )
                 return None, ""
             recovery_max_bars = int(getattr(config, "XAU_PSC_RECOVERY_MAX_BARS", 8) or 8)
             recent = (sweep_bars_df.iloc[-recovery_max_bars:] if len(sweep_bars_df) >= recovery_max_bars else sweep_bars_df)
@@ -4646,13 +6717,22 @@ class DexterScheduler:
                         sweep_depth = depth_val
                         bars_since_sweep = len(recent) - 1 - sw_idx
             if not sweep_detected:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="pattern_context", reason="psc_sweep_v_recovery_not_detected"
+                )
                 return None, ""
             # ── 5. No-chase guard ─────────────────────────────────────────────
             current_price = float(df["close"].iloc[-1])
             no_chase = float(getattr(config, "XAU_PSC_NO_CHASE_MAX_PIPS", 20.0) or 20.0)
             if direction == "long" and current_price > asian_low + no_chase:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="price_plan", reason="psc_no_chase_long_extended_above_asian_low"
+                )
                 return None, ""
             if direction == "short" and current_price < asian_high - no_chase:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="price_plan", reason="psc_no_chase_short_extended_below_asian_high"
+                )
                 return None, ""
             # ── 6. Momentum confirmation (must support recovery direction) ───
             try:
@@ -4673,12 +6753,24 @@ class DexterScheduler:
             min_d = float(getattr(config, "XAU_PSC_MIN_SIGNED_DELTA", 0.02) or 0.02)
             min_t = float(getattr(config, "XAU_PSC_MIN_TICK_UP_RATIO", 0.48) or 0.48)
             if direction == "long" and signed_delta < -min_d:
-                return None, ""   # still cascading down
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="flow_guard", reason="psc_momentum_long_signed_delta_adverse"
+                )
+                return None, ""
             if direction == "short" and signed_delta > min_d:
-                return None, ""   # still surging up
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="flow_guard", reason="psc_momentum_short_signed_delta_adverse"
+                )
+                return None, ""
             if direction == "long" and tick_up < min_t:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="flow_guard", reason="psc_momentum_long_tick_up_ratio_weak"
+                )
                 return None, ""
             if direction == "short" and (1.0 - tick_up) < min_t:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="flow_guard", reason="psc_momentum_short_tick_down_ratio_weak"
+                )
                 return None, ""
             # ── 7. Build price plan ───────────────────────────────────────────
             lane_signal = copy.deepcopy(signal)
@@ -4695,6 +6787,9 @@ class DexterScheduler:
                 new_stop = round(sweep_extreme + sl_buf, 4)
             new_risk = abs(new_entry - new_stop)
             if new_risk <= 0 or new_entry <= 0:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="signal_geometry", reason="psc_computed_entry_stop_invalid"
+                )
                 return None, ""
             # Override TP targets using sweep depth as scale reference
             sign = 1.0 if direction == "long" else -1.0
@@ -4710,6 +6805,9 @@ class DexterScheduler:
                 entry_type="limit",
             )
             if shaped is None:
+                self._stamp_family_canary_skip(
+                    signal, family=family, stage="price_plan", reason="psc_apply_family_price_plan_returned_none"
+                )
                 return None, ""
             lane_source = self._strategy_family_lane_source(base_source, family)
             self._ensure_signal_trace(shaped, source=lane_source)
@@ -4857,7 +6955,7 @@ class DexterScheduler:
         if is_weekend and not bool(getattr(config, "CRYPTO_WEEKEND_TRADING_ENABLED", False)):
             return None, ""
         # Phase 1: Cluster loss guard + daily cap (isolated per symbol, no XAU impact)
-        _clg_blocked, _clg_reason = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _clg_reason = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _cap_reason = self._crypto_daily_cap_check(symbol)
@@ -4883,12 +6981,16 @@ class DexterScheduler:
         raw = dict(getattr(signal, "raw_scores", {}) or {})
         winner_regime = str(raw.get("crypto_winner_logic_regime") or raw.get("winner_logic_regime") or "").strip().lower()
         neural_prob = float(raw.get("neural_probability", 0.0) or 0.0)
+        crypto_v2 = self._crypto_v2_decision(symbol=symbol, family=family, confidence=confidence)
+        crypto_v2_live = bool(crypto_v2 and crypto_v2.enabled and not crypto_v2.shadow_only)
         relaxed_gate_reasons: list[str] = []
         if family == "btc_weekday_lob_momentum":
             if symbol != "BTCUSD" or base_token != "scalp_btcusd":
                 return None, ""
-            if direction != "long":
+            if direction != "long" and not crypto_v2_live:
                 return None, ""
+            if direction == "short" and crypto_v2_live:
+                relaxed_gate_reasons.append("btc_lob_v2_short_enabled")
             btc_sessions = set(config.get_crypto_weekend_btc_allowed_sessions() or set()) if is_weekend else set(config.get_btc_weekday_lob_allowed_sessions() or set())
             if "*" not in btc_sessions and not self._session_signature_matches(session_sig, btc_sessions):
                 # Phase 3: high-confidence session bypass (mirror of XAU Priority #1)
@@ -4904,8 +7006,12 @@ class DexterScheduler:
             if confidence < float(getattr(config, "BTC_WEEKDAY_LOB_MIN_CONFIDENCE", 70.0) or 70.0):
                 return None, ""
             if confidence > float(getattr(config, "BTC_WEEKDAY_LOB_MAX_CONFIDENCE", 74.9) or 74.9):
-                return None, ""
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append("btc_lob_v2_conf_ceiling_removed")
             allowed_patterns = set(config.get_btc_weekday_lob_allowed_patterns() or set())
+            if crypto_v2_live:
+                allowed_patterns.update({"sweep_reversal"})
             if allowed_patterns and ((not pattern) or pattern.lower() not in allowed_patterns):
                 return None, ""
             neutral_ob_allowed = (
@@ -4921,11 +7027,16 @@ class DexterScheduler:
             if weekend_neutral_ok:
                 relaxed_gate_reasons.append("weekend_neutral_winner")
             if bool(getattr(config, "BTC_WEEKDAY_LOB_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not neutral_ob_allowed and not weekend_neutral_ok:
-                return None, ""
-            # Phase 4 MRD: block LOB longs when BTC macro micro-regime is bearish
-            _lob_mrd_regime, _ = self._btc_mrd_check("long")
-            if _lob_mrd_regime == "bearish_micro":
-                return None, ""
+                if not (crypto_v2_live and winner_regime in {"neutral", "cold", ""} and confidence >= 70.0 and neural_prob >= 0.60):
+                    return None, ""
+                relaxed_gate_reasons.append("btc_lob_v2_neutral_winner_probe")
+            # Phase 4 MRD: block LOB longs when BTC macro micro-regime is bearish unless v2 is live soft-tiered
+            _lob_mrd_regime, _ = self._btc_mrd_check(direction)
+            if (direction == "long" and _lob_mrd_regime == "bearish_micro") or (direction == "short" and _lob_mrd_regime == "bullish_micro"):
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append(f"btc_lob_v2_mrd_soft:{_lob_mrd_regime}")
+                crypto_v2 = self._crypto_v2_decision(symbol=symbol, family=family, confidence=confidence, soft_mrd_penalty=-0.20)
             if entry_type == "market" and not bool(getattr(config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True)):
                 return None, ""
             if "choch_entry" in pattern and entry_type != "limit":
@@ -4947,6 +7058,8 @@ class DexterScheduler:
             risk_usd = float(getattr(config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9) or 0.9)
             if relaxed_gate_reasons:
                 risk_usd *= float(getattr(config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.70) or 0.70)
+            if crypto_v2_live and crypto_v2 is not None:
+                risk_usd *= max(0.1, float(getattr(crypto_v2, "size_multiplier", 1.0) or 1.0))
             if is_weekend:
                 risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         else:
@@ -4955,21 +7068,33 @@ class DexterScheduler:
             eth_sessions = set(config.get_crypto_weekend_eth_allowed_sessions() or set()) if is_weekend else set(config.get_eth_weekday_probe_allowed_sessions() or set())
             if "*" not in eth_sessions and not self._session_signature_matches(session_sig, eth_sessions):
                 return None, ""
-            if confidence < float(getattr(config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0) or 74.0):
+            eth_min_conf = float(getattr(config, "ETH_WEEKDAY_PROBE_MIN_CONFIDENCE", 74.0) or 74.0)
+            if crypto_v2_live:
+                eth_min_conf = min(eth_min_conf, 70.0)
+            if confidence < eth_min_conf:
                 return None, ""
             if confidence > float(getattr(config, "ETH_WEEKDAY_PROBE_MAX_CONFIDENCE", 79.9) or 79.9):
-                return None, ""
+                if not crypto_v2_live:
+                    return None, ""
+                relaxed_gate_reasons.append("eth_smart_v2_conf_ceiling_removed")
             allowed_patterns = set(config.get_eth_weekday_probe_allowed_patterns() or set())
+            if crypto_v2_live:
+                allowed_patterns.update({"choch_entry", "sweep_reversal"})
             if allowed_patterns and ((not pattern) or pattern.lower() not in allowed_patterns):
                 return None, ""
             eth_weekend_neutral_ok = is_weekend and bool(getattr(config, "CRYPTO_WEEKEND_ALLOW_NEUTRAL_WINNER", True)) and winner_regime == "neutral"
             if eth_weekend_neutral_ok:
                 relaxed_gate_reasons.append("weekend_neutral_winner")
             if bool(getattr(config, "ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", True)) and winner_regime != "strong" and not eth_weekend_neutral_ok:
-                return None, ""
+                if not (crypto_v2_live and winner_regime in {"neutral", "cold", ""} and confidence >= 70.0 and neural_prob >= 0.60):
+                    return None, ""
+                relaxed_gate_reasons.append("eth_smart_v2_neutral_winner_probe")
             if entry_type == "market" and not bool(getattr(config, "ETH_WEEKDAY_PROBE_ALLOW_MARKET", True)):
                 return None, ""
             risk_usd = float(getattr(config, "ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", 0.35) or 0.35)
+            if crypto_v2_live and crypto_v2 is not None:
+                risk_usd = max(risk_usd, float(getattr(config, "ETH_SMART_V2_RISK_FLOOR_USD", 0.65) or 0.65))
+                risk_usd *= max(0.1, float(getattr(crypto_v2, "size_multiplier", 1.0) or 1.0))
             if is_weekend:
                 risk_usd *= float(getattr(config, "CRYPTO_WEEKEND_RISK_MULTIPLIER", 0.65) or 0.65)
         lane_signal = copy.deepcopy(signal)
@@ -4982,6 +7107,7 @@ class DexterScheduler:
         )
         if shaped is None:
             return None, ""
+        shaped = self._apply_crypto_v2_price_plan(shaped, decision=crypto_v2)
         lane_source = self._strategy_family_lane_source(base_source, family)
         self._ensure_signal_trace(shaped, source=lane_source)
         try:
@@ -5005,6 +7131,22 @@ class DexterScheduler:
             raw["crypto_weekday_pattern"] = pattern
             raw["strategy_family_relaxed_gate"] = bool(relaxed_gate_reasons)
             raw["strategy_family_relaxed_reason"] = ",".join(relaxed_gate_reasons)
+            if crypto_v2 is not None:
+                raw.update(
+                    crypto_redesign_metadata(
+                        crypto_v2,
+                        entry=float(getattr(shaped, "entry", 0.0) or 0.0),
+                        stop_loss=float(getattr(shaped, "stop_loss", 0.0) or 0.0),
+                        take_profit_1=float(getattr(shaped, "take_profit_1", 0.0) or 0.0),
+                        direction=str(getattr(shaped, "direction", "") or ""),
+                        blocked_by="",
+                    )
+                )
+                if bool(crypto_v2.enabled) and not bool(crypto_v2.shadow_only) and str(getattr(shaped, "entry_type", "") or "").strip().lower() == "limit":
+                    raw["crypto_limit_autocancel_enabled"] = bool(getattr(config, "BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", True))
+                    raw["crypto_limit_max_age_sec"] = int(getattr(config, "BTC_LOB_LIMIT_MAX_AGE_SEC", 180) or 180)
+                    raw.setdefault("crypto_limit_fill_rate_window", "shadow_pending")
+                    raw.setdefault("crypto_limit_slippage_bps", "shadow_pending")
             raw["mt5_ignore_open_positions"] = True
             raw["ctrader_risk_usd_override"] = risk_usd
             raw["mt5_limit_allow_market_fallback"] = False
@@ -5078,6 +7220,22 @@ class DexterScheduler:
             raw["ctrader_risk_usd_override"] = risk_usd
             raw["mt5_limit_allow_market_fallback"] = False
             raw["persistent_canary_symbol"] = ctx.get("symbol", "")
+            crypto_v2 = self._crypto_v2_decision(
+                symbol=str(ctx.get("symbol") or ""),
+                family=family,
+                confidence=float(ctx.get("confidence", 0.0) or 0.0),
+            )
+            if crypto_v2 is not None:
+                raw.update(
+                    crypto_redesign_metadata(
+                        crypto_v2,
+                        entry=float(getattr(shaped, "entry", 0.0) or 0.0),
+                        stop_loss=float(getattr(shaped, "stop_loss", 0.0) or 0.0),
+                        take_profit_1=float(getattr(shaped, "take_profit_1", 0.0) or 0.0),
+                        direction=str(getattr(shaped, "direction", "") or ""),
+                        blocked_by="",
+                    )
+                )
             if extra_tags:
                 raw.update(extra_tags)
             shaped.raw_scores = raw
@@ -5085,10 +7243,89 @@ class DexterScheduler:
             pass
         return shaped, lane_source
 
+    # ── BTC/ETH Redesign v2 (Opus 4.7): shadow-safe helpers ─────────────────
+
+    def _crypto_v2_decision(self, *, symbol: str, family: str, confidence: float, soft_mrd_penalty: float = 0.0):
+        if bool(getattr(config, "CRYPTO_REDESIGN_KILL_SWITCH", False)):
+            return None
+        sym = str(symbol or "").strip().upper()
+        fam = str(family or "").strip().lower()
+        if sym == "BTCUSD":
+            enabled = bool(getattr(config, "BTC_LOB_REDESIGN_V2_ENABLED", False))
+            shadow_only = bool(getattr(config, "BTC_LOB_REDESIGN_V2_SHADOW_ONLY", True))
+            tier_enabled = bool(getattr(config, "BTC_LOB_TIER_SIZING_ENABLED", False))
+            tp1_rr = float(getattr(config, "BTC_LOB_TP1_RR", 0.70) or 0.70)
+            runner_rr = float(getattr(config, "BTC_LOB_RUNNER_TP_RR", 2.50) or 2.50)
+        elif sym == "ETHUSD":
+            enabled = bool(getattr(config, "ETH_SMART_V2_ENABLED", False))
+            shadow_only = bool(getattr(config, "ETH_SMART_V2_SHADOW_ONLY", True))
+            tier_enabled = bool(getattr(config, "ETH_SMART_V2_TIER_SIZING_ENABLED", False))
+            tp1_rr = float(getattr(config, "ETH_SMART_V2_TP1_RR", 0.70) or 0.70)
+            runner_rr = float(getattr(config, "ETH_SMART_V2_RUNNER_TP_RR", 2.20) or 2.20)
+        else:
+            return None
+        return crypto_redesign_decision(
+            sym,
+            fam,
+            float(confidence or 0.0),
+            enabled=enabled,
+            shadow_only=shadow_only,
+            tier_sizing_enabled=tier_enabled,
+            tp1_rr=tp1_rr,
+            runner_rr=runner_rr,
+            soft_mrd_penalty=soft_mrd_penalty,
+        )
+
+    def _annotate_crypto_v2_signal(self, signal, *, decision, blocked_by: str = "") -> object:
+        if signal is None or decision is None:
+            return signal
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw.update(
+                crypto_redesign_metadata(
+                    decision,
+                    entry=float(getattr(signal, "entry", 0.0) or 0.0),
+                    stop_loss=float(getattr(signal, "stop_loss", 0.0) or 0.0),
+                    take_profit_1=float(getattr(signal, "take_profit_1", 0.0) or 0.0),
+                    direction=str(getattr(signal, "direction", "") or ""),
+                    blocked_by=blocked_by,
+                )
+            )
+            if bool(decision.enabled) and not bool(decision.shadow_only) and str(getattr(signal, "entry_type", "") or "").strip().lower() == "limit":
+                raw["crypto_limit_autocancel_enabled"] = bool(getattr(config, "BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", True))
+                raw["crypto_limit_max_age_sec"] = int(getattr(config, "BTC_LOB_LIMIT_MAX_AGE_SEC", 180) or 180)
+                raw.setdefault("crypto_limit_fill_rate_window", "shadow_pending")
+                raw.setdefault("crypto_limit_slippage_bps", "shadow_pending")
+            signal.raw_scores = raw
+        except Exception:
+            pass
+        return signal
+
+    def _apply_crypto_v2_price_plan(self, signal, *, decision) -> object:
+        if signal is None or decision is None:
+            return signal
+        if not bool(decision.enabled) or bool(decision.shadow_only):
+            return signal
+        try:
+            entry = float(getattr(signal, "entry", 0.0) or 0.0)
+            stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            tp1, tp2, tp3 = crypto_rr_price_plan(entry, stop_loss, direction, decision.tp1_rr, decision.runner_rr)
+            if tp1 > 0 and tp2 > 0:
+                signal.take_profit_1 = round(float(tp1), 4)
+                signal.take_profit_2 = round(float(tp2), 4)
+                signal.take_profit_3 = round(float(tp3), 4)
+                signal.risk_reward = round(float(decision.tp1_rr), 2)
+        except Exception:
+            pass
+        return signal
+
     # ── Crypto Guards: Cluster Loss + Daily Cap (Phase 1) ────────────────────
 
-    def _crypto_cluster_loss_check(self, symbol: str) -> tuple[bool, str]:
+    def _crypto_cluster_loss_check(self, symbol: str, family: str = "") -> tuple[bool, str]:
         """Block if too many recent losses for this crypto symbol (mirror of XAU cluster loss guard)."""
+        if bool(self._is_pytest_runtime()):
+            return False, ""
         if not bool(getattr(config, "CRYPTO_CLUSTER_LOSS_GUARD_ENABLED", True)):
             return False, ""
         sym = str(symbol or "").strip().upper()
@@ -5103,20 +7340,36 @@ class DexterScheduler:
         try:
             db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
             db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+            fam = str(family or "").strip().lower()
+            per_family = bool(getattr(config, "CRYPTO_CLUSTER_LOSS_PER_FAMILY", False)) and bool(fam)
             with sqlite3.connect(str(db_path), timeout=3) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending') AND execution_utc >= datetime('now', ? || ' hours')",
-                    (sym, f"-{window_h:.1f}"),
-                ).fetchone()
+                if per_family:
+                    row = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM ctrader_deals
+                         WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending')
+                           AND execution_utc >= datetime('now', ? || ' hours')
+                           AND LOWER(COALESCE(source,''))=?
+                        """,
+                        (sym, f"-{window_h:.1f}", fam),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM ctrader_deals WHERE symbol=? AND pnl_usd < 0 AND outcome NOT IN ('open','pending') AND execution_utc >= datetime('now', ? || ' hours')",
+                        (sym, f"-{window_h:.1f}"),
+                    ).fetchone()
             loss_count = int((row or [0])[0] or 0)
             if loss_count >= min_losses:
-                return True, f"crypto_cluster_loss_guard:{sym} {loss_count}>={min_losses} losses in {window_h:.1f}h"
+                scope = fam if per_family else sym
+                return True, f"crypto_cluster_loss_guard:{scope} {loss_count}>={min_losses} losses in {window_h:.1f}h"
         except Exception:
             pass
         return False, ""
 
     def _crypto_daily_cap_check(self, symbol: str) -> tuple[bool, str]:
         """Block if daily trade count for this crypto symbol exceeds cap."""
+        if bool(self._is_pytest_runtime()):
+            return False, ""
         sym = str(symbol or "").strip().upper()
         if sym == "BTCUSD":
             cap = int(getattr(config, "BTC_DAILY_TRADE_CAP", 3) or 3)
@@ -5197,7 +7450,7 @@ class DexterScheduler:
         if confidence < float(getattr(config, "BTC_FSS_MIN_CONFIDENCE", 67.0) or 67.0):
             return None, ""
         # Phase 1 guards re-applied (BFSS skips weekday builder, call directly)
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
@@ -5310,7 +7563,7 @@ class DexterScheduler:
         if confidence < float(getattr(config, "BTC_FLS_MIN_CONFIDENCE", 67.0) or 67.0):
             return None, ""
         # Phase 1 guards
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
@@ -5417,7 +7670,7 @@ class DexterScheduler:
         if direction not in {"long", "short"}:
             return None, ""
         # Phase 1 guards
-        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol)
+        _clg_blocked, _ = self._crypto_cluster_loss_check(symbol, family)
         if _clg_blocked:
             return None, ""
         _cap_blocked, _ = self._crypto_daily_cap_check(symbol)
@@ -5826,20 +8079,55 @@ class DexterScheduler:
             self._maybe_execute_mt5_signal(mt5_signal, source=lane_source)
             report["mt5"] = True
         if bool(profile.get("direct_enabled", False)) and bool(profile.get("ctrader_enabled", False)):
-            ctr_signal = _prepare_copy()
-            try:
-                result = ctrader_executor.execute_signal(ctr_signal, source=lane_source)
-                report["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
-                logger.info(
-                    "[CTRADER][CANARY] %s %s -> %s (%s) %s",
-                    str(getattr(result, "status", "") or ""),
-                    str(getattr(result, "signal_symbol", getattr(ctr_signal, "symbol", "")) or ""),
-                    str(getattr(result, "broker_symbol", "-") or "-"),
-                    lane_source,
-                    str(getattr(result, "message", "") or ""),
+            _canary_xau = str(symbol or "").strip().upper() in {"XAUUSD", "GOLD"}
+            _canary_holiday_blocked = (
+                _canary_xau
+                and bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True))
+                and session_manager.is_xauusd_holiday()
+            )
+            _canary_closed_blocked = _canary_xau and not session_manager.is_xauusd_market_open()
+            if _canary_holiday_blocked:
+                logger.info("[CTRADER][CANARY] skipped source=%s symbol=%s reason=xauusd_market_holiday", lane_source, symbol)
+            elif _canary_closed_blocked:
+                logger.info("[CTRADER][CANARY] skipped source=%s symbol=%s reason=xauusd_market_closed", lane_source, symbol)
+            else:
+                ctr_signal = _prepare_copy()
+                # ── BUG FIX (2026-04-22): canary lane previously bypassed
+                # _allow_ctrader_source_profile entirely (no MTF/conf/session/tf/
+                # entry_type checks). This let xauusd_scheduled:canary execute
+                # SHORTs that the main lane refused with d1_h4_h1_block:short_vs_long
+                # and conf_below:70. Apply the same gate here BEFORE execute_signal.
+                _canary_allow, _canary_reason = self._allow_ctrader_source_profile(
+                    ctr_signal, lane_source
                 )
-            except Exception as e:
-                logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
+                if not _canary_allow:
+                    logger.info(
+                        "[CTRADER][CANARY] skipped source=%s symbol=%s reason=source_profile_blocked:%s",
+                        lane_source,
+                        symbol,
+                        _canary_reason,
+                    )
+                    try:
+                        _r = dict(getattr(ctr_signal, "raw_scores", {}) or {})
+                        _r["ctrader_canary_source_profile_blocked"] = True
+                        _r["ctrader_canary_source_profile_reason"] = str(_canary_reason or "")
+                        ctr_signal.raw_scores = _r
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        result = ctrader_executor.execute_signal(ctr_signal, source=lane_source)
+                        report["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
+                        logger.info(
+                            "[CTRADER][CANARY] %s %s -> %s (%s) %s",
+                            str(getattr(result, "status", "") or ""),
+                            str(getattr(result, "signal_symbol", getattr(ctr_signal, "symbol", "")) or ""),
+                            str(getattr(result, "broker_symbol", "-") or "-"),
+                            lane_source,
+                            str(getattr(result, "message", "") or ""),
+                        )
+                    except Exception as e:
+                        logger.warning("[CTRADER][CANARY] execute failed source=%s symbol=%s err=%s", lane_source, symbol, e)
         # Pre-load directive once so the family loop can respect blocked families/sources.
         # Canary families previously bypassed _allow_ctrader_source_profile entirely.
         # Fix: mirror the EXACT same check as _allow_ctrader_source_profile (lines 979-988):
@@ -5870,6 +8158,18 @@ class DexterScheduler:
                     for s in list(_directive.get("blocked_sources") or [])
                     if str(s).strip()
                 }
+        # ── Global off_hours block for canary families ──────────────────
+        # WR is low across all families during off_hours. Block first, let Hermes re-enable.
+        _canary_off_hours_block = bool(getattr(config, "CANARY_BLOCK_OFF_HOURS", True))
+        if _canary_off_hours_block and symbol == "XAUUSD":
+            try:
+                _sess_info = session_manager.get_session_info()
+                _active_sessions = set(str(s).lower() for s in (_sess_info.get("active_sessions") or []))
+                if "off_hours" in _active_sessions and not _active_sessions.intersection({"london", "new_york"}):
+                    logger.info("[CANARY] global off_hours block — skipping all family variants")
+                    return report
+            except Exception:
+                pass
         family_candidates = self._load_strategy_family_candidates(symbol=symbol, base_source=base_source)
         for candidate in list(family_candidates or []):
             try:
@@ -5927,19 +8227,42 @@ class DexterScheduler:
                 self._maybe_execute_mt5_signal(family_signal, source=family_source)
                 family_row["mt5"] = True
             if bool(profile.get("ctrader_enabled", False)):
-                try:
-                    result = ctrader_executor.execute_signal(copy.deepcopy(family_signal), source=family_source)
-                    family_row["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
+                # ── BUG FIX (2026-04-22): apply source profile gate to family canary
+                # variants too. Same root cause as the persistent canary lane —
+                # MTF/conf/session/tf/entry_type checks were bypassed entirely.
+                _fc_signal = copy.deepcopy(family_signal)
+                _fc_allow, _fc_reason = self._allow_ctrader_source_profile(
+                    _fc_signal, family_source
+                )
+                if not _fc_allow:
                     logger.info(
-                        "[CTRADER][CANARY][FAMILY] %s %s -> %s (%s) %s",
-                        str(getattr(result, "status", "") or ""),
-                        str(getattr(result, "signal_symbol", getattr(family_signal, "symbol", "")) or ""),
-                        str(getattr(result, "broker_symbol", "-") or "-"),
+                        "[CTRADER][CANARY][FAMILY] skipped source=%s symbol=%s reason=source_profile_blocked:%s",
                         family_source,
-                        str(getattr(result, "message", "") or ""),
+                        symbol,
+                        _fc_reason,
                     )
-                except Exception as e:
-                    logger.warning("[CTRADER][CANARY][FAMILY] execute failed source=%s symbol=%s err=%s", family_source, symbol, e)
+                    self._store_xau_family_canary_gate_journal(
+                        signal,
+                        candidate=candidate,
+                        base_source=base_source,
+                        lane_source=str(family_source or ""),
+                        gate_stage="source_profile",
+                        reason=str(_fc_reason or ""),
+                    )
+                else:
+                    try:
+                        result = ctrader_executor.execute_signal(_fc_signal, source=family_source)
+                        family_row["ctrader"] = bool(getattr(result, "ok", False) or getattr(result, "dry_run", False))
+                        logger.info(
+                            "[CTRADER][CANARY][FAMILY] %s %s -> %s (%s) %s",
+                            str(getattr(result, "status", "") or ""),
+                            str(getattr(result, "signal_symbol", getattr(family_signal, "symbol", "")) or ""),
+                            str(getattr(result, "broker_symbol", "-") or "-"),
+                            family_source,
+                            str(getattr(result, "message", "") or ""),
+                        )
+                    except Exception as e:
+                        logger.warning("[CTRADER][CANARY][FAMILY] execute failed source=%s symbol=%s err=%s", family_source, symbol, e)
             report["family_variants"].append(family_row)
         return report
 
@@ -6276,6 +8599,12 @@ class DexterScheduler:
         """
         if signal is None:
             return {"applied": False, "reason": "no_signal"}
+        self._normalize_signal_confidence(signal, stage="neural_pre")
+        try:
+            apply_entry_template_hints(signal)
+            apply_entry_template_conf_tailwind(signal)
+        except Exception:
+            pass
         try:
             raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
             if raw_scores.get("neural_confidence_adjusted"):
@@ -6302,7 +8631,7 @@ class DexterScheduler:
             if adjust.get("applied"):
                 adjusted = float(adjust.get("adjusted_confidence", base_conf))
                 delta = float(adjust.get("delta", adjusted - base_conf))
-                signal.confidence = round(adjusted, 1)
+                signal.confidence = self._normalize_confidence_value(adjusted)
                 raw_scores["confidence_post_neural"] = round(signal.confidence, 3)
                 raw_scores["neural_adjust_delta"] = round(delta, 3)
                 if prob is not None:
@@ -6333,6 +8662,7 @@ class DexterScheduler:
 
             raw_scores["neural_confidence_adjusted"] = True
             signal.raw_scores = raw_scores
+            self._normalize_signal_confidence(signal, stage="neural_post")
             return adjust
         except Exception as e:
             logger.debug("[NeuralBrain] soft-adjust error: %s", e)
@@ -7086,6 +9416,126 @@ class DexterScheduler:
             "sent": sent,
         }
 
+    def _check_post_sl_reversal_signal(self) -> bool:
+        """
+        Check XAUUSD M1 for sweep + reversal pattern and fire a market re-entry
+        directly into the main cTrader lane if confirmed.
+
+        Runs every ~30s inside _run_xau_guard_transition_watch.
+        Governed by POST_SL_REVERSAL_COOLDOWN_SECONDS to prevent over-trading.
+        Returns True if a signal was dispatched.
+        """
+        if not bool(getattr(config, "POST_SL_REVERSAL_ENABLED", False)):
+            return False
+        if bool(getattr(config, "XAU_HOLIDAY_GUARD_ENABLED", True)) and session_manager.is_xauusd_holiday():
+            return False
+        if not session_manager.is_xauusd_market_open():
+            return False
+        cooldown = float(getattr(config, "POST_SL_REVERSAL_COOLDOWN_SECONDS", 300.0) or 300.0)
+        if (time.time() - self._post_sl_reversal_last_fired_ts) < cooldown:
+            return False
+        try:
+            sweep = scalping_scanner.detect_xau_sweep_reversal()
+        except Exception as e:
+            logger.debug("[PostSLReversal] detect error: %s", e)
+            return False
+        if bool(sweep.get("armed")) and not bool(sweep.get("confirmed")):
+            try:
+                self._capture_xau_reversal_zone(
+                    sweep,
+                    stage=str(sweep.get("stage") or "armed"),
+                    trigger_source="post_sl_reversal_watch",
+                )
+            except Exception:
+                logger.debug("[ReversalZoneCapture] armed capture failed", exc_info=True)
+        if not bool(sweep.get("confirmed")):
+            logger.debug("[PostSLReversal] no pattern: %s", sweep.get("reason", "-"))
+            return False
+        direction = str(sweep.get("direction") or "long").strip().lower()
+        sweep_level = float(sweep.get("sweep_level") or 0.0)
+        current_price = float(sweep.get("current_close") or 0.0)
+        atr = float(sweep.get("atr") or 1.0)
+        wick_ratio = float(sweep.get("sweep_wick_ratio") or 0.0)
+        if current_price <= 0 or atr <= 0:
+            return False
+        try:
+            capture_meta = self._capture_xau_reversal_zone(
+                sweep,
+                stage="confirmed",
+                trigger_source="post_sl_reversal_watch",
+            )
+        except Exception:
+            logger.debug("[ReversalZoneCapture] confirmed capture failed", exc_info=True)
+            capture_meta = {}
+        # ── Sharpness guard — block sweep reversal in knife microstructure ──
+        if bool(getattr(config, "XAU_ENTRY_SHARPNESS_ENABLED", True)):
+            try:
+                sweep_snap = dict(live_profile_autopilot.latest_capture_feature_snapshot(symbol="XAUUSD", lookback_sec=int(getattr(config, "XAU_TICK_DEPTH_FILTER_LOOKBACK_SEC", 240) or 240), direction=direction, confidence=float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0)) or {})
+                sweep_features = dict((sweep_snap.get("gate") or {}).get("features") or sweep_snap.get("features") or {})
+                if sweep_features:
+                    from analysis.entry_sharpness import compute_entry_sharpness_score as _compute_sharpness
+                    sweep_sharpness = _compute_sharpness(sweep_features, direction, micro_vol_scale=float(getattr(config, "XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", 0.025) or 0.025), max_spread_expansion=float(getattr(config, "XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", 1.20) or 1.20))
+                    if int(sweep_sharpness.get("sharpness_score", 50) or 50) < max(1, int(getattr(config, "XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD", 30) or 30)):
+                        logger.info("[PostSLReversal] blocked by sharpness knife score=%s", sweep_sharpness.get("sharpness_score"))
+                        return False
+            except Exception:
+                pass
+        sl_buf = atr * float(getattr(config, "POST_SL_REVERSAL_SL_BUFFER_ATR", 0.20) or 0.20)
+        tp1_r = float(getattr(config, "POST_SL_REVERSAL_TP1_R", 1.5) or 1.5)
+        tp2_r = float(getattr(config, "POST_SL_REVERSAL_TP2_R", 2.5) or 2.5)
+        tp3_r = float(getattr(config, "POST_SL_REVERSAL_TP3_R", 3.5) or 3.5)
+        conf = float(getattr(config, "POST_SL_REVERSAL_CONFIDENCE", 74.0) or 74.0)
+        if direction == "long":
+            sl = sweep_level - sl_buf
+            risk = max(current_price - sl, 0.5)
+            tp1 = current_price + risk * tp1_r
+            tp2 = current_price + risk * tp2_r
+            tp3 = current_price + risk * tp3_r
+        else:
+            sl = sweep_level + sl_buf
+            risk = max(sl - current_price, 0.5)
+            tp1 = current_price - risk * tp1_r
+            tp2 = current_price - risk * tp2_r
+            tp3 = current_price - risk * tp3_r
+        from analysis.signals import TradeSignal
+        sig = TradeSignal()
+        sig.symbol = "XAUUSD"
+        sig.direction = direction
+        sig.confidence = conf
+        sig.entry = current_price
+        sig.entry_type = "market"
+        sig.stop_loss = round(sl, 2)
+        sig.take_profit_1 = round(tp1, 2)
+        sig.take_profit_2 = round(tp2, 2)
+        sig.take_profit_3 = round(tp3, 2)
+        sig.atr = round(atr, 3)
+        sig.pattern = f"SWEEP_REVERSAL_{direction.upper()}"
+        sig.raw_scores = {
+            "sweep_reversal": True,
+            "sweep_level": round(sweep_level, 2),
+            "sweep_wick_ratio": round(wick_ratio, 3),
+            "post_sl_reversal_signal": True,
+            "reversal_zone_capture_run_id": str((capture_meta or {}).get("run_id") or ""),
+            "reversal_zone_capture_stage": "confirmed",
+        }
+        logger.info(
+            "[PostSLReversal] sweep confirmed dir=%s sweep_level=%.2f wick=%.2f entry=%.2f sl=%.2f tp1=%.2f",
+            direction, sweep_level, wick_ratio, current_price, sl, tp1,
+        )
+        result = self._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+        if result is not None:
+            self._post_sl_reversal_last_fired_ts = time.time()
+            try:
+                notifier.send_alert(
+                    f"\U0001f9f2 [Sweep Reversal] {direction.upper()} XAUUSD\n"
+                    f"Entry: {current_price:.2f} | SL: {sl:.2f} | TP1: {tp1:.2f}\n"
+                    f"Sweep @ {sweep_level:.2f} | Wick {wick_ratio:.0%}"
+                )
+            except Exception:
+                pass
+            return True
+        return False
+
     def _run_xau_guard_transition_watch(self, force: bool = False) -> dict:
         if (not bool(getattr(config, "XAU_GUARD_TRANSITION_ALERT_ENABLED", True))) and (not force):
             return {"enabled": False, "status": "disabled"}
@@ -7154,6 +9604,10 @@ class DexterScheduler:
             row["summary_text"] = str(publish_meta.get("text", "") or "")
             row["admin_sent"] = int(publish_meta.get("sent", 0) or 0)
             dispatched.append(row)
+        try:
+            self._check_post_sl_reversal_signal()
+        except Exception:
+            logger.debug("[PostSLReversal] check error", exc_info=True)
         return {
             "enabled": True,
             "status": "alerted" if dispatched else "unchanged",
@@ -7293,6 +9747,7 @@ class DexterScheduler:
         bypass = self._resolve_mt5_bypass_profile(signal, source)
         exec_source = str(bypass.get("source") or source)
         self._ensure_signal_trace(signal, source=exec_source)
+        self._normalize_signal_confidence(signal, stage="mt5_pre_execute")
         if bool(bypass.get("enabled")):
             try:
                 raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
@@ -7475,74 +9930,272 @@ class DexterScheduler:
         elif (not result.ok) and config.MT5_NOTIFY_FAILED and status in {"rejected", "error", "invalid_stops", "blocked"}:
             notifier.send_mt5_execution_update(signal, result, source=source)
 
+    def _xau_opportunity_first_live_unlock(self, signal) -> bool:
+        symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
+        return bool(
+            symbol == "XAUUSD"
+            and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+        )
+
+    @staticmethod
+    def _tag_xau_opportunity_first_bypass(signal, gate: str, reason: str, *, source: str = "") -> None:
+        try:
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["xau_opportunity_first_live_unlock"] = True
+            raw["xau_opportunity_first_rule"] = "opportunity_wins_over_blocks"
+            bypassed = list(raw.get("xau_opportunity_first_bypassed_gates") or [])
+            bypassed.append({
+                "gate": str(gate or ""),
+                "reason": str(reason or ""),
+                "source": str(source or ""),
+            })
+            raw["xau_opportunity_first_bypassed_gates"] = bypassed
+            signal.raw_scores = raw
+        except Exception:
+            return
+
     def _maybe_execute_ctrader_signal(self, signal, source: str):
         if not bool(getattr(config, "CTRADER_ENABLED", False)):
             return None
         if not bool(getattr(config, "CTRADER_AUTOTRADE_ENABLED", False)):
             return None
         self._ensure_signal_trace(signal, source=str(source or ""))
+        self._normalize_signal_confidence(signal, stage="ctrader_pre_adi")
+        xau_opportunity_first = self._xau_opportunity_first_live_unlock(signal)
+        if xau_opportunity_first:
+            self._tag_xau_opportunity_first_bypass(signal, "policy", "enabled", source=str(source or ""))
+        try:
+            annotate_xau_impulse_shadow(
+                signal,
+                source=str(source or ""),
+                stage="ctrader_pre_dispatch",
+                logger=logger,
+            )
+        except Exception as shadow_exc:
+            logger.debug("[XAUImpulseShadow] ctrader annotation skipped: %s", shadow_exc, exc_info=True)
+        try:
+            impulse_guard = evaluate_xau_impulse_guard(
+                signal,
+                config=config,
+                source=str(source or ""),
+                stage="ctrader_pre_dispatch",
+                logger=logger,
+            )
+            if impulse_guard.blocked:
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "xau_impulse_guard", impulse_guard.reason, source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass xau_impulse_guard source=%s symbol=%s reason=%s",
+                        str(source or ""), getattr(signal, "symbol", ""), impulse_guard.reason,
+                    )
+                else:
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="xau_impulse_guard",
+                        reason=impulse_guard.reason,
+                        dispatch_meta={"xau_impulse_guard": True, "xau_impulse_shadow": impulse_guard.payload},
+                    )
+                    return None
+        except Exception as guard_exc:
+            logger.debug("[XAUImpulseGuard] ctrader check skipped: %s", guard_exc, exc_info=True)
+        # ── ADI: Adaptive Directional Intelligence confidence modifier ──
+        try:
+            self._apply_adi_modifier(signal, source=str(source or ""))
+        except Exception as e:
+            logger.debug("[ADI] _apply_adi_modifier failed (non-fatal): %s", e)
+        self._normalize_signal_confidence(signal, stage="ctrader_post_adi")
+
+        # Fibo-specific final clamp — keep under FIBO_ADVANCE_MAX_CONFIDENCE after
+        # scheduler-level bonuses (ADI/Hermes) so band-gates and first_sample_mode
+        # don't see inflated values past the build-time ceiling.
+        if str(source or "").lower().startswith("fibo"):
+            try:
+                fibo_cap = float(getattr(config, "FIBO_ADVANCE_MAX_CONFIDENCE", 96.0) or 96.0)
+                cur_conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+                if cur_conf > fibo_cap:
+                    raw = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw["fibo_post_bonus_clamp_before"] = round(cur_conf, 3)
+                    raw["fibo_post_bonus_clamp_after"] = round(fibo_cap, 3)
+                    signal.raw_scores = raw
+                    signal.confidence = fibo_cap
+                    logger.info(
+                        "[CONF] fibo post-bonus clamp source=%s %.1f->%.1f",
+                        str(source or "-"), cur_conf, fibo_cap,
+                    )
+            except Exception:
+                pass
+
+        # ── ADI Catastrophic Gate: hard-block when any dimension is extreme ──
+        # catastrophic_flag fires when ANY of the 5 ADI dimensions ≤ -25
+        # (empirical collapse, all-TF counter-trend, extreme adverse flow, etc.)
+        try:
+            _adi_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            _adi_catastrophic = bool(_adi_raw.get("adi_catastrophic", False))
+            _adi_gate_enabled = bool(getattr(config, "ADI_CATASTROPHIC_GATE_ENABLED", True))
+            _adi_rec = str(_adi_raw.get("adi_recommendation", ""))
+            _sig_dir = str(getattr(signal, "direction", "") or "")
+            _sig_sym = str(getattr(signal, "symbol", "") or "")
+            if _adi_catastrophic and _adi_gate_enabled:
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "adi_catastrophic", str(_adi_rec), source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass adi_catastrophic source=%s symbol=%s rec=%s",
+                        str(source or ""), _sig_sym, _adi_rec,
+                    )
+                else:
+                    logger.info(
+                        "[ADI-GATE] CATASTROPHIC hard-block | %s %s %s | conf=%.1f | rec=%s | dims=%s",
+                        str(source or ""), _sig_sym, _sig_dir,
+                        float(getattr(signal, "confidence", 0)),
+                        _adi_rec,
+                        str(_adi_raw.get("adi_dimensions", {})),
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="adi_catastrophic",
+                        reason=f"adi_catastrophic:{_adi_rec}",
+                        dispatch_meta={"adi_catastrophic": True, "adi_recommendation": _adi_rec},
+                    )
+                    return None
+        except Exception as e:
+            logger.debug("[ADI-GATE] catastrophic check error (non-fatal): %s", e)
+
+        # ── Hermes Toxic Pattern Gate: hard-block known losing patterns ──
+        # When Hermes skill modifier is severely negative AND enough samples exist,
+        # the pattern is proven toxic — don't trade it.
+        try:
+            _hermes_raw = dict(getattr(signal, "raw_scores", {}) or {})
+            _hermes_mod = float(_hermes_raw.get("hermes_modifier", 0.0) or 0.0)
+            _hermes_detail = _hermes_raw.get("hermes_detail", {}) or {}
+            _hermes_samples = int(_hermes_detail.get("total_samples", 0) or 0)
+            _hermes_avg_wr = float(_hermes_detail.get("avg_wr", 1.0) or 1.0)
+            _hermes_gate_enabled = bool(getattr(config, "HERMES_TOXIC_GATE_ENABLED", True))
+            _hermes_toxic_threshold = float(getattr(config, "HERMES_TOXIC_MODIFIER_THRESHOLD", -10.0) or -10.0)
+            _hermes_toxic_min_samples = int(getattr(config, "HERMES_TOXIC_MIN_SAMPLES", 5) or 5)
+            if (_hermes_gate_enabled
+                    and _hermes_mod <= _hermes_toxic_threshold
+                    and _hermes_samples >= _hermes_toxic_min_samples):
+                _sig_dir = str(getattr(signal, "direction", "") or "")
+                _sig_sym = str(getattr(signal, "symbol", "") or "")
+                if xau_opportunity_first:
+                    reason = f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}"
+                    self._tag_xau_opportunity_first_bypass(signal, "hermes_toxic", reason, source=str(source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass hermes_toxic source=%s symbol=%s reason=%s",
+                        str(source or ""), _sig_sym, reason,
+                    )
+                else:
+                    logger.info(
+                        "[HERMES-GATE] TOXIC hard-block | %s %s %s | hermes_mod=%.1f | "
+                        "samples=%d | avg_wr=%.3f | conf=%.1f",
+                        str(source or ""), _sig_sym, _sig_dir,
+                        _hermes_mod, _hermes_samples, _hermes_avg_wr,
+                        float(getattr(signal, "confidence", 0)),
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source="",
+                        gate="hermes_toxic",
+                        reason=f"hermes_toxic:mod={_hermes_mod:.1f}:wr={_hermes_avg_wr:.3f}:n={_hermes_samples}",
+                        dispatch_meta={"hermes_toxic": True, "hermes_modifier": _hermes_mod,
+                                       "hermes_avg_wr": _hermes_avg_wr, "hermes_samples": _hermes_samples},
+                    )
+                    return None
+        except Exception as e:
+            logger.debug("[HERMES-GATE] toxic check error (non-fatal): %s", e)
+
         dispatch_source, dispatch_meta = self._ctrader_pick_dispatch_source(signal, source)
         if not dispatch_source:
             skip_reason = str((dispatch_meta or {}).get("winner_reason", "source_not_allowed"))
-            logger.info(
-                "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                str(source or ""),
-                getattr(signal, "symbol", ""),
-                skip_reason,
-            )
-            self._audit_xau_pre_dispatch_skip(
-                signal,
-                requested_source=str(source or ""),
-                dispatch_source="",
-                gate="dispatch_source",
-                reason=skip_reason,
-                dispatch_meta=dispatch_meta,
-            )
-            return None
-        if str(dispatch_source or "").strip().lower() in {"scalp_xauusd", "scalp_xauusd:winner"}:
-            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source="scalp_xauusd")
-            if not allow_xau:
-                skip_reason = str(xau_reason or "xau_live_filter_blocked")
+            if xau_opportunity_first and str(source or "").strip():
+                dispatch_source = str(source or "").strip()
+                dispatch_meta = dict(dispatch_meta or {})
+                dispatch_meta["dispatch_source"] = dispatch_source
+                dispatch_meta["winner_reason"] = f"xau_opportunity_first_source_unlock:{skip_reason}"
+                self._tag_xau_opportunity_first_bypass(signal, "dispatch_source", skip_reason, source=dispatch_source)
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] unlock dispatch source=%s symbol=%s previous_reason=%s",
+                    dispatch_source, getattr(signal, "symbol", ""), skip_reason,
+                )
+            else:
                 logger.info(
                     "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                    str(dispatch_source or ""),
+                    str(source or ""),
                     getattr(signal, "symbol", ""),
                     skip_reason,
                 )
                 self._audit_xau_pre_dispatch_skip(
                     signal,
                     requested_source=str(source or ""),
-                    dispatch_source=str(dispatch_source or ""),
-                    gate="xau_live_filter",
+                    dispatch_source="",
+                    gate="dispatch_source",
                     reason=skip_reason,
                     dispatch_meta=dispatch_meta,
                 )
                 return None
+        if str(dispatch_source or "").strip().lower() in {"scalp_xauusd", "scalp_xauusd:winner"}:
+            allow_xau, xau_reason = self._allow_scalp_xau_live_mt5(signal, source=dispatch_source)
+            if not allow_xau:
+                skip_reason = str(xau_reason or "xau_live_filter_blocked")
+                if xau_opportunity_first:
+                    self._tag_xau_opportunity_first_bypass(signal, "xau_live_filter", skip_reason, source=str(dispatch_source or ""))
+                    logger.info(
+                        "[XAU_OPPORTUNITY_FIRST] bypass xau_live_filter source=%s symbol=%s reason=%s",
+                        str(dispatch_source or ""), getattr(signal, "symbol", ""), skip_reason,
+                    )
+                else:
+                    logger.info(
+                        "[CTRADER] skipped source=%s symbol=%s reason=%s",
+                        str(dispatch_source or ""),
+                        getattr(signal, "symbol", ""),
+                        skip_reason,
+                    )
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source=str(dispatch_source or ""),
+                        gate="xau_live_filter",
+                        reason=skip_reason,
+                        dispatch_meta=dispatch_meta,
+                    )
+                    return None
         allow_source, source_reason = self._allow_ctrader_source_profile(signal, dispatch_source)
         if not allow_source:
             skip_reason = str(source_reason or "source_profile_blocked")
-            logger.info(
-                "[CTRADER] skipped source=%s symbol=%s reason=%s",
-                str(dispatch_source or ""),
-                getattr(signal, "symbol", ""),
-                skip_reason,
-            )
-            try:
-                raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
-                raw_scores["ctrader_source_profile_blocked"] = True
-                raw_scores["ctrader_source_profile_reason"] = skip_reason
-                signal.raw_scores = raw_scores
-            except Exception:
-                pass
-            self._audit_xau_pre_dispatch_skip(
-                signal,
-                requested_source=str(source or ""),
-                dispatch_source=str(dispatch_source or ""),
-                gate="source_profile",
-                reason=skip_reason,
-                dispatch_meta=dispatch_meta,
-            )
-            return None
+            if xau_opportunity_first:
+                self._tag_xau_opportunity_first_bypass(signal, "source_profile", skip_reason, source=str(dispatch_source or ""))
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] bypass source_profile source=%s symbol=%s reason=%s",
+                    str(dispatch_source or ""), getattr(signal, "symbol", ""), skip_reason,
+                )
+            else:
+                logger.info(
+                    "[CTRADER] skipped source=%s symbol=%s reason=%s",
+                    str(dispatch_source or ""),
+                    getattr(signal, "symbol", ""),
+                    skip_reason,
+                )
+                try:
+                    raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
+                    raw_scores["ctrader_source_profile_blocked"] = True
+                    raw_scores["ctrader_source_profile_reason"] = skip_reason
+                    signal.raw_scores = raw_scores
+                except Exception:
+                    pass
+                self._audit_xau_pre_dispatch_skip(
+                    signal,
+                    requested_source=str(source or ""),
+                    dispatch_source=str(dispatch_source or ""),
+                    gate="source_profile",
+                    reason=skip_reason,
+                    dispatch_meta=dispatch_meta,
+                )
+                return None
         if dispatch_source != str(source or ""):
             try:
                 raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
@@ -7551,6 +10204,45 @@ class DexterScheduler:
                 signal.raw_scores = raw_scores
             except Exception:
                 pass
+        # Opus non-Fibo redesign: opportunity-first protection. Do not turn a
+        # family off after recent bleeding; throttle side-specific risk and
+        # enforce minimum planned RR only when the explicit kill switch is not set.
+        try:
+            sym = str(getattr(signal, "symbol", "") or "").strip().upper()
+            src_key = str(dispatch_source or "").strip().lower()
+            direction = str(getattr(signal, "direction", "") or "").strip().lower()
+            if sym == "XAUUSD" and is_nonfibo_xau_source(src_key) and not bool(getattr(config, "XAU_NONFIBO_REDESIGN_KILL", False)):
+                entry = float(getattr(signal, "entry", 0.0) or 0.0)
+                stop_loss = float(getattr(signal, "stop_loss", 0.0) or 0.0)
+                tp = float(getattr(signal, "take_profit_1", 0.0) or 0.0)
+                rr = nonfibo_planned_rr(entry, stop_loss, tp, direction)
+                min_rr = float(getattr(config, "XAU_MIN_PLANNED_RR", 2.7) or 2.7)
+                raw = dict(getattr(signal, "raw_scores", {}) or {})
+                raw["xau_min_rr_check"] = {
+                    "rr": round(rr, 4),
+                    "min_rr": round(min_rr, 4),
+                    "tp_used": round(tp, 4),
+                    "tp_policy": "take_profit_1",
+                    "enforced": bool(getattr(config, "XAU_MIN_RR_ENFORCE", False)),
+                }
+                signal.raw_scores = raw
+                if bool(getattr(config, "XAU_MIN_RR_ENFORCE", False)) and 0.0 < rr < min_rr:
+                    skip_reason = f"xau_min_rr_below:{rr:.2f}<{min_rr:.2f}"
+                    logger.info("[CTRADER] skipped source=%s symbol=%s reason=%s", src_key, sym, skip_reason)
+                    self._audit_xau_pre_dispatch_skip(
+                        signal,
+                        requested_source=str(source or ""),
+                        dispatch_source=str(dispatch_source or ""),
+                        gate="xau_min_rr",
+                        reason=skip_reason,
+                        dispatch_meta=dispatch_meta,
+                    )
+                    return None
+                self._apply_xau_rasg_throttle(signal, dispatch_source)
+                if src_key.split(":", 1)[0] == "scalp_xauusd":
+                    self._apply_xau_reclaim_v3_live_adjustments(signal, dispatch_source)
+        except Exception as exc:
+            logger.debug("[XAU_NONFIBO] redesign guard skipped source=%s err=%s", dispatch_source, exc, exc_info=True)
         try:
             result = ctrader_executor.execute_signal(signal, source=dispatch_source)
             logger.info(
@@ -7618,8 +10310,31 @@ class DexterScheduler:
                     self._run_ct_only_watch_report(force=False)
                 except Exception:
                     logger.debug("[Scheduler] cTrader sync ct-only watch follow-up failed", exc_info=True)
+
+                # ── Feed fibo_advance trade results to circuit breaker ──────
+                try:
+                    self._feed_fibo_trade_results(rpt)
+                except Exception:
+                    logger.debug("[Scheduler] fibo trade result feed failed", exc_info=True)
+                try:
+                    self._feed_xau_winner_mistake_learning(rpt)
+                except Exception:
+                    logger.debug("[Scheduler] xau winner mistake learning feed failed", exc_info=True)
             else:
-                logger.warning("[CTRADER] sync failed: %s", rpt.get("error") or rpt.get("message"))
+                err_msg = str(rpt.get("error") or rpt.get("message") or "")
+                logger.warning("[CTRADER] sync failed: %s", err_msg)
+                # Auto-refresh token on auth failures
+                if any(k in err_msg for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID", "Unauthorized")):
+                    try:
+                        from api.ctrader_token_manager import token_manager as _tm
+                        logger.info("[CTRADER] Auth failure detected — attempting token refresh")
+                        new_token = _tm.try_refresh()
+                        if new_token:
+                            logger.info("[CTRADER] Token refreshed after sync auth failure")
+                        else:
+                            logger.error("[CTRADER] Token refresh failed — trading may be disrupted")
+                    except Exception as refresh_err:
+                        logger.debug("[CTRADER] Token refresh error: %s", refresh_err)
             if bool(getattr(config, "NEURAL_GATE_LEARNING_ENABLED", True)):
                 try:
                     gate_loop = neural_gate_learning_loop.run_cycle()
@@ -7651,6 +10366,7 @@ class DexterScheduler:
             bypass = self._resolve_mt5_bypass_profile(signal, source)
             exec_source = str(bypass.get("source") or source)
             self._ensure_signal_trace(signal, source=exec_source)
+            self._normalize_signal_confidence(signal, stage="mt5_batch_pre_execute")
             if bool(bypass.get("enabled")):
                 try:
                     raw_scores = dict(getattr(signal, "raw_scores", {}) or {})
@@ -8385,6 +11101,86 @@ class DexterScheduler:
             return False
         return True
 
+    def _run_shock_v2_refresh(self):
+        """Refresh shock V2 state. Fail-silent. Never blocks anything."""
+        try:
+            from learning.shock_resolver import refresh_state
+            refresh_state(save=True)
+        except Exception as e:
+            try:
+                logger.warning("[ShockV2] refresh error: %s", str(e)[:80])
+            except Exception:
+                pass
+
+    def _run_opportunity_health_beacon(self):
+        """2026-04-29 surgery: opportunity health beacon. Never blocks anything;
+        purely emits a compact log line every N minutes summarising:
+          - which xau_* state machines are currently 'active' (= potential blockers)
+          - their applied_at age (the ceiling auto-clears at >XAU_DIRECTIVE_PAUSE_CEILING_MIN)
+          - the directive bypass threshold + soft kill_zone status
+
+        Goal: a silent half-day freeze (the failure mode that wrecked 2026-04-28 NY)
+        is impossible to miss in journalctl after this.
+        """
+        try:
+            runtime_state = self._load_trading_routing_runtime_state() or {}
+            now_utc = datetime.now(timezone.utc)
+            ceiling_min = int(getattr(config, "XAU_DIRECTIVE_PAUSE_CEILING_MIN", 10) or 10)
+            actives: list[str] = []
+            for key, val in runtime_state.items():
+                if not isinstance(val, dict):
+                    continue
+                if not str(key or "").startswith("xau_"):
+                    continue
+                if str(val.get("status") or "").strip().lower() != "active":
+                    continue
+                applied_raw = str(val.get("applied_at") or "").strip()
+                age_str = "?"
+                if applied_raw:
+                    try:
+                        applied_dt = datetime.fromisoformat(applied_raw.replace("Z", "+00:00"))
+                        if applied_dt.tzinfo is None:
+                            applied_dt = applied_dt.replace(tzinfo=timezone.utc)
+                        age_min = (now_utc - applied_dt).total_seconds() / 60.0
+                        age_str = f"{age_min:.1f}m"
+                    except Exception:
+                        pass
+                mode = str(val.get("mode") or "")
+                actives.append(f"{key}({mode})/{age_str}")
+            bypass = float(getattr(config, "XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", 999) or 999)
+            kz_hard = bool(getattr(config, "XAUUSD_SCALP_REQUIRE_KILL_ZONE", False))
+            self._opportunity_health_last_ts = time.time()
+            if actives:
+                logger.info(
+                    "[OpportunityHealth] ceiling=%dmin bypass>=%.0f kill_zone_hard=%s active_states=%s",
+                    ceiling_min, bypass, kz_hard, ",".join(actives) or "none",
+                )
+            else:
+                logger.info(
+                    "[OpportunityHealth] ceiling=%dmin bypass>=%.0f kill_zone_hard=%s NO_ACTIVE_BLOCKERS — lane open",
+                    ceiling_min, bypass, kz_hard,
+                )
+        except Exception as e:
+            try:
+                logger.warning("[OpportunityHealth] beacon error: %s", str(e)[:80])
+            except Exception:
+                pass
+
+    def _run_xau_reversal_setup_scan(self):
+        """5-layer reversal setup detector tick. Fail-silent. Never blocks
+        existing scanners. Emits live market/limit signals when conditions
+        align; logs shadow ghost trades for tentative scores.
+        """
+        try:
+            from learning.reversal_setup_runner import run_xau_reversal_setup_scan
+            executor = getattr(self, "ctrader_executor", None) or ctrader_executor
+            run_xau_reversal_setup_scan(executor=executor, logger=logger)
+        except Exception as e:
+            try:
+                logger.warning("[ReversalSetup] scan error: %s", str(e)[:80])
+            except Exception:
+                pass
+
     def _run_xauusd_scan(self, force_alert: bool = False, source: str = "scheduled"):
         """Execute XAUUSD scan and send alert if signal found."""
         session_info = session_manager.get_session_info()
@@ -8443,6 +11239,44 @@ class DexterScheduler:
                 "take_profit_2": float(signal.take_profit_2),
                 "atr": float(signal.atr or 0),
             }
+            try:
+                result["signal"]["xau_impulse_shadow"] = annotate_xau_impulse_shadow(
+                    signal,
+                    source=f"xauusd_{source}",
+                    stage="candidate",
+                    logger=logger,
+                )
+            except Exception as shadow_exc:
+                logger.debug("[XAUImpulseShadow] annotation skipped: %s", shadow_exc, exc_info=True)
+            try:
+                impulse_guard = evaluate_xau_impulse_guard(
+                    signal,
+                    config=config,
+                    source=f"xauusd_{source}",
+                    stage="candidate",
+                    logger=logger,
+                )
+                if impulse_guard.blocked:
+                    result["status"] = "xau_impulse_guard_blocked"
+                    result["signal"]["xau_impulse_guard"] = {
+                        "blocked": True,
+                        "reason": impulse_guard.reason,
+                        "shadow": impulse_guard.payload,
+                    }
+                    logger.info("[Scheduler] XAUUSD signal blocked by impulse guard: %s", impulse_guard.reason)
+                    try:
+                        result["diagnostics"] = xauusd_scanner.get_last_scan_diagnostics()
+                    except Exception:
+                        result["diagnostics"] = {}
+                    try:
+                        self._attach_xau_previous_signal_context(result)
+                        if self._should_send_xauusd_scan_status(source):
+                            notifier.send_xauusd_scan_status(result)
+                    except Exception:
+                        logger.debug("[Scheduler] XAUUSD impulse-guard status send failed", exc_info=True)
+                    return result
+            except Exception as guard_exc:
+                logger.debug("[XAUImpulseGuard] candidate check skipped: %s", guard_exc, exc_info=True)
 
             if signal.confidence < config.MIN_SIGNAL_CONFIDENCE:
                 result["status"] = "below_confidence"
@@ -8760,6 +11594,427 @@ class DexterScheduler:
         except Exception as e:
             logger.warning("[Scheduler] scalping store failed: %s", e)
             return None
+
+    def _feed_xau_winner_mistake_learning(self, sync_report: dict | None = None) -> dict:
+        """Persist closed losing scalp_xauusd:winner context so future tuning can learn.
+
+        Direction truth comes from ctrader_positions.direction.  ctrader_deals.direction
+        may be the closing side and must not be used as entry direction.
+        """
+        report = {"enabled": bool(getattr(config, "SCALP_XAU_WINNER_MISTAKE_LEARNING_ENABLED", True)), "inserted": 0, "seen": 0}
+        if not report["enabled"]:
+            return report
+        db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+        if not db_path.exists():
+            report["reason"] = "db_missing"
+            return report
+        table = str(getattr(config, "SCALP_XAU_WINNER_MISTAKE_LEARNING_TABLE", "xau_winner_mistake_journal") or "xau_winner_mistake_journal")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table):
+            table = "xau_winner_mistake_journal"
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        position_id INTEGER PRIMARY KEY,
+                        journal_id INTEGER,
+                        source TEXT,
+                        symbol TEXT,
+                        entry_direction TEXT,
+                        entry_price REAL,
+                        close_price REAL,
+                        pnl_usd REAL,
+                        outcome INTEGER,
+                        opened_utc TEXT,
+                        closed_utc TEXT,
+                        mistake_type TEXT,
+                        recommended_action TEXT,
+                        features_json TEXT NOT NULL DEFAULT '{{}}',
+                        raw_scores_json TEXT NOT NULL DEFAULT '{{}}',
+                        created_utc TEXT NOT NULL
+                    )
+                """)
+                rows = conn.execute(
+                    """
+                    SELECT p.position_id, p.journal_id, p.source, p.symbol, p.direction AS entry_direction,
+                           p.entry_price, p.first_seen_utc AS opened_utc, p.last_seen_utc AS closed_utc,
+                           COALESCE(SUM(CASE WHEN d.has_close_detail=1 THEN d.pnl_usd ELSE 0 END), 0.0) AS pnl_usd,
+                           MAX(CASE WHEN d.has_close_detail=1 THEN d.execution_price ELSE NULL END) AS close_price,
+                           MIN(CASE WHEN d.has_close_detail=1 THEN d.outcome ELSE NULL END) AS outcome,
+                           ej.request_json
+                      FROM ctrader_positions p
+                      LEFT JOIN ctrader_deals d ON d.position_id = p.position_id
+                      LEFT JOIN execution_journal ej ON ej.id = p.journal_id
+                     WHERE LOWER(COALESCE(p.source,'')) = 'scalp_xauusd:winner'
+                       AND UPPER(COALESCE(p.symbol,'')) = 'XAUUSD'
+                       AND COALESCE(p.is_open,0) = 0
+                     GROUP BY p.position_id
+                    HAVING pnl_usd < 0
+                     ORDER BY COALESCE(p.last_seen_utc, p.first_seen_utc) DESC
+                     LIMIT 200
+                    """
+                ).fetchall()
+                report["seen"] = len(rows)
+                now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                for row in rows:
+                    try:
+                        req = json.loads(row["request_json"] or "{}") if row["request_json"] else {}
+                    except Exception:
+                        req = {}
+                    raw = req.get("raw_scores") if isinstance(req.get("raw_scores"), dict) else {}
+                    trigger = raw.get("scalping_trigger") if isinstance(raw.get("scalping_trigger"), dict) else {}
+                    m1 = raw.get("scalp_m1_snapshot") if isinstance(raw.get("scalp_m1_snapshot"), dict) else {}
+                    entry_dir = str(row["entry_direction"] or req.get("direction") or "").strip().lower()
+                    trigger_reason = str(trigger.get("reason") or "").strip().lower()
+                    aligned_short = bool(raw.get("scalp_force_m1_aligned_short"))
+                    aligned_long = bool(raw.get("scalp_force_m1_aligned_long"))
+                    m1_mom = float(m1.get("momentum") or 0.0) if isinstance(m1, dict) else 0.0
+                    m1_rsi = float(m1.get("rsi14") or trigger.get("rsi14") or 50.0) if isinstance(m1, dict) else 50.0
+                    mistake_type = "losing_winner_trade"
+                    recommended_action = "review_context"
+                    if entry_dir == "long" and (trigger_reason in {"m1_long_not_confirmed", "m1_not_confirmed"} or aligned_short or m1_mom < 0 or m1_rsi < 51.0):
+                        mistake_type = "bought_into_m1_rejection_correction"
+                        recommended_action = "block_long_or_study_short"
+                    elif entry_dir == "short" and (trigger_reason in {"m1_short_not_confirmed", "m1_not_confirmed"} or aligned_long or m1_mom > 0 or m1_rsi > 49.0):
+                        mistake_type = "sold_into_m1_rejection_correction"
+                        recommended_action = "block_short_or_study_long"
+                    features = {
+                        "trigger_reason": trigger_reason,
+                        "m1_momentum": m1_mom,
+                        "m1_rsi14": m1_rsi,
+                        "m1_aligned_long": aligned_long,
+                        "m1_aligned_short": aligned_short,
+                        "h1_trend": raw.get("signal_h1_trend") or raw.get("trend_h1") or raw.get("scalp_force_trend_h1"),
+                        "h4_trend": raw.get("signal_h4_trend") or raw.get("trend_h4") or raw.get("scalp_force_trend_h4"),
+                        "winner_logic_scope": raw.get("winner_logic_scope"),
+                        "winner_logic_win_rate": raw.get("winner_logic_win_rate"),
+                        "winner_logic_avg_pnl": raw.get("winner_logic_avg_pnl"),
+                    }
+                    cur = conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {table}(
+                            position_id, journal_id, source, symbol, entry_direction, entry_price, close_price,
+                            pnl_usd, outcome, opened_utc, closed_utc, mistake_type, recommended_action,
+                            features_json, raw_scores_json, created_utc
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            int(row["position_id"]),
+                            row["journal_id"],
+                            row["source"],
+                            row["symbol"],
+                            entry_dir,
+                            float(row["entry_price"] or 0.0),
+                            float(row["close_price"] or 0.0),
+                            float(row["pnl_usd"] or 0.0),
+                            row["outcome"],
+                            row["opened_utc"],
+                            row["closed_utc"],
+                            mistake_type,
+                            recommended_action,
+                            json.dumps(features, ensure_ascii=False, sort_keys=True),
+                            json.dumps(raw, ensure_ascii=False, sort_keys=True)[:20000],
+                            now,
+                        ),
+                    )
+                    report["inserted"] += int(cur.rowcount or 0)
+                conn.commit()
+        except Exception as exc:
+            report["error"] = str(exc)
+            logger.debug("[Scheduler] _feed_xau_winner_mistake_learning error: %s", exc, exc_info=True)
+        return report
+
+    def _feed_fibo_trade_results(self, sync_report: dict) -> None:
+        """
+        After cTrader sync, check for newly closed fibo_xauusd trades and feed
+        their PnL to the fibo_advance scanner's circuit breaker.
+        """
+        closed_ids = list(sync_report.get("closed_position_ids") or [])
+        if not closed_ids:
+            return
+        # Also check for reconciled deals (closed positions that matched journal)
+        if int(sync_report.get("reconciled_journal", 0) or 0) == 0 and not closed_ids:
+            return
+
+        db_cfg = str(getattr(config, "CTRADER_DB_PATH", "") or "").strip()
+        db_path = Path(db_cfg) if db_cfg else (Path(__file__).resolve().parent / "data" / "ctrader_openapi.db")
+        if not db_path.exists():
+            return
+
+        try:
+            import sqlite3
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Get recently closed fibo_xauusd deals (last 10 minutes)
+                rows = conn.execute(
+                    """
+                    SELECT source, COALESCE(pnl_usd, 0.0) as pnl_usd
+                      FROM ctrader_deals
+                     WHERE LOWER(COALESCE(source,'')) IN ('fibo_xauusd', 'xau_fibo_advance')
+                       AND status IN ('closed', 'reconciled')
+                       AND closed_utc >= datetime('now', '-10 minutes')
+                     ORDER BY closed_utc DESC
+                    """
+                ).fetchall()
+
+                for row in rows:
+                    pnl = float(row["pnl_usd"] or 0.0)
+                    fibo_advance_scanner.report_trade_result(pnl)
+                    logger.debug("[Scheduler] fed fibo result: pnl=%.2f", pnl)
+        except Exception as e:
+            logger.debug("[Scheduler] _feed_fibo_trade_results error: %s", e)
+
+    def _maybe_execute_fibo_mtf_micro_live_probe(self, signal, decision) -> dict:
+        """Demo-only adapter that turns a strong Fibo MTF planner probe into a tiny live order.
+
+        It deliberately clones and scrubs the shadow signal before dispatch so the permanent
+        FIBO_MTF_SHADOW -> live invariant stays intact.  Calendar-day evidence is not a
+        runtime blocker here; the user explicitly wants demo acceleration, while RR/reclaim
+        quality, demo-only mode, and one-per-cycle caps remain intact.
+        """
+        report = {"attempted": False, "executed": False, "reason": "", "source": ""}
+        if not bool(getattr(config, "FIBO_MTF_MICRO_LIVE_ENABLED", False)):
+            report["reason"] = "disabled"
+            return report
+        if bool(getattr(config, "FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO", True)) and not bool(getattr(config, "CTRADER_USE_DEMO", False)):
+            report["reason"] = "not_demo"
+            return report
+        route = str(getattr(decision, "route", "") or "").strip().lower()
+        if route != "probe":
+            report["reason"] = f"route_not_probe:{route or 'unknown'}"
+            return report
+        try:
+            rr = float(getattr(signal, "risk_reward", 0.0) or 0.0)
+        except Exception:
+            rr = 0.0
+        min_rr = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_RR", 3.0) or 3.0)
+        if rr < min_rr:
+            report["reason"] = f"rr_below:{rr:.2f}<{min_rr:.2f}"
+            return report
+        raw = dict(getattr(signal, "raw_scores", {}) or {})
+        side = str(getattr(signal, "direction", "") or raw.get("direction") or "").strip().lower()
+        side = "long" if side in {"long", "buy"} else "short" if side in {"short", "sell"} else ""
+        tf = str(raw.get("tf_label") or getattr(signal, "timeframe", "") or "").strip().lower()
+        allowed_tfs = {
+            x.strip().lower()
+            for x in str(getattr(config, "FIBO_MTF_MICRO_LIVE_ALLOWED_TFS", "M1,M5,M15,M30,H1") or "").split(",")
+            if x.strip()
+        }
+        if tf not in allowed_tfs:
+            report["reason"] = f"tf_not_tactical:{tf or 'unknown'}"
+            return report
+        impulse_state = str(raw.get("impulse_state_name") or raw.get("impulse_state") or "").strip().lower()
+        impulse_dir = str(raw.get("impulse_state_direction") or "").strip().lower()
+        impulse_dir = "long" if impulse_dir in {"long", "buy", "bullish"} else "short" if impulse_dir in {"short", "sell", "bearish"} else ""
+        if bool(getattr(config, "FIBO_MTF_MICRO_LIVE_REQUIRE_IMPULSE_FOLLOW", True)):
+            if impulse_state in {"", "idle", "unknown", "none"} or not impulse_dir:
+                report["reason"] = "impulse_context_missing_or_idle"
+                return report
+            if side and impulse_dir and side != impulse_dir:
+                report["reason"] = f"counter_impulse:{side}!={impulse_dir}"
+                return report
+        try:
+            entry = float(getattr(signal, "entry", 0.0) or raw.get("entry") or 0.0)
+            stop = float(getattr(signal, "stop_loss", 0.0) or raw.get("stop_loss") or 0.0)
+            tp = float(getattr(signal, "take_profit_1", 0.0) or raw.get("take_profit") or raw.get("take_profit_1") or 0.0)
+        except Exception:
+            entry = stop = tp = 0.0
+        max_sl = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_SL_DISTANCE", 12.0) or 12.0)
+        max_tp = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_TP_DISTANCE", 36.0) or 36.0)
+        if entry <= 0 or stop <= 0 or tp <= 0:
+            report["reason"] = "invalid_trade_geometry"
+            return report
+        sl_dist = abs(entry - stop)
+        tp_dist = abs(tp - entry)
+        if sl_dist > max_sl:
+            report["reason"] = f"sl_distance_too_wide:{sl_dist:.2f}>{max_sl:.2f}"
+            return report
+        if tp_dist > max_tp:
+            report["reason"] = f"tp_distance_too_wide:{tp_dist:.2f}>{max_tp:.2f}"
+            return report
+        if side == "long" and not (stop < entry < tp):
+            report["reason"] = "long_geometry_wrong_side"
+            return report
+        if side == "short" and not (tp < entry < stop):
+            report["reason"] = "short_geometry_wrong_side"
+            return report
+        try:
+            reclaim_score = float(raw.get("fibo_reclaim_score") or 0.0)
+        except Exception:
+            reclaim_score = 0.0
+        try:
+            cluster_count = int(float(raw.get("fibo_cluster_count") or 0))
+        except Exception:
+            cluster_count = 0
+        min_reclaim = float(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE", 70.0) or 70.0)
+        min_clusters = int(getattr(config, "FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT", 2) or 2)
+        reclaim_setup = str(raw.get("fibo_reclaim_setup") or "").strip().lower()
+        if reclaim_score < min_reclaim:
+            report["reason"] = f"reclaim_score_below:{reclaim_score:.1f}<{min_reclaim:.1f}"
+            return report
+        if cluster_count < min_clusters:
+            report["reason"] = f"cluster_count_below:{cluster_count}<{min_clusters}"
+            return report
+        if not reclaim_setup.startswith("fibo_reclaim_"):
+            report["reason"] = f"reclaim_setup_not_live:{reclaim_setup or 'unknown'}"
+            return report
+
+        source = str(getattr(config, "FIBO_MTF_MICRO_LIVE_SOURCE", "fibo_xauusd") or "fibo_xauusd").strip().lower()
+        def _scrub_shadow_tokens(value):
+            if isinstance(value, str):
+                return value.replace("FIBO_MTF_SHADOW", "FIBO_MTF_MICRO_LIVE").replace("fibo_mtf_shadow", "fibo_mtf_micro_live")
+            if isinstance(value, dict):
+                return {str(k): _scrub_shadow_tokens(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_scrub_shadow_tokens(v) for v in value]
+            return value
+
+        live_signal = copy.deepcopy(signal)
+        live_raw = _scrub_shadow_tokens(dict(getattr(live_signal, "raw_scores", {}) or {}))
+        live_raw["fibo_mtf_shadow"] = False
+        live_raw["shadow_only"] = False
+        live_raw["fibo_mtf_planner_shadow_only"] = False
+        live_raw["fibo_mtf_live_enabled"] = True
+        live_raw["fibo_mtf_micro_live_adapter"] = True
+        live_raw["fibo_mtf_micro_live_source"] = source
+        live_raw["fibo_mtf_calendar_days_gate_bypassed"] = bool(getattr(config, "FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS", True))
+        live_raw["source"] = source
+        live_raw["requested_source"] = source
+        live_raw["display_source"] = source
+        live_signal.raw_scores = live_raw
+        live_signal.pattern = "Fibo MTF Micro Live Probe"
+        report.update({"attempted": True, "source": source})
+        if self._is_fibo_mtf_shadow_signal(live_signal, source, live_raw):
+            report["reason"] = "shadow_invariant_after_scrub"
+            return report
+        result = self._maybe_execute_ctrader_signal(live_signal, source=source)
+        report["executed"] = bool(result is not None and (getattr(result, "ok", False) or getattr(result, "dry_run", False)))
+        report["reason"] = str(getattr(result, "status", "executed") or "executed") if result is not None else "no_result"
+        return report
+
+    def _run_fibo_mtf_shadow_scan(self, source: str = "fibo_mtf_shadow") -> dict:
+        """Run Fibo MTF scanner as shadow evidence with route-planner metadata.
+
+        The scanner remains DB-only telemetry.  Opportunity-first live unlock does
+        not promote FIBO_MTF_SHADOW signals directly; the separate planner writes
+        observe/probe/base_live/runner_add route metadata for Opus review and
+        later explicit promotion via a non-shadow adapter.
+        """
+        report = {"ok": False, "enabled": bool(getattr(config, "FIBO_MTF_SHADOW_ENABLED", True)), "stored": 0, "signals": 0, "executed": 0, "planned": 0, "planner_errors": 0, "routes": {}, "micro_live_attempted": 0, "micro_live_executed": 0, "micro_live_last_reason": "", "error": ""}
+        if not report["enabled"]:
+            report["error"] = "disabled"
+            return report
+        try:
+            signals = fibo_mtf_shadow_scanner.scan(
+                include_suppressed=bool(getattr(config, "FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", True)),
+                emit_all=bool(getattr(config, "FIBO_MTF_SHADOW_EMIT_ALL", True)),
+            )
+            report["signals"] = len(list(signals or []))
+            for sig in list(signals or []):
+                try:
+                    decision = annotate_signal_with_fibo_mtf_plan(sig)
+                    report["planned"] += 1
+                    route = str(getattr(decision, "route", "unknown") or "unknown")
+                    routes = dict(report.get("routes") or {})
+                    routes[route] = int(routes.get(route, 0)) + 1
+                    report["routes"] = routes
+                    self._ensure_signal_trace(sig, source=source)
+                    self._store_shadow_signal(sig, block_reason=f"fibo_mtf_planner:{route}")
+                    report["stored"] += 1
+                    max_micro = max(0, int(getattr(config, "FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE", 1) or 1))
+                    if route == "probe" and int(report.get("micro_live_attempted", 0) or 0) < max_micro:
+                        micro = self._maybe_execute_fibo_mtf_micro_live_probe(sig, decision)
+                        report["micro_live_last_reason"] = str(micro.get("reason") or "")
+                        if bool(micro.get("attempted")):
+                            report["micro_live_attempted"] = int(report.get("micro_live_attempted", 0) or 0) + 1
+                        if bool(micro.get("executed")):
+                            report["micro_live_executed"] = int(report.get("micro_live_executed", 0) or 0) + 1
+                            report["executed"] = int(report.get("executed", 0) or 0) + 1
+                except Exception as exc:
+                    report["planner_errors"] = int(report.get("planner_errors", 0) or 0) + 1
+                    logger.debug("[FiboMTFShadow:Scheduler] plan/store failed: %s", exc)
+            if report["signals"]:
+                tf_counts = {}
+                for sig in list(signals or []):
+                    raw = dict(getattr(sig, "raw_scores", {}) or {})
+                    tf = str(raw.get("tf_label") or getattr(sig, "timeframe", "") or "?")
+                    tf_counts[tf] = int(tf_counts.get(tf, 0)) + 1
+                logger.info(
+                    "[FiboMTFShadow:Scheduler] generated=%s planned=%s planner_errors=%s executed=%s stored=%s routes=%s micro_live=%s/%s last=%s tf_counts=%s",
+                    report["signals"], report["planned"], report["planner_errors"], report["executed"], report["stored"], report.get("routes"), report.get("micro_live_executed", 0), report.get("micro_live_attempted", 0), report.get("micro_live_last_reason", ""), tf_counts,
+                )
+            report["ok"] = True
+            return report
+        except Exception as e:
+            report["error"] = str(e)
+            logger.warning("[FiboMTFShadow:Scheduler] scan error: %s", e, exc_info=True)
+            return report
+
+    def _run_fibo_advance_scan(self, force_alert: bool = False):
+        """
+        Fibonacci Advance scanner — dual-speed Sniper (H4+H1) and Scout (H1+M15).
+        Runs independently on its own interval. Does NOT interfere with any existing
+        scanner or family routing.  Source: fibo_xauusd / Family: xau_fibo_advance.
+        """
+        if not bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
+            return
+        try:
+            # Intentional: P2 telemetry still runs in toxic hours because it is DB-only
+            # shadow evidence; live fibo dispatch remains protected by the guard below.
+            self._run_fibo_mtf_shadow_scan(source="fibo_mtf_shadow")
+        except Exception as e:
+            logger.debug("[FiboMTFShadow:Scheduler] cycle skipped: %s", e)
+        if bool(getattr(config, "XAU_TOXIC_HOUR_GUARD_ENABLED", True)):
+            try:
+                toxic_hours = {int(h.strip()) for h in str(getattr(config, "XAU_TOXIC_HOURS_UTC", "1") or "1").split(",") if h.strip().isdigit()}
+                if datetime.now(timezone.utc).hour in toxic_hours:
+                    logger.debug("[FiboAdvance] Skipping — toxic hour UTC:%d", datetime.now(timezone.utc).hour)
+                    return
+            except Exception:
+                pass
+        try:
+            signal = fibo_advance_scanner.scan()
+            if signal is None:
+                logger.debug("[FiboAdvance:Scheduler] No signal this cycle")
+                return
+
+            source = "fibo_xauusd"
+            self._ensure_signal_trace(signal, source=source)
+            logger.info(
+                "[FiboAdvance:Scheduler] Signal | %s | %s | conf:%.1f | entry:%.2f | pattern:%s",
+                signal.direction.upper(), signal.pattern,
+                signal.confidence, signal.entry,
+                signal.pattern,
+            )
+
+            # Telegram notification
+            try:
+                self._send_signal_with_trace(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] notify error: %s", e)
+
+            # Neural brain recording (statistics + auto-improvement)
+            try:
+                if bool(getattr(config, "SIGNAL_FEEDBACK_ENABLED", False)):
+                    neural_brain.record_signal_sent(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] neural_brain error: %s", e)
+
+            # cTrader live execution (governed by CTRADER_AUTOTRADE_ENABLED + FIBO_ADVANCE_ENABLED)
+            try:
+                self._maybe_execute_ctrader_signal(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] ctrader execute error: %s", e)
+
+            # Persistent canary — family tracking + statistics (safe, non-blocking)
+            try:
+                self._maybe_execute_persistent_canary(signal, source=source)
+            except Exception as e:
+                logger.debug("[FiboAdvance:Scheduler] canary error: %s", e)
+
+        except Exception as e:
+            logger.warning("[FiboAdvance:Scheduler] scan error: %s", e, exc_info=True)
 
     def _run_scalping_scan(self, force: bool = False):
         """
@@ -10920,9 +14175,19 @@ class DexterScheduler:
                         raw_scores_json TEXT NOT NULL DEFAULT '{}',
                         shadow_outcome TEXT,
                         resolved_utc TEXT,
-                        shadow_pnl_rr REAL
+                        shadow_pnl_rr REAL,
+                        shadow_mae_rr REAL,
+                        shadow_mfe_rr REAL
                     )
                 """)
+                for ddl in (
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mae_rr REAL",
+                    "ALTER TABLE xau_shadow_journal ADD COLUMN shadow_mfe_rr REAL",
+                ):
+                    try:
+                        conn.execute(ddl)
+                    except Exception:
+                        pass
                 conn.execute("""
                     INSERT INTO xau_shadow_journal
                         (signal_utc, symbol, direction, confidence, entry, stop_loss,
@@ -11067,6 +14332,214 @@ class DexterScheduler:
                 logger.debug("[Scheduler] Family calibration telegram send failed", exc_info=True)
         return report
 
+    # ── Sharpness Feedback Loop (self-improving) ────────────────────────────
+
+    def _get_self_improving_symbols(self) -> list[str]:
+        """Get list of symbols for self-improving AI features."""
+        raw = str(getattr(config, "SELF_IMPROVING_SYMBOLS", "XAUUSD,BTCUSD,ETHUSD") or "XAUUSD")
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+    def _run_sharpness_feedback_report(self, force: bool = False) -> dict:
+        """Run sharpness correlation + calibration + family decay report for all symbols."""
+        if not bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {"ok": False, "status": "no_db"}
+        symbols = self._get_self_improving_symbols()
+        current_weights = {
+            "XAU_ENTRY_SHARPNESS_W_MOMENTUM": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_MOMENTUM", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_FLOW": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_FLOW", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_ABSORPTION": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_ABSORPTION", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_STABILITY": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_STABILITY", 1.0) or 1.0),
+            "XAU_ENTRY_SHARPNESS_W_POSITIONING": float(getattr(config, "XAU_ENTRY_SHARPNESS_W_POSITIONING", 1.0) or 1.0),
+        }
+        all_reports: dict[str, dict] = {}
+        telegram_lines: list[str] = []
+        try:
+            from learning.sharpness_feedback import build_sharpness_feedback_report, format_sharpness_feedback_text
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.row_factory = _sqlite3.Row
+                for sym in symbols:
+                    try:
+                        report = build_sharpness_feedback_report(
+                            conn,
+                            days=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", 14) or 14)),
+                            symbol=sym,
+                            current_weights=current_weights,
+                            min_trades_for_calibration=max(1, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_MIN_TRADES", 10) or 10)),
+                            decay_recent_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_RECENT_TRADES", 20) or 20)),
+                            decay_baseline_trades=max(1, int(getattr(config, "XAU_FAMILY_DECAY_BASELINE_TRADES", 60) or 60)),
+                            decay_threshold=max(0.01, float(getattr(config, "XAU_FAMILY_DECAY_THRESHOLD", 0.15) or 0.15)),
+                        )
+                        all_reports[sym] = report
+                        report_store.save_report(f"sharpness_feedback_report_{sym.lower()}", report)
+                        summary = dict((report or {}).get("summary") or {})
+                        n_trades = int(summary.get("n_trades_with_sharpness", 0) or 0)
+                        if n_trades > 0:
+                            logger.info(
+                                "[Scheduler] Sharpness feedback %s: trades=%s composite_r=%s calibrate=%s decay_alerts=%s",
+                                sym, n_trades,
+                                round(float(summary.get("composite_r", 0.0) or 0.0), 4),
+                                bool(summary.get("calibration_ready")),
+                                int(summary.get("n_decay_alerts", 0) or 0),
+                            )
+                            telegram_lines.append(format_sharpness_feedback_text(report).replace("Sharpness Feedback Report", f"Sharpness [{sym}]"))
+                        else:
+                            logger.debug("[Scheduler] Sharpness feedback %s: no trades with sharpness", sym)
+                    except Exception as exc:
+                        logger.debug("[Scheduler] Sharpness feedback %s error: %s", sym, exc)
+        except Exception as exc:
+            logger.error("[Scheduler] Sharpness feedback report error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        # Save combined report for backwards compat
+        xau_report = all_reports.get("XAUUSD") or next(iter(all_reports.values()), {"ok": True})
+        try:
+            report_store.save_report("sharpness_feedback_report", xau_report)
+        except Exception:
+            pass
+        # Auto-calibrate from all symbols with sharpness data
+        if bool(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", False)):
+            for sym, sym_report in all_reports.items():
+                self._apply_sharpness_auto_calibrate(sym_report, symbol=sym)
+        # Telegram: combined
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", True)) and (telegram_lines or force):
+            try:
+                if not telegram_lines:
+                    telegram_lines = ["\U0001f4ca Sharpness Feedback Report\nNo trades with sharpness data yet."]
+                notifier._send("\n\n".join(telegram_lines), parse_mode=None, feature="winner_mission")
+            except Exception:
+                logger.debug("[Scheduler] Sharpness feedback telegram send failed", exc_info=True)
+        return {"ok": True, "symbols": list(all_reports.keys()), "reports": {k: bool(v.get("ok")) for k, v in all_reports.items()}}
+
+    def _apply_sharpness_auto_calibrate(self, report: dict, symbol: str = "XAUUSD") -> None:
+        """Apply weight recommendations from sharpness feedback if auto-calibrate is enabled."""
+        calibration = dict((report or {}).get("calibration") or {})
+        if not bool(calibration.get("apply")):
+            return
+        recommendations = list(calibration.get("recommendations") or [])
+        applied = []
+        for rec in recommendations:
+            if str(rec.get("action", "hold") or "hold") == "hold":
+                continue
+            config_key = str(rec.get("config_key", "") or "")
+            new_val = float(rec.get("recommended", 1.0) or 1.0)
+            min_w = max(0.1, float(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT", 0.5) or 0.5))
+            max_w = max(1.0, float(getattr(config, "XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT", 2.0) or 2.0))
+            clamped = max(min_w, min(max_w, new_val))
+            if config_key and hasattr(config, config_key):
+                old_val = float(getattr(config, config_key, 1.0) or 1.0)
+                if abs(clamped - old_val) > 0.001:
+                    setattr(config, config_key, clamped)
+                    applied.append(f"{config_key}: {old_val:.3f} -> {clamped:.3f}")
+        if applied:
+            logger.info("[Scheduler] Sharpness auto-calibrate [%s] applied: %s", symbol, applied)
+            if bool(getattr(config, "STRATEGY_EVOLUTION_ENABLED", True)):
+                try:
+                    from learning.strategy_evolution import log_change
+                    correlation = dict((report or {}).get("correlation") or {})
+                    log_change(
+                        change_type="weight_calibration",
+                        description=f"[{symbol}] Sharpness weights adjusted: {', '.join(applied)}",
+                        component="analysis/entry_sharpness.py",
+                        metric_before={"composite_r": float((correlation.get("composite") or {}).get("r", 0) or 0)},
+                        impact="pending",
+                        auto=True,
+                        source="sharpness_feedback",
+                        metadata={"symbol": symbol, "applied": applied, "n_trades": int(correlation.get("n_trades", 0) or 0)},
+                    )
+                except Exception:
+                    logger.debug("[Scheduler] Strategy evolution log failed", exc_info=True)
+
+    # ── Volume Profile ──────────────────────────────────────────────────────
+
+    def _run_volume_profile_report(self, force: bool = False) -> dict:
+        """Compute session Volume Profile from M1 bars for all self-improving symbols."""
+        if not bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            return {"ok": False, "status": "disabled"}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {"ok": False, "status": "no_db"}
+        symbols = self._get_self_improving_symbols()
+        all_reports: dict[str, dict] = {}
+        try:
+            from analysis.volume_profile import build_session_volume_profile, get_tick_config
+            with _sqlite3.connect(str(db_path), timeout=10) as conn:
+                conn.row_factory = _sqlite3.Row
+                for sym in symbols:
+                    try:
+                        tc = get_tick_config(sym)
+                        report = build_session_volume_profile(
+                            conn,
+                            symbol=sym,
+                            hours_back=max(1, int(getattr(config, "XAU_VOLUME_PROFILE_HOURS_BACK", 24) or 24)),
+                            session="full",
+                            tick_size=float(tc.get("tick_size", 0.01)),
+                            bucket_ticks=int(tc.get("bucket_ticks", 10)),
+                            va_pct=max(0.5, min(0.95, float(getattr(config, "XAU_VOLUME_PROFILE_VA_PCT", 0.70) or 0.70))),
+                        )
+                        all_reports[sym] = report
+                        vp_data = dict(report.get("vp") or {})
+                        vp_data.pop("profile", None)
+                        report_store.save_report(f"volume_profile_{sym.lower()}", {**report, "vp": vp_data})
+                        if bool(report.get("ok")):
+                            vp = dict(report.get("vp") or {})
+                            logger.info(
+                                "[Scheduler] Volume profile %s: POC=%.2f VA=[%.2f,%.2f] bars=%d HVN=%d LVN=%d",
+                                sym,
+                                float(vp.get("poc", 0) or 0),
+                                float(vp.get("va_low", 0) or 0),
+                                float(vp.get("va_high", 0) or 0),
+                                int(report.get("bars_used", 0) or 0),
+                                len(list(vp.get("hvn_levels") or [])),
+                                len(list(vp.get("lvn_levels") or [])),
+                            )
+                    except Exception as exc:
+                        logger.debug("[Scheduler] Volume profile %s error: %s", sym, exc)
+        except Exception as exc:
+            logger.error("[Scheduler] Volume profile error: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        # Backwards-compat: save XAUUSD as default "volume_profile"
+        if "XAUUSD" in all_reports:
+            try:
+                vp_data = dict(all_reports["XAUUSD"].get("vp") or {})
+                vp_data.pop("profile", None)
+                report_store.save_report("volume_profile", {**all_reports["XAUUSD"], "vp": vp_data})
+            except Exception:
+                pass
+        return {"ok": True, "symbols": list(all_reports.keys()), "reports": {k: bool(v.get("ok")) for k, v in all_reports.items()}}
+
+    # ── DOM Liquidity Shift ─────────────────────────────────────────────────
+
+    def _get_dom_liquidity_shift(self, *, symbol: str = "XAUUSD", direction: str = "long") -> dict:
+        """Compute DOM liquidity shift for position manager active defense integration.
+
+        Returns the adverse assessment dict or empty if disabled/unavailable.
+        """
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {}
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "ctrader_openapi.db"
+        if not db_path.exists():
+            return {}
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            with _sqlite3.connect(str(db_path), timeout=5) as conn:
+                conn.row_factory = _sqlite3.Row
+                result = analyze_dom_liquidity(
+                    conn,
+                    symbol=symbol,
+                    direction=direction,
+                    lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)),
+                    max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)),
+                )
+            return result
+        except Exception as exc:
+            logger.debug("[Scheduler] DOM liquidity shift error: %s", exc)
+            return {}
+
     @staticmethod
     def _format_tick_depth_replay_report_text(report: dict) -> str:
         if not bool((report or {}).get("ok")):
@@ -11136,8 +14609,15 @@ class DexterScheduler:
                 or {}
             )
         except Exception as e:
-            logger.warning("[Scheduler] cTrader market capture failed: %s", e)
-            return {"ok": False, "status": "error", "message": str(e)}
+            err_str = str(e)
+            logger.warning("[Scheduler] cTrader market capture failed: %s", err_str)
+            if any(k in err_str for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID")):
+                try:
+                    from api.ctrader_token_manager import token_manager as _tm_cap
+                    _tm_cap.try_refresh()
+                except Exception:
+                    pass
+            return {"ok": False, "status": "error", "message": err_str}
         if bool(report.get("ok")):
             spots_count = int(report.get("spots_count", 0) or len(list(report.get("spots") or [])))
             depth_count = int(report.get("depth_count", 0) or len(list(report.get("depth") or [])))
@@ -11148,7 +14628,14 @@ class DexterScheduler:
                 str(report.get("run_id", "") or ""),
             )
         else:
-            logger.warning("[Scheduler] cTrader market capture failed: %s", report.get("message"))
+            cap_err = str(report.get("message") or "")
+            logger.warning("[Scheduler] cTrader market capture failed: %s", cap_err)
+            if any(k in cap_err for k in ("Invalid access token", "Cannot route", "ACCESS_TOKEN_INVALID")):
+                try:
+                    from api.ctrader_token_manager import token_manager as _tm_cap2
+                    _tm_cap2.try_refresh()
+                except Exception:
+                    pass
         if bool(report.get("ok")) and (force or bool(getattr(config, "CTRADER_TICK_DEPTH_REPLAY_LAB_ENABLED", False))):
             try:
                 self._run_ctrader_tick_depth_replay_lab(force=False)
@@ -11902,6 +15389,41 @@ class DexterScheduler:
 
         # ── Continuous scanners ──────────────────────────────────────────────
         schedule.every(xauusd_mins).minutes.do(self._run_xauusd_scan)
+        # 5-layer reversal setup scanner — emits live market/limit signals
+        # when 5-layer score qualifies (additive, never blocks existing scanners)
+        if str(getattr(config, "XAU_REVERSAL_SETUP_SCANNER_ENABLED", "1")) not in ("0", "false", "False"):
+            _rs_mins = max(1, int(getattr(config, "XAU_REVERSAL_SETUP_SCAN_INTERVAL_MIN", 5) or 5))
+            schedule.every(_rs_mins).minutes.do(self._run_xau_reversal_setup_scan)
+            logger.info("[ReversalSetup] Scheduled every %dmin (5-layer detector)", _rs_mins)
+        # Shock V2 state refresher — multi-source shock score, NEVER blocks
+        if str(getattr(config, "SHOCK_V2_ENABLED", "1")) not in ("0", "false", "False"):
+            _shock_mins = max(1, int(getattr(config, "SHOCK_V2_REFRESH_MIN", 5) or 5))
+            schedule.every(_shock_mins).minutes.do(self._run_shock_v2_refresh)
+            logger.info("[ShockV2] Scheduled every %dmin (multi-source, never blocks)", _shock_mins)
+        # 2026-04-29 surgery: opportunity health beacon — emits a compact log line
+        # every N minutes summarising active blockers + cadence so silent freezes
+        # (the kind that lost an entire NY session on 2026-04-28) become visible
+        # immediately in journalctl. Pure observability — never blocks signals.
+        if str(getattr(config, "XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED", "1")) not in ("0", "false", "False"):
+            _beacon_mins = max(1, int(getattr(config, "XAU_OPPORTUNITY_HEALTH_BEACON_MIN", 5) or 5))
+            schedule.every(_beacon_mins).minutes.do(self._run_opportunity_health_beacon)
+            logger.info("[OpportunityHealth] Scheduled every %dmin (observability beacon)", _beacon_mins)
+        if bool(getattr(config, "XAU_GUARDIAN_ENABLED", True)):
+            _guardian_sec = max(15, int(getattr(config, "XAU_GUARDIAN_INTERVAL_SEC", 60) or 60))
+            if _guardian_sec < 60:
+                schedule.every(_guardian_sec).seconds.do(self._run_xau_profit_guardian)
+            else:
+                schedule.every(max(1, _guardian_sec // 60)).minutes.do(self._run_xau_profit_guardian)
+            logger.info("[XAU_GUARDIAN] Scheduled every %ds mode=%s (post-fill Profit Reservoir)", _guardian_sec, str(getattr(config, "XAU_GUARDIAN_MODE", "shadow") or "shadow"))
+
+        # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
+        if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
+            fibo_interval_sec = max(60, int(getattr(config, "FIBO_ADVANCE_SCAN_INTERVAL_SEC", 300) or 300))
+            if fibo_interval_sec < 60:
+                schedule.every(fibo_interval_sec).seconds.do(self._run_fibo_advance_scan)
+            else:
+                schedule.every(fibo_interval_sec // 60).minutes.do(self._run_fibo_advance_scan)
+            logger.info("[FiboAdvance] Scheduled every %ds (Sniper+Scout dual-speed)", fibo_interval_sec)
         # DISABLED: non-cTrader scans — BTC/ETH handled by scalping scanner via cTrader OpenAPI
         # schedule.every(crypto_mins).minutes.do(self._run_crypto_scan)
         # schedule.every(max(1, fx_mins)).minutes.do(self._run_fx_scan)
@@ -12031,6 +15553,25 @@ class DexterScheduler:
             family_calibration_line = (
                 f"  Family calibration report: every {family_calibration_mins}m "
                 f"(lookback={max(1, int(getattr(config, 'FAMILY_CALIBRATION_REPORT_LOOKBACK_DAYS', 21) or 21))}d)\n"
+            )
+        sharpness_feedback_line = ""
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)):
+            sharpness_fb_mins = max(30, int(getattr(config, "XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN", 120) or 120))
+            schedule.every(sharpness_fb_mins).minutes.do(self._run_sharpness_feedback_report)
+            sharpness_feedback_line = (
+                f"  Sharpness feedback loop: every {sharpness_fb_mins}m "
+                f"(lookback={max(1, int(getattr(config, 'XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS', 14) or 14))}d"
+                f" auto-cal={'ON' if bool(getattr(config, 'XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED', False)) else 'OFF'}"
+                f" decay={'ON' if bool(getattr(config, 'XAU_FAMILY_DECAY_ENABLED', True)) else 'OFF'})\n"
+            )
+        volume_profile_line = ""
+        if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            vp_mins = max(10, int(getattr(config, "XAU_VOLUME_PROFILE_INTERVAL_MIN", 30) or 30))
+            schedule.every(vp_mins).minutes.do(self._run_volume_profile_report)
+            volume_profile_line = (
+                f"  Volume profile: every {vp_mins}m "
+                f"(lookback={max(1, int(getattr(config, 'XAU_VOLUME_PROFILE_HOURS_BACK', 24) or 24))}h"
+                f" bucket={max(1, int(getattr(config, 'XAU_VOLUME_PROFILE_BUCKET_TICKS', 10) or 10))}ticks)\n"
             )
         ctrader_market_capture_line = ""
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_ENABLED", False)):
@@ -12204,6 +15745,8 @@ class DexterScheduler:
             f"{conductor_line}"
             f"{strategy_lab_line}"
             f"{family_calibration_line}"
+            f"{sharpness_feedback_line}"
+            f"{volume_profile_line}"
             f"{ctrader_market_capture_line}"
             f"{ctrader_replay_lab_line}"
             f"{mission_progress_line}"
@@ -12225,6 +15768,32 @@ class DexterScheduler:
     def _run_loop(self):
         """Main scheduler loop (runs in background thread)."""
         self.setup_schedule()
+        
+        # ── Hermes infrastructure: startup health checks ──────────────────
+        try:
+            refresh_meta = refresh_stale_token_if_needed()
+            if refresh_meta.get("attempted"):
+                logger.info(
+                    "[Hermes] proactive cTrader token refresh attempted: refreshed=%s age_h=%s reason=%s",
+                    refresh_meta.get("refreshed"),
+                    refresh_meta.get("hours_since_refresh"),
+                    refresh_meta.get("reason"),
+                )
+            log_token_health_summary()
+        except Exception:
+            logger.debug("[Hermes] auth health check skipped", exc_info=True)
+        try:
+            db_report = run_full_health_check()
+            if db_report.get("status") == "critical":
+                logger.warning("[Hermes] DB health CRITICAL: %s", db_report.get("issues", []))
+            elif db_report.get("status") == "warning":
+                logger.info("[Hermes] DB health WARNING: %s", db_report.get("issues", []))
+            else:
+                logger.info("[Hermes] DB health OK")
+        except Exception:
+            logger.debug("[Hermes] DB health check skipped", exc_info=True)
+        # ── End infrastructure checks ─────────────────────────────────────
+        
         logger.info("[Scheduler] Background loop started")
 
         # Run initial scans on startup
@@ -12281,6 +15850,10 @@ class DexterScheduler:
             self._run_conductor_cycle(force=True)
         if bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ENABLED", False)) and bool(getattr(config, "FAMILY_CALIBRATION_REPORT_ON_START", True)):
             self._run_family_calibration_report(force=True)
+        if bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ENABLED", True)) and bool(getattr(config, "XAU_SHARPNESS_FEEDBACK_ON_START", True)):
+            self._run_sharpness_feedback_report(force=True)
+        if bool(getattr(config, "XAU_VOLUME_PROFILE_ENABLED", True)):
+            self._run_volume_profile_report(force=True)
         if bool(getattr(config, "STRATEGY_LAB_REPORT_ENABLED", False)) and bool(getattr(config, "STRATEGY_LAB_REPORT_ON_START", True)):
             self._run_strategy_lab_report(force=True)
         if bool(getattr(config, "CTRADER_MARKET_CAPTURE_ENABLED", False)) and bool(getattr(config, "CTRADER_MARKET_CAPTURE_ON_START", False)):
@@ -12360,12 +15933,20 @@ class DexterScheduler:
             results["auto_apply_live_profile_report"] = self._run_auto_apply_live_profile(force=True)
         if task in ("canary_audit", "canary_post_trade", "canary_post_trade_audit"):
             results["canary_post_trade_audit_report"] = self._run_canary_post_trade_audit(force=True)
+        if task in ("xau_guardian", "profit_guardian", "basket_guardian", "snowball"):
+            results["xau_profit_guardian"] = self._run_xau_profit_guardian(force=True)
         if task in ("ctrader_data_integrity", "data_integrity", "integrity_report"):
             results["ctrader_data_integrity_report"] = self._run_ctrader_data_integrity_report(force=True)
         if task in ("strategy_lab", "strategy_lab_report"):
             results["strategy_lab_report"] = self._run_strategy_lab_report(force=True)
         if task in ("family_calibration", "calibration", "family_calibration_report"):
             results["family_calibration_report"] = self._run_family_calibration_report(force=True)
+        if task in ("sharpness_feedback", "sharpness_report", "sharpness"):
+            results["sharpness_feedback_report"] = self._run_sharpness_feedback_report(force=True)
+        if task in ("volume_profile", "vp", "vp_report"):
+            results["volume_profile"] = self._run_volume_profile_report(force=True)
+        if task in ("dom_liquidity", "dom_shift", "liquidity_shift"):
+            results["dom_liquidity"] = self._get_dom_liquidity_shift(symbol="XAUUSD", direction="long")
         if task in ("ctrader_capture", "market_capture", "ctrader_market_capture"):
             results["ctrader_market_capture"] = self._run_ctrader_market_capture(force=True)
         if task in ("ctrader_replay", "replay_lab", "ctrader_tick_depth_replay_lab"):

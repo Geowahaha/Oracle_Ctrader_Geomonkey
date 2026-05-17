@@ -737,6 +737,11 @@ class TelegramAdminBot:
             "stock_mt5_filter",
             "plan", "upgrade", "research",
             "grant", "setplan", "revoke", "block", "admin_add", "admin_del", "admin_list", "user_list",
+            "trials", "approve", "reject",
+            "update_openclaw", "skip_openclaw", "openclaw_version",
+            "ask", "chat", "q",
+            "budget", "token_budget",
+            "copy_status", "copy_add_ctrader", "copy_add_mt5", "copy_remove", "copy_pause", "copy_resume", "copy_log",
         }
 
     def _suggest_command(self, command: str) -> Optional[str]:
@@ -3605,24 +3610,28 @@ class TelegramAdminBot:
         mood = dict(s.get("mood_stop") or {})
         symcd = dict(s.get("symbol_cooldown") or {})
         lines = ["US Open Guard (compact)"]
+        window_label = "IN" if s.get('in_us_open_window') else "OUT"
         lines.append(
-            f"window={("IN" if s.get('in_us_open_window') else "OUT")} "
+            f"window={window_label} "
             f"premarket={bool(s.get('premarket'))} t+={s.get('elapsed_after_open_min')}m"
         )
+        macro_label = "ACTIVE" if macro.get('active') else "clear"
         lines.append(
-            f"macro={("ACTIVE" if macro.get('active') else "clear")}"
+            f"macro={macro_label}"
             + (f" (~{macro.get('release_eta_min')}m)" if macro.get("release_eta_min") is not None else "")
         )
         if macro.get("active") and macro.get("reason"):
             lines.append(f"macro_reason: {str(macro.get('reason'))[:140]}")
+        cb_label = "ACTIVE" if cb.get('active') else "clear"
         lines.append(
-            f"cb={("ACTIVE" if cb.get('active') else "clear")}"
+            f"cb={cb_label}"
             + (f" (~{cb.get('release_eta_min')}m)" if cb.get("release_eta_min") is not None else "")
         )
         if cb.get("active") and cb.get("reason"):
             lines.append(f"cb_reason: {str(cb.get('reason'))[:140]}")
+        mood_label = "ACTIVE" if mood.get('active') else "clear"
         lines.append(
-            f"mood={("ACTIVE" if mood.get('active') else "clear")} "
+            f"mood={mood_label} "
             f"weak={mood.get('weak_cycles',0)}/{mood.get('weak_cycles_to_stop',0)}"
         )
         lines.append(
@@ -3651,7 +3660,8 @@ class TelegramAdminBot:
             f"- enabled={macro.get('enabled')} min_score>={macro.get('min_score')} "
             f"max_age<={macro.get('max_age_min')}m priority_only={macro.get('priority_only')}"
         )
-        lines.append(f"- status={("ACTIVE" if macro.get('active') else "clear")} reason={macro.get('reason','-')}")
+        macro_st = "ACTIVE" if macro.get('active') else "clear"
+        lines.append(f"- status={macro_st} reason={macro.get('reason','-')}")
         if macro.get("headline"):
             lines.append(f"- headline={macro.get('headline')}")
         if macro.get("release_eta_min") is not None:
@@ -3659,7 +3669,8 @@ class TelegramAdminBot:
         lines.append("")
         lines.append("circuit-breaker logic:")
         lines.append(f"- enabled={cb.get('enabled')} check_start_after_open={cb.get('check_start_min')}m")
-        lines.append(f"- status={("ACTIVE" if cb.get('active') else "clear")} reason={cb.get('reason','-')}")
+        cb_st = "ACTIVE" if cb.get('active') else "clear"
+        lines.append(f"- status={cb_st} reason={cb.get('reason','-')}")
         if cb.get("release_eta_min") is not None:
             lines.append(f"- release_eta≈{cb.get('release_eta_min')}m")
         if cb.get("release_at_ny"):
@@ -3667,7 +3678,8 @@ class TelegramAdminBot:
         lines.append("")
         lines.append("mood-stop logic:")
         lines.append(f"- enabled={mood.get('enabled')} weak_cycles={mood.get('weak_cycles',0)}/{mood.get('weak_cycles_to_stop',0)}")
-        lines.append(f"- status={("ACTIVE" if mood.get('active') else "clear")} reason={mood.get('reason','-')}")
+        mood_st = "ACTIVE" if mood.get('active') else "clear"
+        lines.append(f"- status={mood_st} reason={mood.get('reason','-')}")
         if mood.get("release_at_ny"):
             lines.append(f"- release_at={mood.get('release_at_ny')}")
         lines.append("")
@@ -5057,12 +5069,22 @@ class TelegramAdminBot:
             self._handle_admin_command(chat_id, user_id, "upgrade", "", is_admin, lang=lang)
             return
 
-        # No automatic AI fallback here: keep natural-language control local and zero-credit.
+        # Fallback: route to AI chat agent for free-form questions (admin only)
         self._record_intent_event(chat_id, user_id, msg, "unmapped", source="heuristic")
-        if not self._ai_api_allowed(user_id, is_admin):
-            self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
-            return
-        self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
+        if is_admin:
+            try:
+                from openclaw.chat_agent import ask as _ask
+                self._send_text(chat_id, "🤔 กำลังวิเคราะห์...")
+                answer = _ask(msg)
+                self._send_text(chat_id, f"💬 {answer}")
+            except Exception as exc:
+                logger.debug("[admin_bot] AI chat fallback error: %s", exc)
+                self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
+        else:
+            if not self._ai_api_allowed(user_id, is_admin):
+                self._send_text_localized(chat_id, "ai_api_locked_trial", lang=lang)
+                return
+            self._send_text(chat_id, self._intent_rephrase_prompt(lang=lang))
 
     def _handle_admin_command(self, chat_id: int, user_id: int, command: str, args: str, is_admin: bool, lang: str = "en") -> None:
         from scheduler import scheduler
@@ -6638,6 +6660,348 @@ class TelegramAdminBot:
                 lines.append(f"- {uid_row}  {handle}  {name or '-'}  plan={plan_txt}  seen={seen}")
             lines.append("Tip: /admin_add @username  or  /admin_add <user_id>")
             self._send_text(chat_id, "\n".join(lines))
+            return
+
+        # ── Parameter Trial Sandbox commands ────────────────────────────────
+        if command in {"trials", "trial_list", "pts"}:
+            if not is_admin:
+                self._send_text(chat_id, "/trials is admin-only.")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                trials = live_profile_autopilot._load_trials()
+            except Exception as e:
+                self._send_text(chat_id, f"Error loading trials: {e}")
+                return
+            if not trials:
+                self._send_text(chat_id, "No parameter trials found.")
+                return
+            lines = ["PARAMETER TRIALS", ""]
+            status_icon = {"pending_bt": "⏳", "bt_running": "🔄", "bt_passed": "✅", "bt_failed": "❌", "applied": "✔️", "rejected": "🚫"}
+            for t in trials[-10:]:
+                tid = str(t.get("id") or "")
+                status = str(t.get("status") or "")
+                icon = status_icon.get(status, "•")
+                param = str(t.get("param") or "")
+                cur = str(t.get("current_value") or "")
+                prop = str(t.get("proposed_value") or "")
+                direction = str(t.get("direction") or "")
+                created = str(t.get("created_at") or "")[:16]
+                lines.append(f"{icon} [{status}] {created}")
+                lines.append(f"   {param}: {cur} → {prop} ({direction})")
+                if status == "bt_passed":
+                    lines.append(f"   ✅ READY → /approve {tid}")
+                elif status == "pending_bt":
+                    lines.append(f"   ⏳ BT pending — waiting for shadow data")
+                lines.append(f"   ID: {tid}")
+                lines.append("")
+            self._send_text(chat_id, "\n".join(lines).strip())
+            return
+
+        if command in {"approve", "approve_trial"}:
+            if not is_admin:
+                self._send_text(chat_id, "/approve is admin-only.")
+                return
+            trial_id = str(args or "").strip()
+            if not trial_id:
+                self._send_text(chat_id, "Usage: /approve <trial_id>\nGet IDs from /trials")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                result = live_profile_autopilot.apply_trial(trial_id)
+            except Exception as e:
+                self._send_text(chat_id, f"Error applying trial: {e}")
+                return
+            if bool(result.get("ok")):
+                param = str(result.get("param") or "")
+                value = str(result.get("value") or "")
+                self._send_text(
+                    chat_id,
+                    f"✅ Trial applied successfully\n\n"
+                    f"  {param} = {value}\n"
+                    f"  Written to .env.local + runtime config\n"
+                    f"  Trial ID: {trial_id}"
+                )
+            else:
+                self._send_text(chat_id, f"❌ Apply failed: {result.get('error', 'unknown')}")
+            return
+
+        if command in {"reject", "reject_trial"}:
+            if not is_admin:
+                self._send_text(chat_id, "/reject is admin-only.")
+                return
+            trial_id = str(args or "").strip()
+            if not trial_id:
+                self._send_text(chat_id, "Usage: /reject <trial_id>")
+                return
+            try:
+                from learning.live_profile_autopilot import live_profile_autopilot
+                trials = live_profile_autopilot._load_trials()
+                trial = next((t for t in trials if str(t.get("id") or "") == trial_id), None)
+                if not trial:
+                    self._send_text(chat_id, f"Trial not found: {trial_id}")
+                    return
+                trial["status"] = "rejected"
+                trial["rejected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                live_profile_autopilot._save_trials(trials)
+                self._send_text(
+                    chat_id,
+                    f"🚫 Trial rejected\n\n"
+                    f"  {trial.get('param')}: {trial.get('current_value')} → {trial.get('proposed_value')}\n"
+                    f"  Current value kept. Trial ID: {trial_id}"
+                )
+            except Exception as e:
+                self._send_text(chat_id, f"Error rejecting trial: {e}")
+            return
+
+        if command in {"budget", "token_budget"}:
+            try:
+                from openclaw.token_budget import get_status as _budget_status
+                st = _budget_status()
+                month = st.get("month", "?")
+                models = st.get("models", {})
+                lines = [f"💰 *Qwen Token Budget — {month}*\n"]
+                if not models:
+                    lines.append("  ยังไม่มีการใช้งาน (เริ่มต้นใหม่)")
+                for model, info in models.items():
+                    used = info.get("used_tokens", 0)
+                    budget = info.get("budget_tokens", 900_000)
+                    pct = info.get("pct", 0)
+                    calls = info.get("calls", 0)
+                    bar = "🟢" if pct < 60 else "🟡" if pct < 80 else "🔴"
+                    lines.append(f"{bar} *{model}*")
+                    lines.append(f"  {used:,} / {budget:,} tokens ({pct}%)")
+                    lines.append(f"  {calls} calls this month")
+                    lines.append(f"  Switch to Groq at 95%")
+                    lines.append("")
+                lines.append("_Groq fallback = ฟรีไม่มี quota_")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Budget error: {exc}")
+            return
+
+        if command == "copy_status":
+            try:
+                from copy_trade.manager import copy_trade_manager
+                self._send_text(chat_id, copy_trade_manager.format_telegram_status(), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"CopyTrade error: {exc}")
+            return
+
+        if command == "copy_add_ctrader":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            parts = str(args or "").strip().split()
+            if len(parts) < 2:
+                self._send_text(
+                    chat_id,
+                    "Usage: /copy_add_ctrader <label> <account_id> [risk_mult] [max_risk_usd]\n"
+                    "Example: /copy_add_ctrader MyAccount2 12345678 0.5 25",
+                )
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                label = parts[0]
+                ct_id = int(parts[1])
+                risk_mult = float(parts[2]) if len(parts) > 2 else 1.0
+                max_risk = float(parts[3]) if len(parts) > 3 else 50.0
+                acc = _ct_reg.add_ctrader(label, ct_id, risk_multiplier=risk_mult, max_risk_usd=max_risk)
+                self._send_text(
+                    chat_id,
+                    f"✅ Added cTrader follower:\n"
+                    f"  Label: {acc.label}\n"
+                    f"  Account: {acc.ctrader_account_id}\n"
+                    f"  Risk: {acc.risk_multiplier}x (max ${acc.max_risk_usd})",
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_add_mt5":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            parts = str(args or "").strip().split()
+            if len(parts) < 2:
+                self._send_text(
+                    chat_id,
+                    "Usage: /copy_add_mt5 <label> <login> [server] [risk_mult] [max_risk_usd]\n"
+                    "Example: /copy_add_mt5 MyMT5 5001234 ICMarkets-Live 0.5 25",
+                )
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                label = parts[0]
+                login = int(parts[1])
+                server = parts[2] if len(parts) > 2 else ""
+                risk_mult = float(parts[3]) if len(parts) > 3 else 1.0
+                max_risk = float(parts[4]) if len(parts) > 4 else 50.0
+                acc = _ct_reg.add_mt5(label, mt5_login=login, mt5_server=server, risk_multiplier=risk_mult, max_risk_usd=max_risk)
+                self._send_text(
+                    chat_id,
+                    f"✅ Added MT5 follower:\n"
+                    f"  Label: {acc.label}\n"
+                    f"  Login: {acc.mt5_login}\n"
+                    f"  Server: {acc.mt5_server or 'default'}\n"
+                    f"  Risk: {acc.risk_multiplier}x (max ${acc.max_risk_usd})",
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_remove":
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            account_id = str(args or "").strip()
+            if not account_id:
+                self._send_text(chat_id, "Usage: /copy_remove <account_id>\nUse /copy_status to see account IDs.")
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                if _ct_reg.remove(account_id):
+                    self._send_text(chat_id, f"✅ Removed: {account_id}")
+                else:
+                    self._send_text(chat_id, f"❌ Not found: {account_id}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command in ("copy_pause", "copy_resume"):
+            if not is_admin:
+                self._send_text(chat_id, "Admin only.")
+                return
+            account_id = str(args or "").strip()
+            if not account_id:
+                self._send_text(chat_id, f"Usage: /{command} <account_id>")
+                return
+            try:
+                from copy_trade.accounts import account_registry as _ct_reg
+                enabled = command == "copy_resume"
+                if _ct_reg.set_enabled(account_id, enabled):
+                    status = "resumed" if enabled else "paused"
+                    self._send_text(chat_id, f"✅ {account_id} {status}")
+                else:
+                    self._send_text(chat_id, f"❌ Not found: {account_id}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command == "copy_log":
+            try:
+                from copy_trade.manager import copy_trade_manager
+                logs = copy_trade_manager.get_recent_log(10)
+                if not logs:
+                    self._send_text(chat_id, "No recent copy trade dispatches.")
+                    return
+                lines = ["📊 *Recent Copy Trades*\n"]
+                for entry in reversed(logs):
+                    sym = entry.get("symbol", "")
+                    d = entry.get("direction", "")
+                    ok = entry.get("success", 0)
+                    fail = entry.get("failed", 0)
+                    ts = entry.get("ts", "")
+                    lines.append(f"  {ts} {sym} {d} | ✅{ok} ❌{fail}")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Error: {exc}")
+            return
+
+        if command in {"ask", "chat", "q"}:
+            question = str(args or "").strip()
+            if not question:
+                self._send_text(
+                    chat_id,
+                    "💬 ถามอะไรก็ได้เกี่ยวกับระบบ:\n\n"
+                    "/ask วันนี้ระบบเป็นยังไง?\n"
+                    "/ask which families are winning?\n"
+                    "/ask should I approve the ETH trial?\n"
+                    "/ask อธิบาย XAU regime ตอนนี้",
+                )
+                return
+            # Show typing indicator via send_chat_action
+            try:
+                from config import config as _cfg
+                _chat_id_str = str(getattr(_cfg, "TELEGRAM_CHAT_ID", "") or "").strip()
+                if _chat_id_str:
+                    self._api_post("sendChatAction", {"chat_id": int(_chat_id_str), "action": "typing"})
+            except Exception:
+                pass
+            try:
+                from openclaw.chat_agent import ask as _ask
+                self._send_text(chat_id, f"🤔 กำลังวิเคราะห์...")
+                answer = _ask(question)
+                self._send_text(chat_id, f"💬 {answer}")
+            except Exception as exc:
+                self._send_text(chat_id, f"❌ Chat error: {exc}")
+            return
+
+        if command in {"openclaw_version", "openclaw_status"}:
+            try:
+                from openclaw.version_guard import get_state as _vg_state, check_and_notify as _vg_check
+                state = _vg_state()
+                installed = state.get("installed_version", "unknown")
+                latest = state.get("latest_version", "unknown")
+                update_available = bool(state.get("update_available"))
+                notified_at = state.get("notified_at", "never")
+                updated_at = state.get("updated_at", "never")
+                lines = [
+                    "🦞 *OpenClaw Version Status*",
+                    f"  Installed: `{installed}`",
+                    f"  Latest:    `{latest}`",
+                    f"  Update available: {'✅ YES' if update_available else '✅ Up to date'}",
+                    f"  Last notified: {notified_at[:16] if notified_at != 'never' else 'never'}",
+                    f"  Last updated:  {updated_at[:16] if updated_at != 'never' else 'never'}",
+                ]
+                if update_available:
+                    lines.append(f"\nSend /update_openclaw to upgrade to {latest}")
+                self._send_text(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:
+                self._send_text(chat_id, f"Version guard error: {exc}")
+            return
+
+        if command in {"update_openclaw"}:
+            if not is_admin:
+                self._send_text(chat_id, "/update_openclaw is admin-only.")
+                return
+            try:
+                from openclaw.version_guard import get_state as _vg_state, do_update as _vg_update
+                state = _vg_state()
+                latest = state.get("latest_version", "unknown")
+                installed = state.get("installed_version", "unknown")
+                if latest == installed and not state.get("update_available"):
+                    self._send_text(chat_id, f"✅ Already at latest: `{installed}`", parse_mode="Markdown")
+                    return
+                self._send_text(chat_id, f"⏳ Updating openclaw `{installed}` → `{latest}`...", parse_mode="Markdown")
+                result = _vg_update()
+                if result["ok"]:
+                    self._send_text(
+                        chat_id,
+                        f"✅ *OpenClaw updated to {result['version']}*\n"
+                        f"Gateway restarted. Qwen + new features active.",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    self._send_text(chat_id, f"❌ Update failed: {result.get('error', 'unknown')}")
+            except Exception as exc:
+                self._send_text(chat_id, f"Update error: {exc}")
+            return
+
+        if command in {"skip_openclaw"}:
+            if not is_admin:
+                self._send_text(chat_id, "/skip_openclaw is admin-only.")
+                return
+            version_to_skip = str(args or "").strip()
+            try:
+                from openclaw.version_guard import _load_state as _vg_load, _save_state as _vg_save
+                state = _vg_load()
+                state["notified_version"] = version_to_skip or state.get("latest_version", "")
+                state["update_available"] = False
+                _vg_save(state)
+                self._send_text(chat_id, f"⏭ Skipped openclaw {version_to_skip}. Next update will notify again.")
+            except Exception as exc:
+                self._send_text(chat_id, f"Skip error: {exc}")
             return
 
         suggestion = self._suggest_command(command)

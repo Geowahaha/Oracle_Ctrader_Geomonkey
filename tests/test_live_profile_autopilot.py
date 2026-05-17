@@ -535,6 +535,99 @@ class LiveProfileAutopilotTests(unittest.TestCase):
         self.assertEqual(int((snap.get("features") or {}).get("spots_count", 0) or 0), 2)
         self.assertLess(float((snap.get("features") or {}).get("spread_avg_pct", 1.0) or 1.0), 0.01)
 
+    def test_run_xau_shadow_backtest_falls_back_to_spot_ticks_when_candle_window_is_empty(self):
+        shadow_ts = "2026-04-06T10:00:00Z"
+        with sqlite3.connect(str(self.ctrader_db)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS xau_shadow_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_utc TEXT NOT NULL,
+                    symbol TEXT NOT NULL DEFAULT 'XAUUSD',
+                    direction TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    entry REAL NOT NULL DEFAULT 0.0,
+                    stop_loss REAL NOT NULL DEFAULT 0.0,
+                    take_profit_1 REAL NOT NULL DEFAULT 0.0,
+                    take_profit_2 REAL NOT NULL DEFAULT 0.0,
+                    take_profit_3 REAL NOT NULL DEFAULT 0.0,
+                    block_reason TEXT NOT NULL DEFAULT '',
+                    raw_scores_json TEXT NOT NULL DEFAULT '{}',
+                    shadow_outcome TEXT,
+                    resolved_utc TEXT,
+                    shadow_pnl_rr REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO xau_shadow_journal(
+                    signal_utc, symbol, direction, confidence, entry, stop_loss, take_profit_1, raw_scores_json
+                ) VALUES(?, 'XAUUSD', 'long', 72.0, 100.0, 99.0, 101.0, '{}')
+                """,
+                (shadow_ts,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO ctrader_spot_ticks(run_id, symbol, event_utc, event_ts, bid, ask, spread, spread_pct, payload_json)
+                VALUES(?, 'XAUUSD', ?, ?, ?, ?, ?, ?, '{}')
+                """,
+                [
+                    ("shadow_run", shadow_ts, 1, 100.00, 100.10, 0.10, 0.001),
+                    ("shadow_run", "2026-04-06T10:01:00Z", 2, 100.55, 100.65, 0.10, 0.001),
+                    ("shadow_run", "2026-04-06T10:02:00Z", 3, 101.00, 101.10, 0.10, 0.001),
+                ],
+            )
+
+        candle_db_path = Path(__file__).resolve().parent.parent / "backtest" / "candle_data.db"
+        temp_candle_db = self.base / "candle_data.db"
+        with sqlite3.connect(str(temp_candle_db)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE candles (
+                    symbol TEXT,
+                    tf TEXT,
+                    ts TEXT,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO candles(symbol, tf, ts, open, high, low, close, volume)
+                VALUES('XAUUSD', '1m', '2026-04-02T10:00:00Z', 99.0, 99.2, 98.8, 99.1, 1.0)
+                """
+            )
+
+        real_connect = sqlite3.connect
+
+        def _patched_connect(path, *args, **kwargs):
+            if str(path) == str(candle_db_path):
+                return real_connect(str(temp_candle_db), *args, **kwargs)
+            return real_connect(path, *args, **kwargs)
+
+        with patch("learning.live_profile_autopilot.sqlite3.connect", side_effect=_patched_connect), \
+             patch("learning.live_profile_autopilot.config.XAU_SHADOW_BACKTEST_ENABLED", True), \
+             patch("learning.live_profile_autopilot.config.XAU_SHADOW_BACKTEST_RESOLVE_HOURS", 4.0), \
+             patch("learning.live_profile_autopilot.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 4, 6, 15, 0, 0, tzinfo=timezone.utc)
+            mock_datetime.strptime = datetime.strptime
+            out = self.engine.run_xau_shadow_backtest()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(int(out["newly_resolved"]), 1)
+        self.assertEqual(int(out["skipped_no_candles"]), 0)
+        with sqlite3.connect(str(self.ctrader_db)) as conn:
+            row = conn.execute(
+                "SELECT shadow_outcome, shadow_pnl_rr FROM xau_shadow_journal ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(str(row[0]), "tp_hit")
+        self.assertGreater(float(row[1] or 0.0), 0.0)
+
     def test_build_xau_tick_depth_filter_report_filters_capture_rows_by_symbol_within_run(self):
         run_id = "ctcap_test_report_mixed"
         now_iso = "2026-03-12T05:30:00Z"

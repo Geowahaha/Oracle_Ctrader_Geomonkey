@@ -461,7 +461,8 @@ class TelegramNotifier:
         if entry_type == "limit":
             tiger_badges.append("🎯 Limit Entry")
         if tiger_badges:
-            lines.append(f"🐯 *TIGER QUALITY:* {' \\| '.join(tiger_badges)}")
+            sep = " \\| "
+            lines.append(f"🐯 *TIGER QUALITY:* {sep.join(tiger_badges)}")
 
         lines += [
             f"🕐 `{e(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}`",
@@ -2092,9 +2093,10 @@ class TelegramNotifier:
         for market, info in overview.get("all_markets", {}).items():
             flag = market_flags.get(market, "🌏")
             status = "🟢 OPEN" if info["open"] else "🔴 CLOSED"
+            hours_utc = info["hours_utc"]
             lines.append(
                 f"{flag} *{e(market)}*  {status}  "
-                f"`{e(info['hours_utc'])} UTC`"
+                f"`{e(hours_utc)} UTC`"
             )
         lines += [
             f"",
@@ -2663,14 +2665,17 @@ class TelegramNotifier:
             raw = dict(getattr(opp.signal, "raw_scores", {}) or {})
             groups[_profile_bucket(raw)].append(opp)
 
+        n_buffett = len(groups["BUFFETT"])
+        n_turnaround = len(groups["TURNAROUND"])
+        n_blend = len(groups["BLEND"])
         lines = [
             f"{'═' * 35}",
             f"{e(region)} *VALUE \\+ TREND SCANNER*",
             f"Top *{e(len(opportunities))}* candidates \\(Buffett/Turnaround separated\\)",
             (
-                f"Mix: Buffett `{e(len(groups['BUFFETT']))}` "
-                f"\\| Turnaround `{e(len(groups['TURNAROUND']))}` "
-                f"\\| Blend `{e(len(groups['BLEND']))}`"
+                f"Mix: Buffett `{e(n_buffett)}` "
+                f"\\| Turnaround `{e(n_turnaround)}` "
+                f"\\| Blend `{e(n_blend)}`"
             ),
             f"{'═' * 35}",
         ]
@@ -2873,12 +2878,14 @@ class TelegramNotifier:
         sep1 = "═" * 35
         sep2 = "─" * 30
         ts = stats.get("tiger_stats", {})
+        total_pnl_usd = stats["total_pnl_usd"]
+        profit_factor = stats["profit_factor"]
         lns = [
             sep1, "🐯 *TIGER HUNTER DAILY REPORT*", sep1, "",
             "📊 *PERFORMANCE*", sep2,
             f"{wr_e} Win Rate: `{e(f'{wr:.1f}')}%`",
-            f"💰 P&L: `${e(f'{stats['total_pnl_usd']:.2f}')}`",
-            f"📈 Profit Factor: `{e(f'{stats['profit_factor']:.2f}')}`",
+            f"💰 P&L: `${e(f'{total_pnl_usd:.2f}')}`",
+            f"📈 Profit Factor: `{e(f'{profit_factor:.2f}')}`",
             "",
             "💎 *$15 → $1M*", sep2,
             f"💵 Equity: `${e(f'{eq:.2f}')}`  Growth: `{e(f'{growth:+.1f}')}%`",

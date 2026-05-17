@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 from analysis.signals import TradeSignal
 from scanners.scalping_scanner import ScalpingScanner
 
@@ -42,6 +44,37 @@ class ScalpingScannerWinnerLogicTests(unittest.TestCase):
 
     def tearDown(self):
         self._td.cleanup()
+
+    def test_forced_xau_scalp_follows_bullish_h1_unless_reversal_is_confirmed(self):
+        idx = pd.date_range("2026-05-14 00:00:00", periods=90, freq="5min", tz="UTC")
+        closes = [4708.0] * 88 + [4707.2, 4706.8]
+        m5 = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.4 for c in closes],
+                "low": [c - 0.4 for c in closes],
+                "close": closes,
+                "ema_9": [4708.5] * 90,
+                "ema_21": [4709.0] * 90,
+                "rsi_14": [47.0] * 90,
+                "atr_14": [6.0] * 90,
+            },
+            index=idx,
+        )
+        h1 = m5.copy()
+        with patch("scanners.scalping_scanner.xauusd_provider.fetch", side_effect=[m5, h1]), \
+             patch.object(self.scanner.ta, "add_all", side_effect=lambda df: df), \
+             patch.object(self.scanner.ta, "determine_trend", return_value="bullish"), \
+             patch.object(self.scanner, "_xau_m1_micro_snapshot", return_value={"available": False}), \
+             patch("scanners.scalping_scanner.session_manager.current_sessions", return_value=["asian"]):
+            sig = self.scanner._build_xau_forced_signal()
+
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.direction, "long")
+        raw = dict(sig.raw_scores or {})
+        self.assertEqual(raw.get("scalp_force_direction_pre_guard"), "short")
+        self.assertTrue(bool(raw.get("scalp_force_trend_follow_override")))
+        self.assertEqual(raw.get("scalp_force_countertrend_reason"), "blocked_short_against_bullish_h1")
 
     @staticmethod
     def _seed_db(path: Path) -> None:
@@ -228,8 +261,11 @@ class ScalpingScannerWinnerLogicTests(unittest.TestCase):
         self.assertIsNone(out)
 
     def test_crypto_weekend_profile_filters_disallowed_session(self):
+        import pandas as pd, numpy as np
+        _idx = pd.date_range("2026-03-20", periods=60, freq="5min", tz="UTC")
+        _df = pd.DataFrame({"open": np.random.uniform(2090, 2110, 60), "high": np.random.uniform(2095, 2115, 60), "low": np.random.uniform(2085, 2105, 60), "close": np.random.uniform(2090, 2110, 60), "volume": np.random.uniform(100, 1000, 60)}, index=_idx)
         sig = TradeSignal(
-            symbol="ETH/USDT",
+            symbol="ETHUSD",
             direction="long",
             confidence=78.0,
             entry=2100.0,
@@ -248,20 +284,23 @@ class ScalpingScannerWinnerLogicTests(unittest.TestCase):
             warnings=[],
             raw_scores={},
         )
-        opp = SimpleNamespace(signal=sig)
         with patch("scanners.scalping_scanner.config.SCALPING_ENABLED", True), \
              patch("scanners.scalping_scanner.config.scalping_symbol_enabled", return_value=True), \
              patch.object(self.scanner, "_is_weekend_utc", return_value=True), \
              patch("scanners.scalping_scanner.config.get_scalping_eth_allowed_sessions_weekend", return_value={"asian", "london,new_york,overlap"}), \
-             patch("scanners.scalping_scanner.crypto_sniper.analyze_single", return_value=opp):
+             patch.object(self.scanner, "_fetch_ctrader_ohlcv", return_value=_df), \
+             patch("analysis.signals.SignalGenerator.score_signal", return_value=sig):
             out = self.scanner.scan_eth()
 
         self.assertEqual(out.status, "session_filtered")
         self.assertIn("session_not_allowed", out.reason)
 
     def test_crypto_weekend_profile_raises_min_confidence(self):
+        import pandas as pd, numpy as np
+        _idx = pd.date_range("2026-03-20", periods=60, freq="5min", tz="UTC")
+        _df = pd.DataFrame({"open": np.random.uniform(71500, 72500, 60), "high": np.random.uniform(71600, 72600, 60), "low": np.random.uniform(71400, 72400, 60), "close": np.random.uniform(71500, 72500, 60), "volume": np.random.uniform(100, 1000, 60)}, index=_idx)
         sig = TradeSignal(
-            symbol="BTC/USDT",
+            symbol="BTCUSD",
             direction="short",
             confidence=73.0,
             entry=72000.0,
@@ -280,14 +319,14 @@ class ScalpingScannerWinnerLogicTests(unittest.TestCase):
             warnings=[],
             raw_scores={},
         )
-        opp = SimpleNamespace(signal=sig)
         with patch("scanners.scalping_scanner.config.SCALPING_ENABLED", True), \
              patch("scanners.scalping_scanner.config.scalping_symbol_enabled", return_value=True), \
              patch.object(self.scanner, "_is_weekend_utc", return_value=True), \
              patch("scanners.scalping_scanner.config.SCALPING_CRYPTO_WINNER_LOGIC_ENABLED", False), \
              patch("scanners.scalping_scanner.config.SCALPING_BTC_MIN_CONFIDENCE_WEEKEND", 74.0), \
              patch("scanners.scalping_scanner.config.get_scalping_btc_allowed_sessions_weekend", return_value={"london,new_york,overlap"}), \
-             patch("scanners.scalping_scanner.crypto_sniper.analyze_single", return_value=opp):
+             patch.object(self.scanner, "_fetch_ctrader_ohlcv", return_value=_df), \
+             patch("analysis.signals.SignalGenerator.score_signal", return_value=sig):
             out = self.scanner.scan_btc()
 
         self.assertEqual(out.status, "below_confidence")

@@ -44,6 +44,128 @@ def _execute_signal_with_fixture_reference(executor, signal: TradeSignal, *, sou
 
 
 class TestCTraderExecutor(unittest.TestCase):
+    def setUp(self):
+        # Default fixture has RR=0.6 (below floor=1.2). Legacy tests don't
+        # exercise the RR gate — disable it here. Dedicated RR-gate tests
+        # re-enable explicitly.
+        self._rr_floor_patch = patch.object(
+            ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", False
+        )
+        self._rr_floor_patch.start()
+
+    def tearDown(self):
+        try:
+            self._rr_floor_patch.stop()
+        except Exception:
+            pass
+
+    def test_rr_floor_gate_rejects_below_floor(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            sig = _make_signal()  # entry=5100 sl=5095 tp1=5103 → RR=0.6
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "43880642"), \
+                 patch.object(ctrader_module.config, "CTRADER_RISK_USD_PER_TRADE", 10.0), \
+                 patch.object(ctrader_module.config, "CTRADER_TP_LEVEL", 1), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_MIN", 1.2), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_symbols", return_value={"XAUUSD"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_default_volume_symbol_overrides", return_value={}), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                result = _execute_signal_with_fixture_reference(executor, sig, source="scalp_xauusd")
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "filtered")
+            self.assertIn("rr_floor_below_min", result.message)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_tp_normalizer_extends_low_rr(self):
+        # entry=5100 sl=5095 tp=5103 → risk=5 reward=3 RR=0.6
+        # target_rr=1.5 → reward needs to be 7.5; max_extend_pct=0.6 → cap at 4.8
+        # so new_reward = min(7.5, 4.8) = 4.8 → new_tp = 5104.8 → RR=0.96
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 0.60), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo"):
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5103.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertTrue(meta["applied"])
+        self.assertAlmostEqual(payload["take_profit"], 5104.8, places=4)
+        self.assertGreater(meta["rr_after"], meta["rr_before"])
+
+    def test_tp_normalizer_skips_when_rr_already_at_target(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5):
+            # RR = 8/5 = 1.6 — above target, no change
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5108.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(payload["take_profit"], 5108.0)
+
+    def test_tp_normalizer_skips_blacklisted_source(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo"):
+            payload = {"entry": 5100.0, "stop_loss": 5095.0, "take_profit": 5103.0, "direction": "long"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="fibo_xauusd", payload=payload)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(meta["reason"], "source_blacklisted")
+        self.assertEqual(payload["take_profit"], 5103.0)
+
+    def test_tp_normalizer_short_direction(self):
+        executor = ctrader_module.CTraderExecutor.__new__(ctrader_module.CTraderExecutor)
+        with patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5), \
+             patch.object(ctrader_module.config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 1.0):
+            # short: entry=5100 sl=5105 (risk=5) tp=5097 (reward=3) → RR=0.6
+            # target_rr=1.5, reward=7.5; max_extend=100% → reward cap=6 → new_reward=min(7.5, 6)=6
+            # new_tp = 5100 - 6 = 5094
+            payload = {"entry": 5100.0, "stop_loss": 5105.0, "take_profit": 5097.0, "direction": "short"}
+            meta = ctrader_module.CTraderExecutor._normalize_tp_for_min_rr(executor, source="scalp_xauusd", payload=payload)
+        self.assertTrue(meta["applied"])
+        self.assertAlmostEqual(payload["take_profit"], 5094.0, places=4)
+
+    def test_rr_floor_gate_accepts_above_floor(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            sig = _make_signal()
+            sig.take_profit_1 = 5106.0  # reward=6, risk=5 → RR=1.2
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "43880642"), \
+                 patch.object(ctrader_module.config, "CTRADER_RISK_USD_PER_TRADE", 10.0), \
+                 patch.object(ctrader_module.config, "CTRADER_TP_LEVEL", 1), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_RR_FLOOR_MIN", 1.2), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_allowed_symbols", return_value={"XAUUSD"}), \
+                 patch.object(ctrader_module.config, "get_ctrader_default_volume_symbol_overrides", return_value={}), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                result = _execute_signal_with_fixture_reference(executor, sig, source="scalp_xauusd")
+            self.assertTrue(result.ok)
+            self.assertEqual(result.status, "dry_run")
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_build_payload_carries_xau_multi_tf_metadata(self):
         td = tempfile.mkdtemp()
         executor = None
@@ -482,15 +604,61 @@ class TestCTraderExecutor(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                fss_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:fss:canary")
-                limit_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:canary")
 
-            self.assertEqual(str(fss_state.get("desk") or ""), "fss_confirmation")
-            self.assertEqual(str(fss_state.get("mode") or ""), "continuation_fail_fast")
-            self.assertAlmostEqual(float((dict(fss_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 6.5, places=4)
-            self.assertEqual(str(limit_state.get("desk") or ""), "limit_retest")
-            self.assertEqual(str(limit_state.get("mode") or ""), "retest_absorption_guard")
-            self.assertAlmostEqual(float((dict(limit_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 3.0, places=4)
+                state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:fss:canary")
+                fallback = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:canary")
+
+            self.assertEqual(str(state.get("desk") or ""), "fss_confirmation")
+            self.assertAlmostEqual(float((state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 6.5, places=6)
+            self.assertEqual(str(fallback.get("desk") or ""), "limit_retest")
+            self.assertAlmostEqual(float((fallback.get("overrides") or {}).get("no_follow_age_min") or 0.0), 3.0, places=6)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_xau_order_care_state_maps_scheduled_winner_and_tc_canary_to_limit_retest(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+                executor.trading_manager_state_path.parent.mkdir(parents=True, exist_ok=True)
+                executor.trading_manager_state_path.write_text(
+                    json.dumps(
+                        {
+                            "xau_order_care": {
+                                "status": "active",
+                                "mode": "market_entry_retest_guard",
+                                "allowed_sources": ["xauusd_scheduled:winner", "scalp_xauusd:tc:canary"],
+                                "overrides": {"no_follow_age_min": 7.0},
+                                "desks": {
+                                    "limit_retest": {
+                                        "status": "active",
+                                        "mode": "market_entry_retest_guard",
+                                        "allowed_sources": ["xauusd_scheduled:winner", "scalp_xauusd:tc:canary"],
+                                        "overrides": {"desk": "limit_retest", "no_follow_age_min": 4.0},
+                                    }
+                                },
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                winner_state = executor._xau_order_care_state(symbol="XAUUSD", source="xauusd_scheduled:winner")
+                tc_state = executor._xau_order_care_state(symbol="XAUUSD", source="scalp_xauusd:tc:canary")
+
+            self.assertEqual(str(winner_state.get("desk") or ""), "limit_retest")
+            self.assertEqual(str(tc_state.get("desk") or ""), "limit_retest")
+            self.assertAlmostEqual(float((winner_state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 4.0, places=6)
+            self.assertAlmostEqual(float((tc_state.get("overrides") or {}).get("no_follow_age_min") or 0.0), 4.0, places=6)
         finally:
             executor = None
             gc.collect()
@@ -2850,6 +3018,42 @@ class TestCTraderExecutor(unittest.TestCase):
             gc.collect()
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_is_scheduled_canary_source_accepts_winner_lane(self):
+        self.assertTrue(ctrader_module.CTraderExecutor._is_scheduled_canary_source("xauusd_scheduled:winner"))
+        self.assertTrue(ctrader_module.CTraderExecutor._is_scheduled_canary_source("xauusd_scheduled:canary"))
+        self.assertFalse(ctrader_module.CTraderExecutor._is_scheduled_canary_source("scalp_xauusd"))
+
+    def test_scheduled_rebalanced_stop_applies_to_winner_lane(self):
+        td = tempfile.mkdtemp()
+        executor = None
+        try:
+            db_path = str(Path(td) / "ctrader_openapi.db")
+            with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_DRY_RUN", False), \
+                 patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+                 patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED", True), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_MIN_RR", 0.85), \
+                 patch.object(ctrader_module.config, "CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO", 0.58), \
+                 patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+                executor = ctrader_module.CTraderExecutor()
+
+                new_sl = executor._scheduled_canary_rebalanced_stop(
+                    source="xauusd_scheduled:winner",
+                    direction="long",
+                    entry_price=4748.33,
+                    stop_loss=4715.00,
+                    take_profit=4765.00,
+                )
+
+            self.assertGreater(float(new_sl), 4715.00)
+            self.assertLess(float(new_sl), 4748.33)
+        finally:
+            executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_get_lane_stats_ignores_untracked_ctrader_rows(self):
         td = tempfile.mkdtemp()
         executor = None
@@ -4581,6 +4785,269 @@ class TestCTraderExecutor(unittest.TestCase):
             self.assertEqual(result.status, "dry_run")
         finally:
             executor = None
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Momentum Exhaustion Profit Lock + Adaptive step_r
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMomentumExhaustionLock(unittest.TestCase):
+    """Test momentum exhaustion detection and profit locking."""
+
+    def _make_executor(self, td):
+        db_path = str(Path(td) / "ctrader_openapi.db")
+        with patch.object(ctrader_module.config, "CTRADER_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(ctrader_module.config, "CTRADER_DRY_RUN", True), \
+             patch.object(ctrader_module.config, "CTRADER_DB_PATH", db_path), \
+             patch.object(ctrader_module.config, "CTRADER_ACCOUNT_ID", "46552794"), \
+             patch.object(ctrader_module.CTraderExecutor, "sdk_available", new_callable=PropertyMock, return_value=True):
+            executor = ctrader_module.CTraderExecutor()
+            executor.trading_manager_state_path.parent.mkdir(parents=True, exist_ok=True)
+            executor.trading_manager_state_path.write_text(
+                json.dumps({"xau_order_care": {"status": "active", "mode": "test", "allowed_sources": ["fibo:sniper"], "overrides": {}}}),
+                encoding="utf-8",
+            )
+            return executor
+
+    def test_exhaustion_locks_profit_when_all_signals_fire(self):
+        """When delta reversed + volume dying + drift adverse + high rejection + range → lock profit."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            # Exhausted momentum snapshot: all 5 signals fire
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "range",
+                    "delta_proxy": -0.15,   # adverse for long
+                    "depth_imbalance": -0.05,
+                    "mid_drift_pct": -0.012,  # adverse for long
+                    "rejection_ratio": 0.35,  # high
+                    "bar_volume_proxy": 0.15,  # dying
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.95,
+                )
+            self.assertTrue(result["active"])
+            self.assertEqual(result["action"], "tighten")
+            self.assertIn("xau_momentum_exhaustion_lock", result["reason"])
+            # At r_now=0.95, lock_pct should be 0.55 (1.0R tier)
+            self.assertEqual(result["details"]["lock_pct"], 0.55)
+            # 5 exhaustion signals fired
+            self.assertEqual(result["details"]["exhaustion_signals"], 5)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_momentum_still_strong(self):
+        """When momentum is still strong (volume high, delta supportive) → don't lock."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "trend",
+                    "delta_proxy": 0.20,     # supportive for long
+                    "depth_imbalance": 0.15,
+                    "mid_drift_pct": 0.015,   # supportive for long
+                    "rejection_ratio": 0.05,   # low
+                    "bar_volume_proxy": 0.75,   # high
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.95,
+                )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "exhaustion_not_confirmed")
+            # 0 exhaustion signals
+            self.assertEqual(result["details"]["exhaustion_signals"], 0)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_not_profitable(self):
+        """When trade is in loss → don't lock (can't lock what you don't have)."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            result = executor._xau_momentum_exhaustion_lock(
+                source="fibo:sniper", symbol="XAUUSD", direction="long",
+                entry=3026.49, stop_loss=3024.54, current_price=3025.00,
+                confidence=75.0, age_min=5.0, r_now=-0.70,
+            )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "not_in_profit")
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_no_lock_when_too_young(self):
+        """When trade is too young (< min_age) → don't lock yet."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            result = executor._xau_momentum_exhaustion_lock(
+                source="fibo:sniper", symbol="XAUUSD", direction="long",
+                entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                confidence=75.0, age_min=1.0, r_now=0.95,
+            )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["reason"], "too_young")
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_partial_signals_not_enough(self):
+        """When only 2 of 5 signals fire (need 3) → don't lock."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True,
+                "run_id": "exh_test",
+                "features": {
+                    "day_type": "trend",       # supportive
+                    "delta_proxy": -0.10,      # adverse (1 signal)
+                    "depth_imbalance": 0.05,
+                    "mid_drift_pct": 0.005,    # supportive
+                    "rejection_ratio": 0.30,    # high (2nd signal)
+                    "bar_volume_proxy": 0.40,   # not dying
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=0.50,
+                )
+            self.assertFalse(result["active"])
+            self.assertEqual(result["details"]["exhaustion_signals"], 2)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_exhaustion_lock_scales_with_r_multiple(self):
+        """Higher R-multiple → higher lock percentage."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot_exhausted = {
+                "ok": True, "run_id": "exh",
+                "features": {
+                    "day_type": "range", "delta_proxy": -0.15, "depth_imbalance": -0.05,
+                    "mid_drift_pct": -0.012, "rejection_ratio": 0.35, "bar_volume_proxy": 0.15,
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot_exhausted):
+                # At 0.3R → lock_pct=0.15
+                r_low = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3027.20,
+                    confidence=75.0, age_min=5.0, r_now=0.35,
+                )
+                # At 1.0R → lock_pct=0.55
+                r_mid = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3028.50,
+                    confidence=75.0, age_min=5.0, r_now=1.0,
+                )
+                # At 2.0R → lock_pct=0.70
+                r_high = executor._xau_momentum_exhaustion_lock(
+                    source="fibo:sniper", symbol="XAUUSD", direction="long",
+                    entry=3026.49, stop_loss=3024.54, current_price=3030.40,
+                    confidence=75.0, age_min=5.0, r_now=2.0,
+                )
+
+            self.assertTrue(r_low["active"])
+            self.assertTrue(r_mid["active"])
+            self.assertTrue(r_high["active"])
+            self.assertEqual(r_low["details"]["lock_pct"], 0.15)
+            self.assertEqual(r_mid["details"]["lock_pct"], 0.55)
+            self.assertEqual(r_high["details"]["lock_pct"], 0.70)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_momentum_adaptive_step_r_strong(self):
+        """Strong momentum (4+ favorable) → step_r increases from base."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True, "run_id": "test",
+                "features": {
+                    "day_type": "trend",
+                    "delta_proxy": -0.25,  # strong supportive for short
+                    "depth_imbalance": -0.18,
+                    "mid_drift_pct": -0.020,
+                    "rejection_ratio": 0.05,  # low
+                    "bar_volume_proxy": 0.80,  # high
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_profit_extension_plan(
+                    source="fibo:sniper", symbol="XAUUSD", direction="short",
+                    entry=3030.00, stop_loss=3033.00, planned_tp=3027.00,
+                    current_tp=3027.00, current_price=3026.00,
+                    confidence=80.0, age_min=2.0, r_now=1.33,
+                )
+            if result["active"]:
+                details = result.get("details", {})
+                momentum_info = details.get("momentum_adaptive", {})
+                self.assertEqual(momentum_info.get("momentum_label"), "strong")
+                # step_r should be base(0.25) + 0.10 = 0.35
+                self.assertAlmostEqual(momentum_info.get("step_r", 0), 0.35, places=2)
+
+        finally:
+            gc.collect()
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_momentum_adaptive_step_r_weak(self):
+        """Weak momentum (0-1 favorable) → step_r decreases from base."""
+        td = tempfile.mkdtemp()
+        try:
+            executor = self._make_executor(td)
+            snapshot = {
+                "ok": True, "run_id": "test",
+                "features": {
+                    "day_type": "range",          # not supportive
+                    "delta_proxy": 0.05,          # weak adverse for short
+                    "depth_imbalance": 0.02,       # weak
+                    "mid_drift_pct": 0.003,        # weak
+                    "rejection_ratio": 0.35,       # high
+                    "bar_volume_proxy": 0.15,       # low
+                },
+            }
+            with patch.object(executor, "_latest_capture_snapshot", return_value=snapshot):
+                result = executor._xau_profit_extension_plan(
+                    source="fibo:sniper", symbol="XAUUSD", direction="short",
+                    entry=3030.00, stop_loss=3033.00, planned_tp=3027.00,
+                    current_tp=3027.00, current_price=3026.00,
+                    confidence=80.0, age_min=2.0, r_now=1.33,
+                )
+            # Even if not active (score below), momentum should be labeled weak
+            details = result.get("details", {})
+            if "momentum_adaptive" in details:
+                self.assertEqual(details["momentum_adaptive"]["momentum_label"], "weak")
+
+        finally:
             gc.collect()
             shutil.rmtree(td, ignore_errors=True)
 

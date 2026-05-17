@@ -119,7 +119,7 @@ class EconomicCalendar:
             return ""
         resp = requests.get(
             self.feed_url,
-            timeout=20,
+            timeout=8,
             headers={"User-Agent": "DexterPro/1.0"},
         )
         resp.raise_for_status()

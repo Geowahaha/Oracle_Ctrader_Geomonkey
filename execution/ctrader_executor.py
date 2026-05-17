@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import config
+from utils.atomic_write import atomic_json_read, atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +129,14 @@ class CTraderExecutor:
         self.worker_path = Path(__file__).resolve().parent.parent / "ops" / "ctrader_execute_once.py"
         self.trading_manager_state_path = self.db_path.parent / "runtime" / "trading_manager_state.json"
         self.trading_team_state_path = self.db_path.parent / "runtime" / "trading_team_state.json"
+        self._rpeak_state_path = self.db_path.parent / "runtime" / "winner_protection_rpeak.json"
         self._autopilot = None
+        self._position_peak_r: dict[int, float] = {}
+        self._policy_r_peak_cache: dict[int, float] = {}
+        self._policy_r_peak_meta: dict[int, dict] = {}
+        self._rpeak_hydrated: bool = False
         self._init_db()
+        self._hydrate_policy_rpeak_cache()
 
     @property
     def enabled(self) -> bool:
@@ -343,6 +350,32 @@ class CTraderExecutor:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_depth_quotes_symbol_ts ON ctrader_depth_quotes(symbol, event_utc DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_depth_quotes_run ON ctrader_depth_quotes(run_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ctrader_reversal_capture_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ts REAL NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    symbol TEXT DEFAULT '',
+                    stage TEXT DEFAULT '',
+                    direction TEXT DEFAULT '',
+                    trigger_source TEXT DEFAULT '',
+                    event_key TEXT DEFAULT '',
+                    event_utc TEXT DEFAULT '',
+                    capture_run_id TEXT DEFAULT '',
+                    capture_status TEXT DEFAULT '',
+                    sweep_level REAL DEFAULT 0,
+                    sweep_wick_ratio REAL DEFAULT 0,
+                    atr REAL DEFAULT 0,
+                    reason TEXT DEFAULT '',
+                    features_json TEXT DEFAULT '{}',
+                    context_json TEXT DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_symbol_ts ON ctrader_reversal_capture_events(symbol, created_utc DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_run ON ctrader_reversal_capture_events(capture_run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_reversal_capture_events_key ON ctrader_reversal_capture_events(event_key)")
 
     def _configured_account_id(self) -> tuple[Optional[int], str]:
         raw_login = str(getattr(config, "CTRADER_ACCOUNT_LOGIN", "") or "").strip()
@@ -400,9 +433,67 @@ class CTraderExecutor:
             canary_allowed = set(getattr(config, "get_persistent_canary_allowed_sources", lambda: set())() or set())
             if base and (base in canary_allowed or root in canary_allowed):
                 return True
+        if bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False)):
+            root = token.split(":", 1)[0]
+            if root in {"scalp_xauusd", "xauusd_scheduled", "fibo_xauusd", "fibo_mtf_shadow"}:
+                return True
         if not allowed:
             return True
         return token in allowed
+
+    @staticmethod
+    def _source_direction_matches(specs: set[tuple[str, str]], *, source: str, direction: str) -> bool:
+        src = str(source or "").strip().lower()
+        side = str(direction or "").strip().lower()
+        if side == "buy":
+            side = "long"
+        elif side == "sell":
+            side = "short"
+        for spec_source, spec_direction in set(specs or set()):
+            s = str(spec_source or "").strip().lower()
+            d = str(spec_direction or "*").strip().lower() or "*"
+            if s not in {"*", "all"} and s != src:
+                continue
+            if d in {"*", "all"} or d == side:
+                return True
+        return False
+
+    def _source_direction_governance_guard(self, *, source: str, symbol: str, direction: str) -> tuple[bool, str, dict]:
+        src = str(source or "").strip().lower()
+        side = str(direction or "").strip().lower()
+        if side == "buy":
+            side = "long"
+        elif side == "sell":
+            side = "short"
+        if not src or side not in {"long", "short"}:
+            return True, "", {"source": src, "direction": side}
+        try:
+            source_norm = str(source or "").strip().lower()
+            symbol_norm = str(symbol or "").strip().upper()
+            if (
+                symbol_norm == "XAUUSD"
+                and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+            ):
+                return True, "", {"source": source_norm, "direction": side, "xau_opportunity_first_live_unlock": True}
+        except Exception:
+            pass
+        protected = set(getattr(config, "get_ctrader_protected_source_directions", lambda: set())() or set())
+        meta = {
+            "source": src,
+            "symbol": str(symbol or "").strip().upper(),
+            "direction": side,
+            "protected": self._source_direction_matches(protected, source=src, direction=side),
+        }
+        if bool(meta["protected"]):
+            return True, "", meta
+        if not bool(getattr(config, "CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED", True)):
+            return True, "", {**meta, "enabled": False}
+        quarantined = set(getattr(config, "get_ctrader_quarantined_source_directions", lambda: set())() or set())
+        blocked = self._source_direction_matches(quarantined, source=src, direction=side)
+        meta.update({"enabled": True, "quarantined": bool(blocked)})
+        if blocked:
+            return False, f"source_direction_quarantined:{src}:{side}", meta
+        return True, "", meta
 
     def _symbol_allowed(self, symbol: str) -> bool:
         allowed = set(getattr(config, "get_ctrader_allowed_symbols", lambda: set())() or set())
@@ -541,6 +632,18 @@ class CTraderExecutor:
         token = str(source or "").strip().lower()
         if not token:
             return ""
+        if bool(getattr(config, "DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", False)):
+            mem_tokens = set(getattr(config, "get_dexter_mempalace_source_tokens", lambda: set())() or set())
+            if mem_tokens and any(mt in token for mt in mem_tokens):
+                fam = str(getattr(config, "DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane") or "").strip().lower()
+                if fam:
+                    return fam
+        if bool(getattr(config, "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED", False)):
+            tc_tokens = set(getattr(config, "get_dexter_trading_central_source_tokens", lambda: set())() or set())
+            if tc_tokens and any(tt in token for tt in tc_tokens):
+                fam = str(getattr(config, "DEXTER_TRADING_CENTRAL_FAMILY_NAME", "xau_scalp_trading_central_intraday") or "").strip().lower()
+                if fam:
+                    return fam
         if ":rr:" in token or "range_repair" in token:
             return "xau_scalp_range_repair"
         if ":td:" in token or "tick_depth_filter" in token:
@@ -557,11 +660,27 @@ class CTraderExecutor:
             return "xau_scheduled_trend"
         if ":ff:" in token or "failed_fade_follow_stop" in token:
             return "xau_scalp_failed_fade_follow_stop"
+        if token.startswith("fibo_xauusd") or "xau_fibo_advance" in token:
+            return "xau_fibo_advance"
         if token.startswith("scalp_xauusd"):
             return "xau_scalp_microtrend"
         if token.startswith("scalp_btcusd"):
+            # 2026-04-29 surgery: route by weekday/weekend rather than always-weekend.
+            # Mon-Fri uses btc_weekday_lob_momentum; Sat-Sun keeps btc_weekend_winner.
+            try:
+                from datetime import datetime, timezone
+                if datetime.now(timezone.utc).weekday() < 5:
+                    return "btc_weekday_lob_momentum"
+            except Exception:
+                pass
             return "btc_weekend_winner"
         if token.startswith("scalp_ethusd"):
+            try:
+                from datetime import datetime, timezone
+                if datetime.now(timezone.utc).weekday() < 5:
+                    return "eth_weekday_overlap_probe"
+            except Exception:
+                pass
             return "eth_weekend_winner"
         return ""
 
@@ -705,6 +824,189 @@ class CTraderExecutor:
             }
         )
         return payload
+
+    @staticmethod
+    def _fibo_phase_context_from_journal(journal_row: Optional[sqlite3.Row]) -> dict:
+        row = dict(journal_row or {}) if journal_row is not None else {}
+        req = CTraderExecutor._safe_json_load(str(row.get("request_json", "") or ""))
+        raw = dict(req.get("raw_scores") or {})
+        phase_profile = dict(raw.get("fibo_phase_profile") or {})
+        return {
+            "phase": str((phase_profile.get("phase") or raw.get("wave_phase") or "unknown")).strip().lower(),
+            "wave_confidence": _safe_float(raw.get("wave_confidence"), 0.0),
+            "correction_end_score": _safe_float(raw.get("correction_end_score"), 0.0),
+            "correction_end_confirmed": bool(raw.get("correction_end_confirmed")),
+            "winner_eligible": bool(raw.get("fibo_winner_eligible") or phase_profile.get("winner_eligible")),
+            "winner_reason": str(raw.get("fibo_winner_reason") or phase_profile.get("winner_reason") or "").strip().lower(),
+            "risk_mult": _safe_float(phase_profile.get("risk_mult"), 1.0),
+            "tp2_mult": _safe_float(phase_profile.get("tp2_mult"), 1.0),
+            "tp3_mult": _safe_float(phase_profile.get("tp3_mult"), 1.0),
+            "stop_buffer_mult": _safe_float(phase_profile.get("stop_buffer_mult"), 1.0),
+        }
+
+    @staticmethod
+    def _fibo_phase_pm_profile(phase_ctx: dict) -> dict:
+        phase = str((phase_ctx or {}).get("phase") or "unknown").strip().lower()
+        out = {
+            "phase": phase,
+            "time_lock_be_min_mult": 1.0,
+            "time_lock_pct_mult": 1.0,
+            "exhaustion_lock_pct_mult": 1.0,
+            "exhaustion_required_signals_delta": 0,
+            "live_extension_step_mult": 1.0,
+            "live_extension_lock_r_mult": 1.0,
+            "winner_profile": False,
+        }
+        if phase == "impulse_restart":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.70,
+                    "time_lock_pct_mult": 1.20,
+                    "exhaustion_lock_pct_mult": 1.15,
+                    "exhaustion_required_signals_delta": 1,
+                    "live_extension_step_mult": 1.30,
+                    "live_extension_lock_r_mult": 1.20,
+                    "winner_profile": bool((phase_ctx or {}).get("winner_eligible")),
+                }
+            )
+        elif phase == "correction_end":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.85,
+                    "time_lock_pct_mult": 1.10,
+                    "exhaustion_lock_pct_mult": 1.05,
+                    "live_extension_step_mult": 1.10,
+                    "live_extension_lock_r_mult": 1.10,
+                    "winner_profile": bool((phase_ctx or {}).get("winner_eligible")),
+                }
+            )
+        elif phase == "correction":
+            out.update(
+                {
+                    "time_lock_be_min_mult": 0.90,
+                    "time_lock_pct_mult": 1.05,
+                    "exhaustion_lock_pct_mult": 1.10,
+                    "exhaustion_required_signals_delta": -1,
+                    "live_extension_step_mult": 0.85,
+                    "live_extension_lock_r_mult": 1.05,
+                }
+            )
+        return out
+
+    def _apply_fibo_phase_extension(
+        self,
+        *,
+        extension: dict,
+        phase_pm: dict,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_tp: float,
+    ) -> dict:
+        if not bool((extension or {}).get("active")):
+            return dict(extension or {})
+        new_tp = _safe_float((extension or {}).get("new_take_profit"), 0.0)
+        new_sl = _safe_float((extension or {}).get("new_stop_loss"), 0.0)
+        phase = str((phase_pm or {}).get("phase") or "unknown")
+        step_mult = max(0.75, float((phase_pm or {}).get("live_extension_step_mult", 1.0) or 1.0))
+        lock_mult = max(0.75, float((phase_pm or {}).get("live_extension_lock_r_mult", 1.0) or 1.0))
+        if self._target_valid_for_position(direction, entry, current_tp) and self._target_valid_for_position(direction, entry, new_tp):
+            if direction == "long":
+                delta = max(0.0, new_tp - current_tp)
+                new_tp = current_tp + delta * step_mult
+            else:
+                delta = max(0.0, current_tp - new_tp)
+                new_tp = current_tp - delta * step_mult
+        if self._stop_valid_for_position(direction, entry, new_sl):
+            if direction == "long":
+                delta_sl = max(0.0, new_sl - stop_loss)
+                new_sl = stop_loss + delta_sl * lock_mult
+            else:
+                delta_sl = max(0.0, stop_loss - new_sl)
+                new_sl = stop_loss - delta_sl * lock_mult
+        out = dict(extension or {})
+        out["new_take_profit"] = round(new_tp, 4) if new_tp > 0 else 0.0
+        out["new_stop_loss"] = round(new_sl, 4) if new_sl > 0 else 0.0
+        out["reason"] = str(out.get("reason") or "xau_profit_extension")
+        out.setdefault("details", {})
+        out["details"] = {
+            **dict(out.get("details") or {}),
+            "phase": phase,
+            "phase_extension_step_mult": step_mult,
+            "phase_extension_lock_r_mult": lock_mult,
+        }
+        return out
+
+    @staticmethod
+    def _apply_fibo_winner_pm_profile(source: str, phase_pm: dict) -> dict:
+        out = dict(phase_pm or {})
+        src = str(source or "").strip().lower()
+        if not src.endswith(":winner"):
+            return out
+        out["winner_profile"] = True
+        out["time_lock_be_min_mult"] = max(1.0, _safe_float(out.get("time_lock_be_min_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_TIME_LOCK_BE_MULT", 1.25), 1.25))
+        out["time_lock_pct_mult"] = min(1.10, _safe_float(out.get("time_lock_pct_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_TIME_LOCK_PCT_MULT", 0.90), 0.90))
+        out["exhaustion_lock_pct_mult"] = min(1.05, _safe_float(out.get("exhaustion_lock_pct_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXHAUSTION_LOCK_PCT_MULT", 0.90), 0.90))
+        out["exhaustion_required_signals_delta"] = int(out.get("exhaustion_required_signals_delta", 0) or 0) + int(getattr(config, "FIBO_PM_WINNER_EXHAUSTION_REQUIRED_SIGNALS_DELTA", 1) or 1)
+        out["live_extension_step_mult"] = max(1.20, _safe_float(out.get("live_extension_step_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXTENSION_STEP_MULT", 1.25), 1.25))
+        out["live_extension_lock_r_mult"] = max(1.05, _safe_float(out.get("live_extension_lock_r_mult"), 1.0) * _safe_float(getattr(config, "FIBO_PM_WINNER_EXTENSION_LOCK_MULT", 1.10), 1.10))
+        return out
+
+    @staticmethod
+    def _fibo_pm_action_seen(journal_row: Optional[sqlite3.Row], *action_prefixes: str) -> bool:
+        row = dict(journal_row or {}) if journal_row is not None else {}
+        execution_meta = CTraderExecutor._safe_json_load(str(row.get("execution_meta_json", "") or ""))
+        audit = [dict(item or {}) for item in list(execution_meta.get("position_manager_audit") or []) if isinstance(item, dict)]
+        tags = [str(tag or "").strip().lower() for tag in list(execution_meta.get("audit_tags") or []) if str(tag or "").strip()]
+        wanted = tuple(str(prefix or "").strip().lower() for prefix in action_prefixes if str(prefix or "").strip())
+        if not wanted:
+            return False
+        for tag in tags:
+            if any(tag.startswith(prefix) for prefix in wanted):
+                return True
+        for item in audit:
+            action = str(item.get("action") or "").strip().lower()
+            if any(action.startswith(prefix) for prefix in wanted):
+                return True
+        return False
+
+    @staticmethod
+    def _fibo_partial_close_volume(volume: int, pct: float, min_volume: int = 1000, step: int = 1000) -> int:
+        total = max(0, int(volume or 0))
+        if total <= 0:
+            return 0
+        min_volume = max(1, int(min_volume or 1))
+        step = max(1, int(step or 1))
+        target = int(total * max(0.05, min(0.95, float(pct or 0.0))))
+        if target < min_volume:
+            target = min_volume
+        target = (target // step) * step
+        if target <= 0:
+            target = min_volume
+        if total - target < min_volume:
+            return 0
+        return min(total, target)
+
+    @staticmethod
+    def _enrich_fibo_pm_action(action: dict, *, phase_pm: dict, entry: float, stop_loss: float, current_price: float) -> dict:
+        out = dict(action or {})
+        details = dict(out.get("details") or {})
+        risk = abs(entry - stop_loss)
+        new_sl = _safe_float(out.get("new_stop_loss"), 0.0)
+        new_tp = _safe_float(out.get("new_take_profit"), 0.0)
+        if risk > 0:
+            if new_sl > 0:
+                if current_price >= new_sl:
+                    details["giveback_r_buffer"] = round(max(0.0, current_price - new_sl) / risk, 4)
+                else:
+                    details["giveback_r_buffer"] = round(max(0.0, new_sl - current_price) / risk, 4)
+                details["locked_r"] = round(max(0.0, abs(new_sl - entry)) / risk, 4)
+            if new_tp > 0:
+                details["target_r"] = round(max(0.0, abs(new_tp - entry)) / risk, 4)
+        details.setdefault("phase", str(phase_pm.get("phase") or "unknown"))
+        details.setdefault("winner_profile", bool(phase_pm.get("winner_profile")))
+        out["details"] = details
+        return out
 
     @staticmethod
     def _worker_price_symbol(symbol: str) -> str:
@@ -1029,12 +1331,31 @@ class CTraderExecutor:
                 "current_risk_usd": round(current_risk, 4),
             }
         if remaining < min_risk:
+            probe_risk = round(min(current_risk, min_risk), 4)
+            payload["risk_usd"] = probe_risk
+            raw = dict(payload.get("raw_scores") or {})
+            raw["xau_pair_risk_cap_applied"] = True
+            raw["xau_pair_risk_mode"] = "same_run_probe_floor"
+            raw["xau_pair_risk_existing_risk_usd"] = round(existing_total, 4)
+            raw["xau_pair_risk_requested_usd"] = round(current_risk, 4)
+            raw["xau_pair_risk_final_usd"] = probe_risk
+            raw["xau_pair_risk_max_usd"] = round(max_total, 4)
+            raw["xau_pair_risk_signal_run_id"] = run_id
+            raw["xau_pair_risk_matched_sources"] = [str(item.get("source") or "") for item in matched_rows]
+            payload["raw_scores"] = raw
+            reasons = self._normalized_text_list(payload.get("reasons"))
+            warnings = self._normalized_text_list(payload.get("warnings"))
+            reasons.append(f"Pair-risk cap exhausted: same run {run_id} demoted to probe {probe_risk:.2f}$")
+            warnings.append(f"Pair-risk cap probe floor trimmed from {current_risk:.2f}$ to {probe_risk:.2f}$")
+            payload["reasons"] = self._normalized_text_list(reasons)
+            payload["warnings"] = self._normalized_text_list(warnings)
             return {
                 "active": True,
-                "blocked": True,
-                "reason": "same_run_pair_risk_cap_exhausted",
+                "blocked": False,
+                "reason": "same_run_pair_probe_floor",
                 "existing_risk_usd": round(existing_total, 4),
                 "requested_risk_usd": round(current_risk, 4),
+                "final_risk_usd": probe_risk,
                 "max_total_risk_usd": round(max_total, 4),
                 "matched_rows": matched_rows,
             }
@@ -1256,6 +1577,192 @@ class CTraderExecutor:
             ), meta
         return True, "", meta
 
+    def _normalize_tp_for_min_rr(self, *, source: str, payload: dict) -> dict:
+        """Extend TP to meet target RR — Phase 2 symmetric SL/TP basis.
+
+        Apr 2026 audit: scalp lanes (FLS RR=0.61, MFU=0.79, winner RR<1 on
+        17/22) shipped TP based on tight pip rules while SL came from a
+        different basis — yielding asymmetric geometry that loses long-run
+        even at 60%+ win rate.
+
+        This function pushes TP further from entry, *only when*:
+        - feature is enabled (CTRADER_TP_NORMALIZER_ENABLED)
+        - source is not in blacklist (CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES;
+          fibo is default-blacklisted because its TPs are structural)
+        - current RR < target (CTRADER_TP_NORMALIZER_TARGET_RR, default 1.5)
+        - extension does not push TP more than MAX_EXTEND_PCT past the original
+          entry-to-TP distance (default 60%) — this caps excursion to plausible
+          near-future structure, not absurd far targets
+
+        Mutates payload.take_profit in place when applied. Returns metadata
+        for journaling (also stored in payload['raw_scores'] under tp_normalizer).
+        """
+        meta = {"applied": False}
+        if not bool(getattr(config, "CTRADER_TP_NORMALIZER_ENABLED", False)):
+            meta["reason"] = "disabled"
+            return meta
+        try:
+            entry = float(payload.get("entry") or 0.0)
+            sl = float(payload.get("stop_loss") or 0.0)
+            tp = float(payload.get("take_profit") or 0.0)
+            direction = str(payload.get("direction") or "").strip().lower()
+        except Exception:
+            meta["reason"] = "missing_levels"
+            return meta
+        if entry <= 0 or sl <= 0 or tp <= 0 or direction not in {"long", "short"}:
+            meta["reason"] = "incomplete_levels"
+            return meta
+        src_lower = str(source or "").lower()
+        try:
+            blacklist_raw = str(getattr(config, "CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo") or "")
+            blacklist = {s.strip().lower() for s in blacklist_raw.split(",") if s.strip()}
+        except Exception:
+            blacklist = {"fibo"}
+        if any(b and (b == src_lower or src_lower.startswith(b)) for b in blacklist):
+            meta["reason"] = "source_blacklisted"
+            meta["source"] = src_lower
+            return meta
+        if direction == "long":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+        if risk <= 0 or reward <= 0:
+            meta["reason"] = "geometry_invalid"
+            return meta
+        rr = reward / risk
+        target_rr = float(getattr(config, "CTRADER_TP_NORMALIZER_TARGET_RR", 1.5) or 1.5)
+        if rr >= target_rr:
+            meta["reason"] = "rr_already_at_target"
+            meta["rr"] = round(rr, 3)
+            return meta
+        max_extend_pct = float(getattr(config, "CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", 0.60) or 0.60)
+        target_reward = risk * target_rr
+        max_reward = reward * (1.0 + max_extend_pct)
+        new_reward = min(target_reward, max_reward)
+        if new_reward <= reward:
+            meta["reason"] = "no_room_to_extend"
+            return meta
+        if direction == "long":
+            new_tp = entry + new_reward
+        else:
+            new_tp = entry - new_reward
+        payload["take_profit"] = float(new_tp)
+        meta.update({
+            "applied": True,
+            "rr_before": round(rr, 3),
+            "rr_after": round(new_reward / risk, 3),
+            "tp_before": round(tp, 6),
+            "tp_after": round(new_tp, 6),
+            "target_rr": round(target_rr, 3),
+            "max_extend_pct": round(max_extend_pct, 3),
+            "source": src_lower,
+        })
+        return meta
+
+    def _rr_floor_guard(self, *, source: str, payload: dict) -> tuple[bool, str, dict]:
+        """RR-based size tilt + shadow log (was: hard block, now: never blocks).
+
+        Replaces the old hard-block gate with a size-tilt + bucket logger.
+        Hard block violated the project rule "never block opportunity"; replaced
+        per user request 2026-04-27 after first profitable trade closed.
+
+        Bucket → multiplier (applied to ctrader_risk_usd_override):
+            RR ≥ 1.5     → 1.00 (full)
+            1.0 ≤ RR < 1.5 → 1.00 (full)
+            0.7 ≤ RR < 1.0 → 0.50 (half — still trades, halved exposure)
+            RR < 0.7     → 0.30 (mini probe — keep collecting data)
+
+        Honors legacy hard-block path only if CTRADER_RR_FLOOR_HARD_BLOCK=1
+        (default off). Always writes raw_scores["rr_bucket_tag"] for shadow
+        analysis: bucket, rr, multiplier.
+        """
+        if not bool(getattr(config, "CTRADER_RR_FLOOR_ENABLED", True)):
+            return True, "", {"enabled": False}
+        try:
+            entry = float(payload.get("entry") or 0.0)
+            sl = float(payload.get("stop_loss") or 0.0)
+            tp = float(payload.get("take_profit") or 0.0)
+            direction = str(payload.get("direction") or "").strip().lower()
+        except Exception:
+            return True, "", {"enabled": True, "applied": False, "reason": "missing_levels"}
+        if entry <= 0 or sl <= 0 or tp <= 0 or direction not in {"long", "short"}:
+            return True, "", {"enabled": True, "applied": False, "reason": "incomplete_levels"}
+        if direction == "long":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+        if risk <= 0 or reward <= 0:
+            return True, "", {"enabled": True, "applied": False, "reason": "geometry_invalid",
+                              "risk": round(risk, 6), "reward": round(reward, 6)}
+        rr = reward / risk
+
+        # Size-tilt bucket (configurable via env)
+        tier_full = float(getattr(config, "CTRADER_RR_TIER_FULL", 1.0) or 1.0)
+        tier_half = float(getattr(config, "CTRADER_RR_TIER_HALF", 0.7) or 0.7)
+        mult_full = float(getattr(config, "CTRADER_RR_MULT_FULL", 1.0) or 1.0)
+        mult_half = float(getattr(config, "CTRADER_RR_MULT_HALF", 0.5) or 0.5)
+        mult_mini = float(getattr(config, "CTRADER_RR_MULT_MINI", 0.3) or 0.3)
+        if rr >= tier_full:
+            bucket, multiplier = ("full", mult_full)
+        elif rr >= tier_half:
+            bucket, multiplier = ("half", mult_half)
+        else:
+            bucket, multiplier = ("mini", mult_mini)
+
+        # Shadow-log into payload.raw_scores so analytics can compare
+        try:
+            rs = dict(payload.get("raw_scores") or {})
+            rs["rr_bucket_tag"] = {
+                "rr": round(rr, 3),
+                "bucket": bucket,
+                "multiplier_applied": multiplier,
+                "risk": round(risk, 6),
+                "reward": round(reward, 6),
+                "source": str(source or ""),
+            }
+            # Apply size tilt to existing risk override (multiply, never blocks)
+            existing = float(rs.get("ctrader_risk_usd_override", 0.0) or 0.0)
+            if existing > 0 and multiplier != 1.0:
+                rs["ctrader_risk_usd_override"] = round(max(0.05, existing * multiplier), 4)
+            payload["raw_scores"] = rs
+        except Exception:
+            pass
+
+        meta = {
+            "enabled": True,
+            "applied": True,
+            "rr": round(rr, 3),
+            "bucket": bucket,
+            "multiplier": multiplier,
+            "risk": round(risk, 6),
+            "reward": round(reward, 6),
+            "source": str(source or ""),
+        }
+
+        # Optional legacy hard-block (off by default)
+        if bool(getattr(config, "CTRADER_RR_FLOOR_HARD_BLOCK", False)):
+            floor = float(getattr(config, "CTRADER_RR_FLOOR_MIN", 0.8) or 0.8)
+            try:
+                overrides = getattr(config, "CTRADER_RR_FLOOR_OVERRIDES", None) or {}
+                if isinstance(overrides, str):
+                    overrides = json.loads(overrides) if overrides.strip() else {}
+                src_key = str(source or "").strip().lower()
+                if isinstance(overrides, dict):
+                    for k, v in overrides.items():
+                        if str(k).lower() == src_key:
+                            floor = float(v)
+                            break
+            except Exception:
+                pass
+            meta["floor"] = round(floor, 3)
+            if rr < floor:
+                return False, f"rr_floor_below_min:rr={rr:.2f}<floor={floor:.2f}", meta
+        return True, "", meta
+
     def _market_entry_drift_guard(self, signal, *, source: str = "") -> tuple[bool, str, dict]:
         if not bool(getattr(config, "CTRADER_MARKET_ENTRY_DRIFT_GUARD_ENABLED", True)):
             return True, "", {"enabled": False}
@@ -1418,6 +1925,50 @@ class CTraderExecutor:
         return sl > entry
 
     @staticmethod
+    def _post_fill_missing_sl_target(
+        *,
+        direction: str,
+        planned_entry: float,
+        planned_stop_loss: float,
+        live_entry: float,
+        candidate_stop_loss: float,
+        missing_stop_loss: bool,
+    ) -> float:
+        """Return a broker-valid SL for a just-filled position.
+
+        Limit/stop orders can fill far away from the planned entry. If the
+        planned SL is no longer valid against the live fill, preserve the
+        originally planned risk distance from the actual fill entry instead of
+        attempting an invalid broker amend that leaves the position naked.
+        """
+        candidate = _safe_float(candidate_stop_loss, 0.0)
+        if not bool(missing_stop_loss):
+            return candidate
+        side = str(direction or "").strip().lower()
+        live = _safe_float(live_entry, 0.0)
+        if CTraderExecutor._stop_valid_for_position(side, live, candidate):
+            return candidate
+        planned = _safe_float(planned_entry, 0.0)
+        planned_sl = _safe_float(planned_stop_loss, 0.0)
+        planned_risk = abs(planned - planned_sl)
+        if live <= 0 or planned_risk <= 0 or side not in {"long", "short"}:
+            return candidate
+        if side == "long":
+            return live - planned_risk
+        return live + planned_risk
+
+    @staticmethod
+    def _stop_valid_for_management(direction: str, current_price: float, stop_loss: float) -> bool:
+        px = _safe_float(current_price, 0.0)
+        sl = _safe_float(stop_loss, 0.0)
+        side = str(direction or "").strip().lower()
+        if px <= 0 or sl <= 0 or side not in {"long", "short"}:
+            return False
+        if side == "long":
+            return sl < px
+        return sl > px
+
+    @staticmethod
     def _price_crossed_target(direction: str, price: float, target: float) -> bool:
         px = _safe_float(price, 0.0)
         tp = _safe_float(target, 0.0)
@@ -1440,6 +1991,267 @@ class CTraderExecutor:
         if side == "long":
             return (px - entry) / risk
         return (entry - px) / risk
+
+    def _family_trade_mode(self, source: str) -> str:
+        family = self._source_family(source)
+        if not family:
+            return "neutral"
+        impulse = set(getattr(config, "get_ctrader_pm_impulse_families", lambda: set())() or set())
+        corrective = set(getattr(config, "get_ctrader_pm_corrective_families", lambda: set())() or set())
+        if family in impulse:
+            return "impulse"
+        if family in corrective:
+            return "corrective"
+        return "neutral"
+
+    def _stagnation_bail_plan(
+        self,
+        *,
+        symbol: str,
+        position_id: int,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        """Trade-not-working bail.
+
+        Apr 2026 audit: avgLossR ≈ -0.6 to -1.1 across families because losers
+        ride to full SL while winners get cut early. This guard exits stagnant
+        trades before they hit full SL, when peak_r never reached a meaningful
+        favorable threshold within the time window.
+
+        Conditions:
+        - age_min >= STAGNATION_MIN_AGE (per-symbol)
+        - peak_r < STAGNATION_MAX_PEAK_R (default 0.30)
+        - r_now <= STAGNATION_MAX_R (default 0.0 — only bail if currently in loss)
+
+        Output action='close'. Logs a structured details payload.
+        """
+        if not bool(getattr(config, "CTRADER_PM_STAGNATION_BAIL_ENABLED", False)):
+            return {"active": False, "reason": "disabled"}
+        if r_now is None or int(position_id or 0) <= 0:
+            return {"active": False, "reason": "missing_state"}
+        sym = (symbol or "").upper().strip()
+        if sym in {"BTCUSD", "ETHUSD"}:
+            min_age = float(getattr(config, "CTRADER_PM_STAGNATION_MIN_AGE_CRYPTO_MIN", 12.0) or 12.0)
+        else:
+            min_age = float(getattr(config, "CTRADER_PM_STAGNATION_MIN_AGE_XAU_MIN", 8.0) or 8.0)
+        if float(age_min) < min_age:
+            return {"active": False, "reason": "too_young", "age_min": round(float(age_min), 2), "min_age": round(min_age, 2)}
+        max_peak = float(getattr(config, "CTRADER_PM_STAGNATION_MAX_PEAK_R", 0.30) or 0.30)
+        max_r_now = float(getattr(config, "CTRADER_PM_STAGNATION_MAX_R_NOW", 0.0) or 0.0)
+        peak_r = float(self._position_peak_r.get(int(position_id), float(r_now)) or float(r_now))
+        # update peak (in case retrace_guard hasn't run yet)
+        peak_r = max(peak_r, float(r_now))
+        self._position_peak_r[int(position_id)] = peak_r
+        if peak_r >= max_peak:
+            return {"active": False, "reason": "peak_above_threshold", "peak_r": round(peak_r, 4)}
+        if float(r_now) > max_r_now:
+            return {"active": False, "reason": "r_above_threshold", "r_now": round(float(r_now), 4)}
+        return {
+            "active": True,
+            "action": "close",
+            "reason": "stagnation_bail",
+            "details": {
+                "age_min": round(float(age_min), 2),
+                "peak_r": round(peak_r, 4),
+                "r_now": round(float(r_now), 4),
+                "max_peak_r": round(max_peak, 4),
+                "max_r_now": round(max_r_now, 4),
+                "min_age_min": round(min_age, 2),
+            },
+        }
+
+    def _profit_retrace_guard_plan(
+        self,
+        *,
+        source: str,
+        symbol: str,
+        direction: str,
+        position_id: int,
+        entry: float,
+        stop_loss: float,
+        current_price: float,
+        confidence: float,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        if not bool(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED", True)):
+            return {"active": False, "reason": "disabled"}
+        if r_now is None:
+            return {"active": False, "reason": "missing_r"}
+        if int(position_id or 0) <= 0:
+            return {"active": False, "reason": "position_missing"}
+        min_age = max(0.0, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN", 4.0) or 4.0))
+        if float(age_min) < min_age:
+            return {"active": False, "reason": "too_young"}
+        min_peak_r = max(0.0, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R", 0.30) or 0.30))
+        retrace_trigger = max(0.01, float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R", 0.22) or 0.22))
+        peak_prev = float(self._position_peak_r.get(int(position_id), float(r_now)) or float(r_now))
+        peak_now = max(peak_prev, float(r_now))
+        self._position_peak_r[int(position_id)] = peak_now
+        if peak_now < min_peak_r:
+            return {
+                "active": False,
+                "reason": "peak_below_min",
+                "details": {"peak_r": round(peak_now, 4), "min_peak_r": round(min_peak_r, 4)},
+            }
+        retrace_r = peak_now - float(r_now)
+        if retrace_r < retrace_trigger:
+            return {
+                "active": False,
+                "reason": "retrace_small",
+                "details": {"peak_r": round(peak_now, 4), "r_now": round(float(r_now), 4), "retrace_r": round(retrace_r, 4)},
+            }
+
+        snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=confidence)
+        features = dict(snapshot.get("features") or {}) if isinstance(snapshot, dict) else {}
+        day_type = str(features.get("day_type") or "").strip().lower()
+        bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
+        mid_drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
+        delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
+        depth_imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
+        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
+        max_weak_volume = max(
+            0.01,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY", 0.22) or 0.22),
+        )
+        max_weak_abs_drift = max(
+            0.0001,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT", 0.004) or 0.004),
+        )
+        weak_market = (
+            bar_volume_proxy <= max_weak_volume
+            and abs(mid_drift_pct) <= max_weak_abs_drift
+        ) or (day_type in {"range", "rotation", "consolidation"})
+        sweep_recovery_enabled = bool(
+            getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", True)
+        )
+        sweep_min_rejection = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", 0.28) or 0.28),
+        )
+        sweep_min_volume = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", 0.30) or 0.30),
+        )
+        sweep_min_delta = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", 0.08) or 0.08),
+        )
+        sweep_min_imbalance = max(
+            0.0,
+            float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", 0.06) or 0.06),
+        )
+        supportive_delta = (
+            (direction == "long" and delta_proxy >= sweep_min_delta)
+            or (direction == "short" and delta_proxy <= (-1.0 * sweep_min_delta))
+        )
+        supportive_depth = (
+            (direction == "long" and depth_imbalance >= sweep_min_imbalance)
+            or (direction == "short" and depth_imbalance <= (-1.0 * sweep_min_imbalance))
+        )
+        sweep_recovery = bool(
+            sweep_recovery_enabled
+            and rejection_ratio >= sweep_min_rejection
+            and bar_volume_proxy >= sweep_min_volume
+            and (supportive_delta or supportive_depth)
+        )
+        family_mode = self._family_trade_mode(source)
+        details = {
+            "family_mode": family_mode,
+            "peak_r": round(peak_now, 4),
+            "r_now": round(float(r_now), 4),
+            "retrace_r": round(retrace_r, 4),
+            "weak_market": bool(weak_market),
+            "bar_volume_proxy": round(bar_volume_proxy, 4),
+            "mid_drift_pct": round(mid_drift_pct, 6),
+            "delta_proxy": round(delta_proxy, 4),
+            "depth_imbalance": round(depth_imbalance, 4),
+            "rejection_ratio": round(rejection_ratio, 4),
+            "sweep_recovery": bool(sweep_recovery),
+            "day_type": day_type,
+        }
+        if family_mode == "impulse":
+            impulse_delta = max(
+                0.0,
+                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY", 0.12) or 0.12),
+            )
+            impulse_volume = max(
+                0.01,
+                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY", 0.30) or 0.30),
+            )
+            continuation_alive = (
+                (direction == "long" and delta_proxy >= impulse_delta)
+                or (direction == "short" and delta_proxy <= (-1.0 * impulse_delta))
+            ) and bar_volume_proxy >= impulse_volume
+            details["continuation_alive"] = bool(continuation_alive)
+            if continuation_alive:
+                return {"active": False, "reason": "impulse_continuation_alive", "details": details}
+            risk = abs(entry - stop_loss)
+            if risk <= 0:
+                return {"active": False, "reason": "invalid_risk", "details": details}
+            lock_r = max(
+                0.0,
+                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", 0.08) or 0.08),
+            )
+            new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+            if not self._stop_valid_for_management(direction, current_price, new_sl):
+                return {"active": False, "reason": "invalid_impulse_lock_stop", "details": details}
+            improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+            if not improves:
+                return {"active": False, "reason": "impulse_lock_not_improving", "details": details}
+            return {
+                "active": True,
+                "action": "tighten",
+                "reason": "profit_retrace_guard_impulse_tighten",
+                "new_stop_loss": round(new_sl, 4),
+                "details": details,
+            }
+
+        if family_mode == "corrective":
+            risk = abs(entry - stop_loss)
+            if risk <= 0:
+                return {"active": False, "reason": "invalid_risk", "details": details}
+            lock_r = max(
+                0.0,
+                float(getattr(config, "CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", 0.05) or 0.05),
+            )
+            new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+            if sweep_recovery and self._stop_valid_for_management(direction, current_price, new_sl):
+                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                if improves:
+                    return {
+                        "active": True,
+                        "action": "tighten",
+                        "reason": "profit_retrace_guard_corrective_sweep_tighten",
+                        "new_stop_loss": round(new_sl, 4),
+                        "details": details,
+                    }
+            if weak_market:
+                return {
+                    "active": True,
+                    "action": "close",
+                    "reason": "profit_retrace_guard_close",
+                    "details": details,
+                }
+            if self._stop_valid_for_management(direction, current_price, new_sl):
+                improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                if improves:
+                    return {
+                        "active": True,
+                        "action": "tighten",
+                        "reason": "profit_retrace_guard_corrective_tighten",
+                        "new_stop_loss": round(new_sl, 4),
+                        "details": details,
+                    }
+        if weak_market:
+            return {
+                "active": True,
+                "action": "close",
+                "reason": "profit_retrace_guard_close",
+                "details": details,
+            }
+        return {"active": False, "reason": "market_not_weak", "details": details}
 
     @staticmethod
     def _planned_rr(journal_row: Optional[sqlite3.Row]) -> float:
@@ -1791,7 +2603,8 @@ class CTraderExecutor:
 
     @staticmethod
     def _is_scheduled_canary_source(source: str) -> bool:
-        return str(source or "").strip().lower() == "xauusd_scheduled:canary"
+        token = str(source or "").strip().lower()
+        return token in {"xauusd_scheduled:canary", "xauusd_scheduled:winner"}
 
     @staticmethod
     def _is_xau_symbol(symbol: str) -> bool:
@@ -1998,6 +2811,27 @@ class CTraderExecutor:
         else:
             reasons.append("day_type_not_supportive")
 
+        # DOM favorable liquidity boost (+1 score when DOM supports direction)
+        dom_favorable_details = {}
+        if bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            try:
+                from analysis.dom_liquidity_shift import analyze_dom_liquidity
+                import sqlite3 as _sqlite3_ext
+                _ext_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+                if _ext_db.exists():
+                    with _sqlite3_ext.connect(str(_ext_db), timeout=5) as _ext_conn:
+                        _ext_conn.row_factory = _sqlite3_ext.Row
+                        dom_result = analyze_dom_liquidity(_ext_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+                    if bool(dom_result.get("ok")):
+                        favorable = dict(dom_result.get("favorable") or {})
+                        fav_score = int(favorable.get("favorable_score", 0) or 0)
+                        if fav_score >= 2:
+                            score += 1
+                            reasons.append("dom_liquidity_favorable")
+                        dom_favorable_details = {"dom_favorable_score": fav_score, "dom_strength": str(favorable.get("strength", "") or ""), "dom_recommendation": str(favorable.get("recommendation", "") or "")}
+            except Exception:
+                pass
+
         details = {
             "run_id": str(snapshot.get("run_id") or ""),
             "day_type": day_type,
@@ -2011,14 +2845,47 @@ class CTraderExecutor:
             "rejection_ratio": round(rejection_ratio, 4),
             "reasons": list(reasons),
         }
+        if dom_favorable_details:
+            details["dom_liquidity"] = dom_favorable_details
         if order_care_state:
             details["order_care_mode"] = str(order_care_state.get("mode") or "")
         if score < extension_score:
             return {"active": False, "reason": "score_below_extend", "details": details}
 
         base_tp_r = max(0.25, float(order_care_overrides.get("extension_tp_r", 1.10) or 1.10))
-        step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
+        base_step_r = max(0.10, float(order_care_overrides.get("extension_step_r", 0.25) or 0.25))
         lock_r = max(0.01, float(order_care_overrides.get("extension_lock_r", 0.18) or 0.18))
+
+        # ── Momentum-adaptive step_r ──────────────────────────────────────
+        # Assess momentum strength from snapshot features
+        momentum_favorable = 0
+        if bar_volume_proxy >= 0.50:
+            momentum_favorable += 1
+        if supportive_delta >= 0.15:
+            momentum_favorable += 1
+        if supportive_imbalance >= 0.12:
+            momentum_favorable += 1
+        if supportive_drift >= 0.015:
+            momentum_favorable += 1
+        if rejection_ratio <= 0.12:
+            momentum_favorable += 1
+
+        if momentum_favorable >= 4:
+            step_r = base_step_r + 0.10  # strong momentum → bigger extension
+            momentum_label = "strong"
+        elif momentum_favorable >= 2:
+            step_r = base_step_r         # moderate → default
+            momentum_label = "moderate"
+        else:
+            step_r = max(0.10, base_step_r - 0.10)  # weak momentum → smaller extension
+            momentum_label = "weak"
+
+        details["momentum_adaptive"] = {
+            "favorable_count": momentum_favorable,
+            "momentum_label": momentum_label,
+            "step_r": round(step_r, 2),
+            "base_step_r": round(base_step_r, 2),
+        }
         target_r = max(base_tp_r, current_target_r + step_r)
         new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
         if not self._target_valid_for_position(direction, entry, new_tp):
@@ -2113,6 +2980,27 @@ class CTraderExecutor:
         if day_type in {"repricing", "fast_expansion", "panic_spread"}:
             score += 1
 
+        # DOM liquidity shift (Tier 2 enhancement)
+        dom_shift_details = {}
+        if bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            try:
+                from analysis.dom_liquidity_shift import analyze_dom_liquidity
+                import sqlite3 as _sqlite3_dom
+                _dom_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+                if _dom_db.exists():
+                    with _sqlite3_dom.connect(str(_dom_db), timeout=5) as _dom_conn:
+                        _dom_conn.row_factory = _sqlite3_dom.Row
+                        dom_result = analyze_dom_liquidity(_dom_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+                    if bool(dom_result.get("ok")):
+                        adverse = dict(dom_result.get("adverse") or {})
+                        dom_adverse_score = int(adverse.get("adverse_score", 0) or 0)
+                        if dom_adverse_score >= 2:
+                            score += 1
+                            reasons.append("dom_liquidity_adverse")
+                        dom_shift_details = {"dom_adverse_score": dom_adverse_score, "dom_severity": str(adverse.get("severity", "") or ""), "dom_recommendation": str(adverse.get("recommendation", "") or "")}
+            except Exception:
+                pass
+
         details = {
             "run_id": str(snapshot.get("run_id") or ""),
             "day_type": day_type,
@@ -2124,6 +3012,8 @@ class CTraderExecutor:
             "rejection_ratio": round(rejection_ratio, 4),
             "reasons": list(reasons),
         }
+        if dom_shift_details:
+            details["dom_liquidity"] = dom_shift_details
         if order_care_state:
             details["order_care_mode"] = str(order_care_state.get("mode") or "")
         if stop_loss <= 0 or entry <= 0:
@@ -2153,8 +3043,55 @@ class CTraderExecutor:
         stop_keep_r = max(0.05, float(order_care_overrides.get("stop_keep_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", 0.42) or 0.42) or 0.42))
         profit_lock_r = max(0.0, float(order_care_overrides.get("profit_lock_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", 0.05) or 0.05) or 0.05))
         trim_tp_r = max(0.10, float(order_care_overrides.get("trim_tp_r", getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", 0.55) or 0.55) or 0.55))
+        r_current = float(r_now) if r_now is not None else None
+        profit_seek_enabled = bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
+        profit_seek_min_r_base = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+        # Fibo trades target 1.272R+: don't lock profit until at least 0.8R (near TP1)
+        _is_fibo_src = str(source or "").strip().lower().startswith("fibo")
+        profit_seek_min_r = max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R", 0.80) or 0.80)) if _is_fibo_src else profit_seek_min_r_base
+        profit_seek_active = bool(profit_seek_enabled and r_current is not None and r_current >= profit_seek_min_r)
 
-        if (r_now is not None) and score >= close_score and float(r_now) <= close_max_r:
+        if (r_current is not None) and score >= close_score and r_current <= close_max_r:
+            if profit_seek_active:
+                base_lock_r = max(
+                    profit_lock_r,
+                    max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", 0.08) or 0.08)),
+                )
+                lock_buffer_r = max(
+                    0.0,
+                    float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", 0.03) or 0.03),
+                )
+                lock_r = min(base_lock_r, max(0.0, r_current - lock_buffer_r))
+                if lock_r > 0.0:
+                    new_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+                    if direction == "long":
+                        new_sl = max(stop_loss, new_sl)
+                    else:
+                        new_sl = min(stop_loss, new_sl)
+                    improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+                    if improves and self._stop_valid_for_position(direction, entry, new_sl):
+                        return {
+                            "active": True,
+                            "action": "tighten",
+                            "reason": "xau_active_defense_profit_protect",
+                            "new_stop_loss": round(new_sl, 4),
+                            "new_take_profit": round(target_tp, 4) if self._target_valid_for_position(direction, entry, target_tp) else 0.0,
+                            "details": {
+                                **details,
+                                "close_suppressed": True,
+                                "profit_seek_min_r": round(profit_seek_min_r, 4),
+                                "profit_lock_r": round(lock_r, 4),
+                            },
+                        }
+                return {
+                    "active": False,
+                    "reason": "profit_seek_close_suppressed_no_valid_lock",
+                    "details": {
+                        **details,
+                        "close_suppressed": True,
+                        "profit_seek_min_r": round(profit_seek_min_r, 4),
+                    },
+                }
             return {
                 "active": True,
                 "action": "close",
@@ -2173,11 +3110,18 @@ class CTraderExecutor:
         else:
             new_sl = min(stop_loss, new_sl)
         new_tp = target_tp
+        # Fibo trades must reach their Fibonacci extension target — never trim TP
+        _is_fibo_source = str(source or "").strip().lower().startswith("fibo")
         if self._target_valid_for_position(direction, entry, target_tp):
-            trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-            if self._target_valid_for_position(direction, entry, trimmed_tp):
-                if abs(trimmed_tp - entry) < abs(target_tp - entry):
-                    new_tp = trimmed_tp
+            if _is_fibo_source:
+                details["tp_trim_suppressed_fibo_source"] = True
+            else:
+                trimmed_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
+                if (not profit_seek_active) and self._target_valid_for_position(direction, entry, trimmed_tp):
+                    if abs(trimmed_tp - entry) < abs(target_tp - entry):
+                        new_tp = trimmed_tp
+                elif profit_seek_active:
+                    details["tp_trim_suppressed_profit_seeking"] = True
 
         breached = (direction == "long" and current_price <= new_sl) or (direction == "short" and current_price >= new_sl)
         if breached:
@@ -2197,6 +3141,675 @@ class CTraderExecutor:
             "new_take_profit": round(new_tp, 4) if self._target_valid_for_position(direction, entry, new_tp) else 0.0,
             "details": details,
         }
+
+    def _hydrate_policy_rpeak_cache(self) -> None:
+        """Load persisted r_peak state into the in-memory cache.
+
+        Must run before the first `_policy_defense_plan` call. Safe on missing
+        or corrupt JSON — returns an empty cache without raising. DB-backed
+        reconstruction is a deliberate future extension, gated on DB health;
+        at v1 we do NOT query ctrader_openapi.db at startup because the 5.4 GB
+        table latency would block scheduler startup.
+        """
+        if self._rpeak_hydrated:
+            return
+        self._rpeak_hydrated = True
+        try:
+            raw = atomic_json_read(self._rpeak_state_path, default=None)
+        except Exception:
+            logger.warning("[rpeak] hydrate: atomic_json_read raised — starting with empty cache", exc_info=True)
+            return
+        if not isinstance(raw, dict):
+            logger.info("[rpeak] hydrate: no prior state at %s — cold start", self._rpeak_state_path)
+            return
+        positions = raw.get("positions") or {}
+        if not isinstance(positions, dict):
+            logger.warning("[rpeak] hydrate: state missing 'positions' — ignoring")
+            return
+        loaded = 0
+        for pid_raw, entry in positions.items():
+            try:
+                pid = int(pid_raw)
+                peak = float((entry or {}).get("r_peak"))
+            except (TypeError, ValueError):
+                continue
+            if peak <= 0.0:
+                continue
+            self._policy_r_peak_cache[pid] = peak
+            meta = {
+                "symbol": str((entry or {}).get("symbol") or "").upper(),
+                "direction": str((entry or {}).get("direction") or "").lower(),
+                "entry_price": float((entry or {}).get("entry_price") or 0.0),
+                "updated_utc": str((entry or {}).get("updated_utc") or ""),
+            }
+            self._policy_r_peak_meta[pid] = meta
+            loaded += 1
+        if loaded:
+            logger.info("[rpeak] hydrate: restored %d r_peak entries from %s", loaded, self._rpeak_state_path)
+
+    def _persist_policy_rpeak_entry(
+        self,
+        *,
+        position_id: int,
+        r_peak: float,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+    ) -> None:
+        """Atomically merge a single r_peak entry into the persisted state.
+
+        Only called when r_peak has strictly increased. Unaffected entries are
+        preserved. On write failure we log and continue — the in-memory cache
+        remains authoritative for the current process lifetime.
+        """
+        try:
+            try:
+                current = atomic_json_read(self._rpeak_state_path, default=None)
+            except Exception:
+                current = None
+            if not isinstance(current, dict):
+                current = {"version": 1, "positions": {}}
+            positions = current.get("positions")
+            if not isinstance(positions, dict):
+                positions = {}
+            pid_key = str(int(position_id))
+            now_iso = datetime.now(timezone.utc).isoformat()
+            positions[pid_key] = {
+                "r_peak": round(float(r_peak), 6),
+                "symbol": str(symbol or "").upper(),
+                "direction": str(direction or "").lower(),
+                "entry_price": round(float(entry_price or 0.0), 6),
+                "updated_utc": now_iso,
+            }
+            current["positions"] = positions
+            current["version"] = int(current.get("version") or 1)
+            current["updated_utc"] = now_iso
+            atomic_json_write(self._rpeak_state_path, current)
+        except Exception:
+            logger.warning("[rpeak] persist failed for position %s", position_id, exc_info=True)
+
+    def _prune_policy_rpeak(self, alive_position_ids: set) -> None:
+        """Drop r_peak cache + persisted entries for positions cTrader no
+        longer reports as open. Called from the account reconcile path.
+        """
+        try:
+            alive = {int(pid) for pid in (alive_position_ids or set())}
+        except Exception:
+            alive = set()
+        if self._policy_r_peak_cache:
+            self._policy_r_peak_cache = {
+                int(pid): float(peak)
+                for pid, peak in self._policy_r_peak_cache.items()
+                if int(pid) in alive
+            }
+        if self._policy_r_peak_meta:
+            self._policy_r_peak_meta = {
+                int(pid): dict(meta)
+                for pid, meta in self._policy_r_peak_meta.items()
+                if int(pid) in alive
+            }
+        try:
+            current = atomic_json_read(self._rpeak_state_path, default=None)
+        except Exception:
+            return
+        if not isinstance(current, dict):
+            return
+        positions = current.get("positions")
+        if not isinstance(positions, dict) or not positions:
+            return
+        pruned = {
+            pid_key: entry
+            for pid_key, entry in positions.items()
+            if (int(pid_key) if str(pid_key).lstrip("-").isdigit() else -1) in alive
+        }
+        if len(pruned) == len(positions):
+            return
+        current["positions"] = pruned
+        current["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        try:
+            atomic_json_write(self._rpeak_state_path, current)
+        except Exception:
+            logger.warning("[rpeak] prune write failed", exc_info=True)
+
+    def _policy_defense_plan(
+        self,
+        *,
+        position_id: int,
+        source: str,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        target_tp: float,
+        current_price: float,
+        confidence: float,
+        age_min: float,
+        r_now: Optional[float],
+    ) -> dict:
+        """
+        V4 policy-layer wrapper around _xau_active_defense_plan.
+
+        When CTRADER_PM_POLICY_LAYER_ENABLED is False (default), delegates to
+        the legacy evaluator unchanged — zero behavior change.
+
+        When enabled, evaluates the WinnerProtection state machine first:
+          - EMERGENCY        → force close (proven winner giving back too much)
+          - TRAILING_STRUCT  → active defense disabled; existing profit-extension
+                               / structural trail paths own the position
+          - LOCKED           → legacy evaluator runs, but a "close" action is
+                               suppressed unless score >= close_score + bonus
+          - ARMED / RUNNING  → legacy evaluator runs unchanged
+        """
+        legacy_call = lambda: self._xau_active_defense_plan(
+            source=source,
+            symbol=symbol,
+            direction=direction,
+            entry=entry,
+            stop_loss=stop_loss,
+            target_tp=target_tp,
+            current_price=current_price,
+            confidence=confidence,
+            age_min=age_min,
+            r_now=r_now,
+        )
+
+        if not bool(getattr(config, "CTRADER_PM_POLICY_LAYER_ENABLED", False)):
+            return legacy_call()
+
+        if r_now is None:
+            return legacy_call()
+        if not self._is_xau_active_defense_source(symbol=symbol, source=source):
+            return legacy_call()
+
+        try:
+            from execution.policy import (
+                ActiveDefenseInput,
+                WinnerProtectionConfig,
+                WinnerProtectionInput,
+                WinnerProtectionPolicy,
+                WinnerState,
+                configure_default_resolver,
+                default_resolver,
+            )
+        except Exception:
+            return legacy_call()
+
+        try:
+            r_now_f = float(r_now)
+        except (TypeError, ValueError):
+            return legacy_call()
+
+        if not hasattr(self, "_policy_r_peak_cache") or self._policy_r_peak_cache is None:
+            self._policy_r_peak_cache = {}
+        if not hasattr(self, "_policy_r_peak_meta") or self._policy_r_peak_meta is None:
+            self._policy_r_peak_meta = {}
+        # Defensive hydrate — no-op after first success.
+        self._hydrate_policy_rpeak_cache()
+        cache = self._policy_r_peak_cache
+        pid_int = int(position_id)
+        prior_peak = float(cache.get(pid_int, r_now_f) or r_now_f)
+        r_peak = max(prior_peak, r_now_f)
+        cache[pid_int] = r_peak
+        if len(cache) > 4096:
+            # Guard against leaks. Keep the 2048 largest r_peak entries.
+            try:
+                retained = dict(sorted(cache.items(), key=lambda kv: kv[1], reverse=True)[:2048])
+                self._policy_r_peak_cache = retained
+                cache = self._policy_r_peak_cache
+                self._policy_r_peak_meta = {
+                    pid: meta for pid, meta in self._policy_r_peak_meta.items() if pid in retained
+                }
+            except Exception:
+                self._policy_r_peak_cache = {pid_int: r_peak}
+                cache = self._policy_r_peak_cache
+                self._policy_r_peak_meta = {}
+        if bool(getattr(config, "CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED", True)) and r_peak > prior_peak + 1e-9:
+            try:
+                self._policy_r_peak_meta[pid_int] = {
+                    "symbol": str(symbol or "").upper(),
+                    "direction": str(direction or "").lower(),
+                    "entry_price": float(entry or 0.0),
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception:
+                pass
+            self._persist_policy_rpeak_entry(
+                position_id=pid_int,
+                r_peak=r_peak,
+                symbol=symbol,
+                direction=direction,
+                entry_price=float(entry or 0.0),
+            )
+
+        try:
+            cfg = WinnerProtectionConfig(
+                arm_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_ARM_R", 0.8) or 0.8),
+                lock_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_R", 1.5) or 1.5),
+                trail_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_TRAIL_R", 3.0) or 3.0),
+                lock_floor_r=float(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", 0.4) or 0.4),
+                giveback_emergency_ratio=float(getattr(config, "CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", 0.45) or 0.45),
+                locked_active_defense_score_bonus=int(getattr(config, "CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", 2) or 2),
+            )
+            resolver = configure_default_resolver(winner_config=cfg)
+        except ValueError:
+            resolver = default_resolver()
+        except Exception:
+            return legacy_call()
+
+        snap = resolver.snapshot()
+        winner_decision = resolver.winner().decide(
+            WinnerProtectionInput(
+                r_now=r_now_f,
+                r_peak=r_peak,
+                regime_label=str(snap.label or ""),
+                regime_confidence=float(snap.confidence or 0.0),
+            )
+        )
+
+        winner_envelope = {
+            "winner_state": winner_decision.state.value,
+            "r_now": round(r_now_f, 4),
+            "r_peak": round(r_peak, 4),
+            "regime_label": str(snap.label or ""),
+            "regime_confidence": round(float(snap.confidence or 0.0), 3),
+        }
+
+        if winner_decision.force_close:
+            return {
+                "active": True,
+                "action": "close",
+                "reason": "winner_protection_emergency",
+                "details": {
+                    **winner_envelope,
+                    "winner_reason": winner_decision.reason,
+                },
+            }
+
+        if winner_decision.state == WinnerState.TRAILING_STRUCT:
+            cache.pop(position_id, None)  # trailing path owns the trade; drop peak cache
+            return {
+                "active": False,
+                "reason": "winner_protection_trailing_struct",
+                "details": {
+                    **winner_envelope,
+                    "sl_floor_r": winner_decision.structural_sl_floor_r,
+                    "winner_reason": winner_decision.reason,
+                },
+            }
+
+        base = legacy_call()
+
+        if winner_decision.state == WinnerState.LOCKED and bool(base.get("active")):
+            action = str(base.get("action") or "").strip().lower()
+            if action == "close":
+                details = dict(base.get("details") or {})
+                score = int(details.get("score") or 0)
+                thresholds = resolver.defense().thresholds(
+                    ActiveDefenseInput(
+                        r_now=r_now_f,
+                        regime_label=str(snap.label or ""),
+                        regime_confidence=float(snap.confidence or 0.0),
+                        winner_state=winner_decision.state.value,
+                    )
+                )
+                bonus = resolver.winner().locked_close_score_bonus()
+                effective_threshold = int(thresholds.close_score) + int(bonus)
+                if score < effective_threshold:
+                    return {
+                        "active": False,
+                        "reason": "winner_protection_locked_suppressed_close",
+                        "details": {
+                            **details,
+                            **winner_envelope,
+                            "effective_close_threshold": effective_threshold,
+                            "base_close_score": int(thresholds.close_score),
+                            "locked_bonus": int(bonus),
+                        },
+                    }
+
+        if isinstance(base, dict):
+            merged_details = dict(base.get("details") or {})
+            merged_details.update(winner_envelope)
+            base = {**base, "details": merged_details}
+        return base
+
+    def _xau_momentum_exhaustion_lock(
+        self,
+        *,
+        source: str,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_price: float,
+        confidence: float,
+        age_min: float,
+        r_now: Optional[float],
+        phase_pm: Optional[dict] = None,
+    ) -> dict:
+        """
+        Detect momentum exhaustion and lock profit BEFORE it evaporates.
+
+        Problem: trade reaches +R profit, momentum dies (delta reverses, volume dries,
+        drift goes adverse), but system waits for price to hit TP or SL — profit evaporates.
+
+        Solution: When all momentum signals are exhausted AND trade is profitable,
+        tighten SL to lock a portion of the profit immediately.
+
+        Triggers when:
+          - r_now > 0 (trade in profit)
+          - age_min > min_age (not too young)
+          - At least 3 of 5 adverse signals fire simultaneously:
+              1. Delta reversed against position
+              2. Volume dying (bar_volume_proxy < 0.25)
+              3. Adverse drift
+              4. High rejection ratio (rejections >= 0.25)
+              5. Day type switched to range/rotation (non-trending)
+        """
+        if not self._is_xau_symbol(symbol):
+            return {"active": False}
+        if r_now is None or r_now <= 0.15:
+            return {"active": False, "reason": "not_in_profit"}
+        order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
+        order_care_overrides = dict(order_care_state.get("overrides") or {}) if order_care_state else {}
+        phase_pm = dict(phase_pm or {})
+
+        min_age = float(order_care_overrides.get(
+            "exhaustion_min_age_min",
+            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN", 3.0) or 3.0,
+        ) or 3.0)
+        if age_min < min_age:
+            return {"active": False, "reason": "too_young"}
+
+        snapshot = self._latest_capture_snapshot(symbol=symbol, direction=direction, confidence=confidence)
+        features = dict(snapshot.get("features") or {})
+        if not bool(snapshot.get("ok")) or not features:
+            return {"active": False, "reason": str(snapshot.get("status") or "no_capture")}
+
+        day_type = str(features.get("day_type") or "trend").strip().lower() or "trend"
+        delta_proxy = _safe_float(features.get("delta_proxy"), 0.0)
+        imbalance = _safe_float(features.get("depth_imbalance"), 0.0)
+        drift_pct = _safe_float(features.get("mid_drift_pct"), 0.0)
+        rejection_ratio = max(0.0, min(1.0, _safe_float(features.get("rejection_ratio"), 0.0)))
+        bar_volume_proxy = max(0.0, _safe_float(features.get("bar_volume_proxy"), 0.0))
+
+        if direction == "long":
+            adverse_delta = max(0.0, -1.0 * delta_proxy)
+            adverse_drift = max(0.0, -1.0 * drift_pct)
+        else:
+            adverse_delta = max(0.0, delta_proxy)
+            adverse_drift = max(0.0, drift_pct)
+
+        # Count exhaustion signals
+        exhaustion_signals = 0
+        reasons: list[str] = []
+
+        delta_threshold = float(order_care_overrides.get(
+            "exhaustion_adverse_delta", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA", 0.08) or 0.08,
+        ) or 0.08)
+        if adverse_delta >= delta_threshold:
+            exhaustion_signals += 1
+            reasons.append("delta_reversed")
+
+        vol_threshold = float(order_care_overrides.get(
+            "exhaustion_max_volume", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME", 0.25) or 0.25,
+        ) or 0.25)
+        if bar_volume_proxy < vol_threshold:
+            exhaustion_signals += 1
+            reasons.append("volume_dying")
+
+        drift_threshold = float(order_care_overrides.get(
+            "exhaustion_adverse_drift", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT", 0.008) or 0.008,
+        ) or 0.008)
+        if adverse_drift >= drift_threshold:
+            exhaustion_signals += 1
+            reasons.append("drift_adverse")
+
+        rejection_threshold = float(order_care_overrides.get(
+            "exhaustion_max_rejection", getattr(config, "CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION", 0.25) or 0.25,
+        ) or 0.25)
+        if rejection_ratio >= rejection_threshold:
+            exhaustion_signals += 1
+            reasons.append("high_rejection")
+
+        if day_type in {"range", "rotation", "consolidation"}:
+            exhaustion_signals += 1
+            reasons.append("day_type_non_trending")
+
+        required_signals = int(order_care_overrides.get(
+            "exhaustion_required_signals",
+            getattr(config, "CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", 3) or 3,
+        ) or 3)
+        required_signals = max(1, required_signals + int(phase_pm.get("exhaustion_required_signals_delta", 0) or 0))
+        if exhaustion_signals < required_signals:
+            return {"active": False, "reason": "exhaustion_not_confirmed", "details": {
+                "exhaustion_signals": exhaustion_signals,
+                "required": required_signals,
+                "reasons": reasons,
+            }}
+
+        # ── Lock profit: tighten SL based on current R-multiple ──────────
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+
+        # Lock percentage scales with R: higher R → lock more
+        if r_now >= 1.5:
+            lock_pct = 0.70   # 70% of risk locked at 1.5R+
+        elif r_now >= 1.0:
+            lock_pct = 0.55   # 55% at 1.0R+
+        elif r_now >= 0.5:
+            lock_pct = 0.35   # 35% at 0.5R+
+        else:
+            lock_pct = 0.15   # 15% at 0.15R+
+        lock_pct = min(0.85, max(0.10, lock_pct * max(0.8, float(phase_pm.get("exhaustion_lock_pct_mult", 1.0) or 1.0))))
+
+        keep_risk = risk * (1.0 - lock_pct)
+        if direction == "long":
+            new_sl = entry - keep_risk
+        else:
+            new_sl = entry + keep_risk
+
+        if not self._stop_valid_for_position(direction, entry, new_sl):
+            return {"active": False, "reason": "invalid_new_sl"}
+        improves = (new_sl > stop_loss) if direction == "long" else (new_sl < stop_loss)
+        if not improves:
+            return {"active": False, "reason": "sl_not_improving"}
+
+        details = {
+            "exhaustion_signals": exhaustion_signals,
+            "required": required_signals,
+            "reasons": reasons,
+            "r_now": round(r_now, 4),
+            "lock_pct": lock_pct,
+            "day_type": day_type,
+            "delta_proxy": round(delta_proxy, 4),
+            "bar_volume_proxy": round(bar_volume_proxy, 4),
+            "adverse_drift": round(adverse_drift, 5),
+            "rejection_ratio": round(rejection_ratio, 4),
+            "phase": str(phase_pm.get("phase") or "unknown"),
+        }
+        logger.info(
+            "[PM:ExhaustionLock] %s %s | r_now=%.2f | signals=%d/%d | lock=%d%% | new_sl=%.2f | reasons=%s",
+            symbol, direction, r_now, exhaustion_signals, required_signals,
+            int(lock_pct * 100), new_sl, reasons,
+        )
+        return {
+            "active": True,
+            "action": "tighten",
+            "reason": "xau_momentum_exhaustion_lock",
+            "new_stop_loss": round(new_sl, 4),
+            "new_take_profit": 0.0,  # keep existing TP
+            "details": details,
+        }
+
+    def _crypto_dom_defense_plan(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        current_price: float,
+        r_now: Optional[float],
+        age_min: float,
+    ) -> dict:
+        """DOM-only active defense for non-XAU symbols (BTC/ETH).
+
+        Lighter than full XAU active defense — only checks DOM liquidity shift.
+        Tightens stop or closes when DOM shows severe adverse liquidity.
+
+        Anti-MM-trap safeguards:
+        1. Profit buffer: skip tighten when position is healthy (r_now > 0.5R)
+           — if position is working, DOM blip is likely MM noise, not real shift
+        2. Require 3+ snapshots: more data points for reliable shift signal
+        3. Close only when severe + already losing (r_now <= 0.15)
+        4. Never tighten past breakeven from adverse alone
+        5. Conservative keep_r (50-65% of risk) — leaves room for normal volatility
+        """
+        if self._is_xau_symbol(symbol):
+            return {"active": False, "reason": "xau_uses_full_active_defense"}
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {"active": False, "reason": "dom_disabled"}
+        min_age = max(1.0, float(getattr(config, "CTRADER_PM_XAU_ACTIVE_DEFENSE_MIN_AGE_MIN", 2.0) or 2.0))
+        if age_min < min_age:
+            return {"active": False, "reason": "too_young"}
+        # Safeguard 1: Profit buffer — position is working well, don't panic on DOM noise
+        profit_buffer_r = float(getattr(config, "CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R", 0.50) or 0.50)
+        if (r_now is not None) and float(r_now) > profit_buffer_r:
+            return {"active": False, "reason": "position_healthy_skip_dom"}
+        if stop_loss <= 0 or entry <= 0:
+            return {"active": False, "reason": "invalid_entry_or_stop"}
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            import sqlite3 as _sqlite3_cdom
+            _cdom_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+            if not _cdom_db.exists():
+                return {"active": False, "reason": "no_db"}
+            with _sqlite3_cdom.connect(str(_cdom_db), timeout=5) as _cdom_conn:
+                _cdom_conn.row_factory = _sqlite3_cdom.Row
+                dom_result = analyze_dom_liquidity(_cdom_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+            if not bool(dom_result.get("ok")):
+                return {"active": False, "reason": "dom_no_data"}
+            # Safeguard 2: Require 3+ snapshots for reliable shift signal
+            snapshots_used = int(dom_result.get("snapshots_used", 0) or 0)
+            if snapshots_used < 3:
+                return {"active": False, "reason": "insufficient_snapshots", "details": {"snapshots_used": snapshots_used}}
+            adverse = dict(dom_result.get("adverse") or {})
+            adverse_score = int(adverse.get("adverse_score", 0) or 0)
+            severity = str(adverse.get("severity", "none") or "none")
+            recommendation = str(adverse.get("recommendation", "hold") or "hold")
+            details = {"dom_adverse_score": adverse_score, "dom_severity": severity, "dom_recommendation": recommendation, "symbol": symbol, "snapshots_used": snapshots_used}
+            # Safeguard 3: Close only when severe + already in loss/near breakeven
+            if severity == "severe" and (r_now is not None) and float(r_now) <= 0.15:
+                return {"active": True, "action": "close", "reason": "crypto_dom_defense_close", "details": details}
+            # Safeguard 4+5: Conservative tighten — only score 3 (severe), keep 65% risk
+            # Score 2 (moderate): keep 65% of risk — leaves plenty of room
+            if adverse_score >= 3:
+                keep_r = 0.50
+            elif adverse_score >= 2:
+                keep_r = 0.65
+            else:
+                return {"active": False, "reason": "dom_not_adverse", "details": details}
+            new_sl = entry - (risk * keep_r) if direction == "long" else entry + (risk * keep_r)
+            if direction == "long":
+                new_sl = max(stop_loss, new_sl)
+            else:
+                new_sl = min(stop_loss, new_sl)
+            return {"active": True, "action": "tighten", "reason": "crypto_dom_defense_tighten", "new_stop_loss": round(new_sl, 4), "new_take_profit": 0.0, "details": details}
+        except Exception:
+            return {"active": False, "reason": "dom_error"}
+
+    def _crypto_dom_tp_extension_plan(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        planned_tp: float,
+        current_tp: float,
+        current_price: float,
+        r_now: Optional[float],
+        age_min: float,
+    ) -> dict:
+        """DOM-based TP extension for BTC/ETH when liquidity is favorable.
+
+        When DOM shows favorable conditions (support building for longs,
+        resistance building for shorts), extend TP to capture more profit.
+
+        Anti-MM-trap safeguards:
+        1. Require 3+ snapshots: avoid spoofing on 1-2 snapshot window
+        2. Max extension cap: 3.0R max to prevent chasing unrealistic targets
+        3. lock_r always locks profit above entry when extending
+        4. Only extend when already in meaningful profit (r_now >= 0.5)
+        """
+        if self._is_xau_symbol(symbol):
+            return {"active": False, "reason": "xau_uses_full_extension"}
+        if not bool(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_ENABLED", True)):
+            return {"active": False, "reason": "dom_disabled"}
+        if stop_loss <= 0 or entry <= 0:
+            return {"active": False, "reason": "invalid_entry_or_stop"}
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return {"active": False, "reason": "invalid_risk"}
+        if not self._target_valid_for_position(direction, entry, current_tp):
+            return {"active": False, "reason": "invalid_current_target"}
+        if not self._price_crossed_target(direction, current_price, current_tp):
+            return {"active": False, "reason": "target_not_crossed"}
+        # Safeguard 4: must be in meaningful profit — don't extend near breakeven
+        if (r_now is not None) and float(r_now) < 0.5:
+            return {"active": False, "reason": "profit_too_small"}
+        if age_min < 1.0:
+            return {"active": False, "reason": "too_young"}
+        current_target_r = abs(current_tp - entry) / risk
+        # Safeguard 2: cap max extension
+        max_extension_r = float(getattr(config, "CRYPTO_DOM_TP_MAX_EXTENSION_R", 3.0) or 3.0)
+        if current_target_r >= max_extension_r:
+            return {"active": False, "reason": "max_extension_reached", "details": {"current_target_r": round(current_target_r, 4), "max_r": max_extension_r}}
+        try:
+            from analysis.dom_liquidity_shift import analyze_dom_liquidity
+            import sqlite3 as _sqlite3_cext
+            _cext_db = Path(__file__).resolve().parent.parent / "data" / "ctrader_openapi.db"
+            if not _cext_db.exists():
+                return {"active": False, "reason": "no_db"}
+            with _sqlite3_cext.connect(str(_cext_db), timeout=5) as _cext_conn:
+                _cext_conn.row_factory = _sqlite3_cext.Row
+                dom_result = analyze_dom_liquidity(_cext_conn, symbol=symbol, direction=direction, lookback_min=max(5, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", 30) or 30)), max_runs=max(2, int(getattr(config, "XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", 6) or 6)))
+            if not bool(dom_result.get("ok")):
+                return {"active": False, "reason": "dom_no_data"}
+            # Safeguard 1: Require 3+ snapshots for reliable favorable signal
+            snapshots_used = int(dom_result.get("snapshots_used", 0) or 0)
+            if snapshots_used < 3:
+                return {"active": False, "reason": "insufficient_snapshots", "details": {"snapshots_used": snapshots_used}}
+            favorable = dict(dom_result.get("favorable") or {})
+            fav_score = int(favorable.get("favorable_score", 0) or 0)
+            strength = str(favorable.get("strength", "none") or "none")
+            if fav_score < 2:
+                return {"active": False, "reason": "dom_not_favorable", "details": {"dom_favorable_score": fav_score, "dom_strength": strength}}
+            step_r = 0.35 if strength == "strong" else 0.25
+            lock_r = 0.15 if strength == "strong" else 0.10
+            target_r = min(current_target_r + step_r, max_extension_r)
+            target_r = max(target_r, 1.0)
+            new_tp = entry + (risk * target_r) if direction == "long" else entry - (risk * target_r)
+            if not self._target_valid_for_position(direction, entry, new_tp):
+                return {"active": False, "reason": "invalid_extension_target"}
+            if not self._target_more_favorable(direction, entry, new_tp, current_tp):
+                return {"active": False, "reason": "extension_not_improving"}
+            if self._price_crossed_target(direction, current_price, new_tp):
+                return {"active": False, "reason": "extension_already_crossed"}
+            # Safeguard 3: lock profit above entry
+            candidate_sl = entry + (risk * lock_r) if direction == "long" else entry - (risk * lock_r)
+            new_sl = max(stop_loss, candidate_sl) if direction == "long" else min(stop_loss, candidate_sl)
+            if not self._stop_valid_for_position(direction, entry, new_sl):
+                new_sl = stop_loss
+            details = {"dom_favorable_score": fav_score, "dom_strength": strength, "dom_reasons": list(favorable.get("reasons") or []), "current_target_r": round(current_target_r, 4), "new_target_r": round(target_r, 4), "max_extension_r": max_extension_r, "snapshots_used": snapshots_used, "symbol": symbol}
+            return {"active": True, "action": "extend", "reason": "crypto_dom_tp_extension", "new_stop_loss": round(new_sl, 4), "new_take_profit": round(new_tp, 4), "details": details}
+        except Exception:
+            return {"active": False, "reason": "dom_error"}
 
     def _scheduled_canary_rebalanced_stop(
         self,
@@ -3037,6 +4650,72 @@ class CTraderExecutor:
             "symbols": symbols,
         }
 
+    def record_reversal_capture_event(
+        self,
+        *,
+        symbol: str,
+        stage: str,
+        direction: str,
+        trigger_source: str,
+        event_key: str,
+        event_utc: str = "",
+        capture_run_id: str = "",
+        capture_status: str = "",
+        sweep_level: float = 0.0,
+        sweep_wick_ratio: float = 0.0,
+        atr: float = 0.0,
+        reason: str = "",
+        features: Optional[dict] = None,
+        context: Optional[dict] = None,
+    ) -> dict:
+        created_ts = time.time()
+        created_utc = _utc_now_iso()
+        payload = {
+            "symbol": str(symbol or "").strip().upper(),
+            "stage": str(stage or "").strip().lower(),
+            "direction": str(direction or "").strip().lower(),
+            "trigger_source": str(trigger_source or "").strip().lower(),
+            "event_key": str(event_key or "").strip(),
+            "event_utc": str(event_utc or "").strip(),
+            "capture_run_id": str(capture_run_id or "").strip(),
+            "capture_status": str(capture_status or "").strip(),
+            "sweep_level": _safe_float(sweep_level, 0.0),
+            "sweep_wick_ratio": _safe_float(sweep_wick_ratio, 0.0),
+            "atr": _safe_float(atr, 0.0),
+            "reason": str(reason or "").strip(),
+            "features_json": json.dumps(dict(features or {}), ensure_ascii=True, separators=(",", ":")),
+            "context_json": json.dumps(dict(context or {}), ensure_ascii=True, separators=(",", ":")),
+        }
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO ctrader_reversal_capture_events(
+                    created_ts, created_utc, symbol, stage, direction, trigger_source,
+                    event_key, event_utc, capture_run_id, capture_status, sweep_level,
+                    sweep_wick_ratio, atr, reason, features_json, context_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    float(created_ts),
+                    created_utc,
+                    payload["symbol"],
+                    payload["stage"],
+                    payload["direction"],
+                    payload["trigger_source"],
+                    payload["event_key"],
+                    payload["event_utc"],
+                    payload["capture_run_id"],
+                    payload["capture_status"],
+                    payload["sweep_level"],
+                    payload["sweep_wick_ratio"],
+                    payload["atr"],
+                    payload["reason"],
+                    payload["features_json"],
+                    payload["context_json"],
+                ),
+            )
+        return {"ok": True, "created_utc": created_utc, **payload}
+
     def capture_market_data(
         self,
         *,
@@ -3231,7 +4910,11 @@ class CTraderExecutor:
         tracked_actions = [
             dict(item or {})
             for item in list(pm_actions or [])
-            if str((item or {}).get("action") or "").strip().lower() == "xau_profit_extension"
+            if (
+                str((item or {}).get("action") or "").strip().lower().startswith("xau_profit_extension")
+                or str((item or {}).get("action") or "").strip().lower().startswith("fibo_")
+                or str((item or {}).get("action") or "").strip().lower() == "xau_momentum_exhaustion_lock"
+            )
         ]
         if not tracked_actions:
             return 0
@@ -3287,7 +4970,10 @@ class CTraderExecutor:
                 ]
                 pm_audit.append(audit_entry)
                 execution_meta["position_manager_audit"] = pm_audit[-12:]
-                execution_meta["xau_profit_extension"] = audit_entry
+                if action_name.startswith("xau_profit_extension"):
+                    execution_meta["xau_profit_extension"] = audit_entry
+                elif action_name.startswith("fibo_") or action_name == "xau_momentum_exhaustion_lock":
+                    execution_meta["fibo_phase_pm"] = audit_entry
                 conn.execute(
                     "UPDATE execution_journal SET execution_meta_json=? WHERE id=?",
                     (json.dumps(execution_meta, ensure_ascii=True, separators=(",", ":")), journal_id),
@@ -3297,6 +4983,80 @@ class CTraderExecutor:
         return persisted
 
     def execute_signal(self, signal, *, source: str = "") -> CTraderExecutionResult:
+        # Overlap tagger: single chokepoint that attaches red/blue zone overlap
+        # context + reversal_confirms to signal.raw_scores. Currently SHADOW
+        # ONLY (size tilt = 1.0 unless XAU_OVERLAP_TILT_* env set). Fail-silent.
+        try:
+            from analysis.overlap_tagger import tag_signal as _overlap_tag_signal
+            _overlap_tag_signal(signal)
+        except Exception:
+            pass
+        # Trend-rider TP extension (Level 2) + tier-runner shadow plan (Level 3).
+        # Extends TP2/TP3 ONLY when overlap+compression say "ride"; never
+        # tightens. Emits shadow tier_runner_plan tag for evidence collection.
+        try:
+            from analysis.trend_rider_tp import apply_trend_rider as _apply_trend_rider
+            _apply_trend_rider(signal=signal)
+        except Exception:
+            pass
+        xau_opportunity_first = bool(
+            str(getattr(signal, "symbol", "") or "").strip().upper() == "XAUUSD"
+            and bool(getattr(config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", False))
+        )
+        # Counter-move guard (Option B): skip live order if last 4/5 M1 bars
+        # contradict direction; instead log a "ghost trade" into
+        # xau_shadow_journal so we can compare would-have outcomes against
+        # taken trades and tune the threshold from evidence.
+        # Disable via CTRADER_COUNTER_MOVE_GUARD_ENABLED=0.
+        try:
+            if str(getattr(config, "CTRADER_COUNTER_MOVE_GUARD_ENABLED", "1")) not in ("0", "false", "False"):
+                from analysis.counter_move_guard import evaluate as _cm_eval, log_ghost_trade as _cm_ghost
+                _cm = _cm_eval(signal, enabled=True)
+                try:
+                    rs = dict(getattr(signal, "raw_scores", {}) or {})
+                    rs["counter_move_tag"] = _cm.get("tag", {})
+                    signal.raw_scores = rs
+                except Exception:
+                    pass
+                if _cm.get("skip"):
+                    if xau_opportunity_first:
+                        try:
+                            rs = dict(getattr(signal, "raw_scores", {}) or {})
+                            rs.setdefault("xau_opportunity_first_executor_bypassed", []).append(str(_cm.get("block_reason", "counter_move_skip")))
+                            signal.raw_scores = rs
+                        except Exception:
+                            pass
+                        logger.info("[XAU_OPPORTUNITY_FIRST] bypass counter_move source=%s reason=%s", source, _cm.get("block_reason"))
+                    else:
+                        _cm_ghost(signal=signal, block_reason=_cm.get("block_reason", "counter_move_skip"))
+                        logger.info("[counter_move] skip+ghost source=%s reason=%s", source, _cm.get("block_reason"))
+                        return CTraderExecutionResult(
+                            ok=False,
+                            status="filtered",
+                            message=str(_cm.get("block_reason", "counter_move_skip")),
+                            signal_symbol=str(getattr(signal, "symbol", "") or ""),
+                        )
+        except Exception:
+            pass
+        # Shock V2 — multi-source confirm + size/SL tilt. NEVER blocks.
+        # Reads cached shock state (refreshed by scheduler every 5 min).
+        # Opportunity override: high-conviction setups get HALF the penalty.
+        try:
+            if str(getattr(config, "SHOCK_V2_ENABLED", "1")) not in ("0", "false", "False"):
+                from learning.shock_resolver import get_current_shock
+                from analysis.shock_action_tilt import apply_shock_tilt
+                _ss = get_current_shock(max_staleness_min=10.0)
+                if not _ss.get("stale"):
+                    apply_shock_tilt(
+                        signal=signal,
+                        shock_score=float(_ss.get("score", 0.0) or 0.0),
+                        layers=_ss.get("layers"),
+                        reasons=_ss.get("reasons", []),
+                    )
+        except Exception:
+            pass
+        except Exception:
+            pass
         symbol = str(getattr(signal, "symbol", "") or "").strip().upper()
         pattern = str(getattr(signal, "pattern", "") or "").strip().upper()
         entry = _safe_float(getattr(signal, "entry", 0.0), 0.0)
@@ -3321,6 +5081,38 @@ class CTraderExecutor:
                 "signal_run_no": int(trace.get("run_no", 0) or 0),
                 "raw_scores": self._safe_json_load(json.dumps(getattr(signal, "raw_scores", {}) or {}, ensure_ascii=True, default=str)),
             }
+
+        def _xau_shadow_log(decision: str, reason: str = "", extra: Optional[dict] = None) -> None:
+            """Shadow-audit hook for XAU high-conf suppression analysis.
+
+            Observability only — never influences a live decision. All
+            failures swallowed inside the logger module.
+            """
+            try:
+                if not bool(getattr(config, "XAU_CONF_SUPPRESSION_SHADOW_ENABLED", False)):
+                    return
+                from execution.xau_suppression_shadow import log_signal_event
+                log_signal_event(
+                    enabled=True,
+                    symbol=symbol,
+                    direction=str(getattr(signal, "direction", "") or ""),
+                    source=str(source or ""),
+                    confidence=_safe_float(getattr(signal, "confidence", 0.0), 0.0),
+                    entry=entry,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    raw_scores=getattr(signal, "raw_scores", {}) or {},
+                    decision=decision,
+                    reason=reason,
+                    signal_run_id=str(trace.get("run_id", "") or ""),
+                    signal_run_no=int(trace.get("run_no", 0) or 0),
+                    pattern=str(getattr(signal, "pattern", "") or ""),
+                    session=str(getattr(signal, "session", "") or ""),
+                    max_file_mb=float(getattr(config, "XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB", 10.0)),
+                    extra=extra,
+                )
+            except Exception:
+                pass
 
         def _early_exit(
             status: str,
@@ -3351,7 +5143,10 @@ class CTraderExecutor:
                 )
             except Exception:
                 pass
+            _xau_shadow_log("rejected", reason=f"{status}:{message}")
             return result
+
+        _xau_shadow_log("arrived")
 
         if not self.enabled:
             return _early_exit("disabled", "ctrader disabled")
@@ -3359,6 +5154,38 @@ class CTraderExecutor:
             return _early_exit("disabled", "ctrader autotrade disabled")
         if not self.sdk_available:
             return _early_exit("unavailable", "ctrader-open-api not installed")
+
+        # Graded health gate (DB + auth). Fail-open on missing/stale state.
+        try:
+            from execution.health_gate import health_gate_decision
+            gate = health_gate_decision(
+                enabled=bool(getattr(config, "CTRADER_HEALTH_GATE_ENABLED", False)),
+                block_on_critical=bool(getattr(config, "CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL", False)),
+                max_state_age_min=float(getattr(config, "CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN", 120.0)),
+            )
+        except Exception:
+            gate = None
+        if gate is not None and gate.status == "block":
+            logger.error(
+                "[health_gate] BLOCK new entry — reason=%s db=%s auth=%s (symbol=%s source=%s)",
+                gate.reason, gate.db_status, gate.auth_status, symbol, source,
+            )
+            return _early_exit(
+                "filtered",
+                f"health_gate_blocked:{gate.reason}",
+                execution_meta={
+                    "health_gate_status": gate.status,
+                    "health_gate_reason": gate.reason,
+                    "health_gate_db_status": gate.db_status,
+                    "health_gate_auth_status": gate.auth_status,
+                },
+            )
+        if gate is not None and gate.status == "warn":
+            logger.warning(
+                "[health_gate] WARN new entry — reason=%s db=%s auth=%s (symbol=%s source=%s)",
+                gate.reason, gate.db_status, gate.auth_status, symbol, source,
+            )
+
         if _looks_like_test_pattern(pattern):
             return _early_exit("filtered", f"test_pattern_filtered:{pattern}")
         if _looks_like_fixture_signal(symbol, entry, stop_loss, take_profit):
@@ -3367,12 +5194,29 @@ class CTraderExecutor:
             return _early_exit("filtered", f"source_not_allowed:{source}")
         if not self._symbol_allowed(symbol):
             return _early_exit("filtered", f"symbol_not_allowed:{symbol}")
+        gov_ok, gov_reason, gov_meta = self._source_direction_governance_guard(
+            source=source,
+            symbol=symbol,
+            direction=str(getattr(signal, "direction", "") or ""),
+        )
+        if not gov_ok:
+            return _early_exit(
+                "filtered",
+                gov_reason,
+                execution_meta={"source_direction_governance": dict(gov_meta or {})},
+            )
         price_ok, price_reason, _price_meta = self._price_sanity_guard(signal, source=source)
         if not price_ok:
-            return _early_exit("filtered", price_reason)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass price_sanity source=%s reason=%s", source, price_reason)
+            else:
+                return _early_exit("filtered", price_reason)
         drift_ok, drift_reason, _drift_meta = self._market_entry_drift_guard(signal, source=source)
         if not drift_ok:
-            return _early_exit("filtered", drift_reason)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass market_entry_drift source=%s reason=%s", source, drift_reason)
+            else:
+                return _early_exit("filtered", drift_reason)
 
         if bool(getattr(config, "CTRADER_EXEC_FEATURE_PACK_ENABLED", False)):
             try:
@@ -3383,31 +5227,118 @@ class CTraderExecutor:
         payload, reason = self._build_payload(signal, source)
         if payload is None:
             return _early_exit("invalid", reason)
+        tp_norm_meta = self._normalize_tp_for_min_rr(source=source, payload=payload)
+        if bool(tp_norm_meta.get("applied")):
+            logger.info(
+                "[tp_normalizer] extend source=%s rr %.2f->%.2f tp %.4f->%.4f",
+                source,
+                float(tp_norm_meta.get("rr_before") or 0.0),
+                float(tp_norm_meta.get("rr_after") or 0.0),
+                float(tp_norm_meta.get("tp_before") or 0.0),
+                float(tp_norm_meta.get("tp_after") or 0.0),
+            )
+            try:
+                rs = dict(payload.get("raw_scores") or {})
+                rs["tp_normalizer"] = dict(tp_norm_meta)
+                payload["raw_scores"] = rs
+            except Exception:
+                pass
+        rr_ok, rr_reason, rr_meta = self._rr_floor_guard(source=source, payload=payload)
+        if not rr_ok:
+            if xau_opportunity_first:
+                logger.info(
+                    "[XAU_OPPORTUNITY_FIRST] bypass rr_floor source=%s symbol=%s rr=%.2f floor=%.2f",
+                    source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
+                )
+            else:
+                logger.warning(
+                    "[rr_floor] reject source=%s symbol=%s rr=%.2f floor=%.2f",
+                    source, symbol, float(rr_meta.get("rr", 0.0) or 0.0), float(rr_meta.get("floor", 0.0) or 0.0),
+                )
+                return _early_exit(
+                    "filtered",
+                    rr_reason,
+                    request_payload=payload,
+                    execution_meta={"rr_floor": dict(rr_meta or {})},
+                )
         short_limit_pause = self._xau_short_limit_pause_state(source=source, payload=payload)
         if bool(short_limit_pause.get("active")):
             remain_min = float(short_limit_pause.get("remaining_min", 0.0) or 0.0)
             run_id = str(short_limit_pause.get("trigger_run_id") or "")
             support_state = str(short_limit_pause.get("support_state") or "fss_support")
-            return _early_exit(
-                "filtered",
-                f"xau_short_limit_pause_active:{remain_min:.1f}m:{support_state}:{run_id}",
-                request_payload=payload,
-                execution_meta={"short_limit_pause": dict(short_limit_pause or {})},
-            )
+            pause_reason = f"xau_short_limit_pause_active:{remain_min:.1f}m:{support_state}:{run_id}"
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass short_limit_pause source=%s reason=%s", source, pause_reason)
+            else:
+                return _early_exit(
+                    "filtered",
+                    pause_reason,
+                    request_payload=payload,
+                    execution_meta={"short_limit_pause": dict(short_limit_pause or {})},
+                )
         dup_ok, dup_reason, _dup_meta = self._source_run_duplicate_guard(source=source, payload=payload)
         if not dup_ok:
-            return _early_exit("filtered", dup_reason, request_payload=payload)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass duplicate_guard source=%s reason=%s", source, dup_reason)
+            else:
+                return _early_exit("filtered", dup_reason, request_payload=payload)
         pair_cap = self._apply_xau_same_run_pair_risk_cap(source=source, payload=payload)
         if bool(pair_cap.get("active")) and bool(pair_cap.get("blocked")):
-            return _early_exit(
-                "filtered",
-                f"same_run_pair_risk_cap_exhausted:{str(payload.get('signal_run_id') or '')}",
-                request_payload=payload,
-                execution_meta={"pair_risk_cap": dict(pair_cap or {})},
-            )
+            pair_reason = f"same_run_pair_risk_cap_exhausted:{str(payload.get('signal_run_id') or '')}"
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass pair_risk_cap source=%s reason=%s", source, pair_reason)
+            else:
+                return _early_exit(
+                    "filtered",
+                    pair_reason,
+                    request_payload=payload,
+                    execution_meta={"pair_risk_cap": dict(pair_cap or {})},
+                )
         pos_ok, pos_reason, _pos_meta = self._position_direction_guard(symbol=symbol, direction=str(getattr(signal, "direction", "") or ""), source=source)
         if not pos_ok:
-            return _early_exit("filtered", pos_reason, request_payload=payload)
+            if xau_opportunity_first:
+                logger.info("[XAU_OPPORTUNITY_FIRST] bypass position_direction_guard source=%s reason=%s", source, pos_reason)
+            else:
+                return _early_exit("filtered", pos_reason, request_payload=payload)
+
+        # Guardian v2 stop-bleed governor: unlike the old opportunity-first
+        # bypasses, this is not a generic entry blocker. It freezes only the
+        # currently adverse/crowded XAU side/family while preserving opposite-side
+        # and future opportunity-first entries. Demo live explicitly requested.
+        try:
+            if symbol == "XAUUSD" and bool(getattr(config, "XAU_GOVERNOR_V2_ENABLED", True)):
+                from execution.xau_governor_v2 import GovernorConfig, XAUExposureGovernor
+                _gov = XAUExposureGovernor(self.db_path, GovernorConfig.from_config(config))
+                _verdict = _gov.allow_entry(
+                    symbol=symbol,
+                    direction=str(payload.get("direction") or getattr(signal, "direction", "") or ""),
+                    source=str(source or payload.get("source") or ""),
+                    confidence=_safe_float(payload.get("confidence", getattr(signal, "confidence", 0.0)), 0.0),
+                )
+                try:
+                    rs = dict(payload.get("raw_scores") or {})
+                    rs["xau_governor_v2"] = dict(_verdict.to_dict())
+                    payload["raw_scores"] = rs
+                except Exception:
+                    pass
+                if not bool(_verdict.allowed):
+                    logger.warning("[XAU_GOVERNOR_V2] freeze entry side=%s source=%s reason=%s metrics=%s", _verdict.side, source, _verdict.reason, _verdict.metrics)
+                    return _early_exit(
+                        "filtered",
+                        f"xau_governor_v2:{_verdict.reason}",
+                        request_payload=payload,
+                        execution_meta={"xau_governor_v2": dict(_verdict.to_dict())},
+                    )
+                if _verdict.guards:
+                    logger.info("[XAU_GOVERNOR_V2] dryrun_allow side=%s source=%s reason=%s", _verdict.side, source, _verdict.reason)
+        except Exception as _gov_exc:
+            logger.warning("[XAU_GOVERNOR_V2] fail-safe freeze source=%s error=%s", source, _gov_exc)
+            return _early_exit(
+                "filtered",
+                f"xau_governor_v2_error:{type(_gov_exc).__name__}",
+                request_payload=payload,
+                execution_meta={"xau_governor_v2_error": str(_gov_exc)},
+            )
 
         if self.dry_run:
             result = CTraderExecutionResult(
@@ -3427,6 +5358,7 @@ class CTraderExecutor:
                 },
             )
             self._journal(signal, result, source=source, request_payload=payload, response_payload={"mode": "dry_run"})
+            _xau_shadow_log("executed", reason="dry_run")
             return result
 
         raw = self._run_worker(
@@ -3475,6 +5407,15 @@ class CTraderExecutor:
                 )
             except Exception as ct_err:
                 logger.debug("[CopyTrade] dispatch skipped: %s", ct_err)
+        try:
+            _exec_status = str(getattr(result, "status", "") or "")
+            _exec_ok = bool(getattr(result, "ok", False))
+            _xau_shadow_log(
+                "executed" if (_exec_ok and _exec_status in {"accepted", "filled"}) else "rejected",
+                reason=f"live:{_exec_status or 'unknown'}",
+            )
+        except Exception:
+            pass
         return result
 
     def health_check(self, *, live: bool = True) -> dict:
@@ -3586,9 +5527,18 @@ class CTraderExecutor:
         if int(position_id or 0) > 0 and resolved_volume <= 0:
             with sqlite3.connect(self.db_path) as conn:
                 row = conn.execute(
-                    "SELECT volume FROM ctrader_positions WHERE position_id=? ORDER BY last_seen_utc DESC LIMIT 1",
+                    "SELECT volume FROM ctrader_positions WHERE position_id=? AND COALESCE(volume,0)>0 ORDER BY last_seen_utc DESC LIMIT 1",
                     (int(position_id),),
                 ).fetchone()
+                if row is None:
+                    # Post-accept emergency closes can happen before reconcile has
+                    # inserted ctrader_positions.  Fall back to the execution
+                    # journal's accepted volume; sending cTrader closeVolume=0 is
+                    # rejected and leaves the naked XAU position alive.
+                    row = conn.execute(
+                        "SELECT volume FROM execution_journal WHERE position_id=? AND COALESCE(volume,0)>0 ORDER BY id DESC LIMIT 1",
+                        (int(position_id),),
+                    ).fetchone()
             if row is not None:
                 resolved_volume = max(0, int(_safe_float(row[0], 0.0)))
         raw = self._run_worker(
@@ -3596,7 +5546,20 @@ class CTraderExecutor:
             payload={"account_id": self._configured_account_id()[0], "position_id": int(position_id or 0), "volume": resolved_volume},
             timeout_sec=max(5, int(getattr(config, "CTRADER_EXECUTOR_TIMEOUT_SEC", 25) or 25)),
         )
-        return self._result_from_dict(raw)
+        result = self._result_from_dict(raw)
+        if bool(result.ok) and int(position_id or 0) > 0:
+            try:
+                from copy_trade.manager import copy_trade_manager
+
+                copy_trade_manager.enforce_close_follow_async(
+                    master_position_id=int(position_id or 0),
+                    master_order_id=int(result.order_id or 0),
+                    reason="master_close_api",
+                    master_close_utc=_utc_now_iso(),
+                )
+            except Exception as ct_err:
+                logger.debug("[CopyTrade] close-follow skipped: %s", ct_err)
+        return result
 
     def amend_position_sltp(
         self,
@@ -3617,7 +5580,20 @@ class CTraderExecutor:
             },
             timeout_sec=max(5, int(getattr(config, "CTRADER_EXECUTOR_TIMEOUT_SEC", 25) or 25)),
         )
-        return self._result_from_dict(raw)
+        result = self._result_from_dict(raw)
+        if bool(result.ok) and int(position_id or 0) > 0:
+            try:
+                from copy_trade.manager import copy_trade_manager
+
+                copy_trade_manager.sync_protection_follow_async(
+                    master_position_id=int(position_id or 0),
+                    stop_loss=_safe_float(stop_loss, 0.0),
+                    take_profit=_safe_float(take_profit, 0.0),
+                    reason="master_amend_sltp",
+                )
+            except Exception as ct_err:
+                logger.debug("[CopyTrade] protection-follow skipped: %s", ct_err)
+        return result
 
     def cancel_order(self, *, order_id: int) -> CTraderExecutionResult:
         raw = self._run_worker(
@@ -3669,7 +5645,8 @@ class CTraderExecutor:
 
         order_type = str(payload.get("order_type", "") or "").strip().lower()
         order = dict(raw_execution.get("order") or {})
-        if status == "accepted" and order_type in {"limit", "stop"} and int(getattr(result, "order_id", 0) or 0) > 0:
+        position = dict(raw_execution.get("position") or {})
+        if status == "accepted" and order_type in {"limit", "stop"} and not position and int(getattr(result, "order_id", 0) or 0) > 0:
             order_sl = _safe_float(order.get("stopLoss"), 0.0)
             order_tp = _safe_float(order.get("takeProfit"), 0.0)
             missing_sl = planned_sl > 0 and order_sl <= 0
@@ -3695,10 +5672,18 @@ class CTraderExecutor:
                 }
 
         execution_type = str(execution_meta.get("execution_type") or "").strip().upper()
-        position = dict(raw_execution.get("position") or {})
         if (
             int(getattr(result, "position_id", 0) or 0) > 0
-            and (status == "filled" or execution_type in {"ORDER_FILLED", "ORDER_PARTIAL_FILL"})
+            and (
+                status == "filled"
+                or execution_type in {"ORDER_FILLED", "ORDER_PARTIAL_FILL"}
+                # cTrader can return ORDER_ACCEPTED with an already-open position
+                # on fast market/IOC paths.  That position may arrive without SL/TP
+                # even though the planned order carried them; treat raw position
+                # payload as an open-position protection repair opportunity instead
+                # of waiting for the next reconcile cycle.
+                or bool(position)
+            )
         ):
             direction = str(payload.get("direction", "") or "").strip().lower()
             symbol = str(payload.get("market_symbol", getattr(result, "signal_symbol", "")) or getattr(result, "signal_symbol", "") or "").strip().upper()
@@ -3721,33 +5706,106 @@ class CTraderExecutor:
                 target_sl = planned_sl if missing_sl else pos_sl
                 if bool(clamp_plan.get("active")):
                     target_sl = _safe_float(clamp_plan.get("new_stop_loss"), target_sl)
+                target_sl = self._post_fill_missing_sl_target(
+                    direction=direction,
+                    planned_entry=planned_entry,
+                    planned_stop_loss=planned_sl,
+                    live_entry=pos_entry or planned_entry,
+                    candidate_stop_loss=target_sl,
+                    missing_stop_loss=missing_sl,
+                )
                 target_tp = planned_tp if (missing_tp and self._target_valid_for_position(direction, pos_entry or planned_entry, planned_tp)) else pos_tp
+                position_id = int(getattr(result, "position_id", 0) or 0)
+                action_name = "clamp_position_stop_after_fill" if bool(clamp_plan.get("active")) else "repair_position_protection"
+                ref_px = 0.0
+                if missing_sl:
+                    try:
+                        ref_px = _safe_float(self._reference_price(symbol), 0.0)
+                    except Exception:
+                        ref_px = 0.0
+                    if ref_px > 0 and not self._stop_valid_for_management(direction, ref_px, target_sl):
+                        close_res = self.close_position(
+                            position_id=position_id,
+                            volume=max(0, int(_safe_float(getattr(result, "volume", 0.0), 0.0))),
+                        )
+                        return {
+                            "attempted": True,
+                            "action": "emergency_close_missing_sl_breached_after_fill",
+                            "position_id": position_id,
+                            "missing_stop_loss": bool(missing_sl),
+                            "missing_take_profit": bool(missing_tp),
+                            "clamped_stop_loss": bool(clamp_plan.get("active")),
+                            "new_stop_loss": _safe_float(target_sl, 0.0),
+                            "reference_price": round(ref_px, 4),
+                            "details": dict(clamp_plan.get("details") or {}),
+                            "ok": bool(close_res.ok),
+                            "status": str(close_res.status or ""),
+                            "message": str(close_res.message or ""),
+                        }
                 amend_res = self.amend_position_sltp(
-                    position_id=int(getattr(result, "position_id", 0) or 0),
+                    position_id=position_id,
                     stop_loss=target_sl,
                     take_profit=target_tp if self._target_valid_for_position(direction, pos_entry or planned_entry, target_tp) else 0.0,
                     trailing_stop_loss=False,
                 )
+                repair_ok = bool(amend_res.ok)
+                close_res = None
+                if missing_sl and not repair_ok:
+                    close_res = self.close_position(
+                        position_id=position_id,
+                        volume=max(0, int(_safe_float(getattr(result, "volume", 0.0), 0.0))),
+                    )
+                    action_name = "emergency_close_missing_sl_repair_failed"
                 return {
                     "attempted": True,
-                    "action": "clamp_position_stop_after_fill" if bool(clamp_plan.get("active")) else "repair_position_protection",
-                    "position_id": int(getattr(result, "position_id", 0) or 0),
+                    "action": action_name,
+                    "position_id": position_id,
                     "missing_stop_loss": bool(missing_sl),
                     "missing_take_profit": bool(missing_tp),
                     "clamped_stop_loss": bool(clamp_plan.get("active")),
                     "new_stop_loss": _safe_float(target_sl, 0.0),
+                    "reference_price": round(ref_px, 4) if ref_px > 0 else 0.0,
                     "details": dict(clamp_plan.get("details") or {}),
-                    "ok": bool(amend_res.ok),
-                    "status": str(amend_res.status or ""),
-                    "message": str(amend_res.message or ""),
+                    "ok": repair_ok if close_res is None else bool(close_res.ok),
+                    "status": str(amend_res.status or "") if close_res is None else str(close_res.status or ""),
+                    "message": str(amend_res.message or "") if close_res is None else str(close_res.message or ""),
+                    "repair_ok": repair_ok,
                 }
         return {}
+
+    @staticmethod
+    def _patient_strategy_sources() -> set[str]:
+        """2026-04-29 surgery 3: sources that trade on a multi-hour patience horizon
+        (fibo, scheduled). They must NOT be cancelled/closed by scalp-side heuristics
+        (far_from_market, stale_ttl@45m, force_close_direction, order_care exits)."""
+        raw = str(getattr(config, "CTRADER_PATIENT_STRATEGY_SOURCES", "") or "").strip().lower()
+        return {token.strip() for token in raw.split(",") if token.strip()}
+
+    @classmethod
+    def _is_patient_strategy_source(cls, source: str) -> bool:
+        token = str(source or "").strip().lower()
+        if not token:
+            return False
+        patient = cls._patient_strategy_sources()
+        if token in patient:
+            return True
+        # also match any prefix in the patient list (so fibo_xauusd:future_variant works)
+        for entry in patient:
+            if entry and token.startswith(entry):
+                return True
+        # default: anything that starts with "fibo" is a patient strategy
+        if token.startswith("fibo_") or token.startswith("fibo:"):
+            return True
+        return False
 
     def _pending_order_ttl_min(self, source: str, symbol: str) -> int:
         token = str(source or "").strip().lower()
         symbol_u = str(symbol or "").strip().upper()
         default_ttl = max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_DEFAULT_MIN", 120) or 120))
         if symbol_u == "XAUUSD":
+            # 2026-04-29 surgery 3: fibo is patient — needs hours not minutes.
+            if token.startswith("fibo_") or token.startswith("fibo:") or "fibo_xauusd" in token:
+                return max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN", 240) or 240))
             if ":td:" in token or "tick_depth_filter" in token:
                 return max(1, int(getattr(config, "CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN", 45) or 45))
             if ":bs:" in token or "breakout_stop" in token:
@@ -4479,11 +6537,18 @@ class CTraderExecutor:
         ttl_min = float(self._pending_order_ttl_min(source, symbol))
         if age_min >= max(1.0, ttl_min):
             return f"stale_ttl:{int(ttl_min)}m"
+        # 2026-04-29 surgery 3: patient strategies (fibo, scheduled) sit at strategic
+        # levels by design and must not be cancelled for "being too far from market".
+        # Without this guard, a perfect 4604.62 sell-limit gets killed at ~05:51 even
+        # though price would later rally to 4608+ and hit it cleanly.
+        _is_patient = self._is_patient_strategy_source(source)
+        _protect_far = bool(getattr(config, "CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET", True))
         if (
             bool(getattr(config, "CTRADER_PENDING_ORDER_MAX_DISTANCE_ENABLED", True))
             and symbol == "XAUUSD"
             and order_type == "limit"
             and family in set(getattr(config, "get_ctrader_pending_order_dynamic_reprice_families", lambda: set())() or set())
+            and not (_is_patient and _protect_far)
         ):
             min_age_sec = max(10, int(getattr(config, "CTRADER_PENDING_ORDER_MAX_DISTANCE_MIN_AGE_SEC", 120) or 120))
             age_sec = max(0.0, float(now_ts) - created_ts) if created_ts > 0 else 0.0
@@ -4666,6 +6731,17 @@ class CTraderExecutor:
                         "status": str(cancel_result.status or ""),
                     })
                     follow_signal, follow_source = self._follow_stop_signal_from_order(order, plan)
+                    # ── FFFS session block: skip overlap/off_hours ──
+                    _fffs_blocked_sessions = {s.strip().lower() for s in str(getattr(config, "FFFS_BLOCKED_SESSIONS", "overlap,off_hours") or "").split(",") if s.strip()}
+                    if _fffs_blocked_sessions:
+                        try:
+                            from market.session_manager import session_manager as _sm
+                            _active = set(s.lower() for s in (_sm.get_session_info() or {}).get("active_sessions", []) or [])
+                            if _active & _fffs_blocked_sessions:
+                                logger.info("[FFFS] blocked: active_sessions=%s overlap blocked_sessions=%s", _active, _fffs_blocked_sessions)
+                                continue
+                        except Exception:
+                            pass
                     follow_result = self.execute_signal(follow_signal, source=follow_source)
                     self._mark_order_follow_stop_launch(
                         conn,
@@ -4749,6 +6825,7 @@ class CTraderExecutor:
             journal_obj = dict(journal_row) if journal_row is not None else {}
             journal_id = int(journal_obj.get("id", 0) or 0)
             source = str(item.get("source") or pos.get("source") or "").strip().lower()
+            lane = str(item.get("lane", "") or pos.get("lane", "") or "").strip().lower()
             symbol = str(pos.get("symbol", "") or "").strip().upper()
             direction = str(pos.get("direction", "") or "").strip().lower()
             position_id = int(_safe_float(pos.get("position_id"), 0))
@@ -4757,6 +6834,9 @@ class CTraderExecutor:
             stop_loss = _safe_float(pos.get("stop_loss"), 0.0)
             live_tp = _safe_float(pos.get("take_profit"), 0.0)
             if position_id <= 0 or entry <= 0 or direction not in {"long", "short"}:
+                continue
+            if source == "untagged_external" or lane == "external":
+                logger.warning("[PM] skip external position %s (%s) — source=%s lane=%s — not managed by Dexter", position_id, symbol, source, lane)
                 continue
             risk = abs(entry - stop_loss) if stop_loss > 0 else 0.0
             if stop_loss > 0 and risk <= 0:
@@ -4840,6 +6920,18 @@ class CTraderExecutor:
                                 "new_stop_loss": round(target_sl, 4),
                                 "new_take_profit": round(take_profit_final, 4),
                             })
+                        else:
+                            close_res = self.close_position(position_id=position_id, volume=volume)
+                            if bool(close_res.ok):
+                                report["pm_actions"].append({
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": "emergency_close_missing_sl_no_ref_repair_failed",
+                                    "reference_price": 0.0,
+                                    "repair_stop_loss": round(target_sl, 4),
+                                    "repair_status": str(res.status or ""),
+                                })
                 continue
             report["managed_positions"] += 1
             planned_tp = _safe_float(journal_row["take_profit"], 0.0) if journal_row is not None else 0.0
@@ -4850,6 +6942,12 @@ class CTraderExecutor:
             risk = abs(entry - stop_loss) if self._stop_valid_for_position(direction, entry, stop_loss) else planned_risk
             
             age_min = self._position_age_min(pos)
+            # TP for amend paths before `target_tp` is computed later (planned vs live).
+            _trail_take_profit = (
+                live_tp
+                if self._target_valid_for_position(direction, entry, live_tp)
+                else (planned_tp if self._target_valid_for_position(direction, entry, planned_tp) else 0.0)
+            )
             # --- NEURAL TRAILING BRAIN HOOK (Bridge Mode) ---
             if (r_now is not None) and risk > 0 and direction in {"long", "short"}:
                 try:
@@ -4886,7 +6984,7 @@ class CTraderExecutor:
                             res = self.amend_position_sltp(
                                 position_id=position_id,
                                 stop_loss=brain_sl,
-                                take_profit=target_tp,
+                                take_profit=_trail_take_profit,
                                 trailing_stop_loss=False,
                             )
                             if bool(res.ok):
@@ -4912,7 +7010,68 @@ class CTraderExecutor:
                 except Exception as e:
                     logger.error(f"[CTraderExecutor] Trailing brain evaluation crashed: {e}", exc_info=True)
             # ----------------------------------
-            
+
+            fibo_phase_ctx = self._fibo_phase_context_from_journal(journal_row)
+            fibo_phase_pm = self._apply_fibo_winner_pm_profile(source, self._fibo_phase_pm_profile(fibo_phase_ctx))
+
+            # ── Fibo time-based profit lock (runs before active defense) ────
+            if "fibo" in source and bool(getattr(config, "FIBO_PM_TIME_LOCK_ENABLED", True)) and r_now is not None and r_now > 0:
+                _fibo_be_min = float(getattr(config, "FIBO_PM_BE_AFTER_MIN", 20)) * max(0.5, float(fibo_phase_pm.get("time_lock_be_min_mult", 1.0) or 1.0))
+                _fibo_lock_tiers = [
+                    (float(getattr(config, "FIBO_PM_LOCK_30_AFTER_MIN", 45)), 0.30),
+                    (float(getattr(config, "FIBO_PM_LOCK_50_AFTER_MIN", 90)), 0.50),
+                    (float(getattr(config, "FIBO_PM_LOCK_70_AFTER_MIN", 150)), 0.70),
+                ]
+                _lock_pct = 0.0
+                _fibo_tighten = False
+                for _tier_min, _tier_pct in reversed(_fibo_lock_tiers):
+                    if age_min >= _tier_min:
+                        _lock_pct = min(0.85, _tier_pct * max(0.8, float(fibo_phase_pm.get("time_lock_pct_mult", 1.0) or 1.0)))
+                        _fibo_tighten = True
+                        break
+                if not _fibo_tighten and age_min >= _fibo_be_min:
+                    _fibo_tighten = True
+                _profit_pts = (ref - entry) if direction == "long" else (entry - ref)
+                if _fibo_tighten and _profit_pts > 0:
+                    _be_buffer = max(abs(entry) * 0.00005, 0.5)
+                    # Tighten SL towards entry from original wide SL:
+                    # lock_pct of the distance from original SL to entry is recovered.
+                    # E.g. short: SL=4807, entry=4706 → risk=101pts.
+                    # lock 50% → new_sl = entry + risk*(1-0.50) = entry + 50.5 = 4756.5
+                    _orig_risk = abs(stop_loss - entry)
+                    if _lock_pct > 0:
+                        _keep_risk = _orig_risk * (1.0 - _lock_pct)
+                    else:
+                        _keep_risk = _be_buffer  # just entry ± buffer for breakeven
+                    if direction == "long":
+                        _new_sl = entry - _keep_risk
+                    else:
+                        _new_sl = entry + _keep_risk
+                    _improves = (_new_sl > stop_loss) if direction == "long" else (_new_sl < stop_loss)
+                    _tol = max(abs(entry) * 0.000001, 0.01)
+                    if _improves and abs(_new_sl - stop_loss) > _tol and self._stop_valid_for_position(direction, entry, _new_sl):
+                        _keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
+                        res = self.amend_position_sltp(
+                            position_id=position_id, stop_loss=_new_sl,
+                            take_profit=_keep_tp, trailing_stop_loss=False,
+                        )
+                        if bool(res.ok):
+                            report["amended_positions"] += 1
+                            _tier_label = "be" if _lock_pct <= 0 else ("lock_%d" % int(_lock_pct * 100))
+                            report["pm_actions"].append(self._enrich_fibo_pm_action({
+                                "position_id": position_id, "source": source, "symbol": symbol,
+                                "action": "fibo_time_profit_lock_%s" % _tier_label,
+                                "reference_price": round(ref, 4), "new_stop_loss": round(_new_sl, 4),
+                                "r_now": round(float(r_now), 4), "age_min": round(float(age_min), 1),
+                                "lock_pct": _lock_pct, "profit_pts": round(_profit_pts, 2),
+                                "phase": str(fibo_phase_pm.get("phase") or "unknown"),
+                            }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
+                            logger.info(
+                                "[PM:FiboTimeLock] pos=%s %s %s | age=%.0fm | profit=%.1fpts | lock=%d%% | new_sl=%.2f",
+                                position_id, symbol, direction, age_min, _profit_pts, int(_lock_pct * 100), _new_sl,
+                            )
+                        continue
+
             action_reason = ""
             live_sl_valid = self._stop_valid_for_position(direction, entry, stop_loss)
             if repair_missing_sl and not live_sl_valid:
@@ -4955,6 +7114,18 @@ class CTraderExecutor:
                             "new_stop_loss": round(target_sl, 4),
                             "new_take_profit": round(new_tp, 4) if self._target_valid_for_position(direction, entry, new_tp) else 0.0,
                         })
+                    else:
+                        close_res = self.close_position(position_id=position_id, volume=volume)
+                        if bool(close_res.ok):
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": "emergency_close_missing_sl_repair_failed",
+                                "reference_price": round(ref, 4),
+                                "repair_stop_loss": round(target_sl, 4),
+                                "repair_status": str(res.status or ""),
+                            })
                     continue
             stop_clamp = self._xau_post_fill_stop_clamp_plan(
                 symbol=symbol,
@@ -5003,6 +7174,174 @@ class CTraderExecutor:
             age_min = self._position_age_min(pos)
             order_care_state = self._xau_order_care_state(symbol=symbol, source=source)
             order_care_overrides = dict(order_care_state.get("overrides") or {})
+
+            # ── Force-close directive: close all positions in target direction ──
+            force_close_dir = str(order_care_state.get("force_close_direction") or "").strip().lower()
+            force_close_reason = str(order_care_state.get("force_close_reason") or "order_care_force_close")
+            # 2026-04-29 surgery 3: never force-close patient strategies. fibo/scheduled
+            # were getting killed at -0.04R by a scalp-side directive, abandoning the
+            # planned 1.5R+ Fibonacci target. Patient sources hit their own SL/TP only.
+            _force_close_protected = self._is_patient_strategy_source(source) and bool(
+                getattr(config, "CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE", True)
+            )
+            if force_close_dir and direction == force_close_dir and not _force_close_protected:
+                res = self.close_position(position_id=position_id, volume=0)
+                action_entry = {
+                    "journal_id": (journal_id or None),
+                    "position_id": position_id,
+                    "source": source,
+                    "symbol": symbol,
+                    "action": "order_care_force_close",
+                    "direction": direction,
+                    "reason": force_close_reason,
+                    "reference_price": round(ref, 4),
+                    "entry_price": round(entry, 4),
+                    "ok": bool(res.ok),
+                }
+                logger.info("[PM] force_close_direction=%s pos=%s %s@%s reason=%s ok=%s", force_close_dir, position_id, symbol, round(ref, 4), force_close_reason, res.ok)
+                report["pm_actions"].append(action_entry)
+                if bool(res.ok):
+                    report["closed_profit_positions"] += 1
+                continue
+            if force_close_dir and direction == force_close_dir and _force_close_protected:
+                logger.info(
+                    "[PM] force_close_skipped (patient_strategy) pos=%s source=%s direction=%s — letting planned SL/TP run",
+                    position_id, source, direction,
+                )
+
+            # ── Momentum exhaustion profit lock (before extension) ────────
+            # If momentum is dead and trade is profitable, lock profit NOW
+            # instead of waiting for TP or letting it evaporate
+            if "fibo" in source and bool(getattr(config, "FIBO_PM_EXHAUSTION_LOCK_ENABLED", True)) and r_now is not None and r_now > 0.15:
+                try:
+                    exhaustion = self._xau_momentum_exhaustion_lock(
+                        source=source, symbol=symbol, direction=direction,
+                        entry=entry, stop_loss=stop_loss, current_price=ref,
+                        confidence=confidence, age_min=age_min, r_now=r_now,
+                        phase_pm=fibo_phase_pm,
+                    )
+                    if bool(exhaustion.get("active")):
+                        _exh_new_sl = _safe_float(exhaustion.get("new_stop_loss"), 0.0)
+                        if self._stop_valid_for_position(direction, entry, _exh_new_sl):
+                            _exh_improves = (_exh_new_sl > stop_loss) if direction == "long" else (_exh_new_sl < stop_loss)
+                            if _exh_improves:
+                                _exh_keep_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else 0.0
+                                _exh_res = self.amend_position_sltp(
+                                    position_id=position_id, stop_loss=_exh_new_sl,
+                                    take_profit=_exh_keep_tp, trailing_stop_loss=False,
+                                )
+                                if bool(_exh_res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append(self._enrich_fibo_pm_action({
+                                        "journal_id": (journal_id or None),
+                                        "position_id": position_id,
+                                        "source": source,
+                                        "symbol": symbol,
+                                        "action": "xau_momentum_exhaustion_lock",
+                                        "reference_price": round(ref, 4),
+                                        "new_stop_loss": round(_exh_new_sl, 4),
+                                        "r_now": round(float(r_now), 4),
+                                        "details": dict(exhaustion.get("details") or {}),
+                                    }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
+                                    logger.info(
+                                        "[PM:ExhaustionLock] pos=%s %s %s | r_now=%.2f | new_sl=%.2f",
+                                        position_id, symbol, direction, r_now, _exh_new_sl,
+                                    )
+                                    continue
+                except Exception as _exh_exc:
+                    logger.debug("[PM] momentum_exhaustion_lock error for %s: %s", symbol, _exh_exc)
+
+            if (
+                "fibo" in source
+                and bool(getattr(config, "FIBO_PM_PARTIAL_BANK_ENABLED", True))
+                and r_now is not None
+                and r_now > 0
+                and not self._fibo_pm_action_seen(journal_row, "fibo_partial_bank")
+            ):
+                _phase = str(fibo_phase_pm.get("phase") or "unknown")
+                _winner = bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner")
+                _partial_trigger_r = (
+                    _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_IMPULSE_RESTART_TRIGGER_R", 1.45), 1.45)
+                    if _phase == "impulse_restart"
+                    else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_CORRECTION_END_TRIGGER_R", 0.85), 0.85)
+                )
+                _partial_trigger_r = _safe_float(fibo_phase_pm.get("partial_bank_trigger_r"), _partial_trigger_r)
+                if _phase in {"correction_end", "impulse_restart"} and float(r_now) >= float(_partial_trigger_r):
+                    _partial_pct = (
+                        _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_WINNER_PCT", 0.25), 0.25)
+                        if _winner
+                        else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_BASE_PCT", 0.35), 0.35)
+                    )
+                    _partial_pct = _safe_float(fibo_phase_pm.get("partial_bank_pct"), _partial_pct)
+                    _partial_volume = self._fibo_partial_close_volume(
+                        volume,
+                        _partial_pct,
+                        int(getattr(config, "FIBO_PM_MIN_PARTIAL_VOLUME", 1000) or 1000),
+                        int(getattr(config, "FIBO_PM_PARTIAL_VOLUME_STEP", 1000) or 1000),
+                    )
+                    if _partial_volume > 0:
+                        _partial_res = self.close_position(position_id=position_id, volume=_partial_volume)
+                        if bool(_partial_res.ok):
+                            _lock_r = (
+                                _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_WINNER_LOCK_R", 0.25), 0.25)
+                                if _winner
+                                else _safe_float(getattr(config, "FIBO_PM_PARTIAL_BANK_BASE_LOCK_R", 0.12), 0.12)
+                            )
+                            _lock_r = _safe_float(fibo_phase_pm.get("partial_bank_lock_r"), _lock_r)
+                            _bank_sl = entry + (risk * _lock_r) if direction == "long" else entry - (risk * _lock_r)
+                            _bank_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else planned_tp
+                            if _phase == "correction_end" and risk > 0:
+                                _bank_tp = max(ref + (risk * 0.30), _bank_tp) if direction == "long" else (min(ref - (risk * 0.30), _bank_tp) if self._target_valid_for_position(direction, entry, _bank_tp) else (ref - (risk * 0.30)))
+                            _bank_amend_ok = False
+                            _bank_action_name = f"fibo_partial_bank_{_phase}"
+                            _bank_action_sl = 0.0
+                            _bank_action_tp = 0.0
+                            if self._stop_valid_for_position(direction, entry, _bank_sl):
+                                _bank_amend = self.amend_position_sltp(
+                                    position_id=position_id,
+                                    stop_loss=_bank_sl,
+                                    take_profit=_bank_tp if self._target_valid_for_position(direction, entry, _bank_tp) else 0.0,
+                                    trailing_stop_loss=False,
+                                )
+                                _bank_amend_ok = bool(_bank_amend.ok)
+                                if _bank_amend_ok:
+                                    report["amended_positions"] += 1
+                                    _bank_action_sl = round(_bank_sl, 4)
+                                    _bank_action_tp = round(_bank_tp, 4) if self._target_valid_for_position(direction, entry, _bank_tp) else 0.0
+                                else:
+                                    _bank_action_name = f"fibo_partial_bank_close_only_{_phase}"
+                            else:
+                                _bank_action_name = f"fibo_partial_bank_close_only_{_phase}"
+                            _bank_action = self._enrich_fibo_pm_action(
+                                {
+                                    "journal_id": (journal_id or None),
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": _bank_action_name,
+                                    "reference_price": round(ref, 4),
+                                    "new_stop_loss": _bank_action_sl,
+                                    "new_take_profit": _bank_action_tp,
+                                    "r_now": round(float(r_now), 4),
+                                    "age_min": round(float(age_min), 4),
+                                    "details": {
+                                        "trigger": "phase_partial_bank",
+                                        "partial_close_volume": int(_partial_volume),
+                                        "partial_close_pct": round(float(_partial_pct), 4),
+                                        "phase": _phase,
+                                        "winner_profile": _winner,
+                                        "partial_trigger_r": round(float(_partial_trigger_r), 4),
+                                        "amend_ok": _bank_amend_ok,
+                                    },
+                                },
+                                phase_pm=fibo_phase_pm,
+                                entry=entry,
+                                stop_loss=stop_loss,
+                                current_price=ref,
+                            )
+                            report["pm_actions"].append(_bank_action)
+                            continue
+
             planned_tp_valid = self._target_valid_for_position(direction, entry, planned_tp)
             live_tp_valid = self._target_valid_for_position(direction, entry, live_tp)
             live_target_more_favorable = planned_tp_valid and live_tp_valid and self._target_more_favorable(direction, entry, live_tp, planned_tp)
@@ -5027,6 +7366,21 @@ class CTraderExecutor:
                     age_min=age_min,
                     r_now=r_now,
                 )
+                # Fallback: crypto DOM TP extension for BTC/ETH
+                if not bool(extension.get("active")) and not self._is_xau_symbol(symbol) and symbol.upper() in {"BTCUSD", "ETHUSD"}:
+                    try:
+                        extension = self._crypto_dom_tp_extension_plan(symbol=symbol, direction=direction, entry=entry, stop_loss=stop_loss, planned_tp=planned_tp, current_tp=target_tp, current_price=ref, r_now=r_now, age_min=age_min)
+                    except Exception:
+                        logger.debug("[PM] crypto_dom_tp_extension error for %s", symbol, exc_info=True)
+                if bool(extension.get("active")) and "fibo" in source:
+                    extension = self._apply_fibo_phase_extension(
+                        extension=extension,
+                        phase_pm=fibo_phase_pm,
+                        direction=direction,
+                        entry=entry,
+                        stop_loss=stop_loss,
+                        current_tp=target_tp,
+                    )
                 if bool(extension.get("active")):
                     new_sl = _safe_float(extension.get("new_stop_loss"), 0.0)
                     new_tp = _safe_float(extension.get("new_take_profit"), 0.0)
@@ -5038,7 +7392,7 @@ class CTraderExecutor:
                     )
                     if bool(res.ok):
                         report["amended_positions"] += 1
-                        report["pm_actions"].append({
+                        report["pm_actions"].append(self._enrich_fibo_pm_action({
                             "journal_id": (journal_id or None),
                             "position_id": position_id,
                             "source": source,
@@ -5052,8 +7406,46 @@ class CTraderExecutor:
                             "details": {
                                 **dict(extension.get("details") or {}),
                                 "trigger": "planned_target",
+                                "phase": str(fibo_phase_pm.get("phase") or "unknown"),
+                                "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
                             },
-                        })
+                        }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
+                        continue
+                if "fibo" in source and str(fibo_phase_pm.get("phase") or "") == "correction_end" and r_now is not None and r_now > 0:
+                    _phase_risk = abs(entry - stop_loss)
+                    _lock_pct = 0.75 if bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner") else 0.60
+                    _keep_risk = _phase_risk * max(0.10, 1.0 - _lock_pct)
+                    if direction == "long":
+                        _phase_sl = entry + (_phase_risk - _keep_risk)
+                        _phase_tp = max(ref + (_phase_risk * 0.35), target_tp)
+                    else:
+                        _phase_sl = entry - (_phase_risk - _keep_risk)
+                        _phase_tp = min(ref - (_phase_risk * 0.35), target_tp) if target_tp > 0 else (ref - (_phase_risk * 0.35))
+                    _phase_res = self.amend_position_sltp(
+                        position_id=position_id,
+                        stop_loss=_phase_sl if self._stop_valid_for_position(direction, entry, _phase_sl) else stop_loss,
+                        take_profit=_phase_tp if self._target_valid_for_position(direction, entry, _phase_tp) else target_tp,
+                        trailing_stop_loss=False,
+                    )
+                    if bool(_phase_res.ok):
+                        report["amended_positions"] += 1
+                        report["pm_actions"].append(self._enrich_fibo_pm_action({
+                            "journal_id": (journal_id or None),
+                            "position_id": position_id,
+                            "source": source,
+                            "symbol": symbol,
+                            "action": "fibo_correction_end_profit_lock",
+                            "reference_price": round(ref, 4),
+                            "new_stop_loss": round(_phase_sl, 4) if self._stop_valid_for_position(direction, entry, _phase_sl) else round(stop_loss, 4),
+                            "new_take_profit": round(_phase_tp, 4) if self._target_valid_for_position(direction, entry, _phase_tp) else round(target_tp, 4),
+                            "r_now": round(float(r_now), 4),
+                            "details": {
+                                "trigger": "planned_target",
+                                "phase": "correction_end",
+                                "winner_profile": bool(fibo_phase_pm.get("winner_profile")) or source.endswith(":winner"),
+                                "lock_pct": _lock_pct,
+                            },
+                        }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                         continue
                 res = self.close_position(position_id=position_id, volume=volume)
                 if bool(res.ok):
@@ -5106,6 +7498,15 @@ class CTraderExecutor:
                         age_min=age_min,
                         r_now=r_now,
                     )
+                    if bool(extension.get("active")) and "fibo" in source:
+                        extension = self._apply_fibo_phase_extension(
+                            extension=extension,
+                            phase_pm=fibo_phase_pm,
+                            direction=direction,
+                            entry=entry,
+                            stop_loss=stop_loss,
+                            current_tp=live_tp,
+                        )
                     if bool(extension.get("active")):
                         new_sl = _safe_float(extension.get("new_stop_loss"), 0.0)
                         new_tp = _safe_float(extension.get("new_take_profit"), 0.0)
@@ -5117,7 +7518,7 @@ class CTraderExecutor:
                         )
                         if bool(res.ok):
                             report["amended_positions"] += 1
-                            report["pm_actions"].append({
+                            report["pm_actions"].append(self._enrich_fibo_pm_action({
                                 "journal_id": (journal_id or None),
                                 "position_id": position_id,
                                 "source": source,
@@ -5131,8 +7532,10 @@ class CTraderExecutor:
                                 "details": {
                                     **dict(extension.get("details") or {}),
                                     "trigger": "live_target",
+                                    "phase": str(fibo_phase_pm.get("phase") or "unknown"),
+                                    "winner_profile": bool(fibo_phase_pm.get("winner_profile")),
                                 },
-                            })
+                            }, phase_pm=fibo_phase_pm, entry=entry, stop_loss=stop_loss, current_price=ref))
                             continue
                     res = self.close_position(position_id=position_id, volume=volume)
                     if bool(res.ok):
@@ -5146,7 +7549,8 @@ class CTraderExecutor:
                             "live_tp": round(live_tp, 4),
                         })
                     continue
-            active_defense = self._xau_active_defense_plan(
+            active_defense = self._policy_defense_plan(
+                position_id=position_id,
                 source=source,
                 symbol=symbol,
                 direction=direction,
@@ -5201,50 +7605,48 @@ class CTraderExecutor:
                                 "details": details,
                         })
                     continue
-                if not self._is_scheduled_canary_source(source):
-                    if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
-                        no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)
-                        no_follow_max_r = float(order_care_overrides.get("no_follow_max_r", 0.0) or 0.0)
-                        be_trigger_r = float(order_care_overrides.get("be_trigger_r", 0.0) or 0.0)
-                        be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
-                        trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
-                        stop_tol = max(abs(entry) * 0.000001, 0.01)
-                        if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
-                            res = self.close_position(position_id=position_id, volume=volume)
-                            if bool(res.ok):
-                                report["closed_profit_positions"] += 1
-                                report["pm_actions"].append({
-                                    "position_id": position_id,
-                                    "source": source,
-                                    "symbol": symbol,
-                                    "action": "xau_order_care_no_follow_close",
-                                    "reference_price": round(ref, 4),
-                                    "r_now": round(float(r_now), 4),
-                                    "age_min": round(float(age_min), 2),
-                                    "mode": str(order_care_state.get("mode") or ""),
-                                })
-                            continue
-                        if (r_now is not None) and float(r_now) >= be_trigger_r:
-                            r_current = float(r_now)
-                            trail_lock_r = float(be_lock_r)
-                            if r_current >= 1.0:
-                                trail_lock_r = max(trail_lock_r, 0.50)
-                            if r_current >= 2.0:
-                                trail_lock_r = max(trail_lock_r, 1.00)
-                            if r_current >= 3.0:
-                                trail_lock_r = max(trail_lock_r, 2.00)
-                            be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
-                            improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
-                            trimmed_tp = target_tp
-                            if trim_tp_r > 0:
-                                candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
-                                if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
-                                    trimmed_tp = candidate_tp
-                            if improves and abs(be_sl - stop_loss) > stop_tol:
+            elif str(active_defense.get("reason") or "") == "winner_protection_trailing_struct":
+                # V4 TRAILING_STRUCT: legacy active defense is disabled; the
+                # structural SL floor (peak-relative) must still be ratcheted
+                # or the state is a silent no-op.
+                trailing_details = dict(active_defense.get("details") or {})
+                floor_r_raw = trailing_details.get("sl_floor_r")
+                r_now_tf = floor_r_tf = entry_tf = ref_tf = sl_cur_tf = None
+                if floor_r_raw is not None and r_now is not None:
+                    try:
+                        r_now_tf = float(r_now)
+                        floor_r_tf = float(floor_r_raw)
+                        entry_tf = float(entry)
+                        ref_tf = float(ref)
+                        sl_cur_tf = float(stop_loss)
+                    except (TypeError, ValueError):
+                        r_now_tf = floor_r_tf = entry_tf = ref_tf = sl_cur_tf = None
+                if (
+                    r_now_tf is not None
+                    and abs(r_now_tf) > 1e-6
+                    and entry_tf is not None
+                    and entry_tf > 0
+                ):
+                    initial_risk_tf = abs(ref_tf - entry_tf) / abs(r_now_tf)
+                    if initial_risk_tf > 0:
+                        side_tf = str(direction or "").strip().lower()
+                        sl_target_tf = None
+                        if side_tf == "long":
+                            candidate_tf = entry_tf + floor_r_tf * initial_risk_tf
+                            if candidate_tf > sl_cur_tf:
+                                sl_target_tf = candidate_tf
+                        elif side_tf == "short":
+                            candidate_tf = entry_tf - floor_r_tf * initial_risk_tf
+                            if candidate_tf < sl_cur_tf:
+                                sl_target_tf = candidate_tf
+                        if sl_target_tf is not None:
+                            stop_tol_tf = max(abs(entry_tf) * 0.000001, 0.01)
+                            if abs(sl_target_tf - sl_cur_tf) > stop_tol_tf and self._stop_valid_for_management(direction, ref_tf, sl_target_tf):
+                                tp_for_amend_tf = target_tp if self._target_valid_for_position(direction, entry, target_tp) else 0.0
                                 res = self.amend_position_sltp(
                                     position_id=position_id,
-                                    stop_loss=be_sl,
-                                    take_profit=trimmed_tp,
+                                    stop_loss=sl_target_tf,
+                                    take_profit=tp_for_amend_tf,
                                     trailing_stop_loss=False,
                                 )
                                 if bool(res.ok):
@@ -5253,14 +7655,182 @@ class CTraderExecutor:
                                         "position_id": position_id,
                                         "source": source,
                                         "symbol": symbol,
-                                        "action": "xau_order_care_breakeven",
-                                        "reference_price": round(ref, 4),
-                                        "new_stop_loss": round(be_sl, 4),
-                                        "take_profit": round(trimmed_tp, 4),
-                                        "r_now": round(float(r_now), 4),
-                                        "mode": str(order_care_state.get("mode") or ""),
+                                        "action": "winner_protection_trailing_ratchet",
+                                        "reference_price": round(ref_tf, 4),
+                                        "new_stop_loss": round(sl_target_tf, 4),
+                                        "r_now": round(r_now_tf, 4),
+                                        "details": {**trailing_details, "sl_floor_r": round(floor_r_tf, 4)},
                                     })
-                                continue
+                continue  # TRAILING_STRUCT owns the trade; skip lower-state defenses
+            # DOM-only defense for non-XAU symbols (BTC/ETH)
+            if not self._is_xau_symbol(symbol) and symbol.upper() in {"BTCUSD", "ETHUSD"}:
+                try:
+                    crypto_dom = self._crypto_dom_defense_plan(symbol=symbol, direction=direction, entry=entry, stop_loss=stop_loss, current_price=ref, r_now=r_now, age_min=age_min)
+                    if bool(crypto_dom.get("active")):
+                        c_action = str(crypto_dom.get("action") or "").strip().lower()
+                        c_details = dict(crypto_dom.get("details") or {})
+                        if c_action == "close":
+                            res = self.close_position(position_id=position_id, volume=volume)
+                            if bool(res.ok):
+                                report["pm_actions"].append({"position_id": position_id, "source": source, "symbol": symbol, "action": str(crypto_dom.get("reason") or "crypto_dom_defense_close"), "reference_price": round(ref, 4), "r_now": (None if r_now is None else round(float(r_now), 4)), "details": c_details})
+                            continue
+                        if c_action == "tighten":
+                            c_new_sl = _safe_float(crypto_dom.get("new_stop_loss"), 0.0)
+                            c_stop_tol = max(abs(entry) * 0.000001, 0.01)
+                            if self._stop_valid_for_position(direction, entry, c_new_sl) and abs(c_new_sl - stop_loss) > c_stop_tol:
+                                res = self.amend_position_sltp(position_id=position_id, stop_loss=c_new_sl, take_profit=target_tp, trailing_stop_loss=False)
+                                if bool(res.ok):
+                                    report["amended_positions"] += 1
+                                    report["pm_actions"].append({"position_id": position_id, "source": source, "symbol": symbol, "action": str(crypto_dom.get("reason") or "crypto_dom_defense_tighten"), "reference_price": round(ref, 4), "new_stop_loss": round(c_new_sl, 4), "r_now": (None if r_now is None else round(float(r_now), 4)), "details": c_details})
+                            continue
+                except Exception:
+                    logger.debug("[PM] crypto_dom_defense error for %s", symbol, exc_info=True)
+            stagnation = self._stagnation_bail_plan(
+                symbol=symbol,
+                position_id=position_id,
+                age_min=age_min,
+                r_now=r_now,
+            )
+            if bool(stagnation.get("active")):
+                logger.info(
+                    "[stagnation_bail] close pos=%s sym=%s age=%.1fm peak_r=%.2f r_now=%.2f",
+                    position_id, symbol, float(age_min or 0.0),
+                    float((stagnation.get("details") or {}).get("peak_r") or 0.0),
+                    float(r_now or 0.0),
+                )
+                res = self.close_position(position_id=position_id, volume=volume)
+                if bool(res.ok):
+                    report["pm_actions"].append({
+                        "position_id": position_id,
+                        "source": source,
+                        "symbol": symbol,
+                        "action": "stagnation_bail",
+                        "reference_price": round(ref, 4),
+                        "r_now": (None if r_now is None else round(float(r_now), 4)),
+                        "details": dict(stagnation.get("details") or {}),
+                    })
+                continue
+            retrace_guard = self._profit_retrace_guard_plan(
+                source=source,
+                symbol=symbol,
+                direction=direction,
+                position_id=position_id,
+                entry=entry,
+                stop_loss=stop_loss,
+                current_price=ref,
+                confidence=confidence,
+                age_min=age_min,
+                r_now=r_now,
+            )
+            if bool(retrace_guard.get("active")):
+                guard_action = str(retrace_guard.get("action") or "").strip().lower()
+                guard_reason = str(retrace_guard.get("reason") or "profit_retrace_guard")
+                guard_details = dict(retrace_guard.get("details") or {})
+                if guard_action == "close":
+                    res = self.close_position(position_id=position_id, volume=volume)
+                    if bool(res.ok):
+                        report["closed_profit_positions"] += 1
+                        report["pm_actions"].append({
+                            "position_id": position_id,
+                            "source": source,
+                            "symbol": symbol,
+                            "action": guard_reason,
+                            "reference_price": round(ref, 4),
+                            "r_now": (None if r_now is None else round(float(r_now), 4)),
+                            "details": guard_details,
+                        })
+                    continue
+                if guard_action == "tighten":
+                    guard_sl = _safe_float(retrace_guard.get("new_stop_loss"), 0.0)
+                    guard_tp = live_tp if self._target_valid_for_position(direction, entry, live_tp) else target_tp
+                    stop_tol = max(abs(entry) * 0.000001, 0.01)
+                    if self._stop_valid_for_management(direction, ref, guard_sl) and abs(guard_sl - stop_loss) > stop_tol:
+                        res = self.amend_position_sltp(
+                            position_id=position_id,
+                            stop_loss=guard_sl,
+                            take_profit=guard_tp if self._target_valid_for_position(direction, entry, guard_tp) else 0.0,
+                            trailing_stop_loss=False,
+                        )
+                        if bool(res.ok):
+                            report["amended_positions"] += 1
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": guard_reason,
+                                "reference_price": round(ref, 4),
+                                "new_stop_loss": round(guard_sl, 4),
+                                "new_take_profit": round(guard_tp, 4) if self._target_valid_for_position(direction, entry, guard_tp) else 0.0,
+                                "r_now": (None if r_now is None else round(float(r_now), 4)),
+                                "details": guard_details,
+                            })
+                        continue
+            if not self._is_scheduled_canary_source(source):
+                if order_care_state and self._target_valid_for_position(direction, entry, target_tp):
+                    no_follow_age = float(order_care_overrides.get("no_follow_age_min", 0.0) or 0.0)
+                    no_follow_max_r = float(order_care_overrides.get("no_follow_max_r", 0.0) or 0.0)
+                    be_trigger_r = float(order_care_overrides.get("be_trigger_r", 0.0) or 0.0)
+                    be_lock_r = float(order_care_overrides.get("be_lock_r", 0.0) or 0.0)
+                    trim_tp_r = float(order_care_overrides.get("trim_tp_r", 0.0) or 0.0)
+                    stop_tol = max(abs(entry) * 0.000001, 0.01)
+                    profit_seek_active_pm = (
+                        bool(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", True))
+                        and self._is_xau_symbol(symbol)
+                        and (r_now is not None)
+                        and float(r_now) >= max(0.0, float(getattr(config, "CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", 0.15) or 0.15))
+                    )
+                    if (r_now is not None) and age_min >= no_follow_age and float(r_now) <= no_follow_max_r:
+                        res = self.close_position(position_id=position_id, volume=volume)
+                        if bool(res.ok):
+                            report["closed_profit_positions"] += 1
+                            report["pm_actions"].append({
+                                "position_id": position_id,
+                                "source": source,
+                                "symbol": symbol,
+                                "action": "xau_order_care_no_follow_close",
+                                "reference_price": round(ref, 4),
+                                "r_now": round(float(r_now), 4),
+                                "age_min": round(float(age_min), 2),
+                                "mode": str(order_care_state.get("mode") or ""),
+                            })
+                        continue
+                    if (r_now is not None) and float(r_now) >= be_trigger_r:
+                        r_current = float(r_now)
+                        trail_lock_r = float(be_lock_r)
+                        if r_current >= 1.0:
+                            trail_lock_r = max(trail_lock_r, 0.50)
+                        if r_current >= 2.0:
+                            trail_lock_r = max(trail_lock_r, 1.00)
+                        if r_current >= 3.0:
+                            trail_lock_r = max(trail_lock_r, 2.00)
+                        be_sl = entry + (risk * trail_lock_r) if direction == "long" else entry - (risk * trail_lock_r)
+                        improves = (be_sl > stop_loss) if direction == "long" else (be_sl < stop_loss)
+                        trimmed_tp = target_tp
+                        if trim_tp_r > 0 and not profit_seek_active_pm:
+                            candidate_tp = entry + (risk * trim_tp_r) if direction == "long" else entry - (risk * trim_tp_r)
+                            if self._target_valid_for_position(direction, entry, candidate_tp) and abs(candidate_tp - entry) < abs(target_tp - entry):
+                                trimmed_tp = candidate_tp
+                        if improves and abs(be_sl - stop_loss) > stop_tol:
+                            res = self.amend_position_sltp(
+                                position_id=position_id,
+                                stop_loss=be_sl,
+                                take_profit=trimmed_tp,
+                                trailing_stop_loss=False,
+                            )
+                            if bool(res.ok):
+                                report["amended_positions"] += 1
+                                report["pm_actions"].append({
+                                    "position_id": position_id,
+                                    "source": source,
+                                    "symbol": symbol,
+                                    "action": "xau_order_care_breakeven",
+                                    "reference_price": round(ref, 4),
+                                    "new_stop_loss": round(be_sl, 4),
+                                    "take_profit": round(trimmed_tp, 4),
+                                    "r_now": round(float(r_now), 4),
+                                    "mode": str(order_care_state.get("mode") or ""),
+                                })
+                            continue
                     if ":canary" in source and risk > 0 and self._target_valid_for_position(direction, entry, target_tp):
                         canary_be_trigger_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_TRIGGER_R", 0.80) or 0.80)
                         canary_be_lock_r = float(getattr(config, "CTRADER_PM_CANARY_FAMILY_BE_LOCK_R", 0.05) or 0.05)
@@ -5674,6 +8244,16 @@ class CTraderExecutor:
                 source = str(meta.get("source") or "").strip().lower()
                 symbol = str(pos.get("symbol") or meta.get("symbol") or "").strip().upper()
                 lane = str(meta.get("lane") or self._source_lane(source))
+                if not source and symbol:
+                    logger.warning(
+                        "[CTrader:Reconcile] position %s (%s) has NO source tag — "
+                        "label=%s comment=%s — marking as untagged_external",
+                        position_id, symbol,
+                        str(pos.get("label", "") or "")[:60],
+                        str(pos.get("comment", "") or "")[:60],
+                    )
+                    source = "untagged_external"
+                    lane = "external"
                 untracked_unsafe = False
                 journal_row = self._find_journal_match(
                     conn,
@@ -5835,9 +8415,10 @@ class CTraderExecutor:
                             "last_seen_utc": now_iso,
                         },
                         "source": source,
+                        "lane": lane,
                         "journal_row": journal_row,
                     })
-                if auto_close_unsafe and (untracked_unsafe or self._unsafe_untracked_position(pos, journal_id=journal_id)):
+                if auto_close_unsafe and lane != "external" and source != "untagged_external" and (untracked_unsafe or self._unsafe_untracked_position(pos, journal_id=journal_id)):
                     pending_close.append({"position_id": position_id, "source": source, "symbol": symbol})
             if seen_positions:
                 placeholders = ",".join(["?"] * len(seen_positions))
@@ -5861,6 +8442,19 @@ class CTraderExecutor:
                     "UPDATE ctrader_orders SET is_open=0, last_seen_utc=? WHERE account_id=?",
                     (now_iso, account_id),
                 )
+            alive = set(int(pid) for pid in seen_positions)
+            if self._position_peak_r:
+                self._position_peak_r = {
+                    int(pid): float(peak)
+                    for pid, peak in self._position_peak_r.items()
+                    if int(pid) in alive
+                }
+            # V4 WinnerProtection r_peak cache + persisted state — mirror prune.
+            if self._policy_r_peak_cache or self._policy_r_peak_meta:
+                try:
+                    self._prune_policy_rpeak(alive)
+                except Exception:
+                    logger.warning("[rpeak] prune raised during reconcile", exc_info=True)
             for deal in deals:
                 position_id = int(_safe_float(deal.get("position_id"), 0))
                 source = ""
@@ -5880,6 +8474,16 @@ class CTraderExecutor:
                     signal_run_id = str(prow["signal_run_id"] or "")
                     signal_run_no = int(prow["signal_run_no"] or 0)
                 else:
+                    # 2026-04-29 surgery: when there is no prior position row, try the
+                    # broker label/comment carried on the deal payload itself before
+                    # falling back to journal — that recovers the source field for
+                    # the path that bypassed sync_account_state (the silent-untagged
+                    # path responsible for 8/9 untagged trades on 2026-04-28).
+                    deal_meta = self._parse_label_meta(
+                        str(deal.get("label", "") or ""),
+                        str(deal.get("comment", "") or ""),
+                    )
+                    deal_source_hint = str(deal_meta.get("source") or "").strip().lower()
                     jrow = self._find_journal_match(
                         conn,
                         position_id=position_id,
@@ -5891,9 +8495,23 @@ class CTraderExecutor:
                     journal_id = int(jrow["id"]) if jrow is not None else None
                     jrow_obj = dict(jrow) if jrow is not None else {}
                     source = str(jrow_obj.get("source", "") or "").strip().lower()
+                    # If journal lookup also empty, use the broker label hint we just parsed.
+                    if not source and deal_source_hint:
+                        source = deal_source_hint
+                    # Last-resort observability tag so the deal does not disappear from
+                    # winner-logic / family-promotion analytics.
+                    if not source and symbol:
+                        source = "untagged_external"
                     lane = self._source_lane(source)
                     signal_run_id = str(jrow_obj.get("signal_run_id", "") or "")
                     signal_run_no = int(jrow_obj.get("signal_run_no", 0) or 0)
+                    if not signal_run_id:
+                        signal_run_id = str(deal_meta.get("run_id") or "")
+                    if signal_run_no <= 0:
+                        try:
+                            signal_run_no = int(deal_meta.get("run_no") or 0)
+                        except Exception:
+                            signal_run_no = 0
                 journal_detail_row = None
                 if journal_id is not None:
                     journal_detail_row = conn.execute(
@@ -5927,6 +8545,18 @@ class CTraderExecutor:
                             closed_at=str(deal.get("execution_utc") or now_iso),
                             extra={"kind": "ctrader_close", "deal": deal, "journal_id": journal_id},
                         )
+                    try:
+                        from copy_trade.manager import copy_trade_manager
+
+                        copy_trade_manager.enforce_close_follow_async(
+                            master_position_id=position_id,
+                            master_order_id=int(deal.get("order_id") or 0),
+                            master_deal_id=int(deal.get("deal_id") or 0),
+                            reason="master_close_reconcile",
+                            master_close_utc=str(deal.get("execution_utc") or now_iso),
+                        )
+                    except Exception as ct_err:
+                        logger.debug("[CopyTrade] reconcile close-follow skipped: %s", ct_err)
                 conn.execute(
                     """
                     INSERT INTO ctrader_deals(

@@ -196,8 +196,29 @@ def cmd_monitor():
             console.print("[yellow]Telegram runtime disabled for this monitor session.[/]")
         else:
             notifier.send_startup_message()
+        # ── cTrader OpenAPI token health check ──
+        if bool(getattr(config, "CTRADER_ENABLED", False)):
+            try:
+                from api.ctrader_token_manager import token_manager
+                health = token_manager.health_check()
+                if "critical" in str(health.get("status", "")):
+                    console.print(f"[red]🔴 cTrader Token: {health.get('message', 'CRITICAL')}[/]")
+                elif "refreshed" in str(health.get("status", "")):
+                    console.print(f"[green]✅ cTrader Token refreshed at startup[/]")
+                else:
+                    console.print(f"[green]✅ cTrader Token OK[/]")
+            except Exception as e:
+                console.print(f"[yellow]⚠️ cTrader token check skipped: {e}[/]")
+
         if bool(getattr(config, "SIM_ENABLED", True)):
             signal_simulator.start()
+        # ── Hermes self-improving loop ──
+        try:
+            from learning.hermes_loop import improvement_loop
+            improvement_loop.start(interval_sec=300)
+            console.print("[green]✅ Hermes self-improving loop started (5-min cycle)[/]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Hermes loop start skipped: {e}[/]")
         scheduler.start()
         if not telegram_disabled:
             admin_bot.start()

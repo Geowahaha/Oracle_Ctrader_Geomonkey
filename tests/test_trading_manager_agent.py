@@ -565,6 +565,66 @@ class TradingManagerAgentTests(unittest.TestCase):
         self.assertEqual(str((routing.get("changes") or {}).get("CTRADER_XAU_PRIMARY_FAMILY") or ""), "")
         self.assertEqual(str((routing.get("changes") or {}).get("CTRADER_XAU_ACTIVE_FAMILIES") or ""), swarm_families)
 
+    def test_trading_manager_swarm_support_yields_to_severe_loss(self):
+        swarm_families = "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up"
+        with patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", True, create=True), \
+             patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES", swarm_families, create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_PRIMARY_FAMILY", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.PERSISTENT_CANARY_STRATEGY_FAMILIES", swarm_families, create=True), \
+             patch.object(self.agent, "_current_value", side_effect=lambda key: {"CTRADER_XAU_PRIMARY_FAMILY": "xau_scalp_pullback_limit", "CTRADER_XAU_ACTIVE_FAMILIES": "xau_scalp_pullback_limit", "PERSISTENT_CANARY_STRATEGY_FAMILIES": swarm_families}.get(key, "")):
+            rec = self.agent._derive_xau_family_routing_recommendation(
+                selected_family="xau_scalp_pullback_limit",
+                shock={},
+                losses={"resolved": 5, "losses": 4, "pnl_usd": -12.5},
+                pb_source_stats={},
+                scheduled_source_stats={},
+                scheduled_family_calibration={},
+                best_same_situation={},
+                best_family_today={},
+                winner_memory_reference={},
+                upcoming_events=[],
+                post_event_learning=[],
+            )
+
+        self.assertEqual(str(rec.get("mode") or ""), "shock_demote")
+        self.assertNotEqual(str(rec.get("mode") or ""), "swarm_support_all")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_PRIMARY_FAMILY") or ""), "xau_scalp_pullback_limit")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_ACTIVE_FAMILIES") or ""), "xau_scalp_pullback_limit")
+
+    def test_trading_manager_swarm_support_yields_to_recent_loss_regime(self):
+        swarm_families = "xau_scalp_pullback_limit,xau_scalp_tick_depth_filter,xau_scalp_microtrend_follow_up"
+        recent_reviews = [
+            {"pnl_usd": -3.4, "source": "xauusd_scheduled:canary"},
+            {"pnl_usd": -1.44, "source": "scalp_xauusd:fss:canary"},
+            {"pnl_usd": 1.82, "source": "xauusd_scheduled:canary"},
+        ]
+        with patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", True, create=True), \
+             patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES", swarm_families, create=True), \
+             patch("learning.trading_manager_agent.config.TRADING_MANAGER_XAU_ORDER_CARE_MIN_LOSSES", 2, create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_PRIMARY_FAMILY", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit", create=True), \
+             patch("learning.trading_manager_agent.config.PERSISTENT_CANARY_STRATEGY_FAMILIES", swarm_families, create=True), \
+             patch.object(self.agent, "_current_value", side_effect=lambda key: {"CTRADER_XAU_PRIMARY_FAMILY": "xau_scalp_pullback_limit", "CTRADER_XAU_ACTIVE_FAMILIES": "xau_scalp_pullback_limit", "PERSISTENT_CANARY_STRATEGY_FAMILIES": swarm_families}.get(key, "")):
+            rec = self.agent._derive_xau_family_routing_recommendation(
+                selected_family="xau_scalp_pullback_limit",
+                shock={},
+                losses={},
+                pb_source_stats={},
+                scheduled_source_stats={},
+                scheduled_family_calibration={},
+                best_same_situation={},
+                best_family_today={},
+                winner_memory_reference={},
+                upcoming_events=[],
+                post_event_learning=[],
+                recent_order_reviews=recent_reviews,
+            )
+
+        self.assertEqual(str(rec.get("mode") or ""), "recent_loss_demote")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_PRIMARY_FAMILY") or ""), "xau_scalp_pullback_limit")
+        self.assertEqual(str((rec.get("changes") or {}).get("CTRADER_XAU_ACTIVE_FAMILIES") or ""), "xau_scalp_pullback_limit")
+
     def test_trading_manager_swarm_support_mode_does_not_flag_selected_family_lag(self):
         (self.report_dir / "mission_progress_report.json").write_text(
             json.dumps({"symbols": [{"symbol": "XAUUSD", "selected_family": "xau_scheduled_trend", "selected_regime": "trend_priority"}]}),
@@ -1306,13 +1366,18 @@ class TradingManagerAgentTests(unittest.TestCase):
         care_state = dict(state.get("xau_order_care") or {})
         self.assertEqual(str(care_state.get("mode") or ""), "continuation_fail_fast")
         self.assertEqual(str(care_state.get("status") or ""), "active")
+        self.assertIn("xauusd_scheduled", list(care_state.get("allowed_sources") or []))
+        self.assertIn("xauusd_scheduled:winner", list(care_state.get("allowed_sources") or []))
         self.assertIn("scalp_xauusd:canary", list(care_state.get("allowed_sources") or []))
         self.assertIn("scalp_xauusd:td:canary", list(care_state.get("allowed_sources") or []))
+        self.assertIn("scalp_xauusd:tc:canary", list(care_state.get("allowed_sources") or []))
         desks = dict(care_state.get("desks") or {})
         self.assertIn("fss_confirmation", desks)
         self.assertIn("limit_retest", desks)
         self.assertEqual(str(((desks.get("fss_confirmation") or {}).get("mode") or "")), "continuation_fail_fast")
         self.assertEqual(str(((desks.get("limit_retest") or {}).get("mode") or "")), "retest_absorption_guard")
+        self.assertIn("xauusd_scheduled:winner", list((desks.get("limit_retest") or {}).get("allowed_sources") or []))
+        self.assertIn("scalp_xauusd:tc:canary", list((desks.get("limit_retest") or {}).get("allowed_sources") or []))
         self.assertAlmostEqual(float((dict(care_state.get("overrides") or {})).get("no_follow_age_min") or 0.0), 5.0, places=6)
         self.assertGreaterEqual(int((dict(care_state.get("overrides") or {})).get("close_score") or 0), 4)
 
@@ -1353,7 +1418,7 @@ class TradingManagerAgentTests(unittest.TestCase):
 
         self.assertEqual(str(apply_out.get("status") or ""), "held")
         self.assertEqual(str(care_state.get("status") or ""), "active")
-        self.assertIn("scalp_xauusd:canary", list(care_state.get("allowed_sources") or []))
+        self.assertEqual(list(care_state.get("allowed_sources") or []), ["scalp_xauusd:canary", "scalp_xauusd:td:canary"])
 
     def test_trading_manager_adds_flow_short_sidecar_to_experimental_set(self):
         (self.report_dir / "chart_state_memory_report.json").write_text(

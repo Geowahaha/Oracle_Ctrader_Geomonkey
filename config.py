@@ -5,25 +5,33 @@ Loads from .env.local first (highest priority), then falls back to .env
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Optional
 from dotenv import load_dotenv
 
 # ── Load order: .env.local → .env ────────────────────────────────────────────
 _BASE = Path(__file__).parent
 
+# In pytest runs we avoid loading user-local `.env.local` to keep unit tests deterministic.
+# Note: `PYTEST_CURRENT_TEST` may not be set yet during module import, so also detect via argv.
+_is_pytest = bool((os.getenv("PYTEST_CURRENT_TEST", "") or "").strip()) or any(
+    "pytest" in str(a).lower() for a in sys.argv
+)
+
 # .env.local overrides everything — this is your real config file
 _env_local = _BASE / ".env.local"
-if _env_local.exists():
-    load_dotenv(dotenv_path=_env_local, override=True)
-    print("[Config] Loaded: .env.local")
-else:
-    # Fallback to plain .env if present
-    _env_file = _BASE / ".env"
-    if _env_file.exists():
-        load_dotenv(dotenv_path=_env_file, override=True)
-        print("[Config] Loaded: .env (tip: rename to .env.local)")
+if not _is_pytest:
+    if _env_local.exists():
+        load_dotenv(dotenv_path=_env_local, override=True)
+        print("[Config] Loaded: .env.local")
     else:
-        print("[Config] WARNING: No .env.local found - using system environment variables only")
+        # Fallback to plain .env if present
+        _env_file = _BASE / ".env"
+        if _env_file.exists():
+            load_dotenv(dotenv_path=_env_file, override=True)
+            print("[Config] Loaded: .env (tip: rename to .env.local)")
+        else:
+            print("[Config] WARNING: No .env.local found - using system environment variables only")
 
 
 class Config:
@@ -57,7 +65,7 @@ class Config:
     CTRADER_SYNC_DEALS_LOOKBACK_HOURS: int = int(os.getenv("CTRADER_SYNC_DEALS_LOOKBACK_HOURS", "72"))
     CTRADER_EXECUTOR_TIMEOUT_SEC: int = int(os.getenv("CTRADER_EXECUTOR_TIMEOUT_SEC", "25"))
     CTRADER_HEALTHCHECK_TIMEOUT_SEC: int = int(os.getenv("CTRADER_HEALTHCHECK_TIMEOUT_SEC", "18"))
-    CTRADER_ALLOWED_SOURCES: str = os.getenv("CTRADER_ALLOWED_SOURCES", "scalp_xauusd,scalp_ethusd,scalp_btcusd,xauusd_scheduled,xauusd_scheduled:winner")
+    CTRADER_ALLOWED_SOURCES: str = os.getenv("CTRADER_ALLOWED_SOURCES", "scalp_xauusd,scalp_ethusd,scalp_btcusd,xauusd_scheduled,xauusd_scheduled:winner,fibo_xauusd,fibo_xauusd:winner")
     CTRADER_ALLOWED_SYMBOLS: str = os.getenv("CTRADER_ALLOWED_SYMBOLS", "XAUUSD,ETHUSD,BTCUSD")
     CTRADER_SOURCE_PROFILE_GATE_ENABLED: bool = os.getenv("CTRADER_SOURCE_PROFILE_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE: float = float(os.getenv("CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", "70.0"))
@@ -65,6 +73,86 @@ class Config:
     CTRADER_XAU_SCHEDULED_ALLOWED_TIMEFRAMES: str = os.getenv("CTRADER_XAU_SCHEDULED_ALLOWED_TIMEFRAMES", "1h")
     CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES: str = os.getenv("CTRADER_XAU_SCHEDULED_ALLOWED_ENTRY_TYPES", "limit")
     CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED: bool = os.getenv("CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_IMPULSE_GUARD_ENABLED: bool = os.getenv("XAU_IMPULSE_GUARD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Opus 4.7 fake-smart confidence stacking fix foundation. Default OFF means
+    # helper modules/tests can ship without changing live routing behavior.
+    XAU_NEW_ROUTER_ENABLED: bool = os.getenv("XAU_NEW_ROUTER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Highest-priority XAU live rule: if a scanner emits an XAUUSD opportunity,
+    # route it to cTrader live execution; strategy gates may tag/adjust but must
+    # not turn the opportunity into shadow-only or pre-dispatch filtered.
+    XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED: bool = os.getenv("XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Profit Reservoir / Basket Guardian (Opus 4.7): post-fill PM only.
+    # Default shadow keeps opportunity-first entries intact and records would-actions;
+    # live actions require explicit XAU_GUARDIAN_MODE=micro_live|half_live|full.
+    XAU_GUARDIAN_ENABLED: bool = os.getenv("XAU_GUARDIAN_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GUARDIAN_MODE: str = os.getenv("XAU_GUARDIAN_MODE", "shadow").strip().lower()
+    XAU_GUARDIAN_INTERVAL_SEC: int = int(os.getenv("XAU_GUARDIAN_INTERVAL_SEC", "60"))
+    XAU_GUARDIAN_BASE_GIVEBACK_PCT: float = float(os.getenv("XAU_GUARDIAN_BASE_GIVEBACK_PCT", "0.10"))
+    XAU_GUARDIAN_HARD_GIVEBACK_PCT: float = float(os.getenv("XAU_GUARDIAN_HARD_GIVEBACK_PCT", "0.25"))
+    XAU_GUARDIAN_MAX_PRUNE_POSITIONS: int = int(os.getenv("XAU_GUARDIAN_MAX_PRUNE_POSITIONS", "2"))
+    XAU_GUARDIAN_MAX_ACTIONS_PER_5MIN: int = int(os.getenv("XAU_GUARDIAN_MAX_ACTIONS_PER_5MIN", "3"))
+    XAU_GUARDIAN_RUNNER_PRESERVE_R: float = float(os.getenv("XAU_GUARDIAN_RUNNER_PRESERVE_R", "1.5"))
+    XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC: int = int(os.getenv("XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC", "120"))
+    XAU_GUARDIAN_RUNTIME_PATH: str = os.getenv("XAU_GUARDIAN_RUNTIME_PATH", "data/runtime/xau_basket_truth.json")
+    # Historical scalp_xauusd:winner LONG reservoir is PM-only: permit runner
+    # preservation / better-entry confirmation without size/risk increase.
+    XAU_WINNER_LONG_RESERVOIR_PM_ENABLED: bool = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_WINNER_LONG_RESERVOIR_PM_HOURS: str = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_HOURS", "12,20,22")
+    XAU_WINNER_LONG_RESERVOIR_PM_SOURCE: str = os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_SOURCE", "scalp_xauusd:winner")
+    XAU_WINNER_LONG_RESERVOIR_PM_MIN_R: float = float(os.getenv("XAU_WINNER_LONG_RESERVOIR_PM_MIN_R", "-0.25"))
+    # Guardian v2 stop-bleed governor: preserves opportunity-first scanning while
+    # freezing only the currently adverse/crowded XAU side/family.
+    XAU_GOVERNOR_V2_ENABLED: bool = os.getenv("XAU_GOVERNOR_V2_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GOVERNOR_V2_MODE: str = os.getenv("XAU_GOVERNOR_V2_MODE", "live").strip().lower()
+    XAU_GOVERNOR_V2_RUNTIME_PATH: str = os.getenv("XAU_GOVERNOR_V2_RUNTIME_PATH", "data/runtime/xau_governor_state.json")
+    XAU_GUARDIAN_V2_DRYRUN: bool = os.getenv("XAU_GUARDIAN_V2_DRYRUN", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GOV_G1_ENTROPY_NATS: float = float(os.getenv("XAU_GOV_G1_ENTROPY_NATS", "0.5"))
+    XAU_GOV_G1_MIN_SAMESIDE: int = int(os.getenv("XAU_GOV_G1_MIN_SAMESIDE", "5"))
+    XAU_GOV_G1_VELOCITY_THRESHOLD_USD_PER_MIN: float = float(os.getenv("XAU_GOV_G1_VELOCITY_THRESHOLD_USD_PER_MIN", "-8"))
+    XAU_GOV_G1_FREEZE_MIN: int = int(os.getenv("XAU_GOV_G1_FREEZE_MIN", "15"))
+    XAU_GOV_G2_BASE_LONG_USD: float = float(os.getenv("XAU_GOV_G2_BASE_LONG_USD", "30"))
+    XAU_GOV_G2_BASE_SHORT_USD: float = float(os.getenv("XAU_GOV_G2_BASE_SHORT_USD", "30"))
+    XAU_GOV_G2_REFILL_RATIO: float = float(os.getenv("XAU_GOV_G2_REFILL_RATIO", "0.4"))
+    XAU_GOV_G4_LINEAGE_WINDOW_SEC: int = int(os.getenv("XAU_GOV_G4_LINEAGE_WINDOW_SEC", "90"))
+    XAU_GOV_G4_LOSS_STREAK: int = int(os.getenv("XAU_GOV_G4_LOSS_STREAK", "2"))
+    XAU_GOV_G4_COOLDOWN_MIN: int = int(os.getenv("XAU_GOV_G4_COOLDOWN_MIN", "15"))
+    XAU_GOV_STALE_TICK_MAX_AGE_SEC: int = int(os.getenv("XAU_GOV_STALE_TICK_MAX_AGE_SEC", os.getenv("XAU_GUARDIAN_STALE_TICK_MAX_AGE_SEC", "600")))
+    XAU_GOV_KILL_IF_STATE_STALE_SEC: int = int(os.getenv("XAU_GOV_KILL_IF_STATE_STALE_SEC", "90"))
+    XAU_IMPULSE_GUARD_MIN_CONFIDENCE: float = float(os.getenv("XAU_IMPULSE_GUARD_MIN_CONFIDENCE", "0.70"))
+    XAU_IMPULSE_GUARD_BLOCK_STATES: str = os.getenv("XAU_IMPULSE_GUARD_BLOCK_STATES", "impulse_run")
+    # Opus 4.7 non-Fibo redesign (demo-first): dynamic confidence floors,
+    # side-specific risk throttle, and min planned R:R. Kill switch bypasses all.
+    XAU_NONFIBO_REDESIGN_KILL: bool = os.getenv("XAU_NONFIBO_REDESIGN_KILL", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RASG_ENABLED: bool = os.getenv("XAU_RASG_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RASG_LOOKBACK_HOURS: float = float(os.getenv("XAU_RASG_LOOKBACK_HOURS", "144"))
+    XAU_RASG_MIN_TRADES: int = int(os.getenv("XAU_RASG_MIN_TRADES", "3"))
+    XAU_RASG_MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("XAU_RASG_MAX_CONSECUTIVE_LOSSES", "3"))
+    XAU_RASG_LOSS_USD_TRIGGER: float = float(os.getenv("XAU_RASG_LOSS_USD_TRIGGER", "8.0"))
+    XAU_RASG_THROTTLE_MULT: float = float(os.getenv("XAU_RASG_THROTTLE_MULT", "0.30"))
+    XAU_CONF_FLOOR_DYNAMIC: bool = os.getenv("XAU_CONF_FLOOR_DYNAMIC", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_CONF_FLOOR_LOOKBACK_HOURS: float = float(os.getenv("XAU_CONF_FLOOR_LOOKBACK_HOURS", "336"))
+    XAU_CONF_FLOOR_WINDOW: int = int(os.getenv("XAU_CONF_FLOOR_WINDOW", "10"))
+    XAU_CONF_FLOOR_MIN_TRADES: int = int(os.getenv("XAU_CONF_FLOOR_MIN_TRADES", "5"))
+    XAU_CONF_FLOOR_LOW_WR: float = float(os.getenv("XAU_CONF_FLOOR_LOW_WR", "0.35"))
+    XAU_CONF_FLOOR_HIGH_WR: float = float(os.getenv("XAU_CONF_FLOOR_HIGH_WR", "0.55"))
+    XAU_CONF_FLOOR_RAISE_DELTA: float = float(os.getenv("XAU_CONF_FLOOR_RAISE_DELTA", "5.0"))
+    XAU_CONF_FLOOR_LOWER_DELTA: float = float(os.getenv("XAU_CONF_FLOOR_LOWER_DELTA", "-3.0"))
+    XAU_CONF_FLOOR_DELTA_MAX: float = float(os.getenv("XAU_CONF_FLOOR_DELTA_MAX", "5.0"))
+    XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE: bool = os.getenv("XAU_CONF_FLOOR_SKIP_WHEN_RASG_ACTIVE", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_MIN_RR_ENFORCE: bool = os.getenv("XAU_MIN_RR_ENFORCE", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_MIN_PLANNED_RR: float = float(os.getenv("XAU_MIN_PLANNED_RR", "2.7"))
+    # XAU Behavior V3 (Opus 4.7): post-capitulation reclaim/staircase capture.
+    # Default is shadow-safe: metadata only, no live gate bypass or sizing change.
+    XAU_RECLAIM_V3_ENABLED: bool = os.getenv("XAU_RECLAIM_V3_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RECLAIM_V3_SHADOW: bool = os.getenv("XAU_RECLAIM_V3_SHADOW", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_RECLAIM_MIN_SCORE: float = float(os.getenv("XAU_RECLAIM_MIN_SCORE", "62"))
+    XAU_RECLAIM_CONF_BONUS: float = float(os.getenv("XAU_RECLAIM_CONF_BONUS", "2.5"))
+    XAU_RECLAIM_CONF_BONUS_CAP: float = float(os.getenv("XAU_RECLAIM_CONF_BONUS_CAP", "85"))
+    XAU_RECLAIM_BASE_COMPRESS_RATIO: float = float(os.getenv("XAU_RECLAIM_BASE_COMPRESS_RATIO", "0.70"))
+    XAU_RECLAIM_BASE_MIN_BARS: int = int(os.getenv("XAU_RECLAIM_BASE_MIN_BARS", "4"))
+    XAU_RECLAIM_MAX_RISK_MULT: float = float(os.getenv("XAU_RECLAIM_MAX_RISK_MULT", "1.75"))
+    XAU_RECLAIM_MIN_RR: float = float(os.getenv("XAU_RECLAIM_MIN_RR", "3.0"))
+    XAU_RECLAIM_WINNER_OVERRIDE: bool = os.getenv("XAU_RECLAIM_WINNER_OVERRIDE", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED: bool = os.getenv("CTRADER_SCHEDULED_CANARY_RR_REBALANCE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_SCHEDULED_CANARY_MIN_RR: float = float(os.getenv("CTRADER_SCHEDULED_CANARY_MIN_RR", "0.85"))
     CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO: float = float(os.getenv("CTRADER_SCHEDULED_CANARY_MIN_STOP_KEEP_RATIO", "0.58"))
@@ -83,6 +171,18 @@ class Config:
     CTRADER_PRICE_SANITY_CRYPTO_MAX_DEVIATION_PCT: float = float(os.getenv("CTRADER_PRICE_SANITY_CRYPTO_MAX_DEVIATION_PCT", "0.35"))
     CTRADER_PRICE_SANITY_XAU_MAX_DEVIATION_PCT: float = float(os.getenv("CTRADER_PRICE_SANITY_XAU_MAX_DEVIATION_PCT", "0.08"))
     CTRADER_PRICE_SANITY_FX_MAX_DEVIATION_PCT: float = float(os.getenv("CTRADER_PRICE_SANITY_FX_MAX_DEVIATION_PCT", "0.03"))
+    CTRADER_RR_FLOOR_ENABLED: bool = os.getenv("CTRADER_RR_FLOOR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_RR_FLOOR_MIN: float = float(os.getenv("CTRADER_RR_FLOOR_MIN", "1.2"))
+    CTRADER_RR_FLOOR_OVERRIDES: str = os.getenv("CTRADER_RR_FLOOR_OVERRIDES", "")
+    CTRADER_TP_NORMALIZER_ENABLED: bool = os.getenv("CTRADER_TP_NORMALIZER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_TP_NORMALIZER_TARGET_RR: float = float(os.getenv("CTRADER_TP_NORMALIZER_TARGET_RR", "1.5"))
+    CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT: float = float(os.getenv("CTRADER_TP_NORMALIZER_MAX_EXTEND_PCT", "0.60"))
+    CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES: str = os.getenv("CTRADER_TP_NORMALIZER_BLACKLIST_SOURCES", "fibo")
+    CTRADER_PM_STAGNATION_BAIL_ENABLED: bool = os.getenv("CTRADER_PM_STAGNATION_BAIL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_STAGNATION_MIN_AGE_XAU_MIN: float = float(os.getenv("CTRADER_PM_STAGNATION_MIN_AGE_XAU_MIN", "8.0"))
+    CTRADER_PM_STAGNATION_MIN_AGE_CRYPTO_MIN: float = float(os.getenv("CTRADER_PM_STAGNATION_MIN_AGE_CRYPTO_MIN", "12.0"))
+    CTRADER_PM_STAGNATION_MAX_PEAK_R: float = float(os.getenv("CTRADER_PM_STAGNATION_MAX_PEAK_R", "0.30"))
+    CTRADER_PM_STAGNATION_MAX_R_NOW: float = float(os.getenv("CTRADER_PM_STAGNATION_MAX_R_NOW", "0.0"))
     CTRADER_MARKET_ENTRY_DRIFT_GUARD_ENABLED: bool = os.getenv("CTRADER_MARKET_ENTRY_DRIFT_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_MARKET_ENTRY_MAX_DRIFT_PCT: float = float(os.getenv("CTRADER_MARKET_ENTRY_MAX_DRIFT_PCT", "0.12"))
     CTRADER_MARKET_ENTRY_MAX_DRIFT_SYMBOL_OVERRIDES: str = os.getenv("CTRADER_MARKET_ENTRY_MAX_DRIFT_SYMBOL_OVERRIDES", "")
@@ -103,7 +203,214 @@ class Config:
     PERSISTENT_CANARY_FAMILY_MT5_VOLUME_MULTIPLIER: float = float(os.getenv("PERSISTENT_CANARY_FAMILY_MT5_VOLUME_MULTIPLIER", "0.10"))
     PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("PERSISTENT_CANARY_FAMILY_CTRADER_RISK_USD", "1.25"))
     PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED: bool = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-    PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES: str = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES", "xau_scalp_tick_depth_filter,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_range_repair")
+    PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES: str = os.getenv("PERSISTENT_CANARY_EXPERIMENTAL_FAMILIES", "xau_scalp_tick_depth_filter,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scalp_flow_short_sidecar,xau_scalp_range_repair,xau_fibo_advance")
+    MEMPALACE_FAMILY_ENABLED: bool = os.getenv("MEMPALACE_FAMILY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    MEMPALACE_FAMILY_ALLOWED_SYMBOLS: str = os.getenv("MEMPALACE_FAMILY_ALLOWED_SYMBOLS", "XAUUSD")
+    MEMPALACE_FAMILY_ALLOWED_BASE_SOURCES: str = os.getenv("MEMPALACE_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd")
+    MEMPALACE_FAMILY_SIGNAL_PATH: str = os.getenv("MEMPALACE_FAMILY_SIGNAL_PATH", "data/runtime/mempalace_family_signal.json")
+    MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC: int = int(os.getenv("MEMPALACE_FAMILY_SIGNAL_MAX_AGE_SEC", "180"))
+    MEMPALACE_FAMILY_MIN_CONFIDENCE: float = float(os.getenv("MEMPALACE_FAMILY_MIN_CONFIDENCE", "68"))
+    MEMPALACE_FAMILY_PRIORITY: int = int(os.getenv("MEMPALACE_FAMILY_PRIORITY", "165"))
+    MEMPALACE_FAMILY_STRATEGY_ID: str = os.getenv("MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1")
+    MEMPALACE_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("MEMPALACE_FAMILY_CTRADER_RISK_USD", "0.75"))
+    TRADING_CENTRAL_FAMILY_ENABLED: bool = os.getenv("TRADING_CENTRAL_FAMILY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS: str = os.getenv("TRADING_CENTRAL_FAMILY_ALLOWED_SYMBOLS", "XAUUSD")
+    TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES: str = os.getenv("TRADING_CENTRAL_FAMILY_ALLOWED_BASE_SOURCES", "scalp_xauusd")
+    TRADING_CENTRAL_FAMILY_SIGNAL_PATH: str = os.getenv("TRADING_CENTRAL_FAMILY_SIGNAL_PATH", "data/runtime/trading_central_intraday_signal.json")
+    TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC: int = int(os.getenv("TRADING_CENTRAL_FAMILY_SIGNAL_MAX_AGE_SEC", "5400"))
+    TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE: float = float(os.getenv("TRADING_CENTRAL_FAMILY_MIN_CONFIDENCE", "72"))
+    TRADING_CENTRAL_FAMILY_PRIORITY: int = int(os.getenv("TRADING_CENTRAL_FAMILY_PRIORITY", "166"))
+    TRADING_CENTRAL_FAMILY_STRATEGY_ID: str = os.getenv("TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1")
+    TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD: float = float(os.getenv("TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", "0.65"))
+
+    # ── Fibonacci Advance (fibo_advance lane / xau_fibo_advance family) ────────
+    FIBO_ADVANCE_ENABLED: bool = os.getenv("FIBO_ADVANCE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_ADVANCE_MIN_CONFIDENCE: float = float(os.getenv("FIBO_ADVANCE_MIN_CONFIDENCE", "62.0"))
+    FIBO_ADVANCE_MIN_FIBO_SCORE: float = float(os.getenv("FIBO_ADVANCE_MIN_FIBO_SCORE", "38.0"))
+    FIBO_ADVANCE_MIN_RR: float = float(os.getenv("FIBO_ADVANCE_MIN_RR", "1.2"))
+    FIBO_ADVANCE_MAX_LEVEL_DIST_PCT: float = float(os.getenv("FIBO_ADVANCE_MAX_LEVEL_DIST_PCT", "0.25"))
+    FIBO_ADVANCE_SWING_LOOKBACK: int = int(os.getenv("FIBO_ADVANCE_SWING_LOOKBACK", "5"))
+    FIBO_ADVANCE_MIN_IMPULSE_ATR: float = float(os.getenv("FIBO_ADVANCE_MIN_IMPULSE_ATR", "1.2"))
+    FIBO_ADVANCE_SL_ATR_BUFFER: float = float(os.getenv("FIBO_ADVANCE_SL_ATR_BUFFER", "0.25"))
+    FIBO_ADVANCE_CTRADER_RISK_USD: float = float(os.getenv("FIBO_ADVANCE_CTRADER_RISK_USD", "1.0"))
+    FIBO_ADVANCE_IMPULSE_RESTART_CONF_BONUS: float = float(os.getenv("FIBO_ADVANCE_IMPULSE_RESTART_CONF_BONUS", "6.0") or 6.0)
+    FIBO_ADVANCE_CORRECTION_END_CONF_BONUS: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_CONF_BONUS", "3.0") or 3.0)
+    FIBO_ADVANCE_IMPULSE_RESTART_RISK_MULT: float = float(os.getenv("FIBO_ADVANCE_IMPULSE_RESTART_RISK_MULT", "1.35") or 1.35)
+    FIBO_ADVANCE_CORRECTION_END_RISK_MULT: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_RISK_MULT", "1.15") or 1.15)
+    FIBO_ADVANCE_IMPULSE_RESTART_STOP_BUFFER_MULT: float = float(os.getenv("FIBO_ADVANCE_IMPULSE_RESTART_STOP_BUFFER_MULT", "0.85") or 0.85)
+    FIBO_ADVANCE_CORRECTION_END_STOP_BUFFER_MULT: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_STOP_BUFFER_MULT", "0.95") or 0.95)
+    FIBO_ADVANCE_IMPULSE_RESTART_TP2_MULT: float = float(os.getenv("FIBO_ADVANCE_IMPULSE_RESTART_TP2_MULT", "1.18") or 1.18)
+    FIBO_ADVANCE_IMPULSE_RESTART_TP3_MULT: float = float(os.getenv("FIBO_ADVANCE_IMPULSE_RESTART_TP3_MULT", "1.32") or 1.32)
+    FIBO_ADVANCE_CORRECTION_END_TP2_MULT: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_TP2_MULT", "1.08") or 1.08)
+    FIBO_ADVANCE_CORRECTION_END_TP3_MULT: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_TP3_MULT", "1.14") or 1.14)
+    # Microstructure thresholds (more lenient than base scanner — institutions accumulate quietly at Fib)
+    FIBO_ADVANCE_MICRO_DELTA_THR: float = float(os.getenv("FIBO_ADVANCE_MICRO_DELTA_THR", "0.30"))
+    FIBO_ADVANCE_MICRO_IMB_THR: float = float(os.getenv("FIBO_ADVANCE_MICRO_IMB_THR", "0.35"))
+    FIBO_ADVANCE_MICRO_VEL_THR: float = float(os.getenv("FIBO_ADVANCE_MICRO_VEL_THR", "0.05"))
+    # Fibonacci Killer protection thresholds
+    FIBO_ADVANCE_KILLER_ATR_MULT: float = float(os.getenv("FIBO_ADVANCE_KILLER_ATR_MULT", "1.8"))
+    FIBO_ADVANCE_KILLER_DELTA_THRESHOLD: float = float(os.getenv("FIBO_ADVANCE_KILLER_DELTA_THRESHOLD", "0.40"))
+    FIBO_ADVANCE_KILLER_VOL_SPIKE: float = float(os.getenv("FIBO_ADVANCE_KILLER_VOL_SPIKE", "2.5"))
+    FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP: float = float(os.getenv("FIBO_ADVANCE_KILLER_MAX_SPREAD_EXP", "1.25"))
+    FIBO_ADVANCE_KILLER_RETRACE_VEL: float = float(os.getenv("FIBO_ADVANCE_KILLER_RETRACE_VEL", "2.0"))
+    # Trend awareness (prevent April 7 disaster — strong D1 trend filter)
+    FIBO_TREND_STRONG_EMA_SPREAD_PCT: float = float(os.getenv("FIBO_TREND_STRONG_EMA_SPREAD_PCT", "0.5"))
+    FIBO_SESSION_DIRECTION_BIAS_PENALTY: float = float(os.getenv("FIBO_SESSION_DIRECTION_BIAS_PENALTY", "-12.0"))
+    # Soft pause after consecutive losses (faster circuit breaker)
+    FIBO_ADVANCE_SOFT_PAUSE_CONSEC: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_CONSEC", "5"))
+    FIBO_ADVANCE_SOFT_PAUSE_MIN: int = int(os.getenv("FIBO_ADVANCE_SOFT_PAUSE_MIN", "30"))
+    FIBO_ADVANCE_SCAN_INTERVAL_SEC: int = int(os.getenv("FIBO_ADVANCE_SCAN_INTERVAL_SEC", "300"))
+    # P2/P3 Fibo multi-timeframe shadow/analytics. Shadow-only; never dispatches orders.
+    FIBO_MTF_SHADOW_ENABLED: bool = os.getenv("FIBO_MTF_SHADOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Opportunity-first: emit every TF candidate. Alignment is a booster, never a gate/blocker.
+    FIBO_MTF_SHADOW_EMIT_ALL: bool = os.getenv("FIBO_MTF_SHADOW_EMIT_ALL", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED: bool = os.getenv("FIBO_MTF_SHADOW_INCLUDE_SUPPRESSED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Demo-only accelerated micro-live adapter: keeps FIBO_MTF_SHADOW evidence immutable,
+    # but allows a reviewed non-shadow cTrader source to fire one tiny probe per cycle.
+    FIBO_MTF_MICRO_LIVE_ENABLED: bool = os.getenv("FIBO_MTF_MICRO_LIVE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO: bool = os.getenv("FIBO_MTF_MICRO_LIVE_REQUIRE_DEMO", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS: bool = os.getenv("FIBO_MTF_MICRO_LIVE_IGNORE_CALENDAR_DAYS", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_SOURCE: str = os.getenv("FIBO_MTF_MICRO_LIVE_SOURCE", "fibo_xauusd")
+    FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE: int = int(os.getenv("FIBO_MTF_MICRO_LIVE_MAX_PER_CYCLE", "1") or 1)
+    FIBO_MTF_MICRO_LIVE_MIN_RR: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_RR", "3.0") or 3.0)
+    FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_RECLAIM_SCORE", "70.0") or 70.0)
+    FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT: int = int(os.getenv("FIBO_MTF_MICRO_LIVE_MIN_CLUSTER_COUNT", "2") or 2)
+    FIBO_MTF_MICRO_LIVE_ALLOWED_TFS: str = os.getenv("FIBO_MTF_MICRO_LIVE_ALLOWED_TFS", "M1,M5,M15,M30,H1")
+    FIBO_MTF_MICRO_LIVE_REQUIRE_IMPULSE_FOLLOW: bool = os.getenv("FIBO_MTF_MICRO_LIVE_REQUIRE_IMPULSE_FOLLOW", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_MTF_MICRO_LIVE_MAX_SL_DISTANCE: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MAX_SL_DISTANCE", "12.0") or 12.0)
+    FIBO_MTF_MICRO_LIVE_MAX_TP_DISTANCE: float = float(os.getenv("FIBO_MTF_MICRO_LIVE_MAX_TP_DISTANCE", "36.0") or 36.0)
+    FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_PER_EXTRA_TF", "3.0") or 3.0)
+    FIBO_MTF_ALIGN_BONUS_MAX: float = float(os.getenv("FIBO_MTF_ALIGN_BONUS_MAX", "12.0") or 12.0)
+    FIBO_MTF_PARENT_DEPTH: int = int(os.getenv("FIBO_MTF_PARENT_DEPTH", "3") or 3)
+    FIBO_MTF_ANALYTICS_MIN_TRADES: int = int(os.getenv("FIBO_MTF_ANALYTICS_MIN_TRADES", "30") or 30)
+    FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR: float = float(os.getenv("FIBO_MTF_ANALYTICS_MIN_PROFIT_FACTOR", "1.3") or 1.3)
+    FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE: float = float(os.getenv("FIBO_MTF_ANALYTICS_MAX_DIRECTION_MISMATCH_RATE", "0.10") or 0.10)
+    # Institution-grade gates
+    FIBO_ADVANCE_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_ADVANCE_SHARPNESS_KNIFE_THR", "30"))
+    FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_ADVANCE_MAX_IMPULSE_AGE_BARS", "40"))
+    # Impulse-birth detection (fibo-lane-local; annotates entry_mode and boosts
+    # score when a fresh impulse origin is detected from a tight base break).
+    # Additive: late_retrace behavior unchanged unless birth condition fires.
+    FIBO_IMPULSE_BIRTH_ENABLED: bool = os.getenv("FIBO_IMPULSE_BIRTH_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_IMPULSE_BIRTH_BASE_BARS: int = int(os.getenv("FIBO_IMPULSE_BIRTH_BASE_BARS", "8"))
+    FIBO_IMPULSE_BIRTH_MAX_BASE_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MAX_BASE_ATR", "1.2"))
+    FIBO_IMPULSE_BIRTH_MIN_BREAK_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_BREAK_ATR", "0.5"))
+    FIBO_IMPULSE_BIRTH_MIN_BODY_PCT: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_BODY_PCT", "0.55"))
+    FIBO_IMPULSE_BIRTH_MAX_BREAKOUT_AGE: int = int(os.getenv("FIBO_IMPULSE_BIRTH_MAX_BREAKOUT_AGE", "3"))
+    FIBO_IMPULSE_BIRTH_MAX_CHASE_ATR: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MAX_CHASE_ATR", "1.5"))
+    FIBO_IMPULSE_BIRTH_WHIPSAW_LOOKBACK: int = int(os.getenv("FIBO_IMPULSE_BIRTH_WHIPSAW_LOOKBACK", "10"))
+    FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE: float = float(os.getenv("FIBO_IMPULSE_BIRTH_MIN_CONFIDENCE", "0.55"))
+    FIBO_IMPULSE_BIRTH_SCORE_BONUS: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SCORE_BONUS", "10.0"))
+    FIBO_IMPULSE_BIRTH_STALE_AGE_BARS: int = int(os.getenv("FIBO_IMPULSE_BIRTH_STALE_AGE_BARS", "25"))
+    # Birth-anchor-based SL/TP for entry_mode == "early_origin" (scanner-local).
+    # When enabled, the scanner swaps the late-retrace fib for the birth fib
+    # when constructing entry / SL / TP, and uses the base as the stop anchor.
+    FIBO_IMPULSE_BIRTH_SLTP_ENABLED: bool = os.getenv("FIBO_IMPULSE_BIRTH_SLTP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_IMPULSE_BIRTH_SLTP_MIN_CONFIDENCE: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SLTP_MIN_CONFIDENCE", "0.60"))
+    FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER: float = float(os.getenv("FIBO_IMPULSE_BIRTH_SL_ATR_BUFFER", "0.25"))
+    FIBO_IMPULSE_BIRTH_ENTRY_RATIO: float = float(os.getenv("FIBO_IMPULSE_BIRTH_ENTRY_RATIO", "0.618"))
+    # Scout mode (H1→M15 intermediate setups — fires while waiting for Sniper)
+    FIBO_SCOUT_ENABLED: bool = os.getenv("FIBO_SCOUT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_SCOUT_MIN_CONFIDENCE: float = float(os.getenv("FIBO_SCOUT_MIN_CONFIDENCE", "55.0"))
+    FIBO_SCOUT_MIN_FIBO_SCORE: float = float(os.getenv("FIBO_SCOUT_MIN_FIBO_SCORE", "28.0"))
+    FIBO_SCOUT_MIN_RR: float = float(os.getenv("FIBO_SCOUT_MIN_RR", "1.0"))
+    FIBO_SCOUT_MAX_LEVEL_DIST_PCT: float = float(os.getenv("FIBO_SCOUT_MAX_LEVEL_DIST_PCT", "0.15"))
+    FIBO_SCOUT_SL_ATR_BUFFER: float = float(os.getenv("FIBO_SCOUT_SL_ATR_BUFFER", "0.20"))
+    FIBO_SCOUT_CTRADER_RISK_USD: float = float(os.getenv("FIBO_SCOUT_CTRADER_RISK_USD", "0.5"))
+    FIBO_SCOUT_IMPULSE_RESTART_CONF_BONUS: float = float(os.getenv("FIBO_SCOUT_IMPULSE_RESTART_CONF_BONUS", "4.0") or 4.0)
+    FIBO_SCOUT_CORRECTION_END_CONF_BONUS: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_CONF_BONUS", "2.0") or 2.0)
+    FIBO_SCOUT_IMPULSE_RESTART_RISK_MULT: float = float(os.getenv("FIBO_SCOUT_IMPULSE_RESTART_RISK_MULT", "1.25") or 1.25)
+    FIBO_SCOUT_CORRECTION_END_RISK_MULT: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_RISK_MULT", "1.05") or 1.05)
+    FIBO_SCOUT_IMPULSE_RESTART_STOP_BUFFER_MULT: float = float(os.getenv("FIBO_SCOUT_IMPULSE_RESTART_STOP_BUFFER_MULT", "0.90") or 0.90)
+    FIBO_SCOUT_CORRECTION_END_STOP_BUFFER_MULT: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_STOP_BUFFER_MULT", "0.96") or 0.96)
+    FIBO_SCOUT_IMPULSE_RESTART_TP2_MULT: float = float(os.getenv("FIBO_SCOUT_IMPULSE_RESTART_TP2_MULT", "1.12") or 1.12)
+    FIBO_SCOUT_IMPULSE_RESTART_TP3_MULT: float = float(os.getenv("FIBO_SCOUT_IMPULSE_RESTART_TP3_MULT", "1.18") or 1.18)
+    FIBO_SCOUT_CORRECTION_END_TP2_MULT: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_TP2_MULT", "1.05") or 1.05)
+    FIBO_SCOUT_CORRECTION_END_TP3_MULT: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_TP3_MULT", "1.10") or 1.10)
+    FIBO_SCOUT_SHARPNESS_KNIFE_THR: int = int(os.getenv("FIBO_SCOUT_SHARPNESS_KNIFE_THR", "25"))
+    FIBO_SCOUT_MAX_IMPULSE_AGE_BARS: int = int(os.getenv("FIBO_SCOUT_MAX_IMPULSE_AGE_BARS", "30"))
+    # When True, entry sharpness / knife gate blocks if capture features are missing (no blind Fib entries).
+    FIBO_REQUIRE_CAPTURE_FEATURES: bool = os.getenv("FIBO_REQUIRE_CAPTURE_FEATURES", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    # Reject Fib setup when |entry−SL| exceeds cap (0 = disabled). Tightens fat structural stops.
+    FIBO_ADVANCE_MAX_RISK_ATR_MULT: float = float(os.getenv("FIBO_ADVANCE_MAX_RISK_ATR_MULT", "0") or 0)
+    FIBO_ADVANCE_MAX_RISK_ENTRY_PCT: float = float(os.getenv("FIBO_ADVANCE_MAX_RISK_ENTRY_PCT", "0") or 0)
+    FIBO_SCOUT_MAX_RISK_ATR_MULT: float = float(os.getenv("FIBO_SCOUT_MAX_RISK_ATR_MULT", "0") or 0)
+    FIBO_SCOUT_MAX_RISK_ENTRY_PCT: float = float(os.getenv("FIBO_SCOUT_MAX_RISK_ENTRY_PCT", "0") or 0)
+    # Cap first TP distance in R so PM can bank sooner (0 = no cap). Long: tp1 <= entry+risk*R; short: tp1 >= entry−risk*R
+    FIBO_ADVANCE_TP1_MAX_R: float = float(os.getenv("FIBO_ADVANCE_TP1_MAX_R", "0") or 0)
+    FIBO_SCOUT_TP1_MAX_R: float = float(os.getenv("FIBO_SCOUT_TP1_MAX_R", "0") or 0)
+    # Evidence gate: do not let Fib trade early 38.2/50% pullbacks as if they were GP entries.
+    FIBO_ADVANCE_REQUIRE_GOLDEN_POCKET: bool = os.getenv("FIBO_ADVANCE_REQUIRE_GOLDEN_POCKET", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_SCOUT_REQUIRE_GOLDEN_POCKET: bool = os.getenv("FIBO_SCOUT_REQUIRE_GOLDEN_POCKET", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_ADVANCE_MIN_ENTRY_LEVEL_RATIO: float = float(os.getenv("FIBO_ADVANCE_MIN_ENTRY_LEVEL_RATIO", "0.618") or 0.618)
+    FIBO_SCOUT_MIN_ENTRY_LEVEL_RATIO: float = float(os.getenv("FIBO_SCOUT_MIN_ENTRY_LEVEL_RATIO", "0.618") or 0.618)
+    FIBO_ADVANCE_MIN_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_ADVANCE_MIN_RETRACEMENT_DEPTH", "0.618") or 0.618)
+    FIBO_SCOUT_MIN_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_SCOUT_MIN_RETRACEMENT_DEPTH", "0.618") or 0.618)
+    FIBO_ADVANCE_MAX_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_ADVANCE_MAX_RETRACEMENT_DEPTH", "0.786") or 0.786)
+    FIBO_SCOUT_MAX_RETRACEMENT_DEPTH: float = float(os.getenv("FIBO_SCOUT_MAX_RETRACEMENT_DEPTH", "0.786") or 0.786)
+    FIBO_GOLDEN_GATE_TOLERANCE: float = float(os.getenv("FIBO_GOLDEN_GATE_TOLERANCE", "0.012") or 0.012)
+    FIBO_ADVANCE_MIN_IMPULSE_STRENGTH_SCORE: float = float(os.getenv("FIBO_ADVANCE_MIN_IMPULSE_STRENGTH_SCORE", "0.55") or 0.55)
+    FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE: float = float(os.getenv("FIBO_SCOUT_MIN_IMPULSE_STRENGTH_SCORE", "0.50") or 0.50)
+    FIBO_ADVANCE_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_ADVANCE_MIN_MOMENTUM_SCORE", "4") or 4)
+    FIBO_SCOUT_MIN_MOMENTUM_SCORE: int = int(os.getenv("FIBO_SCOUT_MIN_MOMENTUM_SCORE", "4") or 4)
+    # 61.8 / golden-pocket confirmation from learned reversal template.
+    FIBO_REVERSAL_TEMPLATE_ENABLED: bool = os.getenv("FIBO_REVERSAL_TEMPLATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_REVERSAL_TEMPLATE_STRICT_REQUIRE_CAPTURE: bool = os.getenv("FIBO_REVERSAL_TEMPLATE_STRICT_REQUIRE_CAPTURE", "0").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE: float = float(os.getenv("FIBO_REVERSAL_TEMPLATE_LEVEL_TOLERANCE", "0.020") or 0.020)
+    FIBO_REVERSAL_TEMPLATE_MIN_SCORE: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_SCORE", "4") or 4)
+    FIBO_REVERSAL_TEMPLATE_MIN_SPOTS: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_SPOTS", "6") or 6)
+    FIBO_REVERSAL_TEMPLATE_MIN_DEPTH: int = int(os.getenv("FIBO_REVERSAL_TEMPLATE_MIN_DEPTH", "24") or 24)
+    FIBO_ADVANCE_ALLOW_CONFIRMED_CORRECTION_END_OUTSIDE_GP: bool = os.getenv("FIBO_ADVANCE_ALLOW_CONFIRMED_CORRECTION_END_OUTSIDE_GP", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_SCOUT_ALLOW_CONFIRMED_CORRECTION_END_OUTSIDE_GP: bool = os.getenv("FIBO_SCOUT_ALLOW_CONFIRMED_CORRECTION_END_OUTSIDE_GP", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_ADVANCE_CORRECTION_END_MIN_SCORE: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_MIN_SCORE", "5.5") or 5.5)
+    FIBO_SCOUT_CORRECTION_END_MIN_SCORE: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_MIN_SCORE", "5.0") or 5.0)
+    FIBO_ADVANCE_CORRECTION_END_MIN_WAVE_CONFIDENCE: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_MIN_WAVE_CONFIDENCE", "0.55") or 0.55)
+    FIBO_SCOUT_CORRECTION_END_MIN_WAVE_CONFIDENCE: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_MIN_WAVE_CONFIDENCE", "0.50") or 0.50)
+    FIBO_ADVANCE_CORRECTION_END_MIN_ENTRY_RATIO: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_MIN_ENTRY_RATIO", "0.55") or 0.55)
+    FIBO_SCOUT_CORRECTION_END_MIN_ENTRY_RATIO: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_MIN_ENTRY_RATIO", "0.52") or 0.52)
+    FIBO_ADVANCE_CORRECTION_END_MAX_ENTRY_RATIO: float = float(os.getenv("FIBO_ADVANCE_CORRECTION_END_MAX_ENTRY_RATIO", "0.82") or 0.82)
+    FIBO_SCOUT_CORRECTION_END_MAX_ENTRY_RATIO: float = float(os.getenv("FIBO_SCOUT_CORRECTION_END_MAX_ENTRY_RATIO", "0.82") or 0.82)
+    FIBO_ADVANCE_CORRECTION_END_MIN_TEMPLATE_SCORE: int = int(os.getenv("FIBO_ADVANCE_CORRECTION_END_MIN_TEMPLATE_SCORE", "4") or 4)
+    FIBO_SCOUT_CORRECTION_END_MIN_TEMPLATE_SCORE: int = int(os.getenv("FIBO_SCOUT_CORRECTION_END_MIN_TEMPLATE_SCORE", "4") or 4)
+    CTRADER_FIBO_WINNER_MIN_CONFIDENCE: float = float(os.getenv("CTRADER_FIBO_WINNER_MIN_CONFIDENCE", "78.0") or 78.0)
+    FIBO_SCOUT_REQUIRE_MTF_STACKING: bool = os.getenv("FIBO_SCOUT_REQUIRE_MTF_STACKING", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Audit result: fibo_xauusd short is quarantined by default; long side remains available.
+    FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED: bool = os.getenv("FIBO_ADVANCE_SHORT_QUARANTINE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")  # DEPRECATED: replaced by FIBO_TREND_ALIGNMENT_GATE
+    FIBO_TREND_ALIGNMENT_GATE_ENABLED: bool = os.getenv("FIBO_TREND_ALIGNMENT_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Fibo Position Manager — time-based profit lock (progressive SL tightening)
+    FIBO_PM_TIME_LOCK_ENABLED: bool = os.getenv("FIBO_PM_TIME_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_PM_BE_AFTER_MIN: float = float(os.getenv("FIBO_PM_BE_AFTER_MIN", "20"))
+    FIBO_PM_LOCK_30_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_30_AFTER_MIN", "45"))
+    FIBO_PM_LOCK_50_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_50_AFTER_MIN", "90"))
+    FIBO_PM_LOCK_70_AFTER_MIN: float = float(os.getenv("FIBO_PM_LOCK_70_AFTER_MIN", "150"))
+    FIBO_PM_WINNER_TIME_LOCK_BE_MULT: float = float(os.getenv("FIBO_PM_WINNER_TIME_LOCK_BE_MULT", "1.25"))
+    FIBO_PM_WINNER_TIME_LOCK_PCT_MULT: float = float(os.getenv("FIBO_PM_WINNER_TIME_LOCK_PCT_MULT", "0.90"))
+    FIBO_PM_WINNER_EXHAUSTION_LOCK_PCT_MULT: float = float(os.getenv("FIBO_PM_WINNER_EXHAUSTION_LOCK_PCT_MULT", "0.90"))
+    FIBO_PM_WINNER_EXHAUSTION_REQUIRED_SIGNALS_DELTA: int = int(os.getenv("FIBO_PM_WINNER_EXHAUSTION_REQUIRED_SIGNALS_DELTA", "1"))
+    FIBO_PM_WINNER_EXTENSION_STEP_MULT: float = float(os.getenv("FIBO_PM_WINNER_EXTENSION_STEP_MULT", "1.25"))
+    FIBO_PM_WINNER_EXTENSION_LOCK_MULT: float = float(os.getenv("FIBO_PM_WINNER_EXTENSION_LOCK_MULT", "1.10"))
+    FIBO_PM_PARTIAL_BANK_ENABLED: bool = os.getenv("FIBO_PM_PARTIAL_BANK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_PM_PARTIAL_BANK_CORRECTION_END_TRIGGER_R: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_CORRECTION_END_TRIGGER_R", "0.85"))
+    FIBO_PM_PARTIAL_BANK_IMPULSE_RESTART_TRIGGER_R: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_IMPULSE_RESTART_TRIGGER_R", "1.45"))
+    FIBO_PM_PARTIAL_BANK_BASE_PCT: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_BASE_PCT", "0.35"))
+    FIBO_PM_PARTIAL_BANK_WINNER_PCT: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_WINNER_PCT", "0.25"))
+    FIBO_PM_PARTIAL_BANK_BASE_LOCK_R: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_BASE_LOCK_R", "0.12"))
+    FIBO_PM_PARTIAL_BANK_WINNER_LOCK_R: float = float(os.getenv("FIBO_PM_PARTIAL_BANK_WINNER_LOCK_R", "0.25"))
+    FIBO_PM_MIN_PARTIAL_VOLUME: int = int(os.getenv("FIBO_PM_MIN_PARTIAL_VOLUME", "1000"))
+    FIBO_PM_PARTIAL_VOLUME_STEP: int = int(os.getenv("FIBO_PM_PARTIAL_VOLUME_STEP", "1000"))
+    # Momentum exhaustion profit lock (lock profit when momentum dies)
+    FIBO_PM_EXHAUSTION_LOCK_ENABLED: bool = os.getenv("FIBO_PM_EXHAUSTION_LOCK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MIN_AGE_MIN", "3.0"))
+    CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DELTA", "0.08"))
+    CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MAX_VOLUME", "0.25"))
+    CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_ADVERSE_DRIFT", "0.008"))
+    CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION: float = float(os.getenv("CTRADER_PM_XAU_EXHAUSTION_MAX_REJECTION", "0.25"))
+    CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS: int = int(os.getenv("CTRADER_PM_XAU_EXHAUSTION_REQUIRED_SIGNALS", "3"))
     # Comma-separated families that ignore Strategy Lab blocked/shadow for persistent canary candidate loading.
     # Default: XAU flow sidecars (still require pattern + chart contexts / first_sample gates in builders).
     PERSISTENT_CANARY_IGNORE_STRATEGY_LAB_BLOCK: str = os.getenv(
@@ -139,6 +446,16 @@ class Config:
     ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER: bool = os.getenv("ETH_WEEKDAY_PROBE_REQUIRE_STRONG_WINNER", "1").strip().lower() in ("1", "true", "yes", "on")
     ETH_WEEKDAY_PROBE_CTRADER_RISK_USD: float = float(os.getenv("ETH_WEEKDAY_PROBE_CTRADER_RISK_USD", "0.35"))
 
+    # ── Autopilot regime-break circuit breaker (Section 12 Verdict #6) ──
+    # Blocks loosen_* canary-tuning proposals when the short recent sample has
+    # deteriorated vs the cumulative baseline, so a lucky streak in long-window
+    # stats cannot self-reinforce a loosening decision across a regime break.
+    AUTOPILOT_REGIME_BREAK_GUARD_ENABLED: bool = os.getenv("AUTOPILOT_REGIME_BREAK_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    AUTOPILOT_REGIME_BREAK_RECENT_N: int = int(os.getenv("AUTOPILOT_REGIME_BREAK_RECENT_N", "20"))
+    AUTOPILOT_REGIME_BREAK_WR_DROP: float = float(os.getenv("AUTOPILOT_REGIME_BREAK_WR_DROP", "0.10"))
+    AUTOPILOT_REGIME_BREAK_MIN_BASELINE_WR: float = float(os.getenv("AUTOPILOT_REGIME_BREAK_MIN_BASELINE_WR", "0.45"))
+    AUTOPILOT_REGIME_BREAK_MAX_LOOKBACK_DAYS: int = int(os.getenv("AUTOPILOT_REGIME_BREAK_MAX_LOOKBACK_DAYS", "14"))
+
     # ── Crypto Cluster Loss Guard + Daily Cap (Phase 1 — isolated from XAU) ──
     CRYPTO_CLUSTER_LOSS_GUARD_ENABLED: bool = os.getenv("CRYPTO_CLUSTER_LOSS_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     BTC_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("BTC_CLUSTER_LOSS_WINDOW_HOURS", "3.0"))
@@ -147,6 +464,24 @@ class Config:
     ETH_CLUSTER_LOSS_WINDOW_HOURS: float = float(os.getenv("ETH_CLUSTER_LOSS_WINDOW_HOURS", "2.0"))
     ETH_CLUSTER_LOSS_MIN_LOSSES: int = int(os.getenv("ETH_CLUSTER_LOSS_MIN_LOSSES", "2"))
     ETH_DAILY_TRADE_CAP: int = int(os.getenv("ETH_DAILY_TRADE_CAP", "2"))
+    CRYPTO_CLUSTER_LOSS_PER_FAMILY: bool = os.getenv("CRYPTO_CLUSTER_LOSS_PER_FAMILY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── BTC/ETH Redesign v2 (Opus 4.7) — default shadow-only/no live behavior change ──
+    CRYPTO_REDESIGN_KILL_SWITCH: bool = os.getenv("CRYPTO_REDESIGN_KILL_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_REDESIGN_V2_ENABLED: bool = os.getenv("BTC_LOB_REDESIGN_V2_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_REDESIGN_V2_SHADOW_ONLY: bool = os.getenv("BTC_LOB_REDESIGN_V2_SHADOW_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_TIER_SIZING_ENABLED: bool = os.getenv("BTC_LOB_TIER_SIZING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    BTC_LOB_TP1_RR: float = float(os.getenv("BTC_LOB_TP1_RR", "0.70"))
+    BTC_LOB_RUNNER_TP_RR: float = float(os.getenv("BTC_LOB_RUNNER_TP_RR", "2.50"))
+    BTC_LOB_LIMIT_MAX_AGE_SEC: int = int(os.getenv("BTC_LOB_LIMIT_MAX_AGE_SEC", "180"))
+    BTC_LOB_LIMIT_AUTOCANCEL_ENABLED: bool = os.getenv("BTC_LOB_LIMIT_AUTOCANCEL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_ENABLED: bool = os.getenv("ETH_SMART_V2_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_SHADOW_ONLY: bool = os.getenv("ETH_SMART_V2_SHADOW_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_TIER_SIZING_ENABLED: bool = os.getenv("ETH_SMART_V2_TIER_SIZING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ETH_SMART_V2_TP1_RR: float = float(os.getenv("ETH_SMART_V2_TP1_RR", "0.70"))
+    ETH_SMART_V2_RUNNER_TP_RR: float = float(os.getenv("ETH_SMART_V2_RUNNER_TP_RR", "2.20"))
+    ETH_SMART_V2_RISK_FLOOR_USD: float = float(os.getenv("ETH_SMART_V2_RISK_FLOOR_USD", "0.65"))
+    ETH_MRD_ENABLED: bool = os.getenv("ETH_MRD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
     # ── BTC Flow Short Sidecar (BFSS) — crypto clone of XAU FSS, isolated ──
     BTC_FSS_ENABLED: bool = os.getenv("BTC_FSS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -186,6 +521,27 @@ class Config:
     BTC_RANGE_REPAIR_TP2_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP2_RR", "0.85"))
     BTC_RANGE_REPAIR_TP3_RR: float = float(os.getenv("BTC_RANGE_REPAIR_TP3_RR", "1.15"))
     BTC_RANGE_REPAIR_CTRADER_RISK_USD: float = float(os.getenv("BTC_RANGE_REPAIR_CTRADER_RISK_USD", "0.55"))
+
+    # ── XAU Toxic Hour Guard — block XAU scalp during historically losing hours ──
+    XAU_TOXIC_HOUR_GUARD_ENABLED: bool = os.getenv("XAU_TOXIC_HOUR_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_TOXIC_HOURS_UTC: str = os.getenv("XAU_TOXIC_HOURS_UTC", "1")  # comma-separated UTC hours, default 01 (=08 BKK)
+
+    # ── ADI — Adaptive Directional Intelligence ──
+    ADI_ENABLED: bool = os.getenv("ADI_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    ADI_CATASTROPHIC_GATE_ENABLED: bool = os.getenv("ADI_CATASTROPHIC_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    ADI_LOOKBACK_DAYS: int = int(os.getenv("ADI_LOOKBACK_DAYS", "14"))
+    ADI_MAX_PENALTY: float = float(os.getenv("ADI_MAX_PENALTY", "-45.0"))
+    ADI_MAX_BOOST: float = float(os.getenv("ADI_MAX_BOOST", "15.0"))
+    ADI_COLD_START_PENALTY: float = float(os.getenv("ADI_COLD_START_PENALTY", "-6.0"))
+
+    # ── Hermes — Self-Improving Trade Intelligence Loop ──
+    HERMES_TOXIC_GATE_ENABLED: bool = os.getenv("HERMES_TOXIC_GATE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    HERMES_TOXIC_MODIFIER_THRESHOLD: float = float(os.getenv("HERMES_TOXIC_MODIFIER_THRESHOLD", "-10.0"))
+    HERMES_TOXIC_MIN_SAMPLES: int = int(os.getenv("HERMES_TOXIC_MIN_SAMPLES", "5"))
+
+    # ── Session Block — proven losing sessions per family ──
+    FFFS_BLOCKED_SESSIONS: str = os.getenv("FFFS_BLOCKED_SESSIONS", "overlap,off_hours")
+    CANARY_BLOCK_OFF_HOURS: bool = os.getenv("CANARY_BLOCK_OFF_HOURS", "1").strip().lower() in ("1", "true", "yes", "on")
 
     # ── XAU MRD — Microstructure Regime Detector (XAUUSD Scanner) ──
     MRD_DELTA_BIAS_THRESHOLD: float = float(os.getenv("MRD_DELTA_BIAS_THRESHOLD", "0.15"))
@@ -269,6 +625,18 @@ class Config:
     CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD: float = float(os.getenv("CRYPTO_BEHAVIORAL_RETEST_ETH_CTRADER_RISK_USD", "0.20"))
 
     CTRADER_XAU_ACTIVE_FAMILIES: str = os.getenv("CTRADER_XAU_ACTIVE_FAMILIES", "xau_scalp_pullback_limit,xau_scalp_breakout_stop")
+    DEXTER_MEMPALACE_FAMILY_LANE_ENABLED: bool = os.getenv("DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    DEXTER_MEMPALACE_FAMILY_NAME: str = os.getenv("DEXTER_MEMPALACE_FAMILY_NAME", "xau_scalp_mempalace_lane")
+    DEXTER_MEMPALACE_SOURCE_TOKENS: str = os.getenv("DEXTER_MEMPALACE_SOURCE_TOKENS", "mempalace,mempalac")
+    DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED: bool = os.getenv(
+        "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED",
+        os.getenv("TRADING_CENTRAL_FAMILY_ENABLED", "1"),
+    ).strip().lower() in ("1", "true", "yes", "on")
+    DEXTER_TRADING_CENTRAL_FAMILY_NAME: str = os.getenv("DEXTER_TRADING_CENTRAL_FAMILY_NAME", "xau_scalp_trading_central_intraday")
+    DEXTER_TRADING_CENTRAL_SOURCE_TOKENS: str = os.getenv(
+        "DEXTER_TRADING_CENTRAL_SOURCE_TOKENS",
+        "trading_central,tradingcentral,:tc:",
+    )
     CTRADER_XAU_PRIMARY_FAMILY: str = os.getenv("CTRADER_XAU_PRIMARY_FAMILY", "")
     TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_SWARM_SAMPLING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     TRADING_MANAGER_XAU_SWARM_ACTIVE_FAMILIES: str = os.getenv(
@@ -280,6 +648,7 @@ class Config:
     XAU_RANGE_REPAIR_LOOKBACK_SEC: int = int(os.getenv("XAU_RANGE_REPAIR_LOOKBACK_SEC", "300"))
     XAU_RANGE_REPAIR_ALLOWED_STATES: str = os.getenv("XAU_RANGE_REPAIR_ALLOWED_STATES", "range_probe")
     XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_DAY_TYPES", "fast_expansion,panic_spread")
+    XAU_RANGE_REPAIR_BLOCKED_SESSIONS: str = os.getenv("XAU_RANGE_REPAIR_BLOCKED_SESSIONS", "london,off_hours")
     XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS: float = float(os.getenv("XAU_RANGE_REPAIR_MAX_CONTINUATION_BIAS", "0.09"))
     XAU_RANGE_REPAIR_MIN_REJECTION_RATIO: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_REJECTION_RATIO", "0.16"))
     XAU_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("XAU_RANGE_REPAIR_MIN_BAR_VOLUME_PROXY", "0.18"))
@@ -343,6 +712,26 @@ class Config:
     XAU_OPENAPI_ENTRY_ROUTER_STOP_STOP_LIFT_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_STOP_STOP_LIFT_RATIO", "0.32"))
     XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO", "0.08"))
     XAU_OPENAPI_ENTRY_ROUTER_LIMIT_STOP_PAD_RATIO: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_LIMIT_STOP_PAD_RATIO", "0.24"))
+    # Signal-now routing: when the scanner/capture stack says momentum is active now,
+    # do not force every XAU scalp lane to wait for a pending limit/stop.
+    # Requires strong continuation, supportive tick direction, stable spread, and a
+    # high chart continuation bias; otherwise the normal stop/limit router still applies.
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED: bool = os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Live entry-advantage guard: do not chase XAU pullback signals at market
+    # unless structure has actually broken. Without this, strong-looking flow can
+    # convert a pullback setup into a disadvantaged now-entry.
+    XAU_ENTRY_ADVANTAGE_GUARD_ENABLED: bool = os.getenv("XAU_ENTRY_ADVANTAGE_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE: int = int(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", "7"))
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", "0.70"))
+    XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT", "0.58"))
+    # Prevent mid-air XAU pullback limits: a limit entry must be anchored by
+    # absorption/rejection, Fibo impulse-zone evidence, or Kronos/forecast path support.
+    # Otherwise the router must promote to a wait-break probe stop instead of killing
+    # the directional opportunity.
+    XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED: bool = os.getenv("XAU_OPENAPI_ENTRY_ROUTER_BLIND_LIMIT_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", "0.35"))
+    XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER: int = int(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_ZONE_MIN_FIBO_CLUSTER", "2"))
+    XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY: float = float(os.getenv("XAU_OPENAPI_ENTRY_ROUTER_KRONOS_MAX_UNCERTAINTY", "0.45"))
     XAU_MULTI_TF_ENTRY_GUARD_ENABLED: bool = os.getenv("XAU_MULTI_TF_ENTRY_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MULTI_TF_ENTRY_GUARD_FAMILIES: str = os.getenv(
         "XAU_MULTI_TF_ENTRY_GUARD_FAMILIES",
@@ -363,6 +752,20 @@ class Config:
     SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_BAR_VOLUME_PROXY", "0.38"))
     SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED: bool = os.getenv("SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ENTRY_TEMPLATE_CATALOG_ENABLED: bool = os.getenv("ENTRY_TEMPLATE_CATALOG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ENTRY_TEMPLATE_CATALOG_PATH: str = os.getenv("ENTRY_TEMPLATE_CATALOG_PATH", "").strip()
+    # Optional pre-neural confidence tailwind from mined impulse capture stats (0 = off).
+    ENTRY_TEMPLATE_CONF_TAILWIND_MAX: float = float(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MAX", "0"))
+    ENTRY_TEMPLATE_CONF_TAILWIND_MIN_CAPTURE: float = float(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MIN_CAPTURE", "0.52"))
+    ENTRY_TEMPLATE_CONF_TAILWIND_MIN_IMPULSES: int = int(os.getenv("ENTRY_TEMPLATE_CONF_TAILWIND_MIN_IMPULSES", "30"))
+    ENTRY_TEMPLATE_SCANNER_BIAS_ENABLED: bool = os.getenv("ENTRY_TEMPLATE_SCANNER_BIAS_ENABLED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    ENTRY_TEMPLATE_SCANNER_MAX_SHIFT_RISK_RATIO: float = float(os.getenv("ENTRY_TEMPLATE_SCANNER_MAX_SHIFT_RISK_RATIO", "0.22"))
+    ENTRY_TEMPLATE_SCANNER_MIN_OFFSET_RISK_TO_ACT: float = float(os.getenv("ENTRY_TEMPLATE_SCANNER_MIN_OFFSET_RISK_TO_ACT", "0.04"))
     XAU_MICROTREND_FOLLOW_UP_ENABLED: bool = os.getenv("XAU_MICROTREND_FOLLOW_UP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED: int = int(os.getenv("XAU_MICROTREND_FOLLOW_UP_MIN_RESOLVED", "3"))
     XAU_MICROTREND_FOLLOW_UP_MIN_STATE_SCORE: float = float(os.getenv("XAU_MICROTREND_FOLLOW_UP_MIN_STATE_SCORE", "18"))
@@ -389,7 +792,7 @@ class Config:
     XAU_FLOW_SHORT_SIDECAR_MIN_RESOLVED: int = int(os.getenv("XAU_FLOW_SHORT_SIDECAR_MIN_RESOLVED", "3"))
     XAU_FLOW_SHORT_SIDECAR_MIN_STATE_SCORE: float = float(os.getenv("XAU_FLOW_SHORT_SIDECAR_MIN_STATE_SCORE", "20"))
     XAU_FLOW_SHORT_SIDECAR_MAX_ROWS: int = int(os.getenv("XAU_FLOW_SHORT_SIDECAR_MAX_ROWS", "6"))
-    XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS", "new_york,london,new_york,overlap")
+    XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_SESSIONS", "new_york,london")
     XAU_FLOW_SHORT_SIDECAR_ALLOWED_PATTERNS: str = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOWED_PATTERNS", "SCALP_FLOW_FORCE")
     XAU_FLOW_SHORT_SIDECAR_ALLOW_ADJACENT_CONFIDENCE: bool = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOW_ADJACENT_CONFIDENCE", "1").strip().lower() in ("1", "true", "yes", "on")
     XAU_FLOW_SHORT_SIDECAR_ALLOW_COMPATIBLE_DAY_TYPE: bool = os.getenv("XAU_FLOW_SHORT_SIDECAR_ALLOW_COMPATIBLE_DAY_TYPE", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -499,6 +902,56 @@ class Config:
     XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MIN_CONFIDENCE_DELTA: float = float(os.getenv("XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MIN_CONFIDENCE_DELTA", "-0.5"))
     XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MAX_SPREAD_EXPANSION_MULT: float = float(os.getenv("XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MAX_SPREAD_EXPANSION_MULT", "1.35"))
     XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MIN_BAR_VOLUME_MULT: float = float(os.getenv("XAU_TICK_DEPTH_FILTER_FAST_EXPANSION_SAMPLE_MIN_BAR_VOLUME_MULT", "1.0"))
+    # ── Entry Sharpness Score (deep data analytics) ──────────────────────
+    XAU_ENTRY_SHARPNESS_ENABLED: bool = os.getenv("XAU_ENTRY_SHARPNESS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD: int = int(os.getenv("XAU_ENTRY_SHARPNESS_KNIFE_THRESHOLD", "30"))
+    XAU_ENTRY_SHARPNESS_CAUTION_THRESHOLD: int = int(os.getenv("XAU_ENTRY_SHARPNESS_CAUTION_THRESHOLD", "50"))
+    XAU_ENTRY_SHARPNESS_SHARP_THRESHOLD: int = int(os.getenv("XAU_ENTRY_SHARPNESS_SHARP_THRESHOLD", "70"))
+    XAU_ENTRY_SHARPNESS_PB_KNIFE_THRESHOLD: int = int(os.getenv("XAU_ENTRY_SHARPNESS_PB_KNIFE_THRESHOLD", "35"))
+    XAU_ENTRY_SHARPNESS_RR_KNIFE_THRESHOLD: int = int(os.getenv("XAU_ENTRY_SHARPNESS_RR_KNIFE_THRESHOLD", "30"))
+    XAU_ENTRY_SHARPNESS_CAUTION_RISK_MULT: float = float(os.getenv("XAU_ENTRY_SHARPNESS_CAUTION_RISK_MULT", "0.75"))
+    XAU_ENTRY_SHARPNESS_SHARP_PROMOTE_MIN_CONT_SCORE: int = int(os.getenv("XAU_ENTRY_SHARPNESS_SHARP_PROMOTE_MIN_CONT_SCORE", "4"))
+    XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE: float = float(os.getenv("XAU_ENTRY_SHARPNESS_MICRO_VOL_SCALE", "0.025"))
+    XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION: float = float(os.getenv("XAU_ENTRY_SHARPNESS_MAX_SPREAD_EXPANSION", "1.20"))
+    XAU_ENTRY_SHARPNESS_W_MOMENTUM: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_MOMENTUM", "1.0"))
+    XAU_ENTRY_SHARPNESS_W_FLOW: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_FLOW", "1.0"))
+    XAU_ENTRY_SHARPNESS_W_ABSORPTION: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_ABSORPTION", "1.0"))
+    XAU_ENTRY_SHARPNESS_W_STABILITY: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_STABILITY", "1.0"))
+    XAU_ENTRY_SHARPNESS_W_POSITIONING: float = float(os.getenv("XAU_ENTRY_SHARPNESS_W_POSITIONING", "1.0"))
+    # ── Sharpness Feedback Loop (self-improving) ────────────────────────────
+    XAU_SHARPNESS_FEEDBACK_ENABLED: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_INTERVAL_MIN", "120"))
+    XAU_SHARPNESS_FEEDBACK_ON_START: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_LOOKBACK_DAYS", "14"))
+    XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM: bool = os.getenv("XAU_SHARPNESS_FEEDBACK_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_FEEDBACK_MIN_TRADES: int = int(os.getenv("XAU_SHARPNESS_FEEDBACK_MIN_TRADES", "10"))
+    SELF_IMPROVING_SYMBOLS: str = os.getenv("SELF_IMPROVING_SYMBOLS", "XAUUSD,BTCUSD,ETHUSD")
+    # ── Sharpness Auto-Calibration ──────────────────────────────────────────
+    XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED: bool = os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MAX_STEP", "0.15"))
+    XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MIN_WEIGHT", "0.5"))
+    XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT: float = float(os.getenv("XAU_SHARPNESS_AUTO_CALIBRATE_MAX_WEIGHT", "2.0"))
+    # ── Family Performance Decay Detector ───────────────────────────────────
+    XAU_FAMILY_DECAY_ENABLED: bool = os.getenv("XAU_FAMILY_DECAY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_FAMILY_DECAY_RECENT_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_RECENT_TRADES", "20"))
+    XAU_FAMILY_DECAY_BASELINE_TRADES: int = int(os.getenv("XAU_FAMILY_DECAY_BASELINE_TRADES", "60"))
+    XAU_FAMILY_DECAY_THRESHOLD: float = float(os.getenv("XAU_FAMILY_DECAY_THRESHOLD", "0.15"))
+    # ── Volume Profile ──────────────────────────────────────────────────────
+    XAU_VOLUME_PROFILE_ENABLED: bool = os.getenv("XAU_VOLUME_PROFILE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_VOLUME_PROFILE_HOURS_BACK: int = int(os.getenv("XAU_VOLUME_PROFILE_HOURS_BACK", "24"))
+    XAU_VOLUME_PROFILE_BUCKET_TICKS: int = int(os.getenv("XAU_VOLUME_PROFILE_BUCKET_TICKS", "10"))
+    XAU_VOLUME_PROFILE_VA_PCT: float = float(os.getenv("XAU_VOLUME_PROFILE_VA_PCT", "0.70"))
+    XAU_VOLUME_PROFILE_INTERVAL_MIN: int = int(os.getenv("XAU_VOLUME_PROFILE_INTERVAL_MIN", "30"))
+    # ── DOM Liquidity Shift Detector ────────────────────────────────────────
+    XAU_DOM_LIQUIDITY_SHIFT_ENABLED: bool = os.getenv("XAU_DOM_LIQUIDITY_SHIFT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_LOOKBACK_MIN", "30"))
+    XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS: int = int(os.getenv("XAU_DOM_LIQUIDITY_SHIFT_MAX_RUNS", "6"))
+    # Crypto DOM defense anti-MM-trap safeguards
+    CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R: float = float(os.getenv("CRYPTO_DOM_DEFENSE_PROFIT_BUFFER_R", "0.50"))
+    CRYPTO_DOM_TP_MAX_EXTENSION_R: float = float(os.getenv("CRYPTO_DOM_TP_MAX_EXTENSION_R", "3.0"))
+    # ── Strategy Evolution Log ──────────────────────────────────────────────
+    STRATEGY_EVOLUTION_ENABLED: bool = os.getenv("STRATEGY_EVOLUTION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    STRATEGY_EVOLUTION_NOTIFY_TELEGRAM: bool = os.getenv("STRATEGY_EVOLUTION_NOTIFY_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")
     CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS: int = int(os.getenv("CT_ONLY_EXPERIMENT_REPORT_LOOKBACK_HOURS", "18"))
     XAU_TD_VS_PB_COMPARE_MIN_RESOLVED: int = int(os.getenv("XAU_TD_VS_PB_COMPARE_MIN_RESOLVED", "4"))
     CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE: bool = os.getenv("CTRADER_AUTO_CLOSE_UNTRACKED_UNSAFE", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -540,6 +993,95 @@ class Config:
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TIGHTEN_STOP_KEEP_R", "0.42"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_PROFIT_LOCK_R", "0.05"))
     CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R: float = float(os.getenv("CTRADER_PM_XAU_ACTIVE_DEFENSE_TRIM_TP_R", "0.55"))
+    # V4 policy layer — WinnerProtection + regime-aware ActiveDefense thresholds.
+    # Default OFF: when disabled, the executor calls the legacy active-defense path
+    # unchanged. When enabled, policy layer pre-checks each defense evaluation and
+    # can override early-exit decisions for trades in LOCKED / TRAILING / EMERGENCY
+    # winner states.
+    CTRADER_PM_POLICY_LAYER_ENABLED: bool = os.getenv(
+        "CTRADER_PM_POLICY_LAYER_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_POLICY_LAYER_ARM_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_ARM_R", "0.8"))
+    CTRADER_PM_POLICY_LAYER_LOCK_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_R", "1.5"))
+    CTRADER_PM_POLICY_LAYER_TRAIL_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_TRAIL_R", "3.0"))
+    CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_LOCK_FLOOR_R", "0.4"))
+    CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO: float = float(os.getenv("CTRADER_PM_POLICY_LAYER_GIVEBACK_EMERGENCY_RATIO", "0.45"))
+    CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS: int = int(os.getenv("CTRADER_PM_POLICY_LAYER_LOCKED_SCORE_BONUS", "2"))
+    # Persist WinnerProtection r_peak across process restarts via
+    # data/runtime/winner_protection_rpeak.json. When disabled, the cache is
+    # in-memory only and each restart warm-starts with r_peak=r_now (pre-fix
+    # behavior). Default ON — the atomic-write primitive is in place.
+    CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED: bool = os.getenv(
+        "CTRADER_PM_POLICY_RPEAK_PERSIST_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    # Graded degrade gate — consumes the persisted health state from
+    # infra/db_health + infra/auth_health to decide whether new entries
+    # should be allowed / warned / blocked. Observability default ON,
+    # blocking default OFF so the first rollout is log-only. Never gates
+    # position management, closes, or TP/SL repair paths.
+    CTRADER_HEALTH_GATE_ENABLED: bool = os.getenv(
+        "CTRADER_HEALTH_GATE_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL: bool = os.getenv(
+        "CTRADER_HEALTH_GATE_BLOCK_ON_CRITICAL", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN: float = float(os.getenv("CTRADER_HEALTH_GATE_MAX_STATE_AGE_MIN", "120"))
+    # XAU high-confidence suppression shadow audit. Pure append-only JSONL
+    # logger that captures every XAU signal reaching the executor (arrived,
+    # executed, rejected) for post-hoc analysis of whether the winner-logic
+    # confidence penalty is suppressing profitable opportunity. Never
+    # influences a live decision; never modifies the XAU direct lane.
+    XAU_CONF_SUPPRESSION_SHADOW_ENABLED: bool = os.getenv(
+        "XAU_CONF_SUPPRESSION_SHADOW_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB: float = float(os.getenv("XAU_CONF_SUPPRESSION_SHADOW_MAX_FILE_MB", "10"))
+    # Profit-seeking guard: if XAU is already working, protect it with SL instead of closing/trimming TP too early.
+    CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED: bool = os.getenv(
+        "CTRADER_PM_XAU_PROFIT_SEEKING_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_MIN_R", "0.15"))
+    CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_FIBO_MIN_R", "0.80"))
+    CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_R", "0.08"))
+    CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R: float = float(os.getenv("CTRADER_PM_XAU_PROFIT_SEEKING_LOCK_BUFFER_R", "0.03"))
+    # Profit retrace guard: bank profit in weak/corrective phases, but keep impulse continuation alive.
+    CTRADER_PM_IMPULSE_FAMILIES: str = os.getenv(
+        "CTRADER_PM_IMPULSE_FAMILIES",
+        "xau_scalp_breakout_stop,xau_scalp_failed_fade_follow_stop,xau_scalp_microtrend_follow_up,xau_scheduled_trend,xau_scalp_mempalace_lane",
+    )
+    CTRADER_PM_CORRECTIVE_FAMILIES: str = os.getenv(
+        "CTRADER_PM_CORRECTIVE_FAMILIES",
+        "xau_scalp_pullback_limit,xau_scalp_range_repair,xau_scalp_flow_short_sidecar,xau_scalp_tick_depth_filter",
+    )
+    CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED: bool = os.getenv(
+        "CTRADER_PM_PROFIT_RETRACE_GUARD_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_AGE_MIN", "4.0"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_MIN_PEAK_R", "0.30"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_EXIT_RETRACE_R", "0.22"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_BAR_VOLUME_PROXY", "0.22"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_WEAK_MAX_ABS_MID_DRIFT_PCT", "0.004"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_DELTA_PROXY", "0.12"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_BYPASS_MIN_BAR_VOLUME_PROXY", "0.30"))
+    CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R: float = float(os.getenv("CTRADER_PM_PROFIT_RETRACE_GUARD_IMPULSE_LOCK_R", "0.08"))
+    # Sweep-recovery detector: avoid premature close when move likely is liquidity sweep + continuation.
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED: bool = os.getenv(
+        "CTRADER_PM_PROFIT_RETRACE_SWEEP_RECOVERY_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_REJECTION_RATIO", "0.28")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_BAR_VOLUME_PROXY", "0.30")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DELTA_PROXY", "0.08")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_MIN_DEPTH_IMBALANCE", "0.06")
+    )
+    CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R: float = float(
+        os.getenv("CTRADER_PM_PROFIT_RETRACE_SWEEP_LOCK_R", "0.05")
+    )
     CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN: float = float(os.getenv("CTRADER_PM_XAU_EXTENSION_MIN_AGE_MIN", "0.15"))
     # When trading manager xau_order_care is inactive, still allow TP extension using config defaults (capture snapshot required).
     CTRADER_PM_XAU_EXTENSION_ALLOW_WITHOUT_ORDER_CARE: bool = os.getenv(
@@ -548,11 +1090,26 @@ class Config:
     CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED: bool = os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_CLAMP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT: float = float(os.getenv("CTRADER_PM_XAU_POST_FILL_STOP_MAX_RISK_MULT", "1.15"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED: bool = os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-    CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN", "20"))
+    # 2026-04-29 surgery: cap directive pause to 5min so a single bad trade can't freeze NY for hours.
+    CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_MIN", "5"))
+    # Hard ceiling enforced at directive read-time — no XAU directive may pause longer than this.
+    XAU_DIRECTIVE_PAUSE_CEILING_MIN: int = int(os.getenv("XAU_DIRECTIVE_PAUSE_CEILING_MIN", "10"))
+    # Confidence (0-100) at which a fresh signal bypasses the directive block. Set to 999 to disable bypass.
+    XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS: float = float(os.getenv("XAU_DIRECTIVE_HIGH_CONFIDENCE_BYPASS", "82"))
+    # 5-minute opportunity health beacon — observability log emitted on a fixed cadence
+    # so silent freezes (the kind that lost the entire 2026-04-28 NY session) show up
+    # immediately in journalctl. Pure observability — never blocks signals.
+    XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED: bool = os.getenv("XAU_OPPORTUNITY_HEALTH_BEACON_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_OPPORTUNITY_HEALTH_BEACON_MIN: int = int(os.getenv("XAU_OPPORTUNITY_HEALTH_BEACON_MIN", "5"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN: int = int(os.getenv("CTRADER_XAU_SHORT_LIMIT_PAUSE_LOOKBACK_MIN", "95"))
     CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES: str = os.getenv(
         "CTRADER_XAU_SHORT_LIMIT_PAUSE_FAMILIES",
-        "xau_scalp_microtrend,xau_scalp_tick_depth_filter",
+        # 2026-04-22: added xau_scheduled_trend — prior list missed scheduled
+        # scanner so the manager directive (live_range_transition_limit_pause)
+        # blocked scalp_xauusd:* but xauusd_scheduled:canary kept firing shorts
+        # into a rally (6 SLs, $-28 across the day). Including scheduled here
+        # makes the directive cover ALL XAU short-limit lanes.
+        "xau_scalp_microtrend,xau_scalp_tick_depth_filter,xau_scheduled_trend",
     )
     CTRADER_XAU_PAIR_RISK_CAP_ENABLED: bool = os.getenv("CTRADER_XAU_PAIR_RISK_CAP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_XAU_PAIR_RISK_CAP_FAMILIES: str = os.getenv(
@@ -575,6 +1132,39 @@ class Config:
     CTRADER_MAX_PENDING_ORDERS_PER_DIRECTION: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_DIRECTION", "1"))
     CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_SYMBOL: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_SYMBOL", "1"))
     CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_DIRECTION: int = int(os.getenv("CTRADER_MAX_PENDING_ORDERS_PER_FAMILY_DIRECTION", "1"))
+    # Evidence governance: block bad source+direction lanes before worker execution.
+    # Format: source:direction, where source may itself contain colons. Direction can be long, short, or *.
+    CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED: bool = os.getenv(
+        "CTRADER_SOURCE_DIRECTION_QUARANTINE_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_QUARANTINED_SOURCE_DIRECTIONS: str = os.getenv(
+        "CTRADER_QUARANTINED_SOURCE_DIRECTIONS",
+        ",".join(
+            [
+                "fibo_xauusd:short",
+                "scalp_xauusd:canary:long",
+                "scalp_xauusd:canary:short",
+                "scalp_xauusd:bs:canary:long",
+                "scalp_xauusd:bs:canary:short",
+                "scalp_xauusd:pb:canary:long",
+                "scalp_xauusd:pb:canary:short",
+                "scalp_xauusd:td:canary:long",
+                "scalp_xauusd:td:canary:short",
+                "scalp_xauusd:short",
+            ]
+        ),
+    )
+    CTRADER_PROTECTED_SOURCE_DIRECTIONS: str = os.getenv(
+        "CTRADER_PROTECTED_SOURCE_DIRECTIONS",
+        ",".join(
+            [
+                "xauusd_scheduled:canary",
+                "xauusd_scheduled:winner",
+                "scalp_xauusd:fss:canary",
+                "scalp_btcusd:canary",
+            ]
+        ),
+    )
     TRADING_TEAM_ENABLED: bool = os.getenv("TRADING_TEAM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     TRADING_TEAM_XAU_PRIORITY_TOPK: int = int(os.getenv("TRADING_TEAM_XAU_PRIORITY_TOPK", "4"))
     TRADING_TEAM_XAU_REASON_SCORE_MULT: float = float(os.getenv("TRADING_TEAM_XAU_REASON_SCORE_MULT", "18"))
@@ -623,7 +1213,7 @@ class Config:
     TRADING_MANAGER_XAU_ORDER_CARE_MIN_ACTIVE_MIN: int = int(os.getenv("TRADING_MANAGER_XAU_ORDER_CARE_MIN_ACTIVE_MIN", "45"))
     TRADING_MANAGER_XAU_ORDER_CARE_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_ALLOWED_SOURCES",
-        "xauusd_scheduled:canary,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:rr:canary",
+        "xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:fss:canary,scalp_xauusd:rr:canary,scalp_xauusd:tc:canary,scalp_xauusd:tc:winner",
     )
     TRADING_MANAGER_XAU_ORDER_CARE_FSS_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_FSS_ALLOWED_SOURCES",
@@ -631,7 +1221,7 @@ class Config:
     )
     TRADING_MANAGER_XAU_ORDER_CARE_LIMIT_RETEST_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_LIMIT_RETEST_ALLOWED_SOURCES",
-        "xauusd_scheduled:canary,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary",
+        "xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner,scalp_xauusd:canary,scalp_xauusd,scalp_xauusd:winner,scalp_xauusd:pb:canary,scalp_xauusd:td:canary,scalp_xauusd:ff:canary,scalp_xauusd:mfu:canary,scalp_xauusd:tc:canary,scalp_xauusd:tc:winner",
     )
     TRADING_MANAGER_XAU_ORDER_CARE_RANGE_REPAIR_ALLOWED_SOURCES: str = os.getenv(
         "TRADING_MANAGER_XAU_ORDER_CARE_RANGE_REPAIR_ALLOWED_SOURCES",
@@ -689,6 +1279,12 @@ class Config:
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_LOSSES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_LOSSES", "2"))
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_DISTINCT_FAMILIES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MIN_DISTINCT_FAMILIES", "2"))
     TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MAX_PNL_USD: float = float(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_MAX_PNL_USD", "-5"))
+    # 2026-04-22: single-family bleed branch — triggers when ONE family loses
+    # repeatedly in the same direction (e.g. xauusd_scheduled:canary's 6 SHORTs
+    # into a +$50 rally on Apr 22). Stricter thresholds than the multi-family
+    # branch so normal noise doesn't trip the guard.
+    TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MIN_LOSSES: int = int(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MIN_LOSSES", "3"))
+    TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MAX_PNL_USD: float = float(os.getenv("TRADING_MANAGER_XAU_CLUSTER_LOSS_GUARD_SINGLE_FAMILY_MAX_PNL_USD", "-10"))
     TRADING_MANAGER_XAU_EXECUTION_DIRECTIVE_ENABLED: bool = os.getenv("TRADING_MANAGER_XAU_EXECUTION_DIRECTIVE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PM_REPAIR_MISSING_SL_ENABLED: bool = os.getenv("CTRADER_PM_REPAIR_MISSING_SL_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_BRIDGE_URL: str = os.getenv("CTRADER_BRIDGE_URL", "http://127.0.0.1:8788")
@@ -703,10 +1299,26 @@ class Config:
     CTRADER_MARKET_CAPTURE_DEPTH_LEVELS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_DEPTH_LEVELS", "5"))
     CTRADER_MARKET_CAPTURE_ON_START: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_MARKET_CAPTURE_ON_EXECUTE: bool = os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED: bool = os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED: bool = os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS: float = float(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_COOLDOWN_SECONDS", "150"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_ARMED_DURATION_SEC", "18"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_CONFIRMED_DURATION_SEC", "30"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_MAX_EVENTS", "1200"))
+    CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS: int = int(os.getenv("CTRADER_REVERSAL_ZONE_CAPTURE_DEPTH_LEVELS", "8"))
+    XAU_REVERSAL_ZONE_CAPTURE_MIN_SWEEP_PIPS: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_MIN_SWEEP_PIPS", "0.5"))
+    XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_WICK_RATIO: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_WICK_RATIO", "0.40"))
+    XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_CLOSE_POS: float = float(os.getenv("XAU_REVERSAL_ZONE_CAPTURE_ARMED_MIN_CLOSE_POS", "0.45"))
 
     # ── Copy Trade System ──
     COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     COPY_TRADE_WORKER_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_WORKER_TIMEOUT_SEC", "25"))
+    COPY_TRADE_CLOSE_FOLLOW_ENABLED: bool = os.getenv("COPY_TRADE_CLOSE_FOLLOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    COPY_TRADE_PROTECTION_FOLLOW_ENABLED: bool = os.getenv("COPY_TRADE_PROTECTION_FOLLOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    COPY_TRADE_LATENCY_WARN_MS: int = int(os.getenv("COPY_TRADE_LATENCY_WARN_MS", "5000"))
+    COPY_TRADE_CLOSE_FOLLOW_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_CLOSE_FOLLOW_TIMEOUT_SEC", "18"))
+    COPY_TRADE_PROTECTION_FOLLOW_TIMEOUT_SEC: int = int(os.getenv("COPY_TRADE_PROTECTION_FOLLOW_TIMEOUT_SEC", "18"))
+    COPY_TRADE_CLOSE_EVENT_DEDUPE_SEC: int = int(os.getenv("COPY_TRADE_CLOSE_EVENT_DEDUPE_SEC", "90"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_DURATION_SEC", "6"))
     CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS: int = int(os.getenv("CTRADER_MARKET_CAPTURE_ON_EXECUTE_MAX_EVENTS", "240"))
     CTRADER_PENDING_ORDER_SWEEP_ENABLED: bool = os.getenv("CTRADER_PENDING_ORDER_SWEEP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -717,6 +1329,19 @@ class Config:
     CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_PULLBACK_MIN", "45"))
     CTRADER_PENDING_ORDER_TTL_XAU_BREAKOUT_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_BREAKOUT_MIN", "15"))
     CTRADER_PENDING_ORDER_TTL_XAU_SCHEDULED_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_SCHEDULED_MIN", "240"))
+    # 2026-04-29 surgery 3: Fibonacci is a patient/strategic strategy — limits often need
+    # hours to retrace into the entry zone. The previous default (45m via XAU_SCALP) was
+    # killing valid setups before the planned move materialised (the 4604.62 sell-limit
+    # cancelled at 74m before price actually rallied to 4608+ where it would have hit).
+    CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_XAU_FIBO_MIN", "240"))
+    # Patient sources that must NOT be subject to scalp-side cancel/close heuristics:
+    # far_from_market sweep, force_close_direction, order_care premature close.
+    CTRADER_PATIENT_STRATEGY_SOURCES: str = os.getenv(
+        "CTRADER_PATIENT_STRATEGY_SOURCES",
+        "fibo_xauusd,fibo_xauusd:winner,fibo_xauusd:scout,xauusd_scheduled,xauusd_scheduled:canary,xauusd_scheduled:winner",
+    )
+    CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE: bool = os.getenv("CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FORCE_CLOSE", "1").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET: bool = os.getenv("CTRADER_PATIENT_STRATEGY_PROTECT_FROM_FAR_FROM_MARKET", "1").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_PENDING_ORDER_TTL_CRYPTO_WINNER_MIN: int = int(os.getenv("CTRADER_PENDING_ORDER_TTL_CRYPTO_WINNER_MIN", "180"))
     CTRADER_PENDING_ORDER_MAX_PER_SOURCE_SYMBOL: int = int(os.getenv("CTRADER_PENDING_ORDER_MAX_PER_SOURCE_SYMBOL", "3"))
     CTRADER_PENDING_ORDER_MAX_PER_SYMBOL: int = int(os.getenv("CTRADER_PENDING_ORDER_MAX_PER_SYMBOL", "2"))
@@ -777,11 +1402,17 @@ class Config:
     CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_DELTA_MULT: float = float(os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_DELTA_MULT", "0.90"))
     CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_BAR_VOLUME_MULT: float = float(os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_REPRICING_SAMPLE_BAR_VOLUME_MULT", "0.95"))
     CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE: bool = os.getenv("CTRADER_PENDING_ORDER_FOLLOW_STOP_PANIC_SPREAD_DISABLE", "1").strip().lower() in ("1", "true", "yes", "on")
-    CTRADER_OPENAPI_CLIENT_ID: str = os.getenv("CTRADER_OPENAPI_CLIENT_ID", os.getenv("OpenAPI_ClientID", ""))
-    CTRADER_OPENAPI_CLIENT_SECRET: str = os.getenv("CTRADER_OPENAPI_CLIENT_SECRET", os.getenv("OpenAPI_Secreat", os.getenv("OpenAPI_Secret", "")))
+    CTRADER_OPENAPI_CLIENT_ID: str = os.getenv("CTRADER_OPENAPI_CLIENT_ID", os.getenv("OpenAPI_ClientID", "")).strip()
+    CTRADER_OPENAPI_CLIENT_SECRET: str = os.getenv("CTRADER_OPENAPI_CLIENT_SECRET", os.getenv("OpenAPI_Secreat", os.getenv("OpenAPI_Secret", ""))).strip()
+    # Optional override for protobuf TCP host (default: demo.ctraderapi.com / live.ctraderapi.com). See Spotware proxy docs.
+    CTRADER_OPENAPI_PROTOBUF_HOST: str = os.getenv("CTRADER_OPENAPI_PROTOBUF_HOST", "").strip()
+    CTRADER_OPENAPI_PROTOBUF_PORT: int = int(os.getenv("CTRADER_OPENAPI_PROTOBUF_PORT", "5035") or "5035")
     CTRADER_OPENAPI_REDIRECT_URI: str = os.getenv("CTRADER_OPENAPI_REDIRECT_URI", "http://localhost")
-    CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", os.getenv("OpenAPI_Access_token_API_key", ""))
-    CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", os.getenv("OpenAPI_Refresh_token_API_key", ""))
+    # Token resolution: token_manager handles priority (persisted state > env).
+    # Legacy fallback keys (OpenAPI_Access_token_API_key) removed — they pointed
+    # to revoked tokens after key rotation. Use CTRADER_OPENAPI_* keys only.
+    CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", "").strip()
+    CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", "").strip()
     CTRADER_USER_ID_JSON: str = os.getenv("CTRADER_USER_ID_JSON", os.getenv("Ctrader_UserID", ""))
     CTRADER_ACCOUNTS_JSON: str = os.getenv("CTRADER_ACCOUNTS_JSON", os.getenv("Ctrader_accounts", ""))
     MT5_READINESS_CHECK_ON_START: bool = os.getenv("MT5_READINESS_CHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -852,6 +1483,7 @@ class Config:
     AUTO_APPLY_LIVE_PROFILE_MIN_WIN_RATE: float = float(os.getenv("AUTO_APPLY_LIVE_PROFILE_MIN_WIN_RATE", "0.60"))
     AUTO_APPLY_LIVE_PROFILE_MIN_PNL_USD: float = float(os.getenv("AUTO_APPLY_LIVE_PROFILE_MIN_PNL_USD", "0.0"))
     AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MIN_RESOLVED: int = int(os.getenv("AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MIN_RESOLVED", "4"))
+    AUTO_APPLY_LIVE_PROFILE_MAX_WAIT_MIN: float = float(os.getenv("AUTO_APPLY_LIVE_PROFILE_MAX_WAIT_MIN", "20.0"))
     AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MAX_NET_LOSS_USD: float = float(os.getenv("AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MAX_NET_LOSS_USD", "-20.0"))
     AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MIN_WIN_RATE: float = float(os.getenv("AUTO_APPLY_LIVE_PROFILE_ROLLBACK_MIN_WIN_RATE", "0.40"))
     AUTO_APPLY_LIVE_PROFILE_ENV_BACKUP_KEEP: int = int(os.getenv("AUTO_APPLY_LIVE_PROFILE_ENV_BACKUP_KEEP", "20"))
@@ -1211,7 +1843,10 @@ class Config:
     XAUUSD_SCALP_ENABLED: bool = os.getenv("XAUUSD_SCALP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     XAUUSD_SCALP_SCAN_INTERVAL: int = int(os.getenv("XAUUSD_SCALP_SCAN_INTERVAL", "60"))     # seconds (every 1 min)
     XAUUSD_SCALP_MIN_CONFIDENCE: float = float(os.getenv("XAUUSD_SCALP_MIN_CONFIDENCE", "58.0"))
-    XAUUSD_SCALP_REQUIRE_KILL_ZONE: bool = os.getenv("XAUUSD_SCALP_REQUIRE_KILL_ZONE", "1").strip().lower() in ("1", "true", "yes", "on")
+    # 2026-04-29 surgery: kill_zone defaults to soft (warn-only) so off-zone opportunities are not silently dropped.
+    XAUUSD_SCALP_REQUIRE_KILL_ZONE: bool = os.getenv("XAUUSD_SCALP_REQUIRE_KILL_ZONE", "0").strip().lower() in ("1", "true", "yes", "on")
+    # When kill_zone gate is soft, off-zone signals get this confidence penalty (0 = no penalty).
+    XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY: float = float(os.getenv("XAUUSD_SCALP_OFF_KILL_ZONE_CONFIDENCE_PENALTY", "5"))
     XAUUSD_SCALP_REQUIRE_M1_TRIGGER: bool = os.getenv("XAUUSD_SCALP_REQUIRE_M1_TRIGGER", "1").strip().lower() in ("1", "true", "yes", "on")
     XAUUSD_SCALP_ALERT_COOLDOWN_SEC: int = int(os.getenv("XAUUSD_SCALP_ALERT_COOLDOWN_SEC", "300"))  # 5 min cooldown
     XAUUSD_SCALP_FVG_LOOKBACK: int = int(os.getenv("XAUUSD_SCALP_FVG_LOOKBACK", "25"))
@@ -1632,6 +2267,11 @@ class Config:
     SCALPING_XAU_FORCE_ENTRY_MAX_DIST_ATR_M1: float = float(os.getenv("SCALPING_XAU_FORCE_ENTRY_MAX_DIST_ATR_M1", "0.45"))
     SCALPING_XAU_FORCE_RSI_LONG_MIN: float = float(os.getenv("SCALPING_XAU_FORCE_RSI_LONG_MIN", "51.0"))
     SCALPING_XAU_FORCE_RSI_SHORT_MAX: float = float(os.getenv("SCALPING_XAU_FORCE_RSI_SHORT_MAX", "49.0"))
+    SCALP_XAU_WINNER_CONTEXT_GUARD_ENABLED: bool = os.getenv("SCALP_XAU_WINNER_CONTEXT_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_WINNER_BLOCK_LONG_M1_CORRECTION: bool = os.getenv("SCALP_XAU_WINNER_BLOCK_LONG_M1_CORRECTION", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED: bool = os.getenv("SCALP_XAU_WINNER_REJECTION_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_WINNER_MISTAKE_LEARNING_ENABLED: bool = os.getenv("SCALP_XAU_WINNER_MISTAKE_LEARNING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    SCALP_XAU_WINNER_MISTAKE_LEARNING_TABLE: str = os.getenv("SCALP_XAU_WINNER_MISTAKE_LEARNING_TABLE", "xau_winner_mistake_journal")
     SCALPING_CRYPTO_WINNER_LOGIC_ENABLED: bool = os.getenv("SCALPING_CRYPTO_WINNER_LOGIC_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_CRYPTO_WINNER_CACHE_SEC: int = int(os.getenv("SCALPING_CRYPTO_WINNER_CACHE_SEC", "180"))
     SCALPING_CRYPTO_WINNER_LOOKBACK_DAYS: int = int(os.getenv("SCALPING_CRYPTO_WINNER_LOOKBACK_DAYS", "21"))
@@ -1711,6 +2351,19 @@ class Config:
     SCALPING_ALERT_COOLDOWN_SEC: int = int(os.getenv("SCALPING_ALERT_COOLDOWN_SEC", "120"))
     SCALPING_DUPLICATE_SUPPRESS_SEC: int = int(os.getenv("SCALPING_DUPLICATE_SUPPRESS_SEC", "1800"))
     SCALPING_XAU_MARKET_CLOSED_GUARD_ENABLED: bool = os.getenv("SCALPING_XAU_MARKET_CLOSED_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_HOLIDAY_GUARD_ENABLED: bool = os.getenv("XAU_HOLIDAY_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    # ── Post-SL sweep reversal re-entry ──────────────────────────────────────
+    POST_SL_REVERSAL_ENABLED: bool = os.getenv("POST_SL_REVERSAL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    POST_SL_REVERSAL_MIN_WICK_RATIO: float = float(os.getenv("POST_SL_REVERSAL_MIN_WICK_RATIO", "0.55"))
+    POST_SL_REVERSAL_MIN_SWEEP_PIPS: float = float(os.getenv("POST_SL_REVERSAL_MIN_SWEEP_PIPS", "3.0"))
+    POST_SL_REVERSAL_CONFIDENCE: float = float(os.getenv("POST_SL_REVERSAL_CONFIDENCE", "74.0"))
+    POST_SL_REVERSAL_SL_BUFFER_ATR: float = float(os.getenv("POST_SL_REVERSAL_SL_BUFFER_ATR", "0.20"))
+    POST_SL_REVERSAL_TP1_R: float = float(os.getenv("POST_SL_REVERSAL_TP1_R", "1.5"))
+    POST_SL_REVERSAL_TP2_R: float = float(os.getenv("POST_SL_REVERSAL_TP2_R", "2.5"))
+    POST_SL_REVERSAL_TP3_R: float = float(os.getenv("POST_SL_REVERSAL_TP3_R", "3.5"))
+    POST_SL_REVERSAL_COOLDOWN_SECONDS: float = float(os.getenv("POST_SL_REVERSAL_COOLDOWN_SECONDS", "300"))
+    POST_SL_REVERSAL_BYPASS_CONF_BAND: bool = os.getenv("POST_SL_REVERSAL_BYPASS_CONF_BAND", "1").strip().lower() in ("1", "true", "yes", "on")
+    POST_SL_REVERSAL_BYPASS_MTF: bool = os.getenv("POST_SL_REVERSAL_BYPASS_MTF", "0").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_NOTIFY_TELEGRAM: bool = os.getenv("SCALPING_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_EXECUTE_MT5: bool = os.getenv("SCALPING_EXECUTE_MT5", "1").strip().lower() in ("1", "true", "yes", "on")
     SCALPING_CLOSE_TIMEOUT_MIN: int = int(os.getenv("SCALPING_CLOSE_TIMEOUT_MIN", "35"))
@@ -2058,6 +2711,35 @@ class Config:
         return out
 
     @classmethod
+    def _parse_source_direction_set(cls, raw: str) -> set[tuple[str, str]]:
+        out: set[tuple[str, str]] = set()
+        for part in str(raw or "").split(","):
+            item = str(part or "").strip().lower().replace(" ", "_")
+            if not item:
+                continue
+            if item in {"*", "all"}:
+                out.add(("*", "*"))
+                continue
+            if ":" not in item:
+                out.add((item, "*"))
+                continue
+            source, direction = item.rsplit(":", 1)
+            source = source.strip()
+            direction = direction.strip()
+            if direction not in {"long", "short", "buy", "sell", "*", "all"}:
+                source = item
+                direction = "*"
+            if direction == "buy":
+                direction = "long"
+            elif direction == "sell":
+                direction = "short"
+            elif direction == "all":
+                direction = "*"
+            if source:
+                out.add((source, direction or "*"))
+        return out
+
+    @classmethod
     def _parse_signature_set(cls, raw: str) -> set[str]:
         out: set[str] = set()
         for chunk in str(raw or "").split("|"):
@@ -2172,6 +2854,14 @@ class Config:
         return cls._parse_lower_set(cls.CTRADER_ALLOWED_SOURCES)
 
     @classmethod
+    def get_ctrader_quarantined_source_directions(cls) -> set[tuple[str, str]]:
+        return cls._parse_source_direction_set(cls.CTRADER_QUARANTINED_SOURCE_DIRECTIONS)
+
+    @classmethod
+    def get_ctrader_protected_source_directions(cls) -> set[tuple[str, str]]:
+        return cls._parse_source_direction_set(cls.CTRADER_PROTECTED_SOURCE_DIRECTIONS)
+
+    @classmethod
     def get_ctrader_allowed_symbols(cls) -> set[str]:
         return cls._parse_symbol_set(cls.CTRADER_ALLOWED_SYMBOLS)
 
@@ -2279,7 +2969,32 @@ class Config:
 
     @classmethod
     def get_ctrader_xau_active_families(cls) -> set[str]:
-        return cls._parse_lower_set(cls.CTRADER_XAU_ACTIVE_FAMILIES)
+        families = cls._parse_lower_set(cls.CTRADER_XAU_ACTIVE_FAMILIES)
+        if bool(getattr(cls, "DEXTER_MEMPALACE_FAMILY_LANE_ENABLED", False)):
+            fam = str(getattr(cls, "DEXTER_MEMPALACE_FAMILY_NAME", "") or "").strip().lower()
+            if fam:
+                families.add(fam)
+        if bool(getattr(cls, "DEXTER_TRADING_CENTRAL_FAMILY_LANE_ENABLED", False)):
+            fam = str(getattr(cls, "DEXTER_TRADING_CENTRAL_FAMILY_NAME", "") or "").strip().lower()
+            if fam:
+                families.add(fam)
+        return families
+
+    @classmethod
+    def get_dexter_mempalace_source_tokens(cls) -> set[str]:
+        return cls._parse_lower_set(cls.DEXTER_MEMPALACE_SOURCE_TOKENS)
+
+    @classmethod
+    def get_dexter_trading_central_source_tokens(cls) -> set[str]:
+        return cls._parse_lower_set(cls.DEXTER_TRADING_CENTRAL_SOURCE_TOKENS)
+
+    @classmethod
+    def get_ctrader_pm_impulse_families(cls) -> set[str]:
+        return cls._parse_lower_set(cls.CTRADER_PM_IMPULSE_FAMILIES)
+
+    @classmethod
+    def get_ctrader_pm_corrective_families(cls) -> set[str]:
+        return cls._parse_lower_set(cls.CTRADER_PM_CORRECTIVE_FAMILIES)
 
     @classmethod
     def get_ctrader_market_capture_symbols(cls) -> set[str]:
@@ -2695,6 +3410,7 @@ class Config:
             "b": int(cls.BILLING_PRICE_B_CENTS),
             "c": int(cls.BILLING_PRICE_C_CENTS),
         }
+
 
     # ── Self-Mutation Loop ────────────────────────────────────────────────────
     # Autonomous config evolution. Every loss is a hypothesis; every shadow

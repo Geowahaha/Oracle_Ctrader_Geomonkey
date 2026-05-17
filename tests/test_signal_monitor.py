@@ -83,6 +83,7 @@ class SignalMonitorIntentTests(unittest.TestCase):
         notes = list(payload.get("notes") or [])
         self.assertEqual(notes.count("fallback:no_direction_passed_threshold"), 1)
 
+    @unittest.skip("fx_provider disabled — system uses cTrader OpenAPI only")
     def test_build_signal_monitor_payload_supports_gbpusd_fx(self):
         bot = TelegramAdminBot()
         with patch("scanners.fx_major_scanner.fx_major_scanner.scan", return_value=[]), \

@@ -228,6 +228,8 @@ class MacroImpactTracker:
             return self._normalize_series(xauusd_provider.fetch("5m", bars=1000))
 
         def load_crypto(sym: str):
+            if crypto_provider is None:
+                return None
             return self._normalize_series(crypto_provider.fetch_ohlcv(sym, timeframe="5m", bars=1000))
 
         cache["XAUUSD"] = load_xau()

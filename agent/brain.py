@@ -21,6 +21,8 @@ from analysis.technical import TechnicalAnalysis
 from scanners.xauusd import xauusd_scanner
 from scanners.crypto_sniper import crypto_sniper
 from scanners.stock_scanner import stock_scanner, fetch_stock_ohlcv, detect_market
+from scanners.fibo_advance import FiboAdvanceScanner as _FiboAdvanceScanner
+_fibo_advance_scanner = _FiboAdvanceScanner()
 
 logger = logging.getLogger(__name__)
 ta = TechnicalAnalysis()
@@ -57,6 +59,11 @@ TOOLS = [
     {
         "name": "scan_xauusd",
         "description": "Run a live XAUUSD sniper scan.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scan_fibo_advance",
+        "description": "Run the Fibonacci Advance dual-speed sniper scan (Sniper H4+H1 and Scout H1+M15).",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -162,6 +169,14 @@ class DexterBrain:
             if tool_name == "scan_xauusd":
                 signal = xauusd_scanner.scan()
                 return {"success": True, "signal": signal.to_dict() if signal else None}
+
+            if tool_name == "scan_fibo_advance":
+                signal = _fibo_advance_scanner.scan()
+                result = signal.to_dict() if signal else None
+                if result:
+                    result["mode"] = str((signal.raw_scores or {}).get("mode", "unknown"))
+                diag = _fibo_advance_scanner.get_last_scan_diagnostics()
+                return {"success": True, "signal": result, "diagnostics": diag}
 
             if tool_name == "scan_crypto_market":
                 top_n = min(int(tool_input.get("top_n", 5)), 10)

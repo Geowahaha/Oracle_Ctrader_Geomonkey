@@ -1,0 +1,8 @@
+Intraday
+Gold - 4830.00
+22/04/2026 16:11
+Buy
+4748.33
+Take profit at 4830 (8167.0 pips)
+Stop loss at 4715 (-3333.0 pips)
+Source: Trading Central

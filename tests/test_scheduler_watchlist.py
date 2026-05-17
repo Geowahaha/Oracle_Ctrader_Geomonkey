@@ -95,6 +95,47 @@ class SchedulerWatchlistTests(unittest.TestCase):
     def test_scheduler_logs_quality_and_watchlist_counts(self):
         pass
 
+    def test_ctrader_dispatch_blocks_fibo_mtf_shadow_pattern_even_when_winner_eligible(self):
+        dexter = scheduler_module.DexterScheduler()
+        signal = make_signal("XAUUSD", confidence=96.0)
+        signal.raw_scores = {
+            "pattern": "FIBO_MTF_SHADOW_H1",
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "phase_winner",
+            "fibo_mtf_live_enabled": False,
+        }
+
+        with patch.object(
+            scheduler_module.config,
+            "get_ctrader_allowed_sources",
+            return_value={"fibo_xauusd", "fibo_xauusd:winner"},
+        ):
+            dispatch_source, meta = dexter._ctrader_pick_dispatch_source(signal, "fibo_xauusd")
+
+        self.assertEqual(dispatch_source, "")
+        self.assertEqual(meta.get("winner_reason"), "shadow_to_live_invariant")
+        self.assertTrue(meta.get("shadow_to_live_blocked"))
+
+    def test_ctrader_dispatch_keeps_canonical_fibo_winner_opportunity_first(self):
+        dexter = scheduler_module.DexterScheduler()
+        signal = make_signal("XAUUSD", confidence=96.0)
+        signal.raw_scores = {
+            "pattern": "FIBO_ADVANCE_GOLDEN_POCKET",
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "phase_winner",
+        }
+
+        with patch.object(
+            scheduler_module.config,
+            "get_ctrader_allowed_sources",
+            return_value={"fibo_xauusd", "fibo_xauusd:winner"},
+        ):
+            dispatch_source, meta = dexter._ctrader_pick_dispatch_source(signal, "fibo_xauusd")
+
+        self.assertEqual(dispatch_source, "fibo_xauusd:winner")
+        self.assertEqual(meta.get("winner_reason"), "phase_winner")
+        self.assertFalse(meta.get("shadow_to_live_blocked", False))
+
     def test_xauusd_scheduled_scan_respects_cooldown(self):
         dexter = scheduler_module.DexterScheduler()
         signal = make_signal("XAUUSD", confidence=85.0)
@@ -979,6 +1020,52 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertIn("session mismatch", str(getattr(result, "message", "")).lower())
         self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("mt5_xau_scheduled_live_rejected")))
 
+    def test_ctrader_xau_opportunity_first_bypasses_winner_neutral_and_live_band(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=62.5)
+        sig.pattern = "SCALP_FLOW_FORCE"
+        sig.raw_scores.update({"winner_logic_regime": "neutral"})
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", True), \
+             patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd:winner"}), \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_result) as exec_call:
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIs(result, fake_result)
+        self.assertEqual(exec_call.call_count, 1)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "scalp_xauusd")
+        raw = getattr(sig, "raw_scores", {})
+        self.assertTrue(raw.get("xau_opportunity_first_live_unlock"))
+        gates = [str(item.get("gate")) for item in raw.get("xau_opportunity_first_bypassed_gates", [])]
+        self.assertIn("xau_live_filter", gates)
+
+    def test_fibo_mtf_candidates_execute_live_not_shadow_only(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=72.0)
+        sig.pattern = "Fibo MTF 0.618 continuation"
+        sig.raw_scores.update({"tf_label": "M1", "opportunity_score": 72, "block_reason": "fibo_mtf_shadow"})
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "FIBO_MTF_SHADOW_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_OPPORTUNITY_FIRST_LIVE_UNLOCK_ENABLED", True), \
+             patch.object(scheduler_module.fibo_mtf_shadow_scanner, "scan", return_value=[sig]), \
+             patch.object(dexter, "_maybe_execute_ctrader_signal", return_value=fake_result) as exec_call, \
+             patch.object(dexter, "_store_shadow_signal") as shadow_call:
+            report = dexter._run_fibo_mtf_shadow_scan()
+
+        self.assertTrue(report.get("ok"))
+        self.assertEqual(report.get("signals"), 1)
+        self.assertEqual(report.get("executed"), 1)
+        self.assertEqual(report.get("stored"), 0)
+        self.assertEqual(shadow_call.call_count, 0)
+        self.assertEqual(exec_call.call_count, 1)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "fibo_xauusd")
+        self.assertTrue(getattr(sig, "raw_scores", {}).get("xau_opportunity_first_live_unlock"))
+
     def test_ctrader_prefers_crypto_winner_lane_when_allowed(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("ETHUSD", confidence=79.0)
@@ -1072,6 +1159,32 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertIs(result, fake_result)
         self.assertEqual(exec_call.call_args.kwargs.get("source"), "scalp_btcusd")
 
+    def test_ctrader_promotes_fibo_to_winner_lane_when_phase_profile_is_strong(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=84.0)
+        sig.pattern = "FIBO_GoldenPocket_EW2"
+        sig.raw_scores.update({
+            "fibo_winner_eligible": True,
+            "fibo_winner_reason": "impulse_restart_confirmed",
+            "winner_logic_regime": "strong",
+            "wave_phase": "impulse_restart",
+        })
+        fake_result = SimpleNamespace(status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_FIBO_WINNER_MIN_CONFIDENCE", 78.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"fibo_xauusd", "fibo_xauusd:winner"}), \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_result) as exec_call:
+            dispatch_source, dispatch_meta = dexter._ctrader_pick_dispatch_source(sig, source="fibo_xauusd")
+            self.assertEqual(dispatch_source, "fibo_xauusd:winner")
+            self.assertEqual(str(dispatch_meta.get("winner_reason") or ""), "impulse_restart_confirmed")
+            result = dexter._maybe_execute_ctrader_signal(sig, source="fibo_xauusd")
+
+        self.assertIs(result, fake_result)
+        self.assertEqual(exec_call.call_args.kwargs.get("source"), "fibo_xauusd:winner")
+        self.assertEqual(getattr(sig, "raw_scores", {}).get("ctrader_dispatch_source"), "fibo_xauusd:winner")
+
     def test_ctrader_blocks_xau_scalp_outside_safe_live_filter(self):
         dexter = scheduler_module.DexterScheduler()
         sig = make_signal("XAUUSD", confidence=67.5)
@@ -1082,6 +1195,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
              patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd"}), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0), \
@@ -1104,6 +1218,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         fake_ctr = SimpleNamespace(ok=True, dry_run=False, status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
 
         with patch.object(scheduler_module.config, "PERSISTENT_CANARY_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_MT5_ENABLED", True), \
@@ -1120,6 +1235,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"scalp_xauusd"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_maybe_execute_mt5_signal") as mt5_call, \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="scalp_xauusd")
 
@@ -1156,6 +1272,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(scheduler_module.config, "PERSISTENT_CANARY_ENABLED", True))
+            stack.enter_context(patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False))
             stack.enter_context(patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", True))
             stack.enter_context(patch.object(scheduler_module.config, "PERSISTENT_CANARY_MT5_ENABLED", True))
             stack.enter_context(patch.object(scheduler_module.config, "PERSISTENT_CANARY_CTRADER_ENABLED", True))
@@ -1211,6 +1328,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         fake_ctr = SimpleNamespace(ok=True, dry_run=False, status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
 
         with patch.object(scheduler_module.config, "PERSISTENT_CANARY_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_CTRADER_ENABLED", True), \
@@ -1225,6 +1343,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"xauusd_scheduled"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_load_strategy_family_candidates", return_value=[]), \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="xauusd_scheduled")
 
@@ -1248,6 +1367,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         fake_ctr = SimpleNamespace(ok=True, dry_run=False, status="accepted", signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
 
         with patch.object(scheduler_module.config, "PERSISTENT_CANARY_ENABLED", True), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", False), \
              patch.object(scheduler_module.config, "PERSISTENT_CANARY_CTRADER_ENABLED", True), \
@@ -1262,6 +1382,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "get_persistent_canary_direct_allowed_sources", return_value={"xauusd_scheduled"}), \
              patch.object(scheduler_module.config, "get_persistent_canary_allowed_symbols", return_value={"XAUUSD"}), \
              patch.object(dexter, "_load_strategy_family_candidates", return_value=[]), \
+             patch.object(dexter, "_allow_ctrader_source_profile", return_value=(True, "test_bypass")), \
              patch.object(scheduler_module.ctrader_executor, "execute_signal", return_value=fake_ctr) as ctr_call:
             rpt = dexter._maybe_execute_persistent_canary(sig, source="xauusd_scheduled")
 
@@ -1318,6 +1439,84 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertEqual(rows[0]["family"], "xau_scalp_range_repair")
         self.assertEqual(rows[0]["strategy_id"], "xau_scalp_range_repair_v1")
         self.assertTrue(bool(rows[0]["experimental"]))
+
+    def test_strategy_family_candidates_include_mempalace_payload_when_enabled(self):
+        dexter = scheduler_module.DexterScheduler()
+        payload = {"candidates": []}
+        mempalace_payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "short",
+            "entry": 5201.2,
+            "stop_loss": 5204.4,
+            "entry_type": "sell_stop",
+            "confidence": 74.0,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-test-01",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-test-01"},
+        }
+        with patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", True), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 2), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_PRIORITY", 111), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_STRATEGY_ID", "xau_scalp_mempalace_lane_v1"), \
+             patch.object(scheduler_module.config, "get_persistent_canary_experimental_families", return_value=set()), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_active_families", return_value=set()), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=mempalace_payload), \
+             patch.object(scheduler_module.Path, "exists", return_value=True), \
+             patch.object(scheduler_module.Path, "read_text", return_value=json.dumps(payload)):
+            rows = dexter._load_strategy_family_candidates(symbol="XAUUSD", base_source="scalp_xauusd")
+
+        families = [str(row.get("family") or "") for row in rows]
+        self.assertIn("xau_scalp_mempalace_lane", families)
+        mem_row = next(row for row in rows if str(row.get("family") or "") == "xau_scalp_mempalace_lane")
+        self.assertTrue(bool(mem_row.get("experimental")))
+        self.assertEqual(str(mem_row.get("strategy_id") or ""), "xau_scalp_mempalace_lane_v1")
+        self.assertEqual(int(mem_row.get("priority", 0) or 0), 111)
+        self.assertEqual(str(mem_row.get("source") or ""), "mempalace_payload")
+
+    def test_strategy_family_candidates_include_trading_central_payload_when_enabled(self):
+        dexter = scheduler_module.DexterScheduler()
+        payload = {"candidates": []}
+        trading_central_payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry": 4748.33,
+            "stop_loss": 4715.0,
+            "target": 4830.0,
+            "entry_type": "limit",
+            "confidence": 74.0,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-test-01",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-test-01"},
+        }
+        with patch.object(scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", True), \
+             patch.object(scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_MAX_VARIANTS", 2), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_PRIORITY", 112), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_STRATEGY_ID", "xau_scalp_trading_central_intraday_v1"), \
+             patch.object(scheduler_module.config, "get_persistent_canary_experimental_families", return_value=set()), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_active_families", return_value=set()), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=trading_central_payload), \
+             patch.object(scheduler_module.Path, "exists", return_value=True), \
+             patch.object(scheduler_module.Path, "read_text", return_value=json.dumps(payload)):
+            rows = dexter._load_strategy_family_candidates(symbol="XAUUSD", base_source="scalp_xauusd")
+
+        families = [str(row.get("family") or "") for row in rows]
+        self.assertIn("xau_scalp_trading_central_intraday", families)
+        tc_row = next(row for row in rows if str(row.get("family") or "") == "xau_scalp_trading_central_intraday")
+        self.assertTrue(bool(tc_row.get("experimental")))
+        self.assertEqual(str(tc_row.get("strategy_id") or ""), "xau_scalp_trading_central_intraday_v1")
+        self.assertEqual(int(tc_row.get("priority", 0) or 0), 112)
+        self.assertEqual(str(tc_row.get("source") or ""), "trading_central_payload")
 
     def test_strategy_family_candidates_reserve_flow_short_sidecar_when_opportunity_sidecar_active(self):
         dexter = scheduler_module.DexterScheduler()
@@ -1913,6 +2112,196 @@ class SchedulerWatchlistTests(unittest.TestCase):
             "xau_scalp_microtrend_follow_up",
             "xau_scalp_flow_short_sidecar",
         ])
+
+    def test_build_family_canary_signal_for_mempalace_payload(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=72.0)
+        sig.direction = "long"
+        sig.entry = 5200.0
+        sig.stop_loss = 5197.0
+        sig.take_profit_1 = 5202.0
+        sig.take_profit_2 = 5204.0
+        sig.take_profit_3 = 5207.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_mempalace_lane",
+            "strategy_id": "xau_scalp_mempalace_lane_v1",
+            "priority": 155,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "short",
+            "entry": 5198.5,
+            "stop_loss": 5201.0,
+            "entry_type": "sell_stop",
+            "confidence": 74.2,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-1",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-1"},
+        }
+        with patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "MEMPALACE_FAMILY_CTRADER_RISK_USD", 0.66), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:mmp:canary")
+        self.assertEqual(str(getattr(lane_signal, "direction", "")), "short")
+        self.assertEqual(str(getattr(lane_signal, "entry_type", "")), "sell_stop")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertEqual(str(raw.get("strategy_family") or ""), "xau_scalp_mempalace_lane")
+        self.assertEqual(str(raw.get("strategy_family_executor") or ""), "scheduler_canary_family_mempalace")
+        self.assertEqual(str((raw.get("mempalace_family_payload") or {}).get("signal_id") or ""), "mmp-1")
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0), 0.66, places=3)
+
+    def test_build_family_canary_signal_for_mempalace_payload_without_price_plan_uses_base_geometry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=73.0)
+        sig.direction = "long"
+        sig.entry = 5200.0
+        sig.stop_loss = 5196.0
+        sig.take_profit_1 = 5202.5
+        sig.take_profit_2 = 5205.0
+        sig.take_profit_3 = 5208.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_mempalace_lane",
+            "strategy_id": "xau_scalp_mempalace_lane_v1",
+            "priority": 155,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry_type": "limit",
+            "confidence": 75.0,
+            "updated_at": "2026-04-17T08:10:00Z",
+            "signal_id": "mmp-2",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/mempalace_family_signal.json",
+            "raw": {"signal_id": "mmp-2"},
+        }
+        with patch.object(scheduler_module.config, "MEMPALACE_FAMILY_ENABLED", True), \
+             patch.object(dexter, "_load_mempalace_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:mmp:canary")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertTrue(bool((raw.get("mempalace_family_payload") or {}).get("used_base_signal_geometry")))
+        self.assertEqual(str((raw.get("mempalace_family_payload") or {}).get("signal_id") or ""), "mmp-2")
+
+    def test_build_family_canary_signal_for_trading_central_payload_bypasses_mtf_guard(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=71.0)
+        sig.direction = "short"
+        sig.entry = 4746.0
+        sig.stop_loss = 4752.0
+        sig.take_profit_1 = 4741.0
+        sig.take_profit_2 = 4736.0
+        sig.take_profit_3 = 4731.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_trading_central_intraday",
+            "strategy_id": "xau_scalp_trading_central_intraday_v1",
+            "priority": 156,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "entry": 4748.33,
+            "stop_loss": 4715.0,
+            "target": 4830.0,
+            "entry_type": "limit",
+            "confidence": 74.0,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-1",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-1"},
+        }
+        with patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_CTRADER_RISK_USD", 0.61), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=payload), \
+             patch.object(dexter, "_xau_multi_tf_entry_guard", return_value={"blocked": True, "reason": "mtf_unit_test"}) as mtf_guard:
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:tc:canary")
+        self.assertEqual(str(getattr(lane_signal, "direction", "")), "long")
+        mtf_guard.assert_not_called()
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertEqual(str(raw.get("strategy_family") or ""), "xau_scalp_trading_central_intraday")
+        self.assertEqual(str(raw.get("strategy_family_executor") or ""), "scheduler_canary_family_trading_central")
+        self.assertTrue(bool(raw.get("xau_multi_tf_guard_bypass")))
+        self.assertEqual(str((raw.get("trading_central_payload") or {}).get("signal_id") or ""), "tc-1")
+        self.assertAlmostEqual(float(raw.get("ctrader_risk_usd_override", 0.0) or 0.0), 0.61, places=3)
+
+    def test_build_family_canary_signal_for_trading_central_payload_without_price_plan_uses_base_geometry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=73.0)
+        sig.direction = "long"
+        sig.entry = 4748.0
+        sig.stop_loss = 4742.0
+        sig.take_profit_1 = 4752.0
+        sig.take_profit_2 = 4756.0
+        sig.take_profit_3 = 4762.0
+        sig.entry_type = "limit"
+        candidate = {
+            "family": "xau_scalp_trading_central_intraday",
+            "strategy_id": "xau_scalp_trading_central_intraday_v1",
+            "priority": 156,
+            "execution_ready": True,
+            "experimental": True,
+        }
+        payload = {
+            "symbol": "XAUUSD",
+            "base_source": "scalp_xauusd",
+            "direction": "long",
+            "confidence": 74.5,
+            "updated_at": "2026-04-22T09:11:00Z",
+            "signal_id": "tc-2",
+            "provider": "Trading Central",
+            "analysis_type": "intraday",
+            "timeframe": "5m",
+            "path": "D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/data/runtime/trading_central_intraday_signal.json",
+            "raw": {"signal_id": "tc-2"},
+        }
+        with patch.object(scheduler_module.config, "TRADING_CENTRAL_FAMILY_ENABLED", True), \
+             patch.object(dexter, "_load_trading_central_lane_payload", return_value=payload):
+            lane_signal, lane_source = dexter._build_family_canary_signal(
+                sig,
+                base_source="scalp_xauusd",
+                candidate=candidate,
+            )
+
+        self.assertIsNotNone(lane_signal)
+        self.assertEqual(lane_source, "scalp_xauusd:tc:canary")
+        raw = dict(getattr(lane_signal, "raw_scores", {}) or {})
+        self.assertTrue(bool((raw.get("trading_central_payload") or {}).get("used_base_signal_geometry")))
+        self.assertEqual(str((raw.get("trading_central_payload") or {}).get("signal_id") or ""), "tc-2")
 
     def test_build_family_canary_signal_for_tick_depth_filter_uses_capture_gate(self):
         dexter = scheduler_module.DexterScheduler()
@@ -3179,7 +3568,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
         sig = make_signal("XAUUSD", confidence=78.0)
         sig.session = "new_york"
 
-        with patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_FILTER_ENABLED", True), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MIN", 72.0), \
              patch.object(scheduler_module.config, "MT5_SCALP_XAU_LIVE_CONF_MAX", 75.0), \
              patch.object(scheduler_module.config, "get_mt5_scalp_xau_live_sessions", return_value={"new_york"}):
@@ -3207,7 +3597,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
             }
         )
 
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False):
             allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
@@ -3241,7 +3632,8 @@ class SchedulerWatchlistTests(unittest.TestCase):
                 },
             }
         )
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_FSS_SELL_ROUTING_ENABLED", True):
             allow, reason = dexter._allow_scalp_xau_live_mt5(sig, source="scalp_xauusd")
@@ -3273,7 +3665,9 @@ class SchedulerWatchlistTests(unittest.TestCase):
                 },
             }
         )
-        with patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+        with patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_PARTIAL_ALIGN", True), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_PARTIAL_MIN_CONF", 66.0), \
@@ -3308,6 +3702,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
         with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
              patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", False), \
+             patch.object(scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED", False), \
              patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
              patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"scalp_xauusd:winner"}), \
@@ -3349,6 +3744,60 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertIn("xau_scheduled_session_not_allowed", str(audit_call.call_args.kwargs.get("reason", "")))
         self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("ctrader_source_profile_blocked")))
         self.assertIn("xau_scheduled_session_not_allowed", str(getattr(sig, "raw_scores", {}).get("ctrader_source_profile_reason", "")))
+
+    def test_ctrader_xau_scheduled_no_chase_block_emits_late_entry_telemetry(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_guard_no_chase": True,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_AUTOTRADE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "get_ctrader_allowed_sources", return_value={"xauusd_scheduled:winner"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london", "london,new_york,overlap"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}), \
+             patch.object(scheduler_module.config, "get_mt5_xau_scheduled_live_sessions", return_value={"new_york"}), \
+             patch.object(scheduler_module.config, "get_mt5_xau_scheduled_live_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "MT5_XAU_SCHEDULED_LIVE_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.ctrader_executor, "journal_pre_dispatch_skip", return_value=18) as audit_call, \
+             patch.object(scheduler_module.ctrader_executor, "execute_signal") as exec_call:
+            out = dexter._maybe_execute_ctrader_signal(sig, source="xauusd_scheduled")
+
+        self.assertIsNone(out)
+        self.assertEqual(exec_call.call_count, 0)
+        self.assertEqual(audit_call.call_count, 1)
+        self.assertEqual(audit_call.call_args.kwargs.get("gate"), "source_profile")
+        self.assertEqual(str(audit_call.call_args.kwargs.get("reason", "")), "xau_scheduled_no_chase_block")
+        execution_meta = dict(audit_call.call_args.kwargs.get("execution_meta") or {})
+        audit_tags = list(execution_meta.get("audit_tags") or [])
+        self.assertIn("xau_scheduled_late_entry_block", audit_tags)
+        self.assertIn("late_entry_reason:xau_scheduled_no_chase_block", audit_tags)
+        late_block = dict(execution_meta.get("xau_scheduled_late_entry_block") or {})
+        self.assertTrue(bool(late_block.get("active")))
+        self.assertEqual(str(late_block.get("reason") or ""), "xau_scheduled_no_chase_block")
+        self.assertTrue(bool(getattr(sig, "raw_scores", {}).get("xau_scheduled_late_entry_blocked")))
+        self.assertEqual(
+            str(getattr(sig, "raw_scores", {}).get("xau_scheduled_late_entry_block_reason", "")),
+            "xau_scheduled_no_chase_block",
+        )
 
     def test_ctrader_btc_winner_profile_blocks_high_conf_or_wrong_session(self):
         dexter = scheduler_module.DexterScheduler()
@@ -3396,6 +3845,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CHOCH_LIMIT_PULLBACK_RISK_RATIO", 0.12), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -3436,6 +3886,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_NEURAL_PROB", 0.65), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -3499,6 +3950,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
             mock_dt.now.return_value = weekend_dt
@@ -3542,6 +3994,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_NEUTRAL_OB_MIN_NEURAL_PROB", 0.65), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
             mock_dt.now.return_value = weekend_dt
@@ -3612,6 +4065,7 @@ class SchedulerWatchlistTests(unittest.TestCase):
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_ALLOW_MARKET", True), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_CTRADER_RISK_USD", 0.9), \
              patch.object(scheduler_module.config, "BTC_WEEKDAY_LOB_RELAXED_RISK_MULTIPLIER", 0.7), \
+             patch.object(scheduler_module.config, "BTC_MRD_ENABLED", False), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_sessions", return_value={"new_york", "london,new_york,overlap"}), \
              patch.object(scheduler_module.config, "get_btc_weekday_lob_allowed_patterns", return_value={"ob_bounce", "choch_entry"}), \
              patch("scheduler.datetime") as mock_dt:
@@ -4641,6 +5095,156 @@ class SchedulerWatchlistTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "xau_scheduled_profile_pass")
 
+    def test_xau_scheduled_guard_blocks_no_chase_signal(self):
+        """Scheduled lane must reject stretched no-chase entries even when MTF is aligned."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+            "xau_guard_no_chase": True,
+            "xau_guard_penalty": 10.0,
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_no_chase_block")
+
+    def test_xau_scheduled_guard_blocks_trap_guard_blocked_signal(self):
+        """Scheduled lane must reject signals already blocked by scanner trap guard."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+            "xau_guard_blocked": True,
+            "xau_guard_penalty": 26.0,
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_trap_guard_block")
+
+    def test_xau_scheduled_guard_block_overrides_high_conf_bypass(self):
+        """No-chase/trap flags must still block even when neural_probability would otherwise bypass session gating."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=74.0)
+        sig.direction = "short"
+        sig.session = "off_hours"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "signal_d1_trend": "bearish",
+            "signal_h4_trend": "bearish",
+            "signal_h1_trend": "bearish",
+            "neural_probability": 0.95,
+            "xau_guard_no_chase": True,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bearish",
+                "h4_trend": "bearish",
+                "h1_trend": "bearish",
+                "strict_aligned_side": "short",
+                "strict_alignment": "aligned_bearish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "XAU_SCHEDULED_HIGH_CONF_SESSION_BYPASS_THRESHOLD", 0.85), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_ALLOW_COUNTERTREND_CONFIRMED", False), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_no_chase_block")
+
+    def test_xau_scheduled_guard_blocks_sweep_trap_signal(self):
+        """Recent losing scheduled rows had sweep=True while the winner had sweep=False; block this trap before dispatch."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD", confidence=81.9)
+        sig.direction = "long"
+        sig.session = "london"
+        sig.timeframe = "1h"
+        sig.entry_type = "limit"
+        sig.raw_scores.update({
+            "engine": "behavioral_fallback_v2",
+            "signal_d1_trend": "bullish",
+            "signal_h4_trend": "bullish",
+            "signal_h1_trend": "bullish",
+            "xau_guard_sweep": True,
+            "xau_guard_no_chase": False,
+            "xau_guard_blocked": False,
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bullish",
+                "h4_trend": "bullish",
+                "h1_trend": "bullish",
+                "strict_aligned_side": "long",
+                "strict_alignment": "aligned_bullish",
+            },
+        })
+
+        with patch.object(scheduler_module.config, "CTRADER_SOURCE_PROFILE_GATE_ENABLED", True), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MIN_CONFIDENCE", 70.0), \
+             patch.object(scheduler_module.config, "CTRADER_XAU_SCHEDULED_MTF_GUARD_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED", True), \
+             patch.object(scheduler_module.config, "SCALP_XAU_DIRECT_MTF_REQUIRE_D1_H4_H1_ALIGN", True), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_sessions", return_value={"london"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_timeframes", return_value={"1h"}), \
+             patch.object(scheduler_module.config, "get_ctrader_xau_scheduled_allowed_entry_types", return_value={"limit"}):
+            allowed, reason = dexter._allow_ctrader_source_profile(sig, source="xauusd_scheduled")
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "xau_scheduled_sweep_trap_block")
+
     # --- Canary family BE config defaults ---
 
     def test_canary_family_be_config_defaults(self):
@@ -4675,6 +5279,498 @@ class SchedulerWatchlistTests(unittest.TestCase):
         st, r = dexter._classify_family_canary_build_miss(sig2, cand)
         self.assertEqual(st, "multi_tf_guard")
         self.assertEqual(r, "mtf_unit_test")
+
+    def test_family_canary_ff_stamps_executor_only_reason(self):
+        dexter = scheduler_module.DexterScheduler()
+        sig = make_signal("XAUUSD")
+        cand = {"family": "xau_scalp_failed_fade_follow_stop", "strategy_id": "xau_scalp_failed_fade_follow_stop_v1"}
+        with patch.object(dexter, "_xau_multi_tf_entry_guard", return_value={"blocked": False, "allowed": True}):
+            lane, _src = dexter._build_family_canary_signal(sig, base_source="scalp_xauusd", candidate=cand)
+        self.assertIsNone(lane)
+        skip = dict(getattr(sig, "raw_scores", {}) or {}).get("family_canary_skip") or {}
+        self.assertEqual(skip.get("family"), "xau_scalp_failed_fade_follow_stop")
+        self.assertEqual(skip.get("stage"), "family_builder")
+        self.assertIn("executor_spawned", skip.get("reason", ""))
+
+
+# =============================================================================
+# LIVE DISPATCH INTEGRATION TESTS
+#
+# These tests simulate the FULL live signal path:
+#   Scanner → _maybe_execute_ctrader_signal → gate stack → executor.execute_signal
+#
+# The regular unit tests and BT both bypass _allow_scalp_xau_live_mt5() and
+# _allow_ctrader_source_profile() entirely, so bugs there cause live trading to
+# stop while BT and unit tests still show green.  These tests exist to close
+# that gap.  Each test exercises ONE gate in the dispatch stack, leaving all
+# other gates disabled so the failure reason is unambiguous.
+# =============================================================================
+
+class LiveDispatchIntegrationTests(unittest.TestCase):
+    """Full live dispatch path tests: scanner signal → cTrader executor."""
+
+    def setUp(self):
+        self._journal_patcher = patch.object(
+            scheduler_module.ctrader_executor, "journal_pre_dispatch_skip", return_value=0
+        )
+        self._db_journal_patcher = patch.object(
+            scheduler_module.ctrader_executor, "_journal", return_value=0
+        )
+        self._journal_mock = self._journal_patcher.start()
+        self._db_journal_mock = self._db_journal_patcher.start()
+
+    def tearDown(self):
+        self._db_journal_patcher.stop()
+        self._journal_patcher.stop()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _xau_signal(session="new_york", confidence=73.0, direction="long"):
+        sig = make_signal("XAUUSD", confidence=confidence)
+        sig.session = session
+        sig.direction = direction
+        sig.timeframe = "5m"
+        sig.entry = 3100.0
+        sig.stop_loss = 3090.0
+        sig.take_profit_1 = 3110.0
+        sig.take_profit_2 = 3120.0
+        sig.take_profit_3 = 3130.0
+        return sig
+
+    @staticmethod
+    def _base_dispatch_patches(extra=None):
+        """Minimal patches to let a signal reach executor with all gates open."""
+        patches = {
+            "CTRADER_ENABLED": True,
+            "CTRADER_AUTOTRADE_ENABLED": True,
+            "CTRADER_SOURCE_PROFILE_GATE_ENABLED": False,
+            "XAU_HOLIDAY_GUARD_ENABLED": False,
+            "MT5_SCALP_XAU_LIVE_FILTER_ENABLED": False,
+            "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED": False,
+            "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED": False,
+        }
+        if extra:
+            patches.update(extra)
+        return patches
+
+    # ------------------------------------------------------------------
+    # GROUP 1 — SESSION GATE (regression for the bug that stopped XAUUSD)
+    # ------------------------------------------------------------------
+
+    def test_live_xauusd_asian_london_overlap_reaches_executor(self):
+        """
+        REGRESSION: asian,london overlap session must NOT be blocked.
+        Before fix: 'asian,london' not in {'asian','london'} → True → blocked.
+        After fix:  _session_signature_matches allows token-subset match → passes.
+        """
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="asian,london", confidence=73.0)
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "MT5_SCALP_XAU_LIVE_FILTER_ENABLED": True,
+                "MT5_SCALP_XAU_LIVE_CONF_MIN": 70.0,
+                "MT5_SCALP_XAU_LIVE_CONF_MAX": 80.0,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_mt5_scalp_xau_live_sessions",
+                return_value={"asian", "london", "new_york"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertEqual(exec_mock.call_count, 1,
+            "executor.execute_signal must be called for asian,london overlap — was blocked before fix")
+
+    def test_live_xauusd_pure_asian_session_reaches_executor(self):
+        """Pure 'asian' session should reach executor when asian is in allowed list."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="asian", confidence=73.0)
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "MT5_SCALP_XAU_LIVE_FILTER_ENABLED": True,
+                "MT5_SCALP_XAU_LIVE_CONF_MIN": 70.0,
+                "MT5_SCALP_XAU_LIVE_CONF_MAX": 80.0,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_mt5_scalp_xau_live_sessions",
+                return_value={"asian", "london", "new_york"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertEqual(exec_mock.call_count, 1)
+
+    def test_live_xauusd_off_hours_session_is_blocked_by_filter(self):
+        """Session NOT in allowed list must be blocked and executor must NOT be called."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="off_hours", confidence=73.0)
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "MT5_SCALP_XAU_LIVE_FILTER_ENABLED": True,
+                "MT5_SCALP_XAU_LIVE_CONF_MIN": 70.0,
+                "MT5_SCALP_XAU_LIVE_CONF_MAX": 80.0,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_mt5_scalp_xau_live_sessions",
+                return_value={"asian", "london", "new_york"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+        audit_kwargs = self._journal_mock.call_args.kwargs if self._journal_mock.call_count else {}
+        self.assertIn("session_not_allowed", str(audit_kwargs.get("reason", "")))
+
+    # ------------------------------------------------------------------
+    # GROUP 2 — HOLIDAY GATE
+    # ------------------------------------------------------------------
+
+    def test_live_xauusd_good_friday_blocks_dispatch(self):
+        """Good Friday (2026-04-03) must block all XAUUSD orders."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="new_york")
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({"XAU_HOLIDAY_GUARD_ENABLED": True}).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_holiday", return_value=True))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+        audit_kwargs = self._journal_mock.call_args.kwargs if self._journal_mock.call_count else {}
+        self.assertIn("holiday", str(audit_kwargs.get("reason", "")))
+
+    def test_live_xauusd_christmas_blocks_dispatch(self):
+        """Christmas Day (Dec 25) must block XAUUSD dispatch."""
+        from market.data_fetcher import SessionManager
+        from datetime import date
+        christmas = date(2026, 12, 25)
+        self.assertIn(christmas, SessionManager.xauusd_market_holidays(2026))
+
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london")
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({"XAU_HOLIDAY_GUARD_ENABLED": True}).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_holiday", return_value=True))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+
+    def test_live_xauusd_new_years_day_in_holiday_set(self):
+        """New Year's Day must be in the xauusd_market_holidays set for 2026 and 2027."""
+        from market.data_fetcher import SessionManager
+        from datetime import date
+        self.assertIn(date(2026, 1, 1), SessionManager.xauusd_market_holidays(2026))
+        self.assertIn(date(2027, 1, 1), SessionManager.xauusd_market_holidays(2027))
+
+    def test_live_xauusd_easter_algorithm_correct_2026(self):
+        """Butcher's Easter algorithm must return 2026-04-05 for 2026."""
+        from market.data_fetcher import SessionManager
+        from datetime import date
+        self.assertEqual(SessionManager._easter_sunday(2026), date(2026, 4, 5))
+        good_friday_2026 = date(2026, 4, 3)
+        self.assertIn(good_friday_2026, SessionManager.xauusd_market_holidays(2026))
+
+    def test_live_xauusd_normal_weekday_not_blocked_by_holiday_guard(self):
+        """A regular Tuesday must NOT be blocked by the holiday guard."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london")
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({"XAU_HOLIDAY_GUARD_ENABLED": True}).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            # Explicitly: not a holiday, not weekend
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_holiday", return_value=False))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_market_open", return_value=True))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertEqual(exec_mock.call_count, 1,
+            "Normal weekday must reach executor — holiday guard must not over-block")
+
+    # ------------------------------------------------------------------
+    # GROUP 3 — WEEKEND GATE
+    # ------------------------------------------------------------------
+
+    def test_live_xauusd_weekend_blocks_dispatch(self):
+        """Saturday must be blocked by market-closed check (not holiday guard)."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="off_hours")
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({"XAU_HOLIDAY_GUARD_ENABLED": True}).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_holiday", return_value=False))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_market_open", return_value=False))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+
+    # ------------------------------------------------------------------
+    # GROUP 4 — MTF GUARD (in dispatch path)
+    # ------------------------------------------------------------------
+
+    def test_live_xauusd_all_unknown_mtf_allows_dispatch(self):
+        """
+        REGRESSION: when D1/H4/H1 all return 'unknown' (no provider data),
+        signal must still reach executor.  Before fix: blocked as d1_h4_h1_not_aligned.
+        """
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london", confidence=73.0)
+        # No trend data → all methods return "unknown"
+        sig.raw_scores["xau_multi_tf_snapshot"] = {
+            "strict_aligned_side": "", "strict_alignment": "unknown"
+        }
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED": True,
+                "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR": False,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        mtf = dict((sig.raw_scores or {}).get("xau_direct_lane_mtf_guard") or {})
+        self.assertEqual(mtf.get("reason"), "missing_mtf_trends_allow",
+            "All-unknown MTF must return missing_mtf_trends_allow and allow dispatch")
+        self.assertEqual(exec_mock.call_count, 1)
+
+    def test_live_xauusd_counter_trend_mtf_blocks_dispatch(self):
+        """Bullish D1+H4+H1 with short direction must block dispatch."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london", confidence=73.0, direction="short")
+        sig.raw_scores.update({
+            "signal_d1_trend": "bullish", "signal_h4_trend": "bullish",
+            "signal_h1_trend": "bullish",
+            "xau_multi_tf_snapshot": {
+                "d1_trend": "bullish", "h4_trend": "bullish", "h1_trend": "bullish",
+                "strict_aligned_side": "long", "strict_alignment": "aligned_bullish",
+            },
+        })
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "SCALP_XAU_DIRECT_MTF_STRICT_ENABLED": True,
+                "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED": False,
+                "SCALP_XAU_DIRECT_MTF_USE_INTRABAR_COLOR": False,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+        mtf = dict((sig.raw_scores or {}).get("xau_direct_lane_mtf_guard") or {})
+        self.assertIn("d1_h4_h1_block", str(mtf.get("reason", "")))
+
+    # ------------------------------------------------------------------
+    # GROUP 5 — FULL END-TO-END (all gates open → executor called)
+    # ------------------------------------------------------------------
+
+    def test_live_xauusd_full_path_executor_called_with_correct_source(self):
+        """
+        All gates disabled → executor.execute_signal must be called exactly once
+        with source='scalp_xauusd' (or winner lane).
+        This is the end-to-end smoke test for the dispatch stack.
+        """
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london", confidence=73.0)
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches().items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertEqual(exec_mock.call_count, 1, "executor must be called exactly once")
+        called_source = exec_mock.call_args.kwargs.get("source") or exec_mock.call_args[1].get("source", "")
+        self.assertIn("scalp_xauusd", str(called_source))
+
+    # ------------------------------------------------------------------
+    # GROUP 6 — CANARY DISPATCH PATH
+    # ------------------------------------------------------------------
+
+    def test_live_canary_holiday_blocks_persistent_canary(self):
+        """
+        Holiday guard must also block _maybe_execute_persistent_canary.
+        The canary used to bypass _allow_ctrader_source_profile entirely
+        (fixed 2026-03-31), but the holiday guard is newer — verify it holds.
+        """
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london")
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        profile = {
+            "enabled": True,
+            "direct_enabled": True,
+            "ctrader_enabled": True,
+            "mt5_enabled": False,
+            "source": "scalp_xauusd:behavioral_v2:canary",
+            "base_source": "scalp_xauusd",
+            "symbol": "XAUUSD",
+            "run_parallel": False,
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                scheduler_module.config, "XAU_HOLIDAY_GUARD_ENABLED", True))
+            stack.enter_context(patch.object(
+                scheduler_module.session_manager, "is_xauusd_holiday", return_value=True))
+            stack.enter_context(patch.object(
+                dexter, "_persistent_canary_profile", return_value=profile))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "PERSISTENT_CANARY_ENABLED", True))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "PERSISTENT_CANARY_CTRADER_ENABLED", True))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "PERSISTENT_CANARY_FAMILY_EXECUTOR_ENABLED", False))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "PERSISTENT_CANARY_EXPERIMENTAL_FAMILY_EXECUTOR_ENABLED", False))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            report = dexter._maybe_execute_persistent_canary(sig, source="scalp_xauusd")
+
+        self.assertFalse(bool(report.get("ctrader")),
+            "Holiday must block canary ctrader execution")
+        self.assertEqual(exec_mock.call_count, 0,
+            "executor.execute_signal must NOT be called on a holiday")
+
+    def test_live_xauusd_confidence_below_band_blocks_dispatch(self):
+        """
+        Confidence below MT5_SCALP_XAU_LIVE_CONF_MIN must block dispatch.
+        This gate fires after the holiday check and before the MTF guard.
+        """
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london", confidence=65.0)  # below 72 floor
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "XAU_HOLIDAY_GUARD_ENABLED": False,
+                "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED": True,
+                "MT5_SCALP_XAU_LIVE_CONF_MIN": 72.0,
+                "MT5_SCALP_XAU_LIVE_CONF_MAX": 80.0,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            result = dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertIsNone(result)
+        self.assertEqual(exec_mock.call_count, 0)
+        audit_kwargs = self._journal_mock.call_args.kwargs if self._journal_mock.call_count else {}
+        self.assertIn("conf_below_live_band", str(audit_kwargs.get("reason", "")))
+
+    def test_live_xauusd_confidence_within_band_reaches_executor(self):
+        """Confidence within [conf_min, conf_max) must pass the confidence gate."""
+        dexter = scheduler_module.DexterScheduler()
+        sig = self._xau_signal(session="london", confidence=73.5)
+        fake = SimpleNamespace(ok=True, dry_run=False, status="accepted",
+                               signal_symbol="XAUUSD", broker_symbol="XAUUSD", message="ok")
+
+        with ExitStack() as stack:
+            for k, v in self._base_dispatch_patches({
+                "XAU_HOLIDAY_GUARD_ENABLED": False,
+                "SCALP_XAU_DIRECT_CONF_FILTER_ENABLED": True,
+                "MT5_SCALP_XAU_LIVE_CONF_MIN": 72.0,
+                "MT5_SCALP_XAU_LIVE_CONF_MAX": 80.0,
+            }).items():
+                stack.enter_context(patch.object(scheduler_module.config, k, v))
+            stack.enter_context(patch.object(
+                scheduler_module.config, "get_ctrader_allowed_sources",
+                return_value={"scalp_xauusd"}))
+            exec_mock = stack.enter_context(patch.object(
+                scheduler_module.ctrader_executor, "execute_signal", return_value=fake))
+            dexter._maybe_execute_ctrader_signal(sig, source="scalp_xauusd")
+
+        self.assertEqual(exec_mock.call_count, 1)
 
 
 if __name__ == "__main__":
