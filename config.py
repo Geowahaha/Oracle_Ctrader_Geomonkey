@@ -2747,5 +2747,16 @@ class Config:
     CONFLUENCE_BOOSTER_MIN_AGREE_LOW: int = int(os.getenv("CONFLUENCE_BOOSTER_MIN_AGREE_LOW", "2"))
     CONFLUENCE_BOOSTER_MAX_MULTIPLIER: float = float(os.getenv("CONFLUENCE_BOOSTER_MAX_MULTIPLIER", "2.0"))
 
+    # ── Kronos-Primary Router ────────────────────────────────────────────────
+    # Lets Kronos drive route/timing when uncertainty is low AND aligned with bias.
+    KRONOS_ROUTER_ENABLED: bool = os.getenv("KRONOS_ROUTER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    KRONOS_ROUTER_MAX_UNCERTAINTY: float = float(os.getenv("KRONOS_ROUTER_MAX_UNCERTAINTY", "0.30"))
+    KRONOS_ROUTER_MAX_FORECAST_AGE_SEC: float = float(os.getenv("KRONOS_ROUTER_MAX_FORECAST_AGE_SEC", "120.0"))
+    KRONOS_ROUTER_DAILY_SHARE_CAP: float = float(os.getenv("KRONOS_ROUTER_DAILY_SHARE_CAP", "0.30"))
+    KRONOS_ROUTER_DAILY_TOTAL_ENTRIES_ESTIMATE: int = int(os.getenv("KRONOS_ROUTER_DAILY_TOTAL_ENTRIES_ESTIMATE", "30"))
+    KRONOS_ROUTER_FAILURE_LOCKOUT_THRESHOLD: int = int(os.getenv("KRONOS_ROUTER_FAILURE_LOCKOUT_THRESHOLD", "3"))
+    KRONOS_ROUTER_FAILURE_LOCKOUT_WINDOW_HOURS: float = float(os.getenv("KRONOS_ROUTER_FAILURE_LOCKOUT_WINDOW_HOURS", "24.0"))
+    KRONOS_ROUTER_RISK_MULTIPLIER: float = float(os.getenv("KRONOS_ROUTER_RISK_MULTIPLIER", "1.0"))
+
 
 config = Config()
