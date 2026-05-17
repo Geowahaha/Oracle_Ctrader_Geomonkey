@@ -2788,5 +2788,30 @@ class Config:
     FREE_RUNNER_BE_PADDING_ATR: float = float(os.getenv("FREE_RUNNER_BE_PADDING_ATR", "0.10"))
     FREE_RUNNER_PARTIAL_CLOSE_SHARE: float = float(os.getenv("FREE_RUNNER_PARTIAL_CLOSE_SHARE", "0.0"))
 
+    # ── Regime-Switching Capital Allocator ───────────────────────────────────
+    # Per-family risk-share allocation, water-filled with floor/ceiling and a
+    # daily-shift cap to prevent flapping.
+    FAMILY_ALLOCATOR_ENABLED: bool = os.getenv("FAMILY_ALLOCATOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    FAMILY_ALLOCATOR_WINDOW_DAYS: float = float(os.getenv("FAMILY_ALLOCATOR_WINDOW_DAYS", "7.0"))
+    FAMILY_ALLOCATOR_MIN_TRADES: int = int(os.getenv("FAMILY_ALLOCATOR_MIN_TRADES", "5"))
+    FAMILY_ALLOCATOR_FLOOR_SHARE: float = float(os.getenv("FAMILY_ALLOCATOR_FLOOR_SHARE", "0.05"))
+    FAMILY_ALLOCATOR_CEILING_SHARE: float = float(os.getenv("FAMILY_ALLOCATOR_CEILING_SHARE", "0.40"))
+    FAMILY_ALLOCATOR_MAX_DAILY_SHIFT: float = float(os.getenv("FAMILY_ALLOCATOR_MAX_DAILY_SHIFT", "0.10"))
+
+    # ── Predictive Pre-Signal Engine ─────────────────────────────────────────
+    # Sustained-conviction pre-arm with short TTL. Conviction is a weighted
+    # fusion of VP + DOM + Sharpness alignment with the bias.
+    PRE_SIGNAL_ENGINE_ENABLED: bool = os.getenv("PRE_SIGNAL_ENGINE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    PRE_SIGNAL_VP_WEIGHT: float = float(os.getenv("PRE_SIGNAL_VP_WEIGHT", "0.40"))
+    PRE_SIGNAL_DOM_WEIGHT: float = float(os.getenv("PRE_SIGNAL_DOM_WEIGHT", "0.35"))
+    PRE_SIGNAL_SHARPNESS_WEIGHT: float = float(os.getenv("PRE_SIGNAL_SHARPNESS_WEIGHT", "0.25"))
+    PRE_SIGNAL_ARM_THRESHOLD: float = float(os.getenv("PRE_SIGNAL_ARM_THRESHOLD", "0.70"))
+    PRE_SIGNAL_SUSTAINED_SEC: float = float(os.getenv("PRE_SIGNAL_SUSTAINED_SEC", "2.0"))
+    PRE_SIGNAL_COOLDOWN_SEC: float = float(os.getenv("PRE_SIGNAL_COOLDOWN_SEC", "60.0"))
+    PRE_SIGNAL_RISK_MULTIPLIER: float = float(os.getenv("PRE_SIGNAL_RISK_MULTIPLIER", "0.10"))
+    PRE_SIGNAL_TTL_SEC: float = float(os.getenv("PRE_SIGNAL_TTL_SEC", "90.0"))
+    PRE_SIGNAL_STOP_ATR_MULT: float = float(os.getenv("PRE_SIGNAL_STOP_ATR_MULT", "1.2"))
+    PRE_SIGNAL_TP_ATR_MULT: float = float(os.getenv("PRE_SIGNAL_TP_ATR_MULT", "1.6"))
+
 
 config = Config()
