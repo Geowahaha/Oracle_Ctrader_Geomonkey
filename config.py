@@ -2735,5 +2735,17 @@ class Config:
     ARCHETYPE_TOURNAMENT_MAX_ARCHETYPES: int = int(os.getenv("ARCHETYPE_TOURNAMENT_MAX_ARCHETYPES", "64"))
     ARCHETYPE_TOURNAMENT_MAX_MULTIPLIER_DELTA: float = float(os.getenv("ARCHETYPE_TOURNAMENT_MAX_MULTIPLIER_DELTA", "0.30"))
 
+    # ── Cross-Family Confluence Booster ──────────────────────────────────────
+    # Multiplier hint when multiple strategy families vote the same side.
+    CONFLUENCE_BOOSTER_ENABLED: bool = os.getenv("CONFLUENCE_BOOSTER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    CONFLUENCE_BOOSTER_WINDOW_MINUTES: float = float(os.getenv("CONFLUENCE_BOOSTER_WINDOW_MINUTES", "10.0"))
+    CONFLUENCE_BOOSTER_DEDUPE_SECONDS: float = float(os.getenv("CONFLUENCE_BOOSTER_DEDUPE_SECONDS", "60.0"))
+    CONFLUENCE_BOOSTER_MULTIPLIER_HIGH: float = float(os.getenv("CONFLUENCE_BOOSTER_MULTIPLIER_HIGH", "2.0"))
+    CONFLUENCE_BOOSTER_MULTIPLIER_MID: float = float(os.getenv("CONFLUENCE_BOOSTER_MULTIPLIER_MID", "1.30"))
+    CONFLUENCE_BOOSTER_MULTIPLIER_LOW: float = float(os.getenv("CONFLUENCE_BOOSTER_MULTIPLIER_LOW", "1.15"))
+    CONFLUENCE_BOOSTER_MIN_AGREE_HIGH: int = int(os.getenv("CONFLUENCE_BOOSTER_MIN_AGREE_HIGH", "3"))
+    CONFLUENCE_BOOSTER_MIN_AGREE_LOW: int = int(os.getenv("CONFLUENCE_BOOSTER_MIN_AGREE_LOW", "2"))
+    CONFLUENCE_BOOSTER_MAX_MULTIPLIER: float = float(os.getenv("CONFLUENCE_BOOSTER_MAX_MULTIPLIER", "2.0"))
+
 
 config = Config()
