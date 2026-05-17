@@ -2758,5 +2758,20 @@ class Config:
     KRONOS_ROUTER_FAILURE_LOCKOUT_WINDOW_HOURS: float = float(os.getenv("KRONOS_ROUTER_FAILURE_LOCKOUT_WINDOW_HOURS", "24.0"))
     KRONOS_ROUTER_RISK_MULTIPLIER: float = float(os.getenv("KRONOS_ROUTER_RISK_MULTIPLIER", "1.0"))
 
+    # ── News-as-Edge Engine ──────────────────────────────────────────────────
+    # Replaces blanket news kill with a narrow consensus-deviation probe in the
+    # opportunity window (-15m..-3m before T1 events). Default OFF; when off,
+    # the existing kill behaviour is preserved.
+    NEWS_EDGE_ENABLED: bool = os.getenv("NEWS_EDGE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    NEWS_EDGE_LEGACY_GUARD_PRE_MIN: float = float(os.getenv("NEWS_EDGE_LEGACY_GUARD_PRE_MIN", "45.0"))
+    NEWS_EDGE_LEGACY_GUARD_POST_MIN: float = float(os.getenv("NEWS_EDGE_LEGACY_GUARD_POST_MIN", "30.0"))
+    NEWS_EDGE_OPPORTUNITY_START_MIN: float = float(os.getenv("NEWS_EDGE_OPPORTUNITY_START_MIN", "15.0"))
+    NEWS_EDGE_OPPORTUNITY_END_MIN: float = float(os.getenv("NEWS_EDGE_OPPORTUNITY_END_MIN", "3.0"))
+    NEWS_EDGE_CHAOS_WINDOW_SEC: float = float(os.getenv("NEWS_EDGE_CHAOS_WINDOW_SEC", "30.0"))
+    NEWS_EDGE_MIN_DRIFT_ATR: float = float(os.getenv("NEWS_EDGE_MIN_DRIFT_ATR", "0.6"))
+    NEWS_EDGE_MIN_VOLUME_RATIO: float = float(os.getenv("NEWS_EDGE_MIN_VOLUME_RATIO", "0.85"))
+    NEWS_EDGE_PROBE_RISK_MULTIPLIER: float = float(os.getenv("NEWS_EDGE_PROBE_RISK_MULTIPLIER", "0.20"))
+    NEWS_EDGE_FORCED_EXIT_MIN_AFTER_EVENT: float = float(os.getenv("NEWS_EDGE_FORCED_EXIT_MIN_AFTER_EVENT", "5.0"))
+
 
 config = Config()
