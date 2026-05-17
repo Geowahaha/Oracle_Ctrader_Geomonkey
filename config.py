@@ -2773,5 +2773,20 @@ class Config:
     NEWS_EDGE_PROBE_RISK_MULTIPLIER: float = float(os.getenv("NEWS_EDGE_PROBE_RISK_MULTIPLIER", "0.20"))
     NEWS_EDGE_FORCED_EXIT_MIN_AFTER_EVENT: float = float(os.getenv("NEWS_EDGE_FORCED_EXIT_MIN_AFTER_EVENT", "5.0"))
 
+    # ── Multi-Route Execution Engine ─────────────────────────────────────────
+    # Splits a high-conviction signal into up to 3 simultaneous legs sharing
+    # one thesis risk budget; first leg to print upgrades siblings to free runners.
+    MULTI_ROUTE_ENABLED: bool = os.getenv("MULTI_ROUTE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    MULTI_ROUTE_MIN_CONFIDENCE: float = float(os.getenv("MULTI_ROUTE_MIN_CONFIDENCE", "80.0"))
+    MULTI_ROUTE_PROBE_SHARE: float = float(os.getenv("MULTI_ROUTE_PROBE_SHARE", "0.20"))
+    MULTI_ROUTE_RETEST_SHARE: float = float(os.getenv("MULTI_ROUTE_RETEST_SHARE", "0.40"))
+    MULTI_ROUTE_BREAKOUT_SHARE: float = float(os.getenv("MULTI_ROUTE_BREAKOUT_SHARE", "0.40"))
+    MULTI_ROUTE_MARGIN_SAFETY_MULTIPLIER: float = float(os.getenv("MULTI_ROUTE_MARGIN_SAFETY_MULTIPLIER", "3.0"))
+    MULTI_ROUTE_MIN_TOTAL_RISK_USD: float = float(os.getenv("MULTI_ROUTE_MIN_TOTAL_RISK_USD", "0.50"))
+    FREE_RUNNER_ENABLED: bool = os.getenv("FREE_RUNNER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    FREE_RUNNER_PROMOTE_R: float = float(os.getenv("FREE_RUNNER_PROMOTE_R", "0.8"))
+    FREE_RUNNER_BE_PADDING_ATR: float = float(os.getenv("FREE_RUNNER_BE_PADDING_ATR", "0.10"))
+    FREE_RUNNER_PARTIAL_CLOSE_SHARE: float = float(os.getenv("FREE_RUNNER_PARTIAL_CLOSE_SHARE", "0.0"))
+
 
 config = Config()
