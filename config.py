@@ -2696,5 +2696,44 @@ class Config:
             "c": int(cls.BILLING_PRICE_C_CENTS),
         }
 
+    # ── Self-Mutation Loop ────────────────────────────────────────────────────
+    # Autonomous config evolution. Every loss is a hypothesis; every shadow
+    # backtest is natural selection. Default OFF; see docs/handoff/SELF_MUTATION_LOOP_SPEC_v1.md.
+    SELF_MUTATION_ENABLED: bool = os.getenv("SELF_MUTATION_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    SELF_MUTATION_KILL_ALL: bool = os.getenv("SELF_MUTATION_KILL_ALL", "0").strip().lower() in ("1", "true", "yes", "on")
+    SELF_MUTATION_DRY_RUN: bool = os.getenv("SELF_MUTATION_DRY_RUN", "1").strip().lower() in ("1", "true", "yes", "on")
+    SELF_MUTATION_LEDGER_PATH: str = os.getenv("SELF_MUTATION_LEDGER_PATH", "data/runtime/self_mutation_ledger.db")
+    SELF_MUTATION_OVERRIDES_PATH: str = os.getenv("SELF_MUTATION_OVERRIDES_PATH", "data/runtime/self_mutation_overrides.json")
+    SELF_MUTATION_LOSS_THRESHOLD_USD: float = float(os.getenv("SELF_MUTATION_LOSS_THRESHOLD_USD", "20.0"))
+    SELF_MUTATION_LOOKBACK_DAYS: int = int(os.getenv("SELF_MUTATION_LOOKBACK_DAYS", "14"))
+    SELF_MUTATION_MIN_PNL_DELTA: float = float(os.getenv("SELF_MUTATION_MIN_PNL_DELTA", "30.0"))
+    SELF_MUTATION_MIN_MAXDD_TOLERANCE: float = float(os.getenv("SELF_MUTATION_MIN_MAXDD_TOLERANCE", "20.0"))
+    SELF_MUTATION_MIN_T_SCORE: float = float(os.getenv("SELF_MUTATION_MIN_T_SCORE", "1.0"))
+    SELF_MUTATION_MIN_N_TRADES: int = int(os.getenv("SELF_MUTATION_MIN_N_TRADES", "5"))
+    SELF_MUTATION_CANARY_HOURS: float = float(os.getenv("SELF_MUTATION_CANARY_HOURS", "24.0"))
+    SELF_MUTATION_ROLLBACK_WINDOW_DAYS: float = float(os.getenv("SELF_MUTATION_ROLLBACK_WINDOW_DAYS", "7.0"))
+    SELF_MUTATION_COOLDOWN_HOURS: float = float(os.getenv("SELF_MUTATION_COOLDOWN_HOURS", "24.0"))
+    SELF_MUTATION_NOTIFY_TELEGRAM: bool = os.getenv("SELF_MUTATION_NOTIFY_TELEGRAM", "1").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── Equity-Adaptive Risk Governor ────────────────────────────────────────
+    # Recommends a global risk multiplier in [0.5, 1.5] from rolling PnL slope.
+    # Read-only by default; consumers opt in by calling `recommended_multiplier`.
+    EQUITY_GOVERNOR_ENABLED: bool = os.getenv("EQUITY_GOVERNOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    EQUITY_GOVERNOR_FAST_WINDOW_HOURS: float = float(os.getenv("EQUITY_GOVERNOR_FAST_WINDOW_HOURS", "24.0"))
+    EQUITY_GOVERNOR_SLOW_WINDOW_DAYS: float = float(os.getenv("EQUITY_GOVERNOR_SLOW_WINDOW_DAYS", "7.0"))
+    EQUITY_GOVERNOR_MIN_TRADES: int = int(os.getenv("EQUITY_GOVERNOR_MIN_TRADES", "5"))
+    EQUITY_GOVERNOR_MIN_MULTIPLIER: float = float(os.getenv("EQUITY_GOVERNOR_MIN_MULTIPLIER", "0.5"))
+    EQUITY_GOVERNOR_MAX_MULTIPLIER: float = float(os.getenv("EQUITY_GOVERNOR_MAX_MULTIPLIER", "1.5"))
+    EQUITY_GOVERNOR_TARGET_PNL_FAST: float = float(os.getenv("EQUITY_GOVERNOR_TARGET_PNL_FAST", "50.0"))
+    EQUITY_GOVERNOR_TARGET_PNL_SLOW: float = float(os.getenv("EQUITY_GOVERNOR_TARGET_PNL_SLOW", "300.0"))
+    EQUITY_GOVERNOR_SENSITIVITY: float = float(os.getenv("EQUITY_GOVERNOR_SENSITIVITY", "0.20"))
+
+    # ── Live Archetype Tournament ────────────────────────────────────────────
+    # Streaming winner-archetype ranking, fed by every closed position.
+    ARCHETYPE_TOURNAMENT_ENABLED: bool = os.getenv("ARCHETYPE_TOURNAMENT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    ARCHETYPE_TOURNAMENT_LOOKBACK_DAYS: float = float(os.getenv("ARCHETYPE_TOURNAMENT_LOOKBACK_DAYS", "7.0"))
+    ARCHETYPE_TOURNAMENT_MAX_ARCHETYPES: int = int(os.getenv("ARCHETYPE_TOURNAMENT_MAX_ARCHETYPES", "64"))
+    ARCHETYPE_TOURNAMENT_MAX_MULTIPLIER_DELTA: float = float(os.getenv("ARCHETYPE_TOURNAMENT_MAX_MULTIPLIER_DELTA", "0.30"))
+
 
 config = Config()
