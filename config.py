@@ -3417,7 +3417,7 @@ class Config:
     # backtest is natural selection. Default OFF; see docs/handoff/SELF_MUTATION_LOOP_SPEC_v1.md.
     SELF_MUTATION_ENABLED: bool = os.getenv("SELF_MUTATION_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     SELF_MUTATION_KILL_ALL: bool = os.getenv("SELF_MUTATION_KILL_ALL", "0").strip().lower() in ("1", "true", "yes", "on")
-    SELF_MUTATION_DRY_RUN: bool = os.getenv("SELF_MUTATION_DRY_RUN", "1").strip().lower() in ("1", "true", "yes", "on")
+    SELF_MUTATION_DRY_RUN: bool = os.getenv("SELF_MUTATION_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
     SELF_MUTATION_LEDGER_PATH: str = os.getenv("SELF_MUTATION_LEDGER_PATH", "data/runtime/self_mutation_ledger.db")
     SELF_MUTATION_OVERRIDES_PATH: str = os.getenv("SELF_MUTATION_OVERRIDES_PATH", "data/runtime/self_mutation_overrides.json")
     SELF_MUTATION_LOSS_THRESHOLD_USD: float = float(os.getenv("SELF_MUTATION_LOSS_THRESHOLD_USD", "20.0"))

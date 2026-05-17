@@ -85,6 +85,42 @@ from analysis.crypto_redesign import (
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Self-Mutation knob resolver — opt-in bridge from the autonomous evolution
+# loop into the live XAU router. Imports are wrapped so the scheduler still
+# boots if the self_mutation package is absent for any reason (older deploy
+# branches, partial rollouts, broken installs). When the resolver is wired,
+# whitelisted knobs read their value through it; canary/main overrides take
+# precedence over the env-driven config default. When the resolver is not
+# wired, behaviour is identical to the previous getattr(config, knob, default).
+try:
+    from learning.self_mutation.resolver import get_default_resolver as _get_knob_resolver  # type: ignore
+    from learning.self_mutation.sampler import KNOB_BY_NAME as _MUTABLE_KNOBS  # type: ignore
+except Exception:  # pragma: no cover — defensive import
+    _get_knob_resolver = None  # type: ignore[assignment]
+    _MUTABLE_KNOBS = {}  # type: ignore[assignment]
+
+
+def _resolve_knob(knob_name: str, default: float) -> float:
+    """Read a whitelisted mutable knob via the Self-Mutation resolver.
+
+    Falls back to ``getattr(config, knob_name, default)`` whenever:
+      * the self_mutation package is unavailable,
+      * the knob is not in the whitelist, or
+      * the resolver raises.
+    Always returns a float; ``None`` config attributes are coerced to ``default``.
+    """
+    if _get_knob_resolver is not None and knob_name in _MUTABLE_KNOBS:
+        try:
+            return float(_get_knob_resolver().get(knob_name))
+        except Exception:
+            logger.debug("knob_resolver_failed knob=%s — falling back to config", knob_name)
+    value = getattr(config, knob_name, default)
+    if value is None:
+        value = default
+    return float(value)
+
+
 class DexterScheduler:
     """
     Background scheduler that runs scans at configured intervals
@@ -3889,8 +3925,8 @@ class DexterScheduler:
                 mode = "promote_to_stop"
                 reasons = continuation_reasons[:5]
                 signal_market_enabled = bool(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_ENABLED", True))
-                market_min_score = max(stop_min_score, int(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", 7) or 7))
-                market_min_bias = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", 0.70) or 0.70)
+                market_min_score = max(stop_min_score, int(_resolve_knob("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_SCORE", 7)))
+                market_min_bias = _resolve_knob("XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_BIAS", 0.70)
                 market_min_tick = float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_SIGNAL_MARKET_MIN_TICK_ALIGNMENT", 0.58) or 0.58)
                 continuation_bias = abs(float(chart_state.get("continuation_bias", 0.0) or 0.0))
                 tick_alignment = (1.0 - tick_up_ratio) if direction == "short" else tick_up_ratio
@@ -4012,7 +4048,7 @@ class DexterScheduler:
                 reasons = ["no_midair_limit", "wait_for_break", "probe_risk"]
                 risk_multiplier *= max(
                     0.10,
-                    min(1.0, float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", 0.35) or 0.35)),
+                    min(1.0, _resolve_knob("XAU_OPENAPI_ENTRY_ROUTER_WAIT_BREAK_PROBE_RISK_MULTIPLIER", 0.35)),
                 )
                 blind_limit_guard = {
                     **dict(blind_limit_guard),
@@ -5361,7 +5397,7 @@ class DexterScheduler:
         elif family == "xau_scalp_breakout_stop":
             if route_entry_type == "limit":
                 retest = max(
-                    base_risk * float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO", 0.08) or 0.08),
+                    base_risk * _resolve_knob("XAU_OPENAPI_ENTRY_ROUTER_LIMIT_RETEST_RISK_RATIO", 0.08),
                     atr_eff * 0.04,
                 )
                 stop_pad = retest * float(getattr(config, "XAU_OPENAPI_ENTRY_ROUTER_LIMIT_STOP_PAD_RATIO", 0.24) or 0.24)
