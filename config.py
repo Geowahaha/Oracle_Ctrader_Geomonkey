@@ -3596,5 +3596,17 @@ class Config:
     XAU_SCALP_QR_MARKET_QUORUM: int = int(os.getenv("XAU_SCALP_QR_MARKET_QUORUM", "5"))
     XAU_SCALP_QR_KILL_CT_NO_ANCHOR: bool = os.getenv("XAU_SCALP_QR_KILL_CT_NO_ANCHOR", "1").strip().lower() in ("1", "true", "yes", "on")
 
+    # ── Fibo Golden-Break Entry (Sniper + Scout) ────────────────────────────
+    # Operator directive 2026-05-18: fibo signals should wait for an actual
+    # break-bar inside the 0.50 ↔ 0.618 ↔ 0.88 zone before live entry; LIMIT
+    # at the retracement is chase-prone.
+    FIBO_GOLDEN_BREAK_ENTRY_ENABLED: bool = os.getenv("FIBO_GOLDEN_BREAK_ENTRY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    FIBO_GOLDEN_BREAK_ZONE_LOW: float = float(os.getenv("FIBO_GOLDEN_BREAK_ZONE_LOW", "0.50"))
+    FIBO_GOLDEN_BREAK_ZONE_HIGH: float = float(os.getenv("FIBO_GOLDEN_BREAK_ZONE_HIGH", "0.88"))
+    FIBO_GOLDEN_BREAK_STOP_BUFFER_ATR: float = float(os.getenv("FIBO_GOLDEN_BREAK_STOP_BUFFER_ATR", "0.10"))
+    FIBO_GOLDEN_BREAK_SL_BUFFER_ATR: float = float(os.getenv("FIBO_GOLDEN_BREAK_SL_BUFFER_ATR", "1.0"))
+    FIBO_GOLDEN_BREAK_TP_RR: float = float(os.getenv("FIBO_GOLDEN_BREAK_TP_RR", "1.5"))
+    FIBO_GOLDEN_BREAK_MAX_RISK_ATR: float = float(os.getenv("FIBO_GOLDEN_BREAK_MAX_RISK_ATR", "4.5"))
+
 
 config = Config()

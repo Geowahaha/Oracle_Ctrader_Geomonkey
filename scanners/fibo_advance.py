@@ -1708,6 +1708,133 @@ class FiboAdvanceScanner:
 
         return 0.0, "session_bias_ok"
 
+    # ── Golden-Break Entry Filter ──────────────────────────────────────────────
+    def _apply_golden_break_filter(self, signal, fibo_ctx, df_m5):
+        """Operator directive 2026-05-18: rather than emit a LIMIT inside the
+        Fibonacci golden pocket and risk chasing the retracement, wait for an
+        actual break-bar inside the 0.50-0.88 zone, then live entry.
+
+        Returns the mutated signal (with entry_type upgraded to ``market`` or
+        ``stop``), or ``None`` to suppress the signal entirely (when price is
+        outside the golden zone). When the feature flag is OFF, the signal is
+        returned unchanged.
+        """
+        if signal is None:
+            return signal
+        if not bool(getattr(config, "FIBO_GOLDEN_BREAK_ENTRY_ENABLED", False)):
+            return signal
+        try:
+            from analysis.fibo_golden_break import (
+                FiboGoldenBreakEntry, FiboGoldenBreakConfig, FiboGoldenInputs,
+                ACTION_LIVE_MARKET, ACTION_WAIT_BREAK_STOP, ACTION_SKIP,
+            )
+            fib_levels = getattr(fibo_ctx, "fib_levels", None) if fibo_ctx is not None else None
+            if fib_levels is None:
+                return signal
+            swing_start = float(getattr(fib_levels, "swing_start", 0.0) or 0.0)
+            swing_end = float(getattr(fib_levels, "swing_end", 0.0) or 0.0)
+            if swing_start <= 0 or swing_end <= 0:
+                return signal
+            impulse_high = max(swing_start, swing_end)
+            impulse_low = min(swing_start, swing_end)
+
+            # Recent micro-swing from last 5 M5 candles.
+            if df_m5 is None or getattr(df_m5, "empty", True) or len(df_m5) < 5:
+                return signal
+            last5 = df_m5.tail(5)
+            micro_high = float(last5["high"].max())
+            micro_low = float(last5["low"].min())
+            last_close = float(last5.iloc[-1].get("close", 0.0) or 0.0)
+            current_price = float(getattr(signal, "entry", last_close) or last_close)
+            atr = abs(float(getattr(signal, "atr", 0.0) or 0.0))
+            if atr <= 0:
+                atr = max(current_price * 0.0006, 0.8)
+
+            cfg = FiboGoldenBreakConfig(
+                enabled=True,
+                zone_low=float(getattr(config, "FIBO_GOLDEN_BREAK_ZONE_LOW", 0.50)),
+                zone_high=float(getattr(config, "FIBO_GOLDEN_BREAK_ZONE_HIGH", 0.88)),
+                stop_trigger_buffer_atr=float(getattr(config, "FIBO_GOLDEN_BREAK_STOP_BUFFER_ATR", 0.10)),
+                sl_buffer_atr=float(getattr(config, "FIBO_GOLDEN_BREAK_SL_BUFFER_ATR", 1.0)),
+                tp_rr_target=float(getattr(config, "FIBO_GOLDEN_BREAK_TP_RR", 1.5)),
+                max_risk_atr_mult=float(getattr(config, "FIBO_GOLDEN_BREAK_MAX_RISK_ATR", 4.5)),
+                skip_when_zone_invalid=False,
+            )
+            inputs = FiboGoldenInputs(
+                direction=str(getattr(signal, "direction", "") or ""),
+                impulse_high=impulse_high,
+                impulse_low=impulse_low,
+                current_price=current_price,
+                atr=atr,
+                recent_micro_high=micro_high,
+                recent_micro_low=micro_low,
+                last_m1_close=last_close,
+                original_entry=current_price,
+                original_stop_loss=float(getattr(signal, "stop_loss", 0.0) or 0.0),
+                original_take_profit=float(getattr(signal, "take_profit_1", 0.0) or 0.0),
+            )
+            decision = FiboGoldenBreakEntry(config=cfg).evaluate(inputs)
+
+            raw = dict(getattr(signal, "raw_scores", {}) or {})
+            raw["fibo_golden_break"] = {
+                "action": decision.action,
+                "reason": decision.reason,
+                "ratio_at_price": decision.ratio_at_price,
+                "inside_zone": decision.inside_golden_zone,
+                "break_confirmed": decision.break_confirmed,
+                "impulse_high": impulse_high,
+                "impulse_low": impulse_low,
+                "micro_high": micro_high,
+                "micro_low": micro_low,
+            }
+            signal.raw_scores = raw
+
+            if decision.action == ACTION_LIVE_MARKET:
+                # Strong setup: enter at market, preserve original SL/TP.
+                signal.entry = decision.new_entry
+                signal.entry_type = "market"
+                logger.info(
+                    "[FiboGoldenBreak] LIVE_MARKET dir=%s ratio=%.3f entry=%s — %s",
+                    getattr(signal, "direction", ""), decision.ratio_at_price,
+                    decision.new_entry, decision.reason,
+                )
+                return signal
+
+            if decision.action == ACTION_WAIT_BREAK_STOP:
+                # Inside zone but no break yet: place STOP at micro swing + buffer.
+                signal.entry = decision.new_entry
+                signal.entry_type = "stop"
+                signal.stop_loss = decision.new_stop_loss
+                signal.take_profit_1 = decision.new_take_profit
+                # Rescale TP2/TP3 from new risk if structure attrs exist.
+                try:
+                    risk_now = abs(decision.new_entry - decision.new_stop_loss)
+                    if getattr(signal, "direction", "").lower() in {"long", "buy"}:
+                        signal.take_profit_2 = round(decision.new_entry + risk_now * 2.0, 6)
+                        signal.take_profit_3 = round(decision.new_entry + risk_now * 3.0, 6)
+                    else:
+                        signal.take_profit_2 = round(decision.new_entry - risk_now * 2.0, 6)
+                        signal.take_profit_3 = round(decision.new_entry - risk_now * 3.0, 6)
+                except Exception:
+                    pass
+                logger.info(
+                    "[FiboGoldenBreak] WAIT_BREAK_STOP dir=%s ratio=%.3f entry=%s SL=%s TP=%s — %s",
+                    getattr(signal, "direction", ""), decision.ratio_at_price,
+                    decision.new_entry, decision.new_stop_loss, decision.new_take_profit,
+                    decision.reason,
+                )
+                return signal
+
+            if decision.action == ACTION_SKIP:
+                logger.info(
+                    "[FiboGoldenBreak] SKIP dir=%s ratio=%.3f — %s",
+                    getattr(signal, "direction", ""), decision.ratio_at_price, decision.reason,
+                )
+                return None
+        except Exception as exc:
+            logger.debug("[FiboGoldenBreak] guard error: %s", exc)
+        return signal
+
     # ── Main Scan ──────────────────────────────────────────────────────────────
 
     def scan(self) -> Optional[TradeSignal]:
@@ -1983,7 +2110,20 @@ class FiboAdvanceScanner:
                                             str(sharpness.get("sharpness_band", "") or ""),
                                             vp_reason, quality_reason,
                                         )
-                                        return signal
+                                        # Apply golden-break filter: wait for
+                                        # actual break-bar inside zone before
+                                        # firing live. Returns None when price
+                                        # is outside the zone.
+                                        filtered_signal = self._apply_golden_break_filter(signal, fibo_ctx, df_m5)
+                                        if filtered_signal is None:
+                                            sniper_fired = False
+                                            self._set_diag(
+                                                status="golden_break_skip_sniper",
+                                                unmet=["outside_golden_zone"],
+                                                notes=["Sniper signal skipped by golden-break filter"],
+                                            )
+                                        else:
+                                            return filtered_signal
 
         # ══ SCOUT MODE: H1 impulse → M15 entry (fires while waiting for Sniper) ══
         if not sniper_fired and bool(_cfg("FIBO_SCOUT_ENABLED", True)):
@@ -2064,7 +2204,18 @@ class FiboAdvanceScanner:
                     vp_reason=str(scout_signal.raw_scores.get("vp_reason", "") or ""),
                     notes=scout_signal.reasons,
                 )
-                return scout_signal
+                # Apply golden-break filter — same rule for Scout. Skip if
+                # price outside golden zone; otherwise upgrade to MARKET or
+                # WAIT_BREAK_STOP based on break confirmation.
+                filtered_scout = self._apply_golden_break_filter(scout_signal, fibo_ctx, df_m5)
+                if filtered_scout is None:
+                    self._set_diag(
+                        status="golden_break_skip_scout",
+                        unmet=["outside_golden_zone"],
+                        notes=["Scout signal skipped by golden-break filter"],
+                    )
+                else:
+                    return filtered_scout
 
         self._set_diag(
             status="no_signal",
