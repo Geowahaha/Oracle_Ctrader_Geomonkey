@@ -200,6 +200,169 @@ class DexterScheduler:
     def _now_ts() -> float:
         return float(time.time())
 
+    def _run_xau_impulse_runner_tick(self) -> dict:
+        """Impulse Runner tick — extends TP + trails SL on open winning positions.
+
+        Reads open XAU positions, evaluates each against the ImpulseRunner engine,
+        and amends SL/TP via `ctrader_executor.amend_position_sltp` when a
+        directive is issued. Feature-flagged OFF by default; when enabled,
+        respects allowed_sources_csv to scope to specific lanes.
+
+        Pattern fixed: 2026-05-18 scalp captured 6% of a 60pt impulse leg
+        because TP was fixed and SL got hunted before continuation.
+        """
+        if not bool(getattr(config, "XAU_IMPULSE_RUNNER_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        try:
+            from learning.impulse_runner import (
+                ImpulseRunner,
+                ImpulseRunnerConfig,
+                PositionSnapshot,
+                StructureBreakSignal,
+            )
+        except Exception as exc:
+            logger.debug("[ImpulseRunner] import failed: %s", exc)
+            return {"ok": False, "status": "import_failed", "error": str(exc)}
+
+        if not hasattr(self, "_impulse_runner"):
+            self._impulse_runner = ImpulseRunner(config=ImpulseRunnerConfig(
+                enabled=True,
+                min_mfe_r=float(getattr(config, "XAU_IMPULSE_RUNNER_MIN_MFE_R", 1.0)),
+                min_break_strength=float(getattr(config, "XAU_IMPULSE_RUNNER_MIN_BREAK_STRENGTH", 0.50)),
+                require_delta_confirms=bool(getattr(config, "XAU_IMPULSE_RUNNER_REQUIRE_DELTA", True)),
+                require_5m_break_close=bool(getattr(config, "XAU_IMPULSE_RUNNER_REQUIRE_5M_CLOSE", True)),
+                trail_atr_mult=float(getattr(config, "XAU_IMPULSE_RUNNER_TRAIL_ATR_MULT", 1.20)),
+                extend_atr_mult=float(getattr(config, "XAU_IMPULSE_RUNNER_EXTEND_ATR_MULT", 3.50)),
+                cooldown_seconds=float(getattr(config, "XAU_IMPULSE_RUNNER_COOLDOWN_SEC", 90.0)),
+                allowed_sources_csv=str(getattr(config, "XAU_IMPULSE_RUNNER_ALLOWED_SOURCES", "") or ""),
+            ))
+
+        db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+        snap = dict(getattr(self, "_last_xauusd_signal_snapshot", {}) or {})
+        atr_5m = float(snap.get("atr") or snap.get("atr_5m") or 0.0)
+        if atr_5m <= 0:
+            return {"ok": False, "status": "no_atr"}
+        # StructureBreakSignal — derived from the last scanner snapshot fields.
+        # These are best-effort: we never amend a position unless ALL four match.
+        swing_break = bool(snap.get("swing_break") or snap.get("structure_break"))
+        trend_dir = str(snap.get("trend_direction") or "").lower()
+        delta_flip_long = bool(snap.get("delta_flip_long") or snap.get("delta_flip") == "long")
+        delta_flip_short = bool(snap.get("delta_flip_short") or snap.get("delta_flip") == "short")
+        last_5m_break_close = bool(snap.get("last_5m_break_close") or snap.get("m5_close_break"))
+        break_strength = float(snap.get("break_strength") or snap.get("structure_break_strength") or 0.0)
+        last_price = float(snap.get("last_price") or snap.get("current_price") or 0.0)
+
+        import sqlite3
+        directives_issued = []
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = list(conn.execute(
+                    "SELECT position_id, symbol, direction, source, volume, entry_price, stop_loss, take_profit "
+                    "FROM ctrader_positions WHERE is_open=1 AND UPPER(COALESCE(symbol,''))='XAUUSD' "
+                    "ORDER BY first_seen_utc DESC LIMIT 16"
+                ).fetchall())
+        except Exception as exc:
+            logger.warning("[ImpulseRunner] DB read failed: %s", exc)
+            return {"ok": False, "status": "db_error", "error": str(exc)}
+
+        for r in rows:
+            try:
+                direction = str(r["direction"] or "").lower()
+                aligned = (
+                    (direction == "long" and trend_dir == "up" and delta_flip_long) or
+                    (direction == "short" and trend_dir == "down" and delta_flip_short)
+                )
+                price_for_pos = last_price or float(r["entry_price"] or 0.0)
+                position = PositionSnapshot(
+                    position_id=int(r["position_id"] or 0),
+                    symbol=str(r["symbol"] or "XAUUSD"),
+                    direction=direction,
+                    entry_price=float(r["entry_price"] or 0.0),
+                    current_price=price_for_pos,
+                    stop_loss=float(r["stop_loss"] or 0.0),
+                    take_profit=float(r["take_profit"] or 0.0),
+                    atr_5m=atr_5m,
+                    volume=float(r["volume"] or 0.0),
+                    source=str(r["source"] or ""),
+                )
+                if position.position_id <= 0 or position.entry_price <= 0 or position.stop_loss <= 0:
+                    continue
+                structure = StructureBreakSignal(
+                    aligned_with_position=bool(aligned),
+                    strength=break_strength,
+                    last_5m_close_break=last_5m_break_close,
+                    delta_confirms=(delta_flip_long if direction == "long" else delta_flip_short),
+                )
+                directive = self._impulse_runner.evaluate(position=position, structure=structure)
+                if directive is None:
+                    continue
+                amend = ctrader_executor.amend_position_sltp(
+                    position_id=directive.position_id,
+                    stop_loss=directive.new_stop_loss,
+                    take_profit=directive.new_take_profit,
+                )
+                directives_issued.append({
+                    "position_id": directive.position_id,
+                    "new_sl": directive.new_stop_loss,
+                    "new_tp": directive.new_take_profit,
+                    "ok": bool(getattr(amend, "ok", False)),
+                    "status": str(getattr(amend, "status", "") or ""),
+                    "reason": directive.reason,
+                })
+                logger.info(
+                    "[ImpulseRunner] amended pid=%d sl=%.5f tp=%.5f ok=%s — %s",
+                    directive.position_id, directive.new_stop_loss, directive.new_take_profit,
+                    bool(getattr(amend, "ok", False)), directive.reason,
+                )
+            except Exception as exc:
+                logger.debug("[ImpulseRunner] position eval failed: %s", exc)
+                continue
+
+        return {"ok": True, "directives": directives_issued, "positions_scanned": len(rows)}
+
+    def _run_missed_opportunity_scan(self) -> dict:
+        """Scan broker journal for winners that left runners on the table.
+
+        Pure read-only. Emits MissedRunnerEvent rows into a small SQLite store
+        for later review and (next iteration) feeds the Self-Mutation Loop.
+        """
+        if not bool(getattr(config, "MISSED_OPPORTUNITY_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        try:
+            from learning.missed_opportunity import (
+                MissedOpportunityDetector,
+                MissedRunnerStore,
+            )
+        except Exception as exc:
+            return {"ok": False, "status": "import_failed", "error": str(exc)}
+        try:
+            store_path = str(getattr(config, "MISSED_OPPORTUNITY_DB_PATH", "data/runtime/missed_runners.db"))
+            db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+            store = MissedRunnerStore(store_path)
+            detector = MissedOpportunityDetector(
+                journal_db_path=db_path,
+                store=store,
+                lookback_hours=float(getattr(config, "MISSED_OPPORTUNITY_LOOKBACK_HOURS", 24.0)),
+                evaluation_minutes_after_close=float(getattr(config, "MISSED_OPPORTUNITY_EVAL_MIN_AFTER_CLOSE", 60.0)),
+                min_missed_factor=float(getattr(config, "MISSED_OPPORTUNITY_MIN_FACTOR", 3.0)),
+                min_captured_pts=float(getattr(config, "MISSED_OPPORTUNITY_MIN_CAPTURED_PTS", 0.5)),
+            )
+            events = detector.scan()
+            if events:
+                for ev in events:
+                    logger.info(
+                        "[MissedRunner] pid=%d %s captured=%.2f continuation=%.2f factor=%.2f — %s",
+                        ev.position_id, ev.direction, ev.captured_pts, ev.continuation_pts,
+                        ev.missed_factor, ev.notes,
+                    )
+            return {"ok": True, "events_detected": len(events)}
+        except Exception as exc:
+            logger.warning("[MissedRunner] scan failed: %s", exc, exc_info=True)
+            return {"ok": False, "status": "error", "error": str(exc)}
+
     def _run_xau_profit_guardian(self, force: bool = False) -> dict:
         """Run Opus 4.7 Profit Reservoir guardian for XAU post-fill PM.
 
@@ -15451,6 +15614,16 @@ class DexterScheduler:
             else:
                 schedule.every(max(1, _guardian_sec // 60)).minutes.do(self._run_xau_profit_guardian)
             logger.info("[XAU_GUARDIAN] Scheduled every %ds mode=%s (post-fill Profit Reservoir)", _guardian_sec, str(getattr(config, "XAU_GUARDIAN_MODE", "shadow") or "shadow"))
+
+        # ── Impulse Runner (TP extend + SL trail on open winners) ────────────
+        if bool(getattr(config, "XAU_IMPULSE_RUNNER_ENABLED", False)):
+            schedule.every(30).seconds.do(self._run_xau_impulse_runner_tick)
+            logger.info("[ImpulseRunner] Scheduled every 30s — extends TP / trails SL when MFE>=R and structure_break confirmed")
+
+        # ── Missed Opportunity Detector (read-only learning) ─────────────────
+        if bool(getattr(config, "MISSED_OPPORTUNITY_ENABLED", False)):
+            schedule.every(5).minutes.do(self._run_missed_opportunity_scan)
+            logger.info("[MissedRunner] Scheduled every 5min — feeds Self-Mutation Loop")
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):
