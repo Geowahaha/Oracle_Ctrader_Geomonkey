@@ -97,7 +97,17 @@ class Governor:
         """Build a Governor from the global Config singleton."""
         ledger = Ledger(getattr(config_obj, "SELF_MUTATION_LEDGER_PATH", "data/runtime/self_mutation_ledger.db"))
         overrides = OverrideStore(getattr(config_obj, "SELF_MUTATION_OVERRIDES_PATH", "data/runtime/self_mutation_overrides.json"))
-        journal_db = getattr(config_obj, "CTRADER_DB_PATH", "") or "data/runtime/ctrader.db"
+        # cTrader DB path — try the executor's resolved path first (which honours
+        # broker-config), then env-var CTRADER_DB_PATH, then the live default
+        # `data/ctrader_openapi.db`. The earlier fallback (`data/runtime/ctrader.db`)
+        # was wrong on the live VM and caused the loop to be blind to losses.
+        journal_db = ""
+        try:
+            from execution.ctrader_executor import ctrader_executor as _exec  # local import
+            journal_db = str(getattr(_exec, "db_path", "") or "")
+        except Exception:
+            journal_db = ""
+        journal_db = journal_db or str(getattr(config_obj, "CTRADER_DB_PATH", "") or "") or "data/ctrader_openapi.db"
         runner = CounterfactualRunner(
             db_path=journal_db,
             lookback_days=int(getattr(config_obj, "SELF_MUTATION_LOOKBACK_DAYS", 14)),

@@ -3562,5 +3562,15 @@ class Config:
     XAU_ANTI_STOP_HUNT_BUFFER_ATR_MULT: float = float(os.getenv("XAU_ANTI_STOP_HUNT_BUFFER_ATR_MULT", "1.0"))
     XAU_ANTI_STOP_HUNT_MAX_WIDENING_ATR_MULT: float = float(os.getenv("XAU_ANTI_STOP_HUNT_MAX_WIDENING_ATR_MULT", "2.5"))
 
+    # ── Counter-Trend Blocker (scalp lane direction guard) ──────────────────
+    # Lesson 2026-05-18 07:30 UTC (-$70.23): scalp shorted into a +11.5pt M1
+    # impulse and was stopped out in 43 seconds. Blocker rejects scalp signals
+    # whose direction conflicts with the last N M1 candle streak (with body
+    # magnitude vs ATR check). Flag-gated; default OFF.
+    XAU_COUNTER_TREND_BLOCKER_ENABLED: bool = os.getenv("XAU_COUNTER_TREND_BLOCKER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_COUNTER_TREND_LOOKBACK: int = int(os.getenv("XAU_COUNTER_TREND_LOOKBACK", "3"))
+    XAU_COUNTER_TREND_MIN_BODY_ATR_RATIO: float = float(os.getenv("XAU_COUNTER_TREND_MIN_BODY_ATR_RATIO", "0.30"))
+    XAU_COUNTER_TREND_SHADOW_ONLY: bool = os.getenv("XAU_COUNTER_TREND_SHADOW_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 config = Config()

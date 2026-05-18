@@ -2123,6 +2123,75 @@ class ScalpingScanner:
             return forced or blocked
 
         self._apply_xau_entry_template_m1_bias(signal, trigger=trigger)
+
+        # Counter-Trend Blocker — additive guard against shorting into a
+        # bullish M1 impulse or longing into a bearish one. Lesson 2026-05-18
+        # 07:30 UTC (-$70.23): scalp shorted right into +11.5pt rally that
+        # stopped out in 43 seconds. The blocker fires only when the last N
+        # M1 candles agree with the trend AND have material bodies vs ATR.
+        # Flag-gated; when off, behaviour identical to pre-patch.
+        if bool(getattr(config, "XAU_COUNTER_TREND_BLOCKER_ENABLED", False)):
+            try:
+                from analysis.counter_trend_block import (
+                    CounterTrendBlocker, CounterTrendBlockerConfig, M1Candle,
+                )
+                _lookback = max(2, int(getattr(config, "XAU_COUNTER_TREND_LOOKBACK", 3)))
+                _min_body = float(getattr(config, "XAU_COUNTER_TREND_MIN_BODY_ATR_RATIO", 0.30))
+                _shadow_only = bool(getattr(config, "XAU_COUNTER_TREND_SHADOW_ONLY", False))
+                tf = str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m") or "1m")
+                df_m1 = xauusd_provider.fetch(tf, bars=max(_lookback + 2, 5))
+                if df_m1 is not None and not getattr(df_m1, "empty", True) and len(df_m1) >= _lookback:
+                    last_n = df_m1.tail(_lookback)
+                    candles = [
+                        M1Candle(
+                            open=float(row.get("open", 0.0) or 0.0),
+                            close=float(row.get("close", 0.0) or 0.0),
+                            high=float(row.get("high", 0.0) or 0.0),
+                            low=float(row.get("low", 0.0) or 0.0),
+                        )
+                        for _, row in last_n.iterrows()
+                    ]
+                    atr_for_block = abs(self._as_float(getattr(signal, "atr", 0.0), 0.0))
+                    if atr_for_block <= 0:
+                        atr_for_block = max(self._as_float(getattr(signal, "entry", 0.0), 0.0) * 0.0006, 0.8)
+                    blocker = CounterTrendBlocker(config=CounterTrendBlockerConfig(
+                        enabled=True, lookback=_lookback, min_body_atr_ratio=_min_body,
+                    ))
+                    decision = blocker.evaluate(
+                        direction=str(getattr(signal, "direction", "") or ""),
+                        m1_candles=candles, atr=atr_for_block,
+                    )
+                    if decision.blocked:
+                        raw = dict(getattr(signal, "raw_scores", {}) or {})
+                        raw["counter_trend_block"] = {
+                            "reason": decision.reason,
+                            "bull_count": decision.bull_count,
+                            "bear_count": decision.bear_count,
+                            "avg_body": decision.avg_body,
+                            "atr": decision.atr,
+                            "shadow_only": _shadow_only,
+                        }
+                        signal.raw_scores = raw
+                        if _shadow_only:
+                            logger.info(
+                                "[CounterTrendBlock] shadow_only — would_block dir=%s reason=%s",
+                                getattr(signal, "direction", ""), decision.reason,
+                            )
+                        else:
+                            logger.warning(
+                                "[CounterTrendBlock] blocking dir=%s reason=%s",
+                                getattr(signal, "direction", ""), decision.reason,
+                            )
+                            return ScalpingScanResult(
+                                source=source, symbol="XAUUSD",
+                                status="counter_trend_blocked",
+                                reason=decision.reason,
+                                signal=None, trigger=trigger,
+                            )
+            except Exception as _cte:
+                # Never let the blocker take down the scanner.
+                logger.debug("[CounterTrendBlock] guard error: %s", _cte)
+
         return ScalpingScanResult(source=source, symbol="XAUUSD", status="ready", reason="ok", signal=signal, trigger=trigger)
 
     def _mrd_guard_check(self, signal: TradeSignal) -> dict:
