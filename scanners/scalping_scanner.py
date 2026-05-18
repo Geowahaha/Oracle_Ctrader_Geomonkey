@@ -2124,6 +2124,106 @@ class ScalpingScanner:
 
         self._apply_xau_entry_template_m1_bias(signal, trigger=trigger)
 
+        # Break-Confirm Entry — transforms chase LIMIT orders into wait-break
+        # STOP orders sitting beyond a recent swing extreme. Operator directive
+        # 2026-05-18: "limit order ไม่เหมาะ ... ต้องรอให้เบรคก่อนลงก่อน". When
+        # counter-trend M1 streak is detected AND signal is LIMIT, we convert
+        # to STOP at the swing break level so the order only triggers when the
+        # tape actually confirms the direction. Default OFF; identical to
+        # pre-patch behaviour when off. Runs BEFORE CounterTrendBlocker so
+        # converted signals are no longer counter-trend at their new entry.
+        if bool(getattr(config, "XAU_SCALP_BREAK_CONFIRM_ENABLED", False)):
+            try:
+                from analysis.break_confirm_entry import (
+                    BreakConfirmEntry, BreakConfirmEntryConfig, BreakConfirmInputs,
+                )
+                _bc_lookback = max(3, int(getattr(config, "XAU_SCALP_BREAK_CONFIRM_LOOKBACK", 5)))
+                _entry_type = str(getattr(signal, "entry_type", "") or "").lower()
+                # Only intercept limit-style entries; market/stop signals are
+                # already action-confirmed.
+                if _entry_type in {"limit", "buy_limit", "sell_limit", ""}:
+                    tf = str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m") or "1m")
+                    df_m1 = xauusd_provider.fetch(tf, bars=max(_bc_lookback + 3, 8))
+                    if df_m1 is not None and not getattr(df_m1, "empty", True) and len(df_m1) >= _bc_lookback:
+                        last_n = df_m1.tail(_bc_lookback)
+                        swing_high = float(last_n["high"].max())
+                        swing_low = float(last_n["low"].min())
+                        bull = sum(1 for _, r in last_n.iterrows() if float(r.get("close", 0)) > float(r.get("open", 0)))
+                        bear = _bc_lookback - bull
+                        dir_norm = str(getattr(signal, "direction", "") or "").lower()
+                        counter_trend = (
+                            (dir_norm in {"short", "sell"} and bull >= max(2, _bc_lookback - 1)) or
+                            (dir_norm in {"long", "buy"} and bear >= max(2, _bc_lookback - 1))
+                        )
+                        atr_for_bc = abs(self._as_float(getattr(signal, "atr", 0.0), 0.0))
+                        if atr_for_bc <= 0:
+                            atr_for_bc = max(self._as_float(getattr(signal, "entry", 0.0), 0.0) * 0.0006, 0.8)
+                        bc_cfg = BreakConfirmEntryConfig(
+                            enabled=True,
+                            only_counter_trend=bool(getattr(config, "XAU_SCALP_BREAK_CONFIRM_ONLY_COUNTER_TREND", True)),
+                            buffer_atr_mult=float(getattr(config, "XAU_SCALP_BREAK_CONFIRM_BUFFER_ATR", 0.10)),
+                            sl_buffer_atr_mult=float(getattr(config, "XAU_SCALP_BREAK_CONFIRM_SL_BUFFER_ATR", 1.0)),
+                            tp_rr_target=float(getattr(config, "XAU_SCALP_BREAK_CONFIRM_TP_RR", 1.2)),
+                            min_rr=float(getattr(config, "XAU_SCALP_BREAK_CONFIRM_MIN_RR", 0.8)),
+                        )
+                        decision = BreakConfirmEntry(config=bc_cfg).evaluate(
+                            BreakConfirmInputs(
+                                direction=dir_norm,
+                                original_entry=self._as_float(getattr(signal, "entry", 0.0), 0.0),
+                                original_stop_loss=self._as_float(getattr(signal, "stop_loss", 0.0), 0.0),
+                                original_take_profit=self._as_float(getattr(signal, "take_profit_1", 0.0), 0.0),
+                                atr=atr_for_bc,
+                                swing_high=swing_high,
+                                swing_low=swing_low,
+                                counter_trend=counter_trend,
+                            )
+                        )
+                        if decision.converted:
+                            raw = dict(getattr(signal, "raw_scores", {}) or {})
+                            raw["break_confirm_entry"] = {
+                                "original_entry_type": _entry_type or "limit",
+                                "original_entry": self._as_float(getattr(signal, "entry", 0.0), 0.0),
+                                "original_sl": self._as_float(getattr(signal, "stop_loss", 0.0), 0.0),
+                                "original_tp": self._as_float(getattr(signal, "take_profit_1", 0.0), 0.0),
+                                "new_entry": decision.new_entry,
+                                "new_sl": decision.new_stop_loss,
+                                "new_tp": decision.new_take_profit,
+                                "rr": decision.new_rr,
+                                "reason": decision.reason,
+                                "counter_trend": counter_trend,
+                                "swing_high": swing_high,
+                                "swing_low": swing_low,
+                            }
+                            signal.raw_scores = raw
+                            signal.entry = decision.new_entry
+                            signal.stop_loss = decision.new_stop_loss
+                            signal.take_profit_1 = decision.new_take_profit
+                            # Rescale TP2/TP3 from new risk if present.
+                            new_risk = decision.new_risk_distance
+                            tp2_rr = float(getattr(config, "SCALPING_XAU_TP2_RR", 1.35) or 1.35)
+                            tp3_rr = float(getattr(config, "SCALPING_XAU_TP3_RR", 1.9) or 1.9)
+                            if dir_norm in {"short", "sell"}:
+                                signal.take_profit_2 = round(decision.new_entry - new_risk * tp2_rr, 6)
+                                signal.take_profit_3 = round(decision.new_entry - new_risk * tp3_rr, 6)
+                            else:
+                                signal.take_profit_2 = round(decision.new_entry + new_risk * tp2_rr, 6)
+                                signal.take_profit_3 = round(decision.new_entry + new_risk * tp3_rr, 6)
+                            signal.entry_type = "stop"
+                            try:
+                                signal.risk_reward = round(decision.new_rr, 2)
+                            except Exception:
+                                pass
+                            logger.info(
+                                "[BreakConfirm] converted dir=%s entry=%s→%s SL=%s→%s TP=%s→%s rr=%.2f counter_trend=%s",
+                                dir_norm,
+                                raw["break_confirm_entry"]["original_entry"], decision.new_entry,
+                                raw["break_confirm_entry"]["original_sl"], decision.new_stop_loss,
+                                raw["break_confirm_entry"]["original_tp"], decision.new_take_profit,
+                                decision.new_rr, counter_trend,
+                            )
+            except Exception as _bce:
+                logger.debug("[BreakConfirm] guard error: %s", _bce)
+
         # Counter-Trend Blocker — additive guard against shorting into a
         # bullish M1 impulse or longing into a bearish one. Lesson 2026-05-18
         # 07:30 UTC (-$70.23): scalp shorted right into +11.5pt rally that

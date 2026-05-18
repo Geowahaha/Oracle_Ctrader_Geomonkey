@@ -3572,5 +3572,17 @@ class Config:
     XAU_COUNTER_TREND_MIN_BODY_ATR_RATIO: float = float(os.getenv("XAU_COUNTER_TREND_MIN_BODY_ATR_RATIO", "0.30"))
     XAU_COUNTER_TREND_SHADOW_ONLY: bool = os.getenv("XAU_COUNTER_TREND_SHADOW_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 
+    # ── Break-Confirm Entry (chase LIMIT → wait-break STOP) ─────────────────
+    # Operator directive 2026-05-18: chase limit orders get SL-hunted before
+    # the move; wait for break confirmation, then live entry. Converts a
+    # counter-trend LIMIT scalp into a STOP at the recent swing extreme.
+    XAU_SCALP_BREAK_CONFIRM_ENABLED: bool = os.getenv("XAU_SCALP_BREAK_CONFIRM_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SCALP_BREAK_CONFIRM_ONLY_COUNTER_TREND: bool = os.getenv("XAU_SCALP_BREAK_CONFIRM_ONLY_COUNTER_TREND", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SCALP_BREAK_CONFIRM_LOOKBACK: int = int(os.getenv("XAU_SCALP_BREAK_CONFIRM_LOOKBACK", "5"))
+    XAU_SCALP_BREAK_CONFIRM_BUFFER_ATR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_BUFFER_ATR", "0.10"))
+    XAU_SCALP_BREAK_CONFIRM_SL_BUFFER_ATR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_SL_BUFFER_ATR", "1.0"))
+    XAU_SCALP_BREAK_CONFIRM_TP_RR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_TP_RR", "1.2"))
+    XAU_SCALP_BREAK_CONFIRM_MIN_RR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_MIN_RR", "0.8"))
+
 
 config = Config()
