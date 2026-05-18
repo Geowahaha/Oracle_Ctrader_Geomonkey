@@ -2124,6 +2124,114 @@ class ScalpingScanner:
 
         self._apply_xau_entry_template_m1_bias(signal, trigger=trigger)
 
+        # Entry Quality Router — first gate. Operator directive 2026-05-18:
+        # "kill BUY/SELL limit แบบไร้คุณภาพ; improve ด้วย stop order or live
+        # executed entry แบบสด". Three outcomes:
+        #   - KILL    : drop low-confidence or anchorless counter-trend
+        #   - MARKET  : upgrade strong-quality LIMIT to LIVE market fill
+        #   - PASS    : hand off to BreakConfirmEntry / CounterTrendBlocker
+        # Runs first because KILL/MARKET decisions short-circuit the rest.
+        if bool(getattr(config, "XAU_SCALP_ENTRY_QUALITY_ROUTER_ENABLED", False)):
+            try:
+                from analysis.entry_quality_router import (
+                    EntryQualityRouter, EntryQualityRouterConfig, EntryQualityInputs,
+                    ACTION_KILL, ACTION_MARKET,
+                )
+                # Read alignment indicators from raw_scores when present.
+                raw_now = dict(getattr(signal, "raw_scores", {}) or {})
+                dir_norm = str(getattr(signal, "direction", "") or "").lower()
+
+                # Pull last 5 M1 candles for trend alignment + structure-break check.
+                tf = str(getattr(config, "SCALPING_M1_TRIGGER_TF", "1m") or "1m")
+                df_m1q = xauusd_provider.fetch(tf, bars=8)
+                m1_aligned = False
+                m5_aligned = bool(raw_now.get("m5_trend_aligned") or raw_now.get("trend_h1_aligned"))
+                has_break = False
+                counter_trend_q = False
+                price_now = self._as_float(getattr(signal, "entry", 0.0), 0.0)
+                if df_m1q is not None and not getattr(df_m1q, "empty", True) and len(df_m1q) >= 5:
+                    last_5 = df_m1q.tail(5)
+                    bull = sum(1 for _, r in last_5.iterrows() if float(r.get("close", 0)) > float(r.get("open", 0)))
+                    bear = 5 - bull
+                    if dir_norm in {"short", "sell"}:
+                        m1_aligned = bear >= 3
+                        counter_trend_q = bull >= 4
+                        # structure break: last close BELOW the lowest of prior 4 closes
+                        prior_lows = [float(r.get("close", 0)) for _, r in last_5.iloc[:-1].iterrows()]
+                        last_close = float(last_5.iloc[-1].get("close", 0))
+                        has_break = bool(prior_lows) and last_close < min(prior_lows)
+                    elif dir_norm in {"long", "buy"}:
+                        m1_aligned = bull >= 3
+                        counter_trend_q = bear >= 4
+                        prior_highs = [float(r.get("close", 0)) for _, r in last_5.iloc[:-1].iterrows()]
+                        last_close = float(last_5.iloc[-1].get("close", 0))
+                        has_break = bool(prior_highs) and last_close > max(prior_highs)
+                    if price_now <= 0:
+                        price_now = float(last_5.iloc[-1].get("close", 0))
+
+                qr_cfg = EntryQualityRouterConfig(
+                    enabled=True,
+                    kill_confidence_floor=float(getattr(config, "XAU_SCALP_QR_KILL_CONFIDENCE_FLOOR", 60.0)),
+                    market_confidence_threshold=float(getattr(config, "XAU_SCALP_QR_MARKET_CONFIDENCE", 75.0)),
+                    require_all_market_conditions=bool(getattr(config, "XAU_SCALP_QR_REQUIRE_ALL_MARKET", False)),
+                    market_quorum=int(getattr(config, "XAU_SCALP_QR_MARKET_QUORUM", 5)),
+                    kill_counter_trend_when_no_anchor=bool(getattr(config, "XAU_SCALP_QR_KILL_CT_NO_ANCHOR", True)),
+                )
+                qr_inputs = EntryQualityInputs(
+                    direction=dir_norm,
+                    confidence=self._as_float(getattr(signal, "confidence", 0.0), 0.0),
+                    current_price=price_now,
+                    original_entry=self._as_float(getattr(signal, "entry", 0.0), 0.0),
+                    original_stop_loss=self._as_float(getattr(signal, "stop_loss", 0.0), 0.0),
+                    original_take_profit=self._as_float(getattr(signal, "take_profit_1", 0.0), 0.0),
+                    atr=abs(self._as_float(getattr(signal, "atr", 0.0), 0.0)) or 0.8,
+                    m1_trend_aligned=m1_aligned,
+                    m5_trend_aligned=m5_aligned,
+                    delta_confirms=bool(raw_now.get("delta_confirms") or raw_now.get("delta_proxy_aligned")),
+                    flow_confirmed=bool(raw_now.get("flow_confirmed") or raw_now.get("flow_score_pass")),
+                    has_structure_break=has_break,
+                    counter_trend=counter_trend_q,
+                    has_anchor=bool(
+                        raw_now.get("has_rejection_candle")
+                        or raw_now.get("fibo_anchor_present")
+                        or raw_now.get("vp_anchor_present")
+                        or raw_now.get("ob_fvg_present")
+                    ),
+                )
+                qr_decision = EntryQualityRouter(config=qr_cfg).evaluate(qr_inputs)
+                # Stamp the decision into raw_scores for telemetry.
+                raw_now["entry_quality_router"] = {
+                    "action": qr_decision.action,
+                    "reason": qr_decision.reason,
+                    "market_score": qr_decision.market_score,
+                    "counter_trend": counter_trend_q,
+                    "m1_aligned": m1_aligned,
+                    "has_structure_break": has_break,
+                }
+                signal.raw_scores = raw_now
+
+                if qr_decision.action == ACTION_KILL:
+                    logger.warning(
+                        "[EntryQuality] KILL dir=%s reason=%s conf=%.1f",
+                        dir_norm, qr_decision.reason, qr_inputs.confidence,
+                    )
+                    return ScalpingScanResult(
+                        source=source, symbol="XAUUSD",
+                        status="entry_quality_killed",
+                        reason=qr_decision.reason,
+                        signal=None, trigger=trigger,
+                    )
+                if qr_decision.action == ACTION_MARKET:
+                    signal.entry = qr_decision.new_entry
+                    signal.entry_type = "market"
+                    # SL/TP unchanged on market upgrade; the move is happening now.
+                    logger.info(
+                        "[EntryQuality] MARKET upgrade dir=%s entry=%s score=%d reason=%s",
+                        dir_norm, qr_decision.new_entry, qr_decision.market_score, qr_decision.reason,
+                    )
+            except Exception as _qre:
+                logger.debug("[EntryQuality] guard error: %s", _qre)
+
         # Break-Confirm Entry — transforms chase LIMIT orders into wait-break
         # STOP orders sitting beyond a recent swing extreme. Operator directive
         # 2026-05-18: "limit order ไม่เหมาะ ... ต้องรอให้เบรคก่อนลงก่อน". When

@@ -3584,5 +3584,17 @@ class Config:
     XAU_SCALP_BREAK_CONFIRM_TP_RR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_TP_RR", "1.2"))
     XAU_SCALP_BREAK_CONFIRM_MIN_RR: float = float(os.getenv("XAU_SCALP_BREAK_CONFIRM_MIN_RR", "0.8"))
 
+    # ── Entry Quality Router (KILL / MARKET / PASS) ─────────────────────────
+    # Operator directive 2026-05-18: kill low-quality BUY/SELL limit orders;
+    # improve with stop or live market entry. This is the first gate: drops
+    # signals below the kill floor (or anchorless counter-trend), upgrades
+    # very-strong signals to MARKET, or passes through to break-confirm.
+    XAU_SCALP_ENTRY_QUALITY_ROUTER_ENABLED: bool = os.getenv("XAU_SCALP_ENTRY_QUALITY_ROUTER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SCALP_QR_KILL_CONFIDENCE_FLOOR: float = float(os.getenv("XAU_SCALP_QR_KILL_CONFIDENCE_FLOOR", "60.0"))
+    XAU_SCALP_QR_MARKET_CONFIDENCE: float = float(os.getenv("XAU_SCALP_QR_MARKET_CONFIDENCE", "75.0"))
+    XAU_SCALP_QR_REQUIRE_ALL_MARKET: bool = os.getenv("XAU_SCALP_QR_REQUIRE_ALL_MARKET", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_SCALP_QR_MARKET_QUORUM: int = int(os.getenv("XAU_SCALP_QR_MARKET_QUORUM", "5"))
+    XAU_SCALP_QR_KILL_CT_NO_ANCHOR: bool = os.getenv("XAU_SCALP_QR_KILL_CT_NO_ANCHOR", "1").strip().lower() in ("1", "true", "yes", "on")
+
 
 config = Config()
