@@ -3529,5 +3529,38 @@ class Config:
     PRE_SIGNAL_STOP_ATR_MULT: float = float(os.getenv("PRE_SIGNAL_STOP_ATR_MULT", "1.2"))
     PRE_SIGNAL_TP_ATR_MULT: float = float(os.getenv("PRE_SIGNAL_TP_ATR_MULT", "1.6"))
 
+    # ── Impulse Runner (TP extender + SL trailer) ────────────────────────────
+    # Lesson 2026-05-18: scalp caught 6% of 60pt impulse leg because TP was
+    # fixed. Enable to extend TP + trail SL when MFE >= min_mfe_r AND
+    # structure_break is confirmed in the trade's direction.
+    XAU_IMPULSE_RUNNER_ENABLED: bool = os.getenv("XAU_IMPULSE_RUNNER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_IMPULSE_RUNNER_MIN_MFE_R: float = float(os.getenv("XAU_IMPULSE_RUNNER_MIN_MFE_R", "1.0"))
+    XAU_IMPULSE_RUNNER_MIN_BREAK_STRENGTH: float = float(os.getenv("XAU_IMPULSE_RUNNER_MIN_BREAK_STRENGTH", "0.50"))
+    XAU_IMPULSE_RUNNER_REQUIRE_DELTA: bool = os.getenv("XAU_IMPULSE_RUNNER_REQUIRE_DELTA", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_IMPULSE_RUNNER_REQUIRE_5M_CLOSE: bool = os.getenv("XAU_IMPULSE_RUNNER_REQUIRE_5M_CLOSE", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_IMPULSE_RUNNER_TRAIL_ATR_MULT: float = float(os.getenv("XAU_IMPULSE_RUNNER_TRAIL_ATR_MULT", "1.20"))
+    XAU_IMPULSE_RUNNER_EXTEND_ATR_MULT: float = float(os.getenv("XAU_IMPULSE_RUNNER_EXTEND_ATR_MULT", "3.50"))
+    XAU_IMPULSE_RUNNER_COOLDOWN_SEC: float = float(os.getenv("XAU_IMPULSE_RUNNER_COOLDOWN_SEC", "90.0"))
+    XAU_IMPULSE_RUNNER_ALLOWED_SOURCES: str = os.getenv("XAU_IMPULSE_RUNNER_ALLOWED_SOURCES", "")
+
+    # ── Missed Opportunity Detector (Self-Mutation seed source) ──────────────
+    # Lesson 2026-05-18: a +$44 winner left 60pt of continuation on the table.
+    # Scans journal post-close; emits MissedRunnerEvent rows to feed back into
+    # the Self-Mutation Loop as a "missed runner" trigger type.
+    MISSED_OPPORTUNITY_ENABLED: bool = os.getenv("MISSED_OPPORTUNITY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    MISSED_OPPORTUNITY_DB_PATH: str = os.getenv("MISSED_OPPORTUNITY_DB_PATH", "data/runtime/missed_runners.db")
+    MISSED_OPPORTUNITY_LOOKBACK_HOURS: float = float(os.getenv("MISSED_OPPORTUNITY_LOOKBACK_HOURS", "24.0"))
+    MISSED_OPPORTUNITY_EVAL_MIN_AFTER_CLOSE: float = float(os.getenv("MISSED_OPPORTUNITY_EVAL_MIN_AFTER_CLOSE", "60.0"))
+    MISSED_OPPORTUNITY_MIN_FACTOR: float = float(os.getenv("MISSED_OPPORTUNITY_MIN_FACTOR", "3.0"))
+    MISSED_OPPORTUNITY_MIN_CAPTURED_PTS: float = float(os.getenv("MISSED_OPPORTUNITY_MIN_CAPTURED_PTS", "0.5"))
+
+    # ── Anti Stop-Hunt SL Widener ────────────────────────────────────────────
+    # Lesson 2026-05-18: SL just past swing high gets hunted by liquidity sweep
+    # before the real move. Widens proposed SL by ATR-scaled buffer beyond the
+    # last swing extreme.
+    XAU_ANTI_STOP_HUNT_ENABLED: bool = os.getenv("XAU_ANTI_STOP_HUNT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_ANTI_STOP_HUNT_BUFFER_ATR_MULT: float = float(os.getenv("XAU_ANTI_STOP_HUNT_BUFFER_ATR_MULT", "1.0"))
+    XAU_ANTI_STOP_HUNT_MAX_WIDENING_ATR_MULT: float = float(os.getenv("XAU_ANTI_STOP_HUNT_MAX_WIDENING_ATR_MULT", "2.5"))
+
 
 config = Config()
