@@ -323,6 +323,127 @@ class DexterScheduler:
 
         return {"ok": True, "directives": directives_issued, "positions_scanned": len(rows)}
 
+    def _run_mfe_progressive_trail_tick(self) -> dict:
+        """Tighten SL toward profit based on per-position peak MFE.
+
+        Operator complaint 2026-05-18: "ระบบไม่หิวกำไร ... กำไรเกือบ 200$
+        แล้วมาปิดเกือบติดลบ". Smoking-gun pid=621794184: MFE 13.91pt =
+        2.03R captured only 0.18R. The Impulse Runner missed it because
+        source `xauusd_scheduled` wasn't in its allowed list. This trail
+        runs on EVERY open XAU position with NO source filter (or operator-
+        defined whitelist), uses only MFE-in-R to decide, and progressively
+        locks 30/55/70/85% of the peak.
+        """
+        if not bool(getattr(config, "XAU_MFE_TRAIL_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        try:
+            from learning.mfe_progressive_trail import (
+                MFEProgressiveTrail, MFEProgressiveTrailConfig, MFETrailInputs, MFETrailTier,
+            )
+        except Exception as exc:
+            return {"ok": False, "status": "import_failed", "error": str(exc)}
+
+        if not hasattr(self, "_mfe_trail_engine"):
+            tiers_csv = str(getattr(config, "XAU_MFE_TRAIL_TIERS", "1.0:0.30,2.0:0.55,3.0:0.70,4.0:0.85") or "")
+            parsed: list[MFETrailTier] = []
+            for chunk in tiers_csv.split(","):
+                if ":" not in chunk:
+                    continue
+                lhs, rhs = chunk.split(":", 1)
+                try:
+                    parsed.append(MFETrailTier(mfe_r=float(lhs.strip()), lock_fraction=float(rhs.strip())))
+                except ValueError:
+                    continue
+            tiers = tuple(parsed) if parsed else MFEProgressiveTrailConfig().tiers
+            self._mfe_trail_engine = MFEProgressiveTrail(config=MFEProgressiveTrailConfig(
+                enabled=True,
+                min_mfe_r=float(getattr(config, "XAU_MFE_TRAIL_MIN_R", 1.0)),
+                tiers=tiers,
+                cooldown_seconds=float(getattr(config, "XAU_MFE_TRAIL_COOLDOWN_SEC", 30.0)),
+                allowed_sources_csv=str(getattr(config, "XAU_MFE_TRAIL_ALLOWED_SOURCES", "") or ""),
+            ))
+
+        db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+        snap = dict(getattr(self, "_last_xauusd_signal_snapshot", {}) or {})
+        last_price = float(snap.get("last_price") or snap.get("current_price") or 0.0)
+
+        import sqlite3
+        directives_issued = []
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = list(conn.execute(
+                    "SELECT position_id, symbol, direction, source, volume, entry_price, stop_loss, take_profit, first_seen_utc "
+                    "FROM ctrader_positions WHERE is_open=1 AND UPPER(COALESCE(symbol,''))='XAUUSD'"
+                ).fetchall())
+                # If we don't have a fresh last_price from the snapshot, peek the
+                # latest spot tick captured in the broker DB.
+                if last_price <= 0:
+                    t = conn.execute(
+                        "SELECT bid, ask FROM ctrader_spot_ticks WHERE UPPER(symbol)='XAUUSD' AND ask > 0 ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    if t is not None:
+                        last_price = float(t["ask"])
+        except Exception as exc:
+            logger.warning("[MFETrail] DB read failed: %s", exc)
+            return {"ok": False, "status": "db_error", "error": str(exc)}
+
+        if last_price <= 0:
+            return {"ok": True, "directives": [], "positions_scanned": len(rows), "status": "no_price"}
+
+        for r in rows:
+            try:
+                pid = int(r["position_id"] or 0)
+                direction = str(r["direction"] or "").lower()
+                entry_px = float(r["entry_price"] or 0.0)
+                cur_sl = float(r["stop_loss"] or 0.0)
+                if pid <= 0 or entry_px <= 0 or cur_sl <= 0:
+                    continue
+                risk_distance = abs(entry_px - cur_sl)
+                if risk_distance <= 0:
+                    continue
+                # Compute current MFE in R from entry price + current price.
+                if direction in {"long", "buy"}:
+                    mfe_pts = last_price - entry_px
+                else:
+                    mfe_pts = entry_px - last_price
+                mfe_r = max(0.0, mfe_pts / risk_distance)
+                inputs = MFETrailInputs(
+                    position_id=pid,
+                    direction=direction,
+                    entry_price=entry_px,
+                    current_stop_loss=cur_sl,
+                    original_stop_loss=cur_sl,  # caller doesn't track original; current is the best floor we know
+                    mfe_r_observed=mfe_r,
+                )
+                directive = self._mfe_trail_engine.evaluate(inputs=inputs, source=str(r["source"] or ""))
+                if directive is None:
+                    continue
+                amend = ctrader_executor.amend_position_sltp(
+                    position_id=directive.position_id,
+                    stop_loss=directive.new_stop_loss,
+                    take_profit=float(r["take_profit"] or 0.0),
+                )
+                directives_issued.append({
+                    "pid": directive.position_id,
+                    "new_sl": directive.new_stop_loss,
+                    "locked_r": directive.locked_r,
+                    "tier_mfe_r": directive.tier_mfe_r,
+                    "ok": bool(getattr(amend, "ok", False)),
+                })
+                logger.info(
+                    "[MFETrail] pid=%d %s peak_mfe_r=%.2f tier=%.1fR lock=%.0f%% new_sl=%.4f — %s",
+                    pid, direction, mfe_r, directive.tier_mfe_r,
+                    directive.tier_lock_fraction * 100, directive.new_stop_loss,
+                    directive.reason,
+                )
+            except Exception as exc:
+                logger.debug("[MFETrail] position eval failed: %s", exc)
+                continue
+        return {"ok": True, "directives": directives_issued, "positions_scanned": len(rows)}
+
     def _run_missed_opportunity_scan(self) -> dict:
         """Scan broker journal for winners that left runners on the table.
 
@@ -15619,6 +15740,12 @@ class DexterScheduler:
         if bool(getattr(config, "XAU_IMPULSE_RUNNER_ENABLED", False)):
             schedule.every(30).seconds.do(self._run_xau_impulse_runner_tick)
             logger.info("[ImpulseRunner] Scheduled every 30s — extends TP / trails SL when MFE>=R and structure_break confirmed")
+
+        # ── MFE Progressive Trail (ALL XAU positions, MFE-only gates) ────────
+        if bool(getattr(config, "XAU_MFE_TRAIL_ENABLED", False)):
+            mfe_sec = max(10, int(getattr(config, "XAU_MFE_TRAIL_INTERVAL_SEC", 20) or 20))
+            schedule.every(mfe_sec).seconds.do(self._run_mfe_progressive_trail_tick)
+            logger.info("[MFETrail] Scheduled every %ds — locks 30/55/70/85%% of MFE on every XAU position", mfe_sec)
 
         # ── Missed Opportunity Detector (read-only learning) ─────────────────
         if bool(getattr(config, "MISSED_OPPORTUNITY_ENABLED", False)):

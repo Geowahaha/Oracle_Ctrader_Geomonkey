@@ -3608,5 +3608,18 @@ class Config:
     FIBO_GOLDEN_BREAK_TP_RR: float = float(os.getenv("FIBO_GOLDEN_BREAK_TP_RR", "1.5"))
     FIBO_GOLDEN_BREAK_MAX_RISK_ATR: float = float(os.getenv("FIBO_GOLDEN_BREAK_MAX_RISK_ATR", "4.5"))
 
+    # ── MFE Progressive Trail (locks % of MFE on EVERY XAU position) ────────
+    # Operator complaint 2026-05-18: nearly $200 profit reverted to flat.
+    # Smoking-gun pid=621794184: MFE 2.03R, captured 0.18R (6%). Runs on every
+    # open XAU position with NO source whitelist; locks 30/55/70/85% of MFE
+    # by R-multiple tier. Default OFF.
+    XAU_MFE_TRAIL_ENABLED: bool = os.getenv("XAU_MFE_TRAIL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_MFE_TRAIL_INTERVAL_SEC: int = int(os.getenv("XAU_MFE_TRAIL_INTERVAL_SEC", "20"))
+    XAU_MFE_TRAIL_MIN_R: float = float(os.getenv("XAU_MFE_TRAIL_MIN_R", "1.0"))
+    # tiers as csv: "mfe_r:lock_fraction,..." default 1.0:.30, 2.0:.55, 3.0:.70, 4.0:.85
+    XAU_MFE_TRAIL_TIERS: str = os.getenv("XAU_MFE_TRAIL_TIERS", "1.0:0.30,2.0:0.55,3.0:0.70,4.0:0.85")
+    XAU_MFE_TRAIL_COOLDOWN_SEC: float = float(os.getenv("XAU_MFE_TRAIL_COOLDOWN_SEC", "30.0"))
+    XAU_MFE_TRAIL_ALLOWED_SOURCES: str = os.getenv("XAU_MFE_TRAIL_ALLOWED_SOURCES", "")  # empty = all sources
+
 
 config = Config()
