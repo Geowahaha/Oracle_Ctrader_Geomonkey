@@ -960,6 +960,35 @@ class ScalpingScanner:
             risk = float(max_risk)
             stop = entry - risk if direction == "long" else entry + risk
 
+        # Anti-Stop-Hunt widener — pushes SL beyond the swing extreme + ATR
+        # buffer so liquidity sweeps don't hunt our stop before continuation.
+        # Lesson 2026-05-18: two of three scalp shorts got hunted at 0.67pt and
+        # 3pt above the swing high right before a 60pt drop. Defaults to OFF;
+        # treats the currently-proposed stop as the swing extreme (scanner
+        # already placed it just past the swing). The TP recomputation below
+        # picks up the new (wider) risk automatically.
+        if bool(getattr(config, "XAU_ANTI_STOP_HUNT_ENABLED", False)):
+            try:
+                from analysis.anti_stop_hunt import widen_sl_for_anti_hunt, AntiHuntConfig
+                _ahcfg = AntiHuntConfig(
+                    enabled=True,
+                    buffer_atr_mult=float(getattr(config, "XAU_ANTI_STOP_HUNT_BUFFER_ATR_MULT", 1.0)),
+                    max_widening_atr_mult=float(getattr(config, "XAU_ANTI_STOP_HUNT_MAX_WIDENING_ATR_MULT", 2.5)),
+                )
+                _widened = widen_sl_for_anti_hunt(
+                    entry=entry, direction=direction, proposed_sl=stop,
+                    swing_extreme=stop, atr=atr, config=_ahcfg,
+                )
+                _new_risk = abs(entry - _widened)
+                # Only apply if the wider stop stays within 1.5× the existing
+                # max_risk cap; otherwise sizing would explode.
+                if 0 < _new_risk <= max_risk * 1.5 and _new_risk > risk:
+                    stop = _widened
+                    risk = _new_risk
+            except Exception:
+                # Never let anti-hunt break the scanner.
+                pass
+
         tp1_rr = max(0.5, self._as_float(getattr(config, "SCALPING_XAU_TP1_RR", 0.9), 0.9))
         tp2_rr = max(tp1_rr + 0.1, self._as_float(getattr(config, "SCALPING_XAU_TP2_RR", 1.35), 1.35))
         tp3_rr = max(tp2_rr + 0.1, self._as_float(getattr(config, "SCALPING_XAU_TP3_RR", 1.9), 1.9))
