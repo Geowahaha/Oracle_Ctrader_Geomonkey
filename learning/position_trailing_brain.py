@@ -54,14 +54,57 @@ class PositionTrailingBrain:
         # Neural Model: Linear Regressor (8 features)
         self.weights_path = self.model_dir / "trailing_weights_v1.npy"
         self.weights = self._load_weights()
-        
-        # ACTIVE LOGIC: Aggressive Stepped Heuristic (FORCED LIVE IMPROVEMENT)
-        self._active_steps = [
-            (1.80, 1.30, "runner_aggressive"),
-            (1.20, 0.85, "major_aggressive"),
-            (0.80, 0.55, "mid_aggressive"),
-            (0.22, 0.20, "be_plus_aggressive"),
-        ]
+
+        # ACTIVE LOGIC v2 (2026-05-19): operator-tunable MFE-peak heuristic.
+        # The legacy steps used r_now (CURRENT R) which downgraded the lock
+        # whenever price retraced from a peak. The 2026-05-18 loss cluster
+        # was caused by that bug — a 1R MFE peak got retraced and the brain
+        # decided lock=0 (held) instead of locking 55-70% of the peak.
+        #
+        # Now the brain tracks per-position peak_r and locks a FRACTION of
+        # the peak. Once locked, peak only ratchets up — never down.
+        try:
+            from config import config as _cfg
+            steps_csv = str(getattr(_cfg, "TRAILING_BRAIN_PEAK_STEPS_CSV", "") or "")
+        except Exception:
+            steps_csv = ""
+        if steps_csv:
+            self._active_steps = self._parse_steps_csv(steps_csv)
+        if not steps_csv or not self._active_steps:
+            # MFE-peak progressive ladder — see project_breathing_room_2026_05_18 lesson.
+            self._active_steps = [
+                (4.00, 3.20, "runner_max_lock_85pct"),    # peak 4R → lock 80%
+                (3.00, 2.20, "runner_lock_73pct"),
+                (2.00, 1.30, "runner_lock_65pct"),
+                (1.50, 0.90, "major_lock_60pct"),
+                (1.00, 0.55, "mid_lock_55pct"),
+                (0.50, 0.25, "early_lock_50pct"),         # NEW — lock half from 0.5R peak
+                (0.22, 0.10, "be_plus_minimal"),          # gentler at micro-peak
+            ]
+
+        # Per-position peak-MFE cache so a single excursion locks the floor.
+        # In-process memory; resets on restart (acceptable — open positions get
+        # re-seeded from the next tick's r_now if it's >= 0).
+        self._peak_r_by_pid: dict[int, float] = {}
+
+    @staticmethod
+    def _parse_steps_csv(csv: str) -> list:
+        """Parse 'threshold:lock:label,...' into the stepped list."""
+        out = []
+        for chunk in csv.split(","):
+            parts = chunk.split(":")
+            if len(parts) < 2:
+                continue
+            try:
+                thr = float(parts[0].strip())
+                lock = float(parts[1].strip())
+                lbl = parts[2].strip() if len(parts) >= 3 else f"step_{thr}_{lock}"
+            except (TypeError, ValueError):
+                continue
+            out.append((thr, lock, lbl))
+        # Descending order so we pick the highest-applicable step first.
+        out.sort(key=lambda t: t[0], reverse=True)
+        return out
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -126,10 +169,15 @@ class PositionTrailingBrain:
             1.0 # Bias
         ])
 
-    def _predict_heuristic_lock_r(self, r_now: float) -> tuple[float, str]:
-        """AGGRESSIVE STEPPED RULES: Forced Profit Protection."""
+    def _predict_heuristic_lock_r(self, r_value: float) -> tuple[float, str]:
+        """AGGRESSIVE STEPPED RULES — applied to PEAK r (not current r_now).
+
+        Walking the ladder from largest threshold down so the strictest step
+        wins; once a peak crosses a level we stay at that lock or higher
+        even if subsequent ticks show retracement.
+        """
         for thresh, lock, lbl in self._active_steps:
-            if r_now >= thresh:
+            if r_value >= thresh:
                 return lock, lbl
         return 0.0, "hold"
 
@@ -145,8 +193,26 @@ class PositionTrailingBrain:
         family = str(state.get("family", "other"))
 
         r_now = float(state.get("r_now", 0.0))
+        # PEAK R tracking — once a position reaches a peak, the floor is
+        # set there. Retracement does NOT erase the peak. This is the
+        # cure for 2026-05-18 trade 2 (pid=621968762): MFE peaked at 1R+
+        # then retraced, brain saw r_now=0.24 and downgraded to lock=0.20
+        # — leaving SL untouched at the original 4557.60 which then hit.
+        try:
+            from config import config as _cfg
+            _use_peak = bool(getattr(_cfg, "TRAILING_BRAIN_USE_PEAK_R", True))
+        except Exception:
+            _use_peak = True
+        peak_r = r_now
+        if _use_peak and position_id:
+            with self._lock:
+                prev_peak = float(self._peak_r_by_pid.get(int(position_id), 0.0))
+                peak_r = max(prev_peak, r_now)
+                self._peak_r_by_pid[int(position_id)] = peak_r
+
         features = {
             "r_now": r_now,
+            "peak_r": peak_r,
             "time_in_trade_minutes": float(state.get("time_in_trade_minutes", 0.0)),
             "vwap_slope": float(state.get("vwap_slope_100t", 0.0)),
             "tick_velocity": float(state.get("tick_velocity", 0.0)),
@@ -156,8 +222,8 @@ class PositionTrailingBrain:
             "is_canary": 1.0 if "canary" in str(state.get("source_lane", "")) else 0.0
         }
 
-        # 1. Active: Heuristic (Aggressive)
-        heuristic_r, h_label = self._predict_heuristic_lock_r(r_now)
+        # 1. Active: Heuristic on PEAK R (operator-tunable via env)
+        heuristic_r, h_label = self._predict_heuristic_lock_r(peak_r)
         
         # 2. Shadow: Neural Prediction
         neural_r = self._predict_neural_lock_r(features)
@@ -188,10 +254,11 @@ class PositionTrailingBrain:
         except Exception as e:
             logger.error(f"[PositionTrailingBrain] DB log error: {e}")
 
-        # Heavy Audit Log
+        # Heavy Audit Log — shows peak vs r_now so operators can verify the
+        # MFE-peak logic is doing its job.
         logger.info(
-            f"[TRAIL DECISION] {mode.upper()} | r_now={r_now:.2f} -> lock_r={final_lock_r:.2f} | "
-            f"neural_pred={neural_r:.2f} | h_label={h_label}"
+            f"[TRAIL DECISION] {mode.upper()} | r_now={r_now:.2f} peak_r={peak_r:.2f} -> "
+            f"lock_r={final_lock_r:.2f} | neural_pred={neural_r:.2f} | h_label={h_label}"
         )
 
         return TrailingDecision(

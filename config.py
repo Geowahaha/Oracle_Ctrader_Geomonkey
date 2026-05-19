@@ -3637,5 +3637,19 @@ class Config:
     XAU_BREATHING_ROOM_REQUIRE_MAE_R: float = float(os.getenv("XAU_BREATHING_ROOM_REQUIRE_MAE_R", "0.6"))
     XAU_BREATHING_ROOM_ALLOW_MFE_R: float = float(os.getenv("XAU_BREATHING_ROOM_ALLOW_MFE_R", "0.2"))
 
+    # ── Position Trailing Brain (peak-R heuristic) ──────────────────────────
+    # 2026-05-19 root-cause fix: the heuristic was using r_now (current R)
+    # which downgraded the trail lock whenever price retraced from a peak.
+    # Trade 2 of 2026-05-19 (pid=621968762) had MFE 1R+ then retraced; brain
+    # saw r_now=0.24 and locked only 0.20R (BE+ε), then SL was never moved
+    # → original SL hit for -$82. With TRAILING_BRAIN_USE_PEAK_R=1 the brain
+    # tracks peak-R per position and locks the strictest step the peak ever
+    # crossed; retracements never lower the floor.
+    TRAILING_BRAIN_USE_PEAK_R: bool = os.getenv("TRAILING_BRAIN_USE_PEAK_R", "1").strip().lower() in ("1", "true", "yes", "on")
+    # Operator-tunable ladder. Format: "threshold:lock:label,threshold:lock:label,..."
+    # Default ladder locks 50% at 0.5R peak, 55% at 1R, 60% at 1.5R, 65% at 2R,
+    # 73% at 3R, 80% at 4R. Leave empty to use the in-code defaults.
+    TRAILING_BRAIN_PEAK_STEPS_CSV: str = os.getenv("TRAILING_BRAIN_PEAK_STEPS_CSV", "")
+
 
 config = Config()
