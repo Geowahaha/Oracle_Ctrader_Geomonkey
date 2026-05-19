@@ -3651,5 +3651,26 @@ class Config:
     # 73% at 3R, 80% at 4R. Leave empty to use the in-code defaults.
     TRAILING_BRAIN_PEAK_STEPS_CSV: str = os.getenv("TRAILING_BRAIN_PEAK_STEPS_CSV", "")
 
+    # ── Adversarial Awareness (psychology + meta-cognition) ─────────────────
+    # 2026-05-20 audit (-$451 / 34 trades) tagged the trades as:
+    #   PANIC_CLOSE_NOISE = 14, STOP_HUNT_FULL_SL = 6, MFE_GIVEBACK = 2,
+    #   WIN_CUT_EARLY = 2, LOSS_NORMAL = 2, WIN_NORMAL = 8.
+    # Most trades clustered in same direction = revenge-trading loop. This
+    # module detects those meta-patterns and emits cool-down directives so
+    # the scheduler can short-circuit new signals. Default OFF.
+    ADVERSARIAL_AWARENESS_ENABLED: bool = os.getenv("ADVERSARIAL_AWARENESS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    AA_REVENGE_LOSS_COUNT: int = int(os.getenv("AA_REVENGE_LOSS_COUNT", "3"))
+    AA_REVENGE_WINDOW_MIN: float = float(os.getenv("AA_REVENGE_WINDOW_MIN", "60.0"))
+    AA_REVENGE_COOLDOWN_MIN: float = float(os.getenv("AA_REVENGE_COOLDOWN_MIN", "30.0"))
+    AA_HUNT_CLUSTER_COUNT: int = int(os.getenv("AA_HUNT_CLUSTER_COUNT", "3"))
+    AA_HUNT_CLUSTER_WINDOW_MIN: float = float(os.getenv("AA_HUNT_CLUSTER_WINDOW_MIN", "90.0"))
+    AA_HUNT_COOLDOWN_MIN: float = float(os.getenv("AA_HUNT_COOLDOWN_MIN", "20.0"))
+    AA_PANIC_CLUSTER_COUNT: int = int(os.getenv("AA_PANIC_CLUSTER_COUNT", "4"))
+    AA_PANIC_CLUSTER_WINDOW_MIN: float = float(os.getenv("AA_PANIC_CLUSTER_WINDOW_MIN", "60.0"))
+    AA_PANIC_COOLDOWN_MIN: float = float(os.getenv("AA_PANIC_COOLDOWN_MIN", "15.0"))
+    AA_DRAWDOWN_WINDOW_COUNT: int = int(os.getenv("AA_DRAWDOWN_WINDOW_COUNT", "8"))
+    AA_DRAWDOWN_THRESHOLD_USD: float = float(os.getenv("AA_DRAWDOWN_THRESHOLD_USD", "-200.0"))
+    AA_DRAWDOWN_COOLDOWN_MIN: float = float(os.getenv("AA_DRAWDOWN_COOLDOWN_MIN", "60.0"))
+
 
 config = Config()
