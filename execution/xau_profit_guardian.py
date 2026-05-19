@@ -226,6 +226,12 @@ class GuardianConfig:
             ),
             winner_long_reservoir_source=str(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_SOURCE", "scalp_xauusd:winner") or "scalp_xauusd:winner").strip().lower(),
             winner_long_reservoir_min_r=_sf(getattr(config, "XAU_WINNER_LONG_RESERVOIR_PM_MIN_R", -0.25), -0.25),
+            # Operator-driven kill-switches for over-aggressive PM pruning
+            # (lesson 2026-05-18: weak_add_prune closed 8+ trades at -$3 to
+            # -$15 each before they had time to develop MFE).
+            micro_live_allow_weak_prune=bool(getattr(config, "XAU_GUARDIAN_MICRO_LIVE_ALLOW_WEAK_PRUNE", True)),
+            half_live_allow_partial_harvest=bool(getattr(config, "XAU_GUARDIAN_HALF_LIVE_ALLOW_PARTIAL_HARVEST", True)),
+            full_live_allow_harvest=bool(getattr(config, "XAU_GUARDIAN_FULL_LIVE_ALLOW_HARVEST", True)),
         )
 
     @property

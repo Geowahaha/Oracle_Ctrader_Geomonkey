@@ -3621,5 +3621,21 @@ class Config:
     XAU_MFE_TRAIL_COOLDOWN_SEC: float = float(os.getenv("XAU_MFE_TRAIL_COOLDOWN_SEC", "30.0"))
     XAU_MFE_TRAIL_ALLOWED_SOURCES: str = os.getenv("XAU_MFE_TRAIL_ALLOWED_SOURCES", "")  # empty = all sources
 
+    # ── Guardian PM kill-switches (lesson 2026-05-18 cut-too-early disease) ─
+    # Today 16 trades net -$154 because weak_add_prune closed 8 fresh positions
+    # at -$3..-$15 each before they could build any MFE. Default True preserves
+    # legacy behaviour; operators set 0 to disable that branch entirely.
+    XAU_GUARDIAN_MICRO_LIVE_ALLOW_WEAK_PRUNE: bool = os.getenv("XAU_GUARDIAN_MICRO_LIVE_ALLOW_WEAK_PRUNE", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GUARDIAN_HALF_LIVE_ALLOW_PARTIAL_HARVEST: bool = os.getenv("XAU_GUARDIAN_HALF_LIVE_ALLOW_PARTIAL_HARVEST", "1").strip().lower() in ("1", "true", "yes", "on")
+    XAU_GUARDIAN_FULL_LIVE_ALLOW_HARVEST: bool = os.getenv("XAU_GUARDIAN_FULL_LIVE_ALLOW_HARVEST", "1").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── Breathing Room PM filter (give fresh trades time to find direction) ─
+    # Filter that consults position age + MFE/MAE before any tactical close
+    # fires. Default OFF; activates after operator review.
+    XAU_BREATHING_ROOM_ENABLED: bool = os.getenv("XAU_BREATHING_ROOM_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    XAU_BREATHING_ROOM_MIN_MINUTES: float = float(os.getenv("XAU_BREATHING_ROOM_MIN_MINUTES", "10.0"))
+    XAU_BREATHING_ROOM_REQUIRE_MAE_R: float = float(os.getenv("XAU_BREATHING_ROOM_REQUIRE_MAE_R", "0.6"))
+    XAU_BREATHING_ROOM_ALLOW_MFE_R: float = float(os.getenv("XAU_BREATHING_ROOM_ALLOW_MFE_R", "0.2"))
+
 
 config = Config()
