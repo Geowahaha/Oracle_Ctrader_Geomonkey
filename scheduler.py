@@ -16371,6 +16371,17 @@ class DexterScheduler:
         if bool(getattr(config, "TRADING_MANAGER_REPORT_ENABLED", False)) and bool(getattr(config, "TRADING_MANAGER_REPORT_ON_START", True)):
             self._run_trading_manager_report(force=True)
 
+        # Seed the AdversarialAwareness singleton at startup so
+        # ``is_blocked_safe()`` answers correctly from the very first signal.
+        # Without this, the scheduled tick has to wait its turn behind the
+        # ~30 startup-call queue above (can be many minutes on a cold start)
+        # before the singleton becomes usable.
+        if bool(getattr(config, "ADVERSARIAL_AWARENESS_ENABLED", False)):
+            try:
+                self._run_adversarial_awareness_sync()
+            except Exception as exc:
+                logger.debug("[AdvAware] startup seed failed: %s", exc)
+
         while self.running:
             schedule.run_pending()
             try:
