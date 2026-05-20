@@ -444,6 +444,155 @@ class DexterScheduler:
                 continue
         return {"ok": True, "directives": directives_issued, "positions_scanned": len(rows)}
 
+    def _run_adversarial_awareness_sync(self) -> dict:
+        """Sync recently closed trades into the adversarial awareness singleton.
+
+        Reads execution_journal closes since the last successful sync, computes
+        MFE/MAE in R-multiples from spot ticks during each trade's lifetime,
+        tags via PsychologyTagger, then feeds CloseEvents into the singleton
+        which auto-evaluates cool-down patterns.
+
+        Wired-from: scheduler tick (every 60s by default).
+        Consumed-by: scalp_scanner.scan_xauusd via ``is_blocked_safe()``.
+        """
+        if not bool(getattr(config, "ADVERSARIAL_AWARENESS_ENABLED", False)):
+            return {"ok": False, "status": "disabled"}
+        if ctrader_executor is None:
+            return {"ok": False, "status": "executor_missing"}
+        try:
+            from analysis.adversarial_awareness import (
+                get_default_awareness, CloseEvent,
+            )
+        except Exception as exc:
+            return {"ok": False, "status": "import_failed", "error": str(exc)}
+        awareness = get_default_awareness()
+        if awareness is None:
+            return {"ok": False, "status": "instance_unavailable"}
+
+        import sqlite3, json
+        from datetime import datetime, timezone, timedelta
+
+        db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
+        # Track the last-seen deal_id so we only sync new closes.
+        if not hasattr(self, "_aa_last_deal_id"):
+            self._aa_last_deal_id = 0
+        recorded = 0
+        latest_id_seen = int(self._aa_last_deal_id)
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Pull close-side deals (the second deal of a position) since
+                # the last sync. We identify closes by pnl_usd != 0.
+                rows = list(conn.execute(
+                    """
+                    SELECT deal_id, position_id, direction, execution_price, pnl_usd, execution_utc, source
+                      FROM ctrader_deals
+                     WHERE UPPER(symbol)='XAUUSD'
+                       AND deal_id > ?
+                       AND pnl_usd IS NOT NULL
+                       AND pnl_usd != 0
+                     ORDER BY deal_id ASC
+                     LIMIT 50
+                    """,
+                    (int(self._aa_last_deal_id),),
+                ))
+                for r in rows:
+                    deal_id = int(r["deal_id"] or 0)
+                    pid = int(r["position_id"] or 0)
+                    if deal_id <= 0 or pid <= 0:
+                        continue
+                    # Pull open-side deal for entry price.
+                    open_deal = conn.execute(
+                        "SELECT direction, execution_price FROM ctrader_deals WHERE position_id=? ORDER BY deal_id ASC LIMIT 1",
+                        (pid,),
+                    ).fetchone()
+                    if not open_deal:
+                        continue
+                    entry_dir = str(open_deal["direction"] or "").strip().lower()
+                    entry_px = float(open_deal["execution_price"] or 0.0)
+                    close_px = float(r["execution_price"] or 0.0)
+                    pnl = float(r["pnl_usd"] or 0.0)
+                    closed_utc_str = str(r["execution_utc"] or "")
+                    src = str(r["source"] or "").strip().lower()
+                    # Pull original SL from the execution_journal for risk distance.
+                    jrow = conn.execute(
+                        "SELECT request_json, created_utc FROM execution_journal WHERE position_id=? LIMIT 1",
+                        (pid,),
+                    ).fetchone()
+                    sl = 0.0; opened_utc = closed_utc_str
+                    if jrow:
+                        try:
+                            req = json.loads(jrow["request_json"] or "{}")
+                            sl = float(req.get("stop_loss", 0.0) or 0.0)
+                            opened_utc = str(jrow["created_utc"] or closed_utc_str)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            sl = 0.0
+                    risk = abs(entry_px - sl) if sl > 0 else 1.0
+                    if entry_dir == "short":
+                        realised = entry_px - close_px
+                    else:
+                        realised = close_px - entry_px
+                    realised_r = realised / risk if risk > 0 else 0.0
+                    # Compute mfe_r / mae_r from spot ticks during trade.
+                    mfe_r = mae_r = 0.0
+                    try:
+                        ticks = conn.execute(
+                            "SELECT bid, ask FROM ctrader_spot_ticks WHERE UPPER(symbol)='XAUUSD' AND bid > 0 AND event_utc BETWEEN ? AND ? ORDER BY id ASC LIMIT 5000",
+                            (opened_utc.replace(" ", "T"), closed_utc_str),
+                        ).fetchall()
+                        if ticks:
+                            if entry_dir == "short":
+                                mfe = entry_px - min(float(t["ask"]) for t in ticks)
+                                mae = max(float(t["ask"]) for t in ticks) - entry_px
+                            else:
+                                mfe = max(float(t["bid"]) for t in ticks) - entry_px
+                                mae = entry_px - min(float(t["bid"]) for t in ticks)
+                            mfe_r = max(0.0, mfe / risk) if risk > 0 else 0.0
+                            mae_r = max(0.0, mae / risk) if risk > 0 else 0.0
+                    except Exception:
+                        pass
+                    # Parse closed_utc into datetime.
+                    try:
+                        cu = closed_utc_str.replace("Z", "+00:00").replace(" ", "T", 1)
+                        closed_dt = datetime.fromisoformat(cu)
+                        if closed_dt.tzinfo is None:
+                            closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        closed_dt = datetime.now(timezone.utc)
+                    event = CloseEvent(
+                        position_id=pid,
+                        direction=entry_dir,
+                        source=src,
+                        pnl_usd=pnl,
+                        realised_r=realised_r,
+                        mfe_r=mfe_r,
+                        mae_r=mae_r,
+                        closed_utc=closed_dt,
+                    )
+                    tag = awareness.record_close(event)
+                    recorded += 1
+                    if deal_id > latest_id_seen:
+                        latest_id_seen = deal_id
+                    logger.info(
+                        "[AdvAware] tagged pid=%d %s pnl=%.2f realised_r=%.2f mfe_r=%.2f mae_r=%.2f → %s",
+                        pid, entry_dir, pnl, realised_r, mfe_r, mae_r, tag,
+                    )
+        except Exception as exc:
+            logger.warning("[AdvAware] sync failed: %s", exc)
+            return {"ok": False, "status": "db_error", "error": str(exc)}
+
+        self._aa_last_deal_id = latest_id_seen
+        # Refresh directives now that we've fed new events.
+        try:
+            directives = awareness.evaluate()
+            if directives:
+                for d in directives:
+                    logger.info("[AdvAware] cooldown active scope=%s until=%s reason=%s",
+                                d.scope, d.cooldown_until_utc.isoformat(), d.reason)
+        except Exception as exc:
+            logger.debug("[AdvAware] evaluate after sync failed: %s", exc)
+        return {"ok": True, "recorded": recorded, "latest_deal_id": latest_id_seen}
+
     def _run_missed_opportunity_scan(self) -> dict:
         """Scan broker journal for winners that left runners on the table.
 
@@ -15751,6 +15900,12 @@ class DexterScheduler:
         if bool(getattr(config, "MISSED_OPPORTUNITY_ENABLED", False)):
             schedule.every(5).minutes.do(self._run_missed_opportunity_scan)
             logger.info("[MissedRunner] Scheduled every 5min — feeds Self-Mutation Loop")
+
+        # ── Adversarial Awareness (psychology + cool-downs) ──────────────────
+        if bool(getattr(config, "ADVERSARIAL_AWARENESS_ENABLED", False)):
+            aa_sec = max(30, int(getattr(config, "AA_SYNC_INTERVAL_SEC", 60) or 60))
+            schedule.every(aa_sec).seconds.do(self._run_adversarial_awareness_sync)
+            logger.info("[AdvAware] Scheduled every %ds — syncs close events + emits cool-downs", aa_sec)
 
         # ── Fibonacci Advance (Sniper + Scout dual-speed) ─────────────────────
         if bool(getattr(config, "FIBO_ADVANCE_ENABLED", True)):

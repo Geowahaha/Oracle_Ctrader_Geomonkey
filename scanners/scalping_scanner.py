@@ -2124,6 +2124,32 @@ class ScalpingScanner:
 
         self._apply_xau_entry_template_m1_bias(signal, trigger=trigger)
 
+        # Adversarial Awareness — meta-cognition gate. Operator directive
+        # 2026-05-20: "ตลาดกำลังเล่นอะไรกับเรา ... จิตวิทยาการเทรด เอามาใส่ด้วย".
+        # Block dispatch when recent close events form a revenge / hunt /
+        # panic / drawdown-burst pattern. Pure read; the singleton is fed
+        # by the scheduler's _run_adversarial_awareness_sync tick.
+        if bool(getattr(config, "ADVERSARIAL_AWARENESS_ENABLED", False)):
+            try:
+                from analysis.adversarial_awareness import is_blocked_safe
+                dir_norm = str(getattr(signal, "direction", "") or "").lower()
+                src_now = str(getattr(signal, "source", "") or source or "").lower()
+                blocked, why = is_blocked_safe(direction=dir_norm, source=src_now)
+                if blocked:
+                    logger.warning(
+                        "[AdvAware] BLOCKING signal dir=%s src=%s — %s",
+                        dir_norm, src_now, why,
+                    )
+                    return ScalpingScanResult(
+                        source=source, symbol="XAUUSD",
+                        status="adversarial_cooldown",
+                        reason=why,
+                        signal=None, trigger=trigger,
+                    )
+            except Exception as _aae:
+                # Never let awareness crash the scanner.
+                logger.debug("[AdvAware] guard error: %s", _aae)
+
         # Entry Quality Router — first gate. Operator directive 2026-05-18:
         # "kill BUY/SELL limit แบบไร้คุณภาพ; improve ด้วย stop order or live
         # executed entry แบบสด". Three outcomes:

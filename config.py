@@ -3671,6 +3671,8 @@ class Config:
     AA_DRAWDOWN_WINDOW_COUNT: int = int(os.getenv("AA_DRAWDOWN_WINDOW_COUNT", "8"))
     AA_DRAWDOWN_THRESHOLD_USD: float = float(os.getenv("AA_DRAWDOWN_THRESHOLD_USD", "-200.0"))
     AA_DRAWDOWN_COOLDOWN_MIN: float = float(os.getenv("AA_DRAWDOWN_COOLDOWN_MIN", "60.0"))
+    # Scheduler tick interval for close-event sync (seconds, min 30).
+    AA_SYNC_INTERVAL_SEC: int = int(os.getenv("AA_SYNC_INTERVAL_SEC", "60"))
 
 
 config = Config()

@@ -49,6 +49,11 @@ from analysis.adversarial_awareness.awareness import (
     PsychologyTag,
     PsychologyTagger,
 )
+from analysis.adversarial_awareness.instance import (
+    get_default_awareness,
+    is_blocked_safe,
+    reset_default_awareness_for_tests,
+)
 
 
 __all__ = [
@@ -58,4 +63,7 @@ __all__ = [
     "CoolDownDirective",
     "PsychologyTag",
     "PsychologyTagger",
+    "get_default_awareness",
+    "is_blocked_safe",
+    "reset_default_awareness_for_tests",
 ]
