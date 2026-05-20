@@ -455,7 +455,10 @@ class DexterScheduler:
         Wired-from: scheduler tick (every 60s by default).
         Consumed-by: scalp_scanner.scan_xauusd via ``is_blocked_safe()``.
         """
+        logger.info("[AdvAware] sync tick starting (last_deal_id=%d)",
+                    int(getattr(self, "_aa_last_deal_id", 0) or 0))
         if not bool(getattr(config, "ADVERSARIAL_AWARENESS_ENABLED", False)):
+            logger.debug("[AdvAware] disabled flag — skipping")
             return {"ok": False, "status": "disabled"}
         if ctrader_executor is None:
             return {"ok": False, "status": "executor_missing"}
@@ -475,7 +478,19 @@ class DexterScheduler:
         db_path = str(getattr(ctrader_executor, "db_path", "") or getattr(config, "CTRADER_DB_PATH", "") or "data/ctrader_openapi.db")
         # Track the last-seen deal_id so we only sync new closes.
         if not hasattr(self, "_aa_last_deal_id"):
-            self._aa_last_deal_id = 0
+            # On first call, jump to the latest deal_id so we don't reprocess
+            # the entire historical journal — only NEW closes after startup
+            # matter for cool-down detection.
+            try:
+                import sqlite3 as _sq
+                with _sq.connect(db_path) as _c0:
+                    row0 = _c0.execute(
+                        "SELECT COALESCE(MAX(deal_id), 0) FROM ctrader_deals WHERE UPPER(symbol)='XAUUSD'"
+                    ).fetchone()
+                    self._aa_last_deal_id = int(row0[0] or 0) if row0 else 0
+            except Exception:
+                self._aa_last_deal_id = 0
+            logger.info("[AdvAware] seeded last_deal_id=%d (skipping historical)", self._aa_last_deal_id)
         recorded = 0
         latest_id_seen = int(self._aa_last_deal_id)
         try:
