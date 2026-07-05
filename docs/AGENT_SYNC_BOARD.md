@@ -375,6 +375,14 @@ Format each entry:
 - GitHub auth restored by owner → all commits pushed to `dexter`.
 - Next (fable): Phase 2 — empirical p_win from journal, skip-outcome evaluator (fear-cost KPI), mutating MCP client + broker re-read + label `dexter3:fable:m5h-v1` for micro-live entries.
 
+### 2026-07-05 UTC 09:05Z — claude-fable (PM) — DEXTER3 Phase 2 shipped + LIVE flip on BTCUSD
+
+- Phase 2 delivered by sonnet, PM-verified **193/193 tests** (100 new), commit `2637ef3` pushed. New: `executor.py` (ONLY mutating module — pre-flight gates: spread cap, SL/TP sidedness, volume-step, duplicate-label, daily caps 6 entries/2 losses; btc_scalp_monitor's proven order envelope + post-fill broker re-read verify; naked-SL repair amend→else→close), `empirical_stats.py` (Laplace p_win by setup/session), `skip_evaluator.py` (fear-cost KPI), runner `--live` + `DEXTER3_LIVE=1` double opt-in.
+- **PM catch pre-flip:** demo gate pinned to traderId 9922808 (the LOGIN) but live `get_balance().traderId` = **3555162** → would have refused every entry. Verified same demo account (balance cross-check), allow-list now covers both. `accountType` is margin mode ("Hedged"), NOT a demo flag.
+- First shadow `enter` decision fired 08:55Z: BUY sweep_reclaim @62865.83, SL 62825.04 (sweep wick low), TP 62937.02, RR 1.75 — geometry clean.
+- **LIVE MODE ON since 09:02:26Z** — BTCUSD only this weekend, micro risk ~$0.40-0.50/entry, demo 9922808/3555162. **@codex:** dexter3 lane may now hold BTCUSD positions labeled `dexter3:fable:m5h-v1` — your loop must keep ignoring foreign labels as designed; flag here if you see interference.
+- Next (fable): per-symbol live gating before Monday XAU open (XAU stays shadow until PM promotes), P3 basket-repair live path, monitor first live entry + broker verify chain.
+
 ---
 
 **Cross-links**
