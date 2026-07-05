@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
-"""Dexter3 M5 shadow loop — lens -> brain -> journal, NO ORDERS EVER.
+"""Dexter3 M5 shadow/live loop — lens -> brain -> journal (+ demo micro-entries in Phase 2).
 
-This file must never place, amend, or close a real order. Phase 1 is a pure
-observation loop: on every NEW M5 close per symbol, it fetches M5/M15/H1
-trendbars + spot via ``dexter3.mcp_client`` (read-only), runs
-``market_lens`` -> ``hunter_brain.decide()``, journals the decision, and
-also drives a paper (simulated-fill) ``BasketManager`` so basket-management
-telemetry accumulates before any money is at risk (blueprint P1).
+Without ``--live``, this file behaves EXACTLY as Phase 1: a pure observation
+loop that, on every NEW M5 close per symbol, fetches M5/M15/H1 trendbars +
+spot via ``dexter3.mcp_client`` (read-only), runs ``market_lens`` ->
+``hunter_brain.decide()``, journals the decision, and drives a paper
+(simulated-fill) ``BasketManager`` so basket-management telemetry
+accumulates before any money is at risk.
+
+Phase 2 adds an OPT-IN live micro-entry path: passing ``--live`` AND setting
+the environment variable ``DEXTER3_LIVE=1`` (double opt-in — either alone is
+not enough) constructs a ``dexter3.executor.Dexter3Executor`` and invokes it
+for the newest bar's ``action == 'enter'`` decisions only (never for
+historical catch-up bars). The executor itself refuses to trade unless the
+bound account is confirmed demo (see ``dexter3/executor.py``), so a live
+loop pointed at the wrong account still cannot place an order.
+
+Every ``LEARNING_REFRESH_MINUTES`` (default 15), the loop also refreshes
+empirical p_win_est stats (``dexter3.empirical_stats``) and evaluates
+pending skip decisions for the "fear cost" KPI
+(``dexter3.skip_evaluator``) — both additive, both no-ops until enough
+closed trades/skips exist in the journal.
 
 CLI:
     python -m dexter3.shadow_runner --symbols XAUUSD,BTCUSD --once
     python -m dexter3.shadow_runner --symbols XAUUSD,BTCUSD --loop --poll-sec 20
+    DEXTER3_LIVE=1 python -m dexter3.shadow_runner --symbols BTCUSD --loop --live
 
 Single-instance lock: ``data/runtime/dexter3_loop.lock`` (own lock, separate
 from the live scalp loops' locks — blueprint "Non-negotiables" #2). Stale
@@ -43,9 +58,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dexter3 import hunter_brain, market_lens
+from dexter3 import empirical_stats, hunter_brain, market_lens, skip_evaluator
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.decision_journal import DecisionJournal
+from dexter3.executor import LABEL as LIVE_ORDER_LABEL
+from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 
 RUNTIME = ROOT / "data" / "runtime"
@@ -60,6 +77,22 @@ MCP_ZOMBIE_SLEEP_SEC = 60
 MIN_M5_BARS = 60
 M15_BARS_NEEDED = 60
 H1_BARS_NEEDED = 60
+
+# -- Phase 2: live micro-entry double opt-in ---------------------------------
+# Placing a real (demo) order requires BOTH the --live CLI flag AND this env
+# var set to "1" — blueprint P2 "double opt-in" so a stray --live in a test
+# harness or a copy-pasted command can never place an order by accident.
+DEXTER3_LIVE_ENV_VAR = "DEXTER3_LIVE"
+
+# -- Phase 2: periodic learning-loop refresh ---------------------------------
+# "every N cycles (default every 15 min)" per spec section 5; expressed in
+# cycles (not minutes) because run_once has no wall-clock of its own — the
+# caller's poll interval determines how many cycles fit in 15 minutes.
+LEARNING_REFRESH_MINUTES = 15
+
+
+def _learning_refresh_every_cycles(poll_sec: int) -> int:
+    return max(1, int((LEARNING_REFRESH_MINUTES * 60) / max(1, poll_sec)))
 
 
 def utc_now_iso() -> str:
@@ -344,12 +377,21 @@ def run_symbol_cycle(
     baskets: dict[str, PaperBasket],
     state: dict[str, Any],
     symbol: str,
+    *,
+    executor: Dexter3Executor | None = None,
+    journal_stats: dict[str, Any] | None = None,
 ) -> str:
     """Run one evaluation cycle for ``symbol``. Returns a short status string.
 
     Decides EVERY pending completed M5 bar (catch-up), not only the newest.
     Catch-up decisions use only bars completed by that close (no lookahead in
     M5 prefix or M15/H1 context) and carry their lateness in the log line.
+
+    ``executor`` is optional (None in Phase 1 shadow mode and whenever
+    --live is absent — see ``main``/``run_loop``). When provided, it is
+    invoked ONLY for the newest bar's ``enter`` decisions — historical
+    catch-up bars never place a live order (that would be a backfill/
+    lookahead order against a price that has already moved on).
     """
     m5_bars = fetch_fresh_m5(mcp, symbol)
     if len(m5_bars) < MIN_M5_BARS:
@@ -370,15 +412,18 @@ def run_symbol_cycle(
         prefix = m5_bars[: i + 1]
         m15_ctx = [b for b in m15_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
         h1_ctx = [b for b in h1_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
+        is_newest = i == len(m5_bars) - 1
 
-        decision = hunter_brain.decide(symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=None)
+        decision = hunter_brain.decide(
+            symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
+        )
         journal.insert_decision(decision)
         log_decision_line(decision, late_sec=late_sec)
 
         basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
         basket.advance_clock(M5_BAR_SEC / 60.0)
         basket.on_decision(decision)
-        if i == len(m5_bars) - 1:
+        if is_newest:
             try:
                 spot = mcp.get_spot_price(symbol)
                 mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
@@ -389,13 +434,38 @@ def run_symbol_cycle(
             mid = float(m5_bars[i].get("close") or 0.0)
         basket.on_m5_close_tick(mid)
 
+        status = f"decided:{decision.action}:{decision.setup}"
+        if is_newest and executor is not None and decision.action == "enter":
+            exec_result = _execute_live_entry(executor, decision)
+            status += f":live_{exec_result.get('action', 'unknown')}"
+
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
-        status = f"decided:{decision.action}:{decision.setup}"
         if late_sec > 90:
             status += f":late{int(late_sec)}s"
         statuses.append(status)
     return ";".join(statuses)
+
+
+def _execute_live_entry(executor: Dexter3Executor, decision: hunter_brain.Decision) -> dict[str, Any]:
+    """Resolve account state and place a live micro-entry. Never raises."""
+    account_state: dict[str, Any] = {}
+    try:
+        balance = executor.client.get_balance()
+        account_state = {"traderId": balance.get("traderId")}
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {decision.symbol} live_entry_balance_read_failed: {exc}")
+        account_state = {}
+    try:
+        result = executor.execute_entry(decision, account_state)
+    except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
+        log_error(f"execute_entry({decision.symbol})", exc)
+        return {"action": "exception"}
+    log_line(
+        f"{utc_now_iso()} {decision.symbol} LIVE_ENTRY action={result.get('action')} "
+        f"position_id={result.get('position_id')} verified={result.get('verified')}"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -407,12 +477,66 @@ _LAST_STATUS: dict[str, str] = {}
 _STATUS_REPEATS: dict[str, int] = {}
 STATUS_HEARTBEAT_EVERY = 90  # re-log an unchanged status every ~30 min at 20s poll
 
+# per-symbol empirical stats cache, refreshed every _learning_refresh_every_cycles
+# cycles (see run_once). Module-level so --once callers (which run a single
+# cycle) simply never populate it — hunter_brain.decide() then falls back to
+# its own base p_win priors, byte-identical to Phase 1.
+_JOURNAL_STATS_CACHE: dict[str, dict[str, Any]] = {}
+_CYCLE_COUNTER = 0
 
-def run_once(symbols: list[str], mcp: Dexter3McpClient, journal: DecisionJournal, baskets: dict[str, PaperBasket]) -> None:
+
+def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: Dexter3McpClient) -> None:
+    """Every N cycles: refresh empirical p_win stats + evaluate pending skips.
+
+    Never raises — a failure here must not interrupt the decision loop, it
+    only means stats stay stale for another refresh interval.
+    """
+    for symbol in symbols:
+        try:
+            _JOURNAL_STATS_CACHE[symbol] = empirical_stats.stats_to_journal_stats_arg(
+                empirical_stats.compute_from_journal(journal, symbol)
+            ) or None
+        except Exception as exc:  # noqa: BLE001 - stats refresh must never break the loop
+            log_error(f"empirical_stats.compute_from_journal({symbol})", exc)
+    try:
+        result = skip_evaluator.evaluate_pending_skips(journal, mcp)
+        log_line(
+            f"{utc_now_iso()} skip_evaluator checked={result['checked']} "
+            f"evaluated={result['evaluated']} unevaluable={result['unevaluable']}"
+        )
+        fear_cost = skip_evaluator.fear_cost_summary(journal)
+        log_line(
+            f"{utc_now_iso()} fear_cost hours={fear_cost['hours']} "
+            f"skips_evaluated={fear_cost['skips_evaluated']} "
+            f"would_have_wins={fear_cost['would_have_wins']} "
+            f"would_have_pnl_r={fear_cost['would_have_pnl_r']}"
+        )
+    except Exception as exc:  # noqa: BLE001 - loop must never die
+        log_error("skip_evaluator.evaluate_pending_skips", exc)
+
+
+def run_once(
+    symbols: list[str],
+    mcp: Dexter3McpClient,
+    journal: DecisionJournal,
+    baskets: dict[str, PaperBasket],
+    *,
+    executor: Dexter3Executor | None = None,
+    refresh_every_cycles: int | None = None,
+) -> None:
+    global _CYCLE_COUNTER
     state = load_shadow_state()
     for symbol in symbols:
         try:
-            status = run_symbol_cycle(mcp, journal, baskets, state, symbol)
+            status = run_symbol_cycle(
+                mcp,
+                journal,
+                baskets,
+                state,
+                symbol,
+                executor=executor,
+                journal_stats=_JOURNAL_STATS_CACHE.get(symbol),
+            )
             repeats = _STATUS_REPEATS.get(symbol, 0) + 1 if _LAST_STATUS.get(symbol) == status else 0
             _STATUS_REPEATS[symbol] = repeats
             _LAST_STATUS[symbol] = status
@@ -424,17 +548,47 @@ def run_once(symbols: list[str], mcp: Dexter3McpClient, journal: DecisionJournal
         except Exception as exc:  # noqa: BLE001 - loop must never die on a per-symbol error
             log_error(f"run_symbol_cycle({symbol})", exc)
 
+    if refresh_every_cycles:
+        _CYCLE_COUNTER += 1
+        if _CYCLE_COUNTER % refresh_every_cycles == 0:
+            _refresh_learning_loops(symbols, journal, mcp)
 
-def run_loop(symbols: list[str], poll_sec: int) -> None:
+
+def _resolve_live_executor(mcp: Dexter3McpClient, journal: DecisionJournal, live_flag: bool) -> Dexter3Executor | None:
+    """Double opt-in: --live CLI flag AND DEXTER3_LIVE=1 env var, both required.
+
+    Returns None (shadow-only, byte-identical to Phase 1) unless both gates
+    pass — this is deliberately redundant with the demo-refusal gate inside
+    Dexter3Executor itself; the two gates protect against different mistakes
+    (a stray --live vs. a misconfigured/live-bound MCP).
+    """
+    if not live_flag:
+        return None
+    if os.environ.get(DEXTER3_LIVE_ENV_VAR) != "1":
+        log_line(
+            f"{utc_now_iso()} --live requested but {DEXTER3_LIVE_ENV_VAR}=1 env var not set — "
+            "staying in shadow mode (double opt-in required, see blueprint P2)"
+        )
+        return None
+    log_line(f"{utc_now_iso()} DEXTER3 LIVE MODE ENABLED — demo micro-entries may be placed (label={LIVE_ORDER_LABEL})")
+    return Dexter3Executor(mcp, journal, ExecutorConfig())
+
+
+def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     acquire_loop_lock()
     mcp = Dexter3McpClient()
     baskets: dict[str, PaperBasket] = {}
     try:
         with DecisionJournal() as journal:
-            log_line(f"{utc_now_iso()} dexter3 shadow loop started symbols={symbols} poll_sec={poll_sec}")
+            executor = _resolve_live_executor(mcp, journal, live)
+            refresh_every_cycles = _learning_refresh_every_cycles(poll_sec)
+            log_line(
+                f"{utc_now_iso()} dexter3 shadow loop started symbols={symbols} poll_sec={poll_sec} "
+                f"live={'ON' if executor is not None else 'off'}"
+            )
             while True:
                 try:
-                    run_once(symbols, mcp, journal, baskets)
+                    run_once(symbols, mcp, journal, baskets, executor=executor, refresh_every_cycles=refresh_every_cycles)
                 except McpZombieError as exc:
                     log_line(f"{utc_now_iso()} MCP_ZOMBIE (loop-level): {exc}")
                     time.sleep(MCP_ZOMBIE_SLEEP_SEC)
@@ -449,12 +603,21 @@ def run_loop(symbols: list[str], poll_sec: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Dexter3 M5 shadow loop (read-only, no orders)")
+    parser = argparse.ArgumentParser(description="Dexter3 M5 shadow/live loop")
     parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS), help="comma-separated symbol list")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="run a single evaluation cycle per symbol and exit")
     mode.add_argument("--loop", action="store_true", help="run continuously until interrupted")
     parser.add_argument("--poll-sec", type=int, default=DEFAULT_POLL_SEC, help="seconds between loop iterations")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Enable demo micro-entries for 'enter' decisions. Also requires the "
+            f"{DEXTER3_LIVE_ENV_VAR}=1 environment variable (double opt-in) — "
+            "default is OFF/shadow-only."
+        ),
+    )
     args = parser.parse_args(argv)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -463,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.loop:
-        run_loop(symbols, args.poll_sec)
+        run_loop(symbols, args.poll_sec, live=args.live)
         return 0
 
     # --once: no lock required for a single pass, but still respect an
@@ -481,7 +644,8 @@ def main(argv: list[str] | None = None) -> int:
     baskets: dict[str, PaperBasket] = {}
     try:
         with DecisionJournal() as journal:
-            run_once(symbols, mcp, journal, baskets)
+            executor = _resolve_live_executor(mcp, journal, args.live)
+            run_once(symbols, mcp, journal, baskets, executor=executor)
     except McpZombieError as exc:
         log_line(f"{utc_now_iso()} MCP_ZOMBIE (--once): {exc}")
         return 3

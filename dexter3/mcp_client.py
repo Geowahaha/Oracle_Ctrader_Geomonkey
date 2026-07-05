@@ -1,19 +1,33 @@
-"""Thin, read-only HTTP client for the local cTrader MCP (Dexter3 Phase 1).
+"""Thin HTTP client for the local cTrader MCP (Dexter3).
 
 Mirrors the proven request/response envelope used by
 ``scripts/ctrader_mcp_client.py`` (Streamable HTTP transport: JSON-RPC 2.0
 over POST, session id from the ``Mcp-Session-Id`` response header, body may
 arrive as raw JSON or as a single SSE ``data:`` frame). This module does NOT
-invent a new protocol — it copies that parsing exactly and narrows the
-surface to the read-only tools Phase 1 needs:
+invent a new protocol — it copies that parsing exactly.
+
+Phase 1 read-only surface:
 
     get_trendbars(symbol, period, count)
     get_spot_price(symbol)
     get_positions()
     get_balance()
 
-Phase 1 is read-only by contract (see docs/DEXTER3_M5_HUNTER_BLUEPRINT.md,
-"Non-negotiables"). No mutating MCP tools are called from this client.
+Phase 2 adds mutating methods (``dexter3/executor.py`` is the ONLY dexter3
+module allowed to call them — see docs/DEXTER3_M5_HUNTER_BLUEPRINT.md
+"Non-negotiables"). The envelopes below are copied field-for-field from
+``scripts/btc_scalp_monitor.py`` (the production-proven order path against
+this same local MCP), NOT reinvented:
+
+    place_market_order(symbol, side, volume, stop_loss_pips, take_profit_pips, label, comment)
+    amend_position(position_id, stop_loss, take_profit)
+    close_position(position_id)
+
+Order-placement tools take SL/TP as PIP DISTANCE (``stopLossPips``/
+``takeProfitPips``); ``amend_position`` takes ABSOLUTE prices (``stopLoss``/
+``takeProfit``) — this asymmetry is intentional broker/MCP behavior, not a
+bug (see the ctrader-mcp-servers skill, "Stop loss and take profit: pip
+distance vs absolute price").
 
 Zombie detection: an HTTP 404 from the MCP endpoint (including a 404 raised
 during ``initialize``) means the local MCP server is a "zombie" — it still
@@ -274,6 +288,93 @@ class Dexter3McpClient:
         if not isinstance(data, dict):
             raise McpClientError(f"get_balance returned unexpected payload: {data!r}")
         return data
+
+    def get_symbol_details(self, symbol: str) -> dict[str, Any]:
+        """Fetch symbol trading spec (minVolume/volumeStep/lotSize/pipSize) — read-only."""
+        data = self.call("get_symbol_details", {"symbolName": symbol})
+        if not isinstance(data, dict):
+            raise McpClientError(f"get_symbol_details returned unexpected payload: {data!r}")
+        return data
+
+    def get_pending_orders(self) -> list[dict[str, Any]]:
+        """Fetch all pending (unfilled) orders across symbols (read-only)."""
+        data = self.call("get_pending_orders")
+        if isinstance(data, dict):
+            return list(data.get("orders", []))
+        if isinstance(data, list):
+            return data
+        raise McpClientError(f"get_pending_orders returned unexpected payload: {data!r}")
+
+    # -- Phase 2 mutating surface (dexter3/executor.py ONLY) -----------------
+    #
+    # Envelopes copied field-for-field from scripts/btc_scalp_monitor.py —
+    # see module docstring. Do not invent new parameter names here; if the
+    # broker rejects a call, fix the envelope to match the proven monitor,
+    # not the other way around.
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        volume: float,
+        stop_loss_pips: int,
+        take_profit_pips: int,
+        label: str,
+        comment: str = "",
+    ) -> dict[str, Any]:
+        """Place a MARKET order with SL/TP attached (pip distance — see module docstring).
+
+        Mirrors ``scripts/btc_scalp_monitor.py::run_cycle``'s
+        ``mcp.tool("place_market_order", {...})`` call exactly (volumeType
+        "units", label + comment for peer-label isolation).
+        """
+        data = self.call(
+            "place_market_order",
+            {
+                "symbolName": symbol,
+                "side": side,
+                "volume": float(volume),
+                "volumeType": "units",
+                "stopLossPips": int(stop_loss_pips),
+                "takeProfitPips": int(take_profit_pips),
+                "label": label,
+                "comment": comment[:55],
+            },
+        )
+        return data if isinstance(data, dict) else {"raw": data}
+
+    def amend_position(
+        self,
+        position_id: int,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> dict[str, Any]:
+        """Amend an OPEN position's SL/TP (ABSOLUTE prices — see module docstring).
+
+        Mirrors ``scripts/btc_scalp_monitor.py::repair_missing_sltp`` /
+        ``defend_loop_position``'s ``mcp.tool("amend_position", {...})`` call.
+        Only non-None values are sent so a partial amend (e.g. SL only) does
+        not clobber the other leg — mirrors the monitor's own call sites,
+        which always pass both together, but keeps this method safe for
+        callers that only need to fix one side.
+        """
+        payload: dict[str, Any] = {"positionId": int(position_id)}
+        if stop_loss is not None:
+            payload["stopLoss"] = round(float(stop_loss), 5)
+        if take_profit is not None:
+            payload["takeProfit"] = round(float(take_profit), 5)
+        data = self.call("amend_position", payload)
+        return data if isinstance(data, dict) else {"raw": data}
+
+    def close_position(self, position_id: int) -> dict[str, Any]:
+        """Close an OPEN position entirely.
+
+        Mirrors ``scripts/xau_scalp_monitor.py``'s repeated
+        ``mcp.tool("close_position", {"positionId": pid})`` call sites (no
+        volume parameter — full close).
+        """
+        data = self.call("close_position", {"positionId": int(position_id)})
+        return data if isinstance(data, dict) else {"raw": data}
 
 
 # -- small time/normalization helpers (kept local to avoid new deps) --------

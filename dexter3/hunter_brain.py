@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-from dexter3 import market_lens
+from dexter3 import empirical_stats, market_lens
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _ROOT / "scripts"
@@ -410,6 +410,16 @@ def decide(
         rr = _reward_risk(side, entry, sl, tp)
         if rr >= MIN_REWARD_RISK:
             p_win = _p_win_est(setup, ls["value"], session_label)
+            if journal_stats:
+                # journal_stats carries the tuple-keyed empirical stats dict
+                # produced by empirical_stats.compute_from_journal (blueprint
+                # P5 blend: 50% base prior + 50% empirical once a (setup,
+                # session) key has >= empirical_stats.MIN_SAMPLES closed
+                # outcomes; below that floor, base p_win is returned
+                # unchanged). Wiring this in shadow_runner is additive-only
+                # — decide() behaves exactly as Phase 1 when journal_stats
+                # is None (the default).
+                p_win = empirical_stats.blended_p_win(p_win, setup, session_label, journal_stats)
             size_class = "normal" if ls["band"] == "strong" else "small"
             entry_type = "market" if setup in ("sweep_reclaim", "leader_continuation") else "stop"
             full_reasons = list(reasons) + [f"reward_risk={rr:.2f}>=floor={MIN_REWARD_RISK}"]
