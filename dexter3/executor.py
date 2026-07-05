@@ -30,11 +30,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
+from dexter3.mcp_client import (
+    Dexter3McpClient,
+    McpClientError,
+    McpMutationUncertain,
+    McpZombieError,
+)
 
 LABEL = "dexter3:fable:m5h-v1"
 
@@ -553,6 +559,7 @@ class Dexter3Executor:
         comment = f"{decision.setup}|{'|'.join(decision.reasons)}"[:55] if decision.reasons else str(decision.setup)
 
         known_ids = {position_id_of(p) for p in open_positions if position_id_of(p) > 0}
+        reconciled_pid = 0
         try:
             order = self.client.place_market_order(
                 symbol=symbol,
@@ -563,6 +570,16 @@ class Dexter3Executor:
                 label=LABEL,
                 comment=comment,
             )
+        except McpMutationUncertain as exc:
+            # Transport died mid-order: it MAY have filled broker-side.
+            # Reconcile instead of retrying (the 2026-07-05 double-fill).
+            time.sleep(3.0)
+            reconciled_pid = self._resolve_new_position(symbol, known_ids)
+            if reconciled_pid <= 0:
+                return self._refuse(
+                    symbol, "mutation_uncertain_not_filled", error=str(exc), volume=volume
+                )
+            order = {"transport": "uncertain_reconciled", "detail": str(exc)}
         except (McpClientError, McpZombieError) as exc:
             return self._refuse(
                 symbol, "place_market_order_failed", error=str(exc), volume=volume, sl_pips=sl_pips, tp_pips=tp_pips
@@ -573,7 +590,7 @@ class Dexter3Executor:
             self._journal(symbol, "entry_rejected_by_broker", verified=False, payload={"order": order})
             return {"action": "rejected", "order": order}
 
-        pid = self._resolve_new_position(symbol, known_ids)
+        pid = reconciled_pid or self._resolve_new_position(symbol, known_ids)
         post_positions = self._safe_get_positions()
         new_pos = next(
             (p for p in post_positions if position_id_of(p) == pid and is_our_position(p)), None
@@ -721,6 +738,10 @@ class Dexter3Executor:
             )
         try:
             result = self.client.close_position(int(position_id))
+        except McpMutationUncertain as exc:
+            # close MAY have executed — the post re-read below is the truth
+            time.sleep(2.0)
+            result = {"transport": "uncertain_reconciled", "detail": str(exc)}
         except (McpClientError, McpZombieError) as exc:
             return self._refuse(symbol, "close_position_failed", position_id=position_id, error=str(exc))
         post_positions = self._safe_get_positions()
@@ -753,6 +774,10 @@ class Dexter3Executor:
         volume = position_volume_of(pos)
         try:
             self.client.amend_position(int(position_id), stop_loss=sl, take_profit=tp)
+        except McpMutationUncertain as exc:
+            # amend MAY have applied — the post re-read verification decides
+            time.sleep(2.0)
+            log_note = str(exc)  # noqa: F841 - captured in journal payload below via verification
         except (McpClientError, McpZombieError) as exc:
             return self._refuse(symbol, "amend_failed", position_id=position_id, error=str(exc))
         post_positions = self._safe_get_positions()

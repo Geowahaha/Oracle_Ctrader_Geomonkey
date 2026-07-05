@@ -72,6 +72,35 @@ class McpClientError(RuntimeError):
     """Raised for any other MCP transport/protocol failure (not a zombie)."""
 
 
+class McpTransportError(McpClientError):
+    """HTTP layer failed (timeout/connection) — the server may or may not
+    have processed the request. Distinct from a tool-level error, where the
+    server definitively answered."""
+
+
+class McpMutationUncertain(McpClientError):
+    """Transport failed DURING A MUTATING CALL — the order/amend/close MAY
+    have executed broker-side. Callers must reconcile against broker state
+    (re-read positions) and must NEVER blind-retry: a place_market_order
+    retry after a silent fill produced a live double-fill on 2026-07-05
+    (positions 62664.99 + 62654.46, one journal row)."""
+
+
+# Mutating tools are executed with a SINGLE attempt — no transport retry.
+MUTATING_TOOLS = frozenset(
+    {
+        "place_market_order",
+        "place_limit_order",
+        "place_stop_order",
+        "place_stop_limit_order",
+        "amend_position",
+        "amend_order",
+        "close_position",
+        "cancel_order",
+    }
+)
+
+
 def parse_mcp_body(raw: str) -> dict[str, Any]:
     """Parse an MCP HTTP response body.
 
@@ -139,7 +168,7 @@ class Dexter3McpClient:
                 timeout=self.timeout_sec,
             )
         except requests.exceptions.RequestException as exc:
-            raise McpClientError(f"MCP request failed: {exc}") from exc
+            raise McpTransportError(f"MCP request failed: {exc}") from exc
 
         if resp.status_code == 404:
             raise McpZombieError(f"HTTP 404 from {self.url}")
@@ -185,11 +214,26 @@ class Dexter3McpClient:
             pass
 
     def call(self, name: str, args: dict[str, Any] | None = None) -> Any:
-        """Call an MCP tool with one retry + short backoff. Raises on failure.
-
-        Never busy-loops: a single retry, then the exception propagates
-        (``McpZombieError`` for a dead server, ``McpClientError`` otherwise).
+        """Call an MCP tool. READ tools get one retry + short backoff;
+        MUTATING tools get a SINGLE attempt — a transport failure there
+        raises ``McpMutationUncertain`` because the broker may have executed
+        the request even though the response never arrived. Blind-retrying a
+        mutation is how the 2026-07-05 double-fill happened.
         """
+        if name in MUTATING_TOOLS:
+            try:
+                return self._call_once(name, args)
+            except McpZombieError:
+                raise
+            except McpTransportError as exc:
+                self.sid = None
+                raise McpMutationUncertain(
+                    f"transport failed during mutating call {name} — MAY have executed; "
+                    f"reconcile against broker state, do not retry: {exc}"
+                ) from exc
+            # tool-level McpClientError (server answered: rejection/unknown tool)
+            # propagates as-is — the mutation definitively did not execute.
+
         last_exc: Exception | None = None
         for attempt in range(2):
             try:

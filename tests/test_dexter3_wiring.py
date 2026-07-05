@@ -172,6 +172,90 @@ def _chop_bars(n: int = 50, base: float = 62000.0) -> list[dict[str, Any]]:
     return bars
 
 
+# -- mutation-uncertainty (double-fill guard) -----------------------------------
+
+
+def test_client_never_retries_mutating_tools(monkeypatch):
+    from dexter3.mcp_client import (
+        Dexter3McpClient,
+        McpMutationUncertain,
+        McpTransportError,
+    )
+
+    c = Dexter3McpClient()
+    attempts = {"n": 0}
+
+    def failing_call_once(name, args=None):
+        attempts["n"] += 1
+        raise McpTransportError("boom")
+
+    monkeypatch.setattr(c, "_call_once", failing_call_once)
+    monkeypatch.setattr("dexter3.mcp_client.time.sleep", lambda s: None)
+
+    with pytest.raises(McpMutationUncertain):
+        c.call("place_market_order", {})
+    assert attempts["n"] == 1  # SINGLE attempt — no blind retry
+
+    attempts["n"] = 0
+    with pytest.raises(McpTransportError):
+        c.call("get_positions")
+    assert attempts["n"] == 2  # reads still retry once
+
+
+def test_uncertain_entry_reconciles_instead_of_refusing(journal, monkeypatch):
+    from dexter3.mcp_client import McpMutationUncertain
+
+    class UncertainMcp(FakeMcp):
+        def place_market_order(self, **kwargs: Any) -> dict:
+            self.calls.append(("place_market_order", kwargs))
+            # broker filled it, but the response never arrived
+            self._positions.append(_lane_pos(777))
+            raise McpMutationUncertain("timeout mid-order")
+
+    monkeypatch.setattr("dexter3.executor.time.sleep", lambda s: None)
+    mcp = UncertainMcp(positions=[])
+    ex = Dexter3Executor(mcp, journal, ExecutorConfig())
+    out = ex.execute_entry(EnterDecision(), {"traderId": 9922808})
+    assert out["action"] == "entered"
+    assert out["position_id"] == 777
+    assert out["order"]["transport"] == "uncertain_reconciled"
+    assert len([c for c in mcp.calls if c[0] == "place_market_order"]) == 1
+
+
+def test_uncertain_entry_not_filled_refuses(journal, monkeypatch):
+    from dexter3.mcp_client import McpMutationUncertain
+
+    class UncertainMcp(FakeMcp):
+        def place_market_order(self, **kwargs: Any) -> dict:
+            self.calls.append(("place_market_order", kwargs))
+            raise McpMutationUncertain("timeout mid-order")  # and NO fill
+
+    monkeypatch.setattr("dexter3.executor.time.sleep", lambda s: None)
+    mcp = UncertainMcp(positions=[])
+    ex = Dexter3Executor(mcp, journal, ExecutorConfig())
+    out = ex.execute_entry(EnterDecision(), {"traderId": 9922808})
+    assert out["action"] == "refused"
+    assert out["reason"] == "mutation_uncertain_not_filled"
+    assert len([c for c in mcp.calls if c[0] == "place_market_order"]) == 1
+
+
+def test_uncertain_close_trusts_post_reread(journal, monkeypatch):
+    from dexter3.mcp_client import McpMutationUncertain
+
+    class UncertainMcp(FakeMcp):
+        def close_position(self, position_id: int) -> dict:
+            self.calls.append(("close_position", {"position_id": position_id}))
+            # the close actually executed broker-side
+            self._positions = [p for p in self._positions if int(p.get("positionId", 0)) != int(position_id)]
+            raise McpMutationUncertain("timeout mid-close")
+
+    monkeypatch.setattr("dexter3.executor.time.sleep", lambda s: None)
+    mcp = UncertainMcp(positions=[_lane_pos(5)])
+    ex = Dexter3Executor(mcp, journal, ExecutorConfig())
+    out = ex.close_lane_position(5, reason="test")
+    assert out["action"] == "closed"  # post re-read confirmed it is gone
+
+
 @pytest.mark.parametrize("side", ["buy", "sell"])
 def test_repair_geometry_cost_guards(side):
     spread = 12.0
