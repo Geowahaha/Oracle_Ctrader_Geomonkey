@@ -383,6 +383,15 @@ Format each entry:
 - **LIVE MODE ON since 09:02:26Z** — BTCUSD only this weekend, micro risk ~$0.40-0.50/entry, demo 9922808/3555162. **@codex:** dexter3 lane may now hold BTCUSD positions labeled `dexter3:fable:m5h-v1` — your loop must keep ignoring foreign labels as designed; flag here if you see interference.
 - Next (fable): per-symbol live gating before Monday XAU open (XAU stays shadow until PM promotes), P3 basket-repair live path, monitor first live entry + broker verify chain.
 
+### 2026-07-05 UTC 14:40Z — claude-fable (PM) — HUNT MODE LIVE: entry every M5 close + first real fills + double-fill lesson
+
+- Owner challenged: zero executions + demanded literal entry-every-M5-close. Root cause of zero fills: executor pre-flight called nonexistent tool `get_spot_price` (Local MCP is PLURAL `get_spot_prices` even for one symbol) ×4 + one flaky missing traderId. Fixed (`2152cc4`) → **first real fill 14:25:46Z** pid 649286428 (sweep_reclaim BUY, SL/TP verified at broker).
+- **HUNT MODE shipped + live** (`3ca3341`, 565 tests): 8-member direction committee (CLP/swing/day-range tilt/displacement/compression/M15 OLS drift/sweep-reclaim/H1) ALWAYS picks a side; 3 hard vetoes only; SL≥max(6×spread,TRq50), TP≥max(1.2RR, 8×spread). Basket-active bars route to campaign management on REAL broker PnL (`basket_live`): hold/repair/hedge/close-all-in-profit/cap-stop. Proven live 14:30:18Z: `BASKET hold legs=2 agg_r=-0.2` with structure evidence. First hunt entry **14:35:38Z** pid 649286826 `hunt_h1_context` verified.
+- **Incident + fix (`ecbf53d`)**: TWO legs existed but ONE journal row — client transport-retry re-fired place_market_order after a timeout whose first attempt silently filled (classic double-fill). Now MUTATING tools = single attempt; transport failure ⇒ `McpMutationUncertain` ⇒ reconcile against broker (entry re-resolve / close+amend post re-read). Both stopped legs closed at broker-side SLs, total -0.74 USD — protection + caps held.
+- Daily caps were silently ineffective (runner passed 0 counts) — now persisted per-day counters feed executor (6 entries/2 loss-baskets caps). NOTE: hunt cadence will hit the 6/day cap fast — PM raising it is a deliberate decision for next iteration, not an accident.
+- **@codex:** dexter3 lane now trades BTCUSD every M5 close (micro 0.01). Label isolation unchanged.
+- Next (fable): watch hunt PF + basket resolutions tonight; per-symbol live gate before XAU Monday open; entries/day cap decision; empirical p_win feeding from real closes.
+
 ---
 
 **Cross-links**
