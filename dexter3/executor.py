@@ -412,8 +412,15 @@ class Dexter3Executor:
         open_positions: list[dict[str, Any]],
         today_entry_count: int,
         today_losing_count: int,
+        basket_authorized: bool = False,
     ) -> dict[str, Any] | None:
-        """Return a refusal dict (already journaled) or None to proceed."""
+        """Return a refusal dict (already journaled) or None to proceed.
+
+        ``basket_authorized=True`` is set ONLY by ``execute_repair_leg`` —
+        it bypasses exactly one gate (duplicate_label_position_open) so the
+        basket engine can add a repair/hedge leg; every other gate still
+        applies.
+        """
         symbol = str(decision.symbol)
         side = str(decision.side or "")
         entry = float(decision.entry or 0.0)
@@ -449,7 +456,7 @@ class Dexter3Executor:
             for p in open_positions
             if position_symbol_of(p) == symbol and is_our_position(p)
         ]
-        if our_open and not self.config.allow_basket_legs:
+        if our_open and not (self.config.allow_basket_legs or basket_authorized):
             return self._refuse(
                 symbol,
                 "duplicate_label_position_open",
@@ -481,6 +488,7 @@ class Dexter3Executor:
         *,
         today_entry_count: int = 0,
         today_losing_count: int = 0,
+        basket_authorized: bool = False,
     ) -> dict[str, Any]:
         """Place a demo micro-entry for an ``enter`` decision.
 
@@ -511,6 +519,7 @@ class Dexter3Executor:
             open_positions=open_positions,
             today_entry_count=today_entry_count,
             today_losing_count=today_losing_count,
+            basket_authorized=basket_authorized,
         )
         if refusal is not None:
             return refusal
@@ -757,3 +766,58 @@ class Dexter3Executor:
             payload={"sl": sl, "tp": tp, "verification": verification},
         )
         return {"action": "amended", "position_id": position_id, "verified": verified, "verification": verification}
+
+    # -- basket engine surface (HUNT MODE) ------------------------------------
+
+    def execute_close_all(self, position_ids: list[int], reason: str) -> dict[str, Any]:
+        """Close every lane position in ``position_ids`` (close-all-in-profit /
+        cap-stop resolution). Foreign labels are refused per-position by
+        ``close_lane_position`` — a stray peer id in the list cannot be closed."""
+        results: list[dict[str, Any]] = []
+        closed = 0
+        for pid in position_ids:
+            res = self.close_lane_position(int(pid), reason=reason)
+            results.append(res)
+            if res.get("action") == "closed":
+                closed += 1
+        all_closed = closed == len(position_ids) and bool(position_ids)
+        self._journal(
+            "basket",
+            "basket_close_all",
+            position_id=None,
+            verified=all_closed,
+            payload={"reason": reason, "requested": len(position_ids), "closed": closed},
+        )
+        return {
+            "action": "closed_all" if all_closed else "close_all_partial",
+            "requested": len(position_ids),
+            "closed": closed,
+            "results": results,
+        }
+
+    def execute_repair_leg(
+        self,
+        decision: Any,
+        account_state: dict[str, Any] | None = None,
+        *,
+        today_entry_count: int = 0,
+        today_losing_count: int = 0,
+    ) -> dict[str, Any]:
+        """Add a basket repair/hedge leg: the ONLY path that may open a second
+        position on a symbol we already hold. All other pre-flight gates
+        (demo, quote, sidedness, sizing, daily caps) still apply unchanged."""
+        result = self.execute_entry(
+            decision,
+            account_state,
+            today_entry_count=today_entry_count,
+            today_losing_count=today_losing_count,
+            basket_authorized=True,
+        )
+        self._journal(
+            str(getattr(decision, "symbol", "unknown")),
+            "basket_repair_leg",
+            position_id=result.get("position_id"),
+            verified=bool(result.get("verified")),
+            payload={"entry_result_action": result.get("action")},
+        )
+        return result

@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dexter3 import empirical_stats, hunter_brain, market_lens, skip_evaluator
+from dexter3 import basket_live, empirical_stats, hunt_mode, hunter_brain, market_lens, skip_evaluator
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.decision_journal import DecisionJournal
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
@@ -83,6 +83,30 @@ H1_BARS_NEEDED = 60
 # var set to "1" — blueprint P2 "double opt-in" so a stray --live in a test
 # harness or a copy-pasted command can never place an order by accident.
 DEXTER3_LIVE_ENV_VAR = "DEXTER3_LIVE"
+
+# -- HUNT MODE (owner directive 2026-07-05): participation-first ------------
+# When DEXTER3_HUNT=1, the NEWEST bar's decision comes from
+# hunt_mode.decide_hunt (always-enter direction committee) instead of the
+# selective sniper brain, and an open lane basket routes the bar to basket
+# management (basket_live) instead of a fresh entry. Catch-up (historical)
+# bars keep sniper decisions — they are journal-only telemetry either way.
+DEXTER3_HUNT_ENV_VAR = "DEXTER3_HUNT"
+
+
+def _hunt_enabled() -> bool:
+    return os.environ.get(DEXTER3_HUNT_ENV_VAR) == "1"
+
+
+def _daily_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Per-UTC-day counters persisted in the shadow state file: live entries
+    placed + resolved losing baskets. Feeds the executor's daily caps (which
+    were silently ineffective before — the runner always passed 0)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = state.setdefault("daily", {})
+    if daily.get("date") != today:
+        daily.clear()
+        daily.update({"date": today, "entries": 0, "loss_baskets": 0})
+    return daily
 
 # -- Phase 2: periodic learning-loop refresh ---------------------------------
 # "every N cycles (default every 15 min)" per spec section 5; expressed in
@@ -414,33 +438,72 @@ def run_symbol_cycle(
         h1_ctx = [b for b in h1_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
         is_newest = i == len(m5_bars) - 1
 
-        decision = hunter_brain.decide(
-            symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
-        )
+        # -- newest-bar context: spot quote + open lane basket (live only) ---
+        spot: dict[str, Any] | None = None
+        spread_abs = 0.0
+        if is_newest:
+            try:
+                spot = mcp.get_spot_price(symbol)
+                spread_abs = max(0.0, float(spot.get("ask", 0.0) or 0.0) - float(spot.get("bid", 0.0) or 0.0))
+            except (McpClientError, McpZombieError) as exc:
+                # never silent — a broken quote path hid the wrong-tool-name
+                # bug for hours on 2026-07-05
+                log_line(f"{utc_now_iso()} {symbol} spot_read_failed: {exc}")
+                spot = None
+
+        lane: list[dict[str, Any]] | None = []
+        if is_newest and executor is not None:
+            try:
+                lane = basket_live.lane_positions(executor.client.get_positions(), LIVE_ORDER_LABEL)
+                lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
+            except (McpClientError, McpZombieError) as exc:
+                log_line(f"{utc_now_iso()} {symbol} lane_read_failed (no live action this bar): {exc}")
+                lane = None  # unknown broker state → hard veto on live actions
+
+        # -- decision source routing -----------------------------------------
+        basket_action: dict[str, Any] | None = None
+        if is_newest and executor is not None and lane:
+            # BASKET ACTIVE → this bar's action is campaign management
+            decision, basket_action = _manage_lane_basket(
+                executor, symbol, bar_ts, prefix, lane, state, spread_abs
+            )
+        elif is_newest and _hunt_enabled():
+            lens = hunter_brain._run_lens(prefix, hunter_brain._bar_close_ts(bar_ts))
+            decision = hunt_mode.decide_hunt(symbol, prefix, m15_ctx, h1_ctx, lens, spread_abs)
+        else:
+            decision = hunter_brain.decide(
+                symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
+            )
         journal.insert_decision(decision)
         log_decision_line(decision, late_sec=late_sec)
 
         basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
         basket.advance_clock(M5_BAR_SEC / 60.0)
         basket.on_decision(decision)
-        if is_newest:
-            try:
-                spot = mcp.get_spot_price(symbol)
-                mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
-            except (McpClientError, McpZombieError) as exc:
-                # never silent — a broken quote path hid the wrong-tool-name
-                # bug for hours on 2026-07-05
-                log_line(f"{utc_now_iso()} {symbol} spot_read_failed (paper tick falls back to bar close): {exc}")
-                mid = float(m5_bars[i].get("close") or 0.0)
+        if is_newest and spot is not None:
+            mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
         else:
-            # historical catch-up bar: use that bar's close, never fresh spot (no lookahead)
+            # historical catch-up bar (or failed quote): that bar's close — no lookahead
             mid = float(m5_bars[i].get("close") or 0.0)
         basket.on_m5_close_tick(mid)
 
         status = f"decided:{decision.action}:{decision.setup}"
-        if is_newest and executor is not None and decision.action == "enter":
-            exec_result = _execute_live_entry(executor, decision)
-            status += f":live_{exec_result.get('action', 'unknown')}"
+        if basket_action is not None:
+            status += f":basket_{basket_action.get('action', 'unknown')}"
+        elif is_newest and executor is not None and decision.action == "enter":
+            if lane is None:
+                status += ":live_skipped_lane_unverified"
+            else:
+                daily = _daily_state(state)
+                exec_result = _execute_live_entry(
+                    executor,
+                    decision,
+                    today_entry_count=int(daily.get("entries", 0)),
+                    today_losing_count=int(daily.get("loss_baskets", 0)),
+                )
+                if exec_result.get("action") == "entered":
+                    daily["entries"] = int(daily.get("entries", 0)) + 1
+                status += f":live_{exec_result.get('action', 'unknown')}"
 
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
@@ -450,7 +513,14 @@ def run_symbol_cycle(
     return ";".join(statuses)
 
 
-def _execute_live_entry(executor: Dexter3Executor, decision: hunter_brain.Decision) -> dict[str, Any]:
+def _execute_live_entry(
+    executor: Dexter3Executor,
+    decision: hunter_brain.Decision,
+    *,
+    today_entry_count: int = 0,
+    today_losing_count: int = 0,
+    repair: bool = False,
+) -> dict[str, Any]:
     """Resolve account state and place a live micro-entry. Never raises."""
     account_state: dict[str, Any] = {}
     # get_balance() intermittently returns without traderId (observed live
@@ -468,7 +538,20 @@ def _execute_live_entry(executor: Dexter3Executor, decision: hunter_brain.Decisi
         if attempt == 0:
             time.sleep(2)
     try:
-        result = executor.execute_entry(decision, account_state)
+        if repair:
+            result = executor.execute_repair_leg(
+                decision,
+                account_state,
+                today_entry_count=today_entry_count,
+                today_losing_count=today_losing_count,
+            )
+        else:
+            result = executor.execute_entry(
+                decision,
+                account_state,
+                today_entry_count=today_entry_count,
+                today_losing_count=today_losing_count,
+            )
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
         log_error(f"execute_entry({decision.symbol})", exc)
         return {"action": "exception"}
@@ -477,6 +560,122 @@ def _execute_live_entry(executor: Dexter3Executor, decision: hunter_brain.Decisi
         f"position_id={result.get('position_id')} verified={result.get('verified')}"
     )
     return result
+
+
+def _repair_geometry(
+    prefix: list[dict[str, Any]], side: str, spread_abs: float
+) -> tuple[float, float, float]:
+    """Entry/SL/TP for a repair or hedge leg: TR-quantile distances with the
+    same cost guards as hunt mode (SL >= max(6*spread, TR_q50), TP >= both
+    8*spread and 1.2*SL). Returns (entry, sl, tp)."""
+    entry = float(prefix[-1].get("close") or 0.0)
+    trs = sorted(
+        max(1e-9, float(b.get("high", 0.0)) - float(b.get("low", 0.0)))
+        for b in prefix[-40:]
+    )
+    q50 = trs[len(trs) // 2] if trs else 0.0
+    q90 = trs[int(len(trs) * 0.9) - 1] if len(trs) >= 10 else (trs[-1] if trs else 0.0)
+    sl_dist = min(max(6.0 * spread_abs, q50 * 1.2), max(2.0 * q90, 6.0 * spread_abs))
+    tp_dist = max(8.0 * spread_abs, 1.2 * sl_dist)
+    if side == "buy":
+        return entry, round(entry - sl_dist, 5), round(entry + tp_dist, 5)
+    return entry, round(entry + sl_dist, 5), round(entry - tp_dist, 5)
+
+
+def _manage_lane_basket(
+    executor: Dexter3Executor,
+    symbol: str,
+    bar_ts: str,
+    prefix: list[dict[str, Any]],
+    lane: list[dict[str, Any]],
+    state: dict[str, Any],
+    spread_abs: float,
+) -> tuple[hunter_brain.Decision, dict[str, Any]]:
+    """A lane basket is open → this M5 close is a campaign-management action
+    (HUNT MODE contract v2): hold / repair / hedge / close-all. Returns the
+    journal Decision (action='manage') and the executed basket action."""
+    ts_close = hunter_brain._bar_close_ts(bar_ts)
+    lens = hunter_brain._run_lens(prefix, ts_close)
+    daily = _daily_state(state)
+
+    agg = basket_live.aggregate_lane(lane, base_risk_usd=executor.config.risk_usd)
+    agg["lens_liquidity_sweep"] = lens.get("liquidity_sweep")  # sweep-vs-break repair distinction
+    sides = agg.get("sides", {}) or {}
+    basket_side = "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
+    evidence = basket_live.structure_evidence(lens, prefix, basket_side, agg.get("weighted_entry"))
+    action = basket_live.decide_basket_action(
+        BasketConfig(),
+        agg,
+        evidence,
+        now_utc_iso=utc_now_iso(),
+        daily_state={"daily_loss_baskets": int(daily.get("loss_baskets", 0))},
+    )
+    act = str(action.get("action") or "hold")
+    executed: dict[str, Any] = dict(action)
+
+    if act in ("close_all_in_profit", "close_all_cap_stop"):
+        ids = [int(p.get("positionId") or p.get("id") or 0) for p in lane]
+        ids = [x for x in ids if x > 0]
+        executed["exec"] = executor.execute_close_all(ids, reason=act)
+        if act == "close_all_cap_stop" and float(agg.get("aggregate_pnl_usd") or 0.0) < 0:
+            daily["loss_baskets"] = int(daily.get("loss_baskets", 0)) + 1
+    elif act == "add_repair_leg":
+        repair_side = str(action.get("side") or ("sell" if basket_side == "buy" else "buy"))
+        entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)
+        repair_decision = hunter_brain.Decision(
+            ts_close=ts_close,
+            symbol=symbol,
+            action="enter",
+            side=repair_side,
+            entry_type="market",
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            size_class="scout",
+            leader_score=0.0,
+            p_win_est=0.5,
+            setup="basket_repair",
+            reasons=[
+                f"เติมไม้ซ่อมตะกร้า / basket repair leg ({action.get('note') or act})",
+                f"aggregate_r={agg.get('aggregate_r')}, legs={agg.get('legs')}",
+            ],
+            features={"basket": {k: agg.get(k) for k in ("legs", "aggregate_pnl_usd", "aggregate_r", "sides")}},
+        )
+        executed["exec"] = _execute_live_entry(
+            executor,
+            repair_decision,
+            today_entry_count=int(daily.get("entries", 0)),
+            today_losing_count=int(daily.get("loss_baskets", 0)),
+            repair=True,
+        )
+        if executed["exec"].get("action") == "entered":
+            daily["entries"] = int(daily.get("entries", 0)) + 1
+
+    manage_decision = hunter_brain.Decision(
+        ts_close=ts_close,
+        symbol=symbol,
+        action="manage",
+        side=None,
+        entry_type=None,
+        entry=None,
+        sl=None,
+        tp=None,
+        size_class="none",
+        leader_score=0.0,
+        p_win_est=0.0,
+        setup=f"basket_{act}",
+        reasons=[
+            f"บริหารตะกร้า / campaign management: {act}",
+            f"legs={agg.get('legs')} aggregate_r={agg.get('aggregate_r')} pnl_usd={agg.get('aggregate_pnl_usd')}",
+            f"evidence: level_lost={evidence.get('level_lost')} close_beyond={evidence.get('m5_close_beyond')}",
+        ],
+        features={"basket": agg, "evidence": evidence, "basket_action": {k: v for k, v in executed.items() if k != 'exec'}},
+    )
+    log_line(
+        f"{utc_now_iso()} {symbol} BASKET action={act} legs={agg.get('legs')} "
+        f"agg_r={agg.get('aggregate_r')} pnl={agg.get('aggregate_pnl_usd')}"
+    )
+    return manage_decision, executed
 
 
 # ---------------------------------------------------------------------------

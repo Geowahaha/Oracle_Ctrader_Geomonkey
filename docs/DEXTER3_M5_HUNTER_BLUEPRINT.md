@@ -65,6 +65,25 @@ Extensible to futures/indices/stocks later.
 | Repair trigger | structure break WITH evidence (level lost + M5 close beyond), never price-distance alone |
 | Resolve-in-profit target | basket aggregate ≥ +0.2R of base risk → CLOSE ALL |
 
+## HUNT MODE — participation contract v2 (owner directive 2026-07-05)
+
+Owner's challenge: entry EVERY M5 close, not evaluate-and-mostly-skip. Sniper-style setup gating
+(v1) is retired as the primary path; intelligence moves into direction/size/geometry and the basket
+engine. On every M5 close:
+
+- **No lane basket open** → the direction committee (8 weighted math/stat votes: CLP, swing
+  structure, day-range tilt, displacement, compression release, M15 OLS drift, sweep-reclaim
+  override, H1 context) ALWAYS chooses a side + conviction; entry fires at market with structural
+  SL (≥ max(6×spread, TR_q50)) and TP (RR ≥ 1.2 AND ≥ 8×spread — cost guard). Conviction shapes
+  size (scout/small), never participation.
+- **Lane basket open** → the M5 close routes to basket management on REAL broker PnL: hold /
+  same-side repair at better price (structure swept) / hedge-lock (level truly lost) /
+  **close-all-in-profit** at aggregate ≥ +0.2R / cap-stop. Campaign management IS that bar's action.
+- The ONLY permitted skips (hard vetoes, journaled): insufficient bars, invalid quote,
+  spread blowout, daily basket-loss cap, MCP unverified. "No setup" is no longer a reason to sit out.
+- Hard caps unchanged and unbreachable (3 legs, 3× base risk, 180 min, 2 basket losses/day).
+  At $0.50 base risk the worst day is bounded ≈ $3 — the price of a full day of live evidence.
+
 ## Phases
 
 - **P1 (now):** package + tests + shadow runner live on BTCUSD (24/7) and XAUUSD (from Monday open).
