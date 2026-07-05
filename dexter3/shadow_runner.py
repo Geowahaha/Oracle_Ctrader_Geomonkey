@@ -156,6 +156,74 @@ def mark_m5_close_seen(state: dict[str, Any], symbol: str, close_ts: str) -> Non
     sym_state["last_seen_at"] = utc_now_iso()
 
 
+def _iso_to_epoch(ts: str) -> float:
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+
+FRESHNESS_GRACE_SEC = 10
+FRESHNESS_RETRIES = 3
+FRESHNESS_RETRY_SLEEP_SEC = 7
+FRESHNESS_MAX_GAP_SEC = 1800  # newest bar older than this = market closed/idle, no retries
+MAX_CATCHUP_BARS = 6
+
+
+def pending_m5_closes(
+    state: dict[str, Any], symbol: str, bars_m5: list[dict[str, Any]], max_catchup: int = MAX_CATCHUP_BARS
+) -> list[int]:
+    """Indices (oldest→newest) of completed bars not yet decided.
+
+    The blueprint contract is one decision per M5 close with no silent gaps,
+    so a data gap must yield ALL missed bars, not only the newest. First run
+    for a symbol decides only the newest bar (no history replay); gaps larger
+    than ``max_catchup`` are truncated to the newest bars so a long MCP outage
+    cannot trigger a replay storm.
+    """
+    if not bars_m5:
+        return []
+    sym_state = state.get("symbols", {}).get(symbol, {})
+    last_seen = str(sym_state.get("last_m5_close_ts") or "")
+    if not last_seen:
+        return [len(bars_m5) - 1]
+    pending = [i for i, b in enumerate(bars_m5) if str(b.get("ts") or "") > last_seen]
+    return pending[-max_catchup:]
+
+
+def fetch_fresh_m5(mcp: Dexter3McpClient, symbol: str, count: int = MIN_M5_BARS) -> list[dict[str, Any]]:
+    """Fetch M5 bars, retrying briefly when the newest completed bar is missing.
+
+    The local MCP can serve a snapshot one full bar stale (observed
+    2026-07-05: the 08:15 bar stayed absent until 08:25 while the 08:20 bar
+    then appeared within 19s). When ``now`` is past a boundary plus grace and
+    the response lacks that bar, refetch with a varied ``count`` so any
+    request-shaped cache is bypassed. Idle markets (weekend XAU) are exempt:
+    retries fire only when the newest bar is within FRESHNESS_MAX_GAP_SEC of
+    the expected one.
+    """
+    bars = mcp.get_trendbars(symbol, "m5", count)
+    for attempt in range(1, FRESHNESS_RETRIES + 1):
+        if not bars:
+            return bars
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        expected_open = (int(now_epoch - FRESHNESS_GRACE_SEC) // M5_BAR_SEC * M5_BAR_SEC) - M5_BAR_SEC
+        gap = expected_open - _iso_to_epoch(str(bars[-1].get("ts") or ""))
+        if gap <= 0 or gap > FRESHNESS_MAX_GAP_SEC:
+            return bars
+        time.sleep(FRESHNESS_RETRY_SLEEP_SEC)
+        bars = mcp.get_trendbars(symbol, "m5", count + attempt)
+    if bars:
+        log_line(
+            f"{utc_now_iso()} {symbol} data_stale newest_m5={bars[-1].get('ts')} "
+            f"(expected newer bar; will catch up on a later poll)"
+        )
+    return bars[-count:] if len(bars) > count else bars
+
+
 # ---------------------------------------------------------------------------
 # logging
 # ---------------------------------------------------------------------------
@@ -168,11 +236,12 @@ def log_line(text: str) -> None:
         fh.write(text + "\n")
 
 
-def log_decision_line(decision: hunter_brain.Decision) -> None:
+def log_decision_line(decision: hunter_brain.Decision, late_sec: float = 0.0) -> None:
     reasons_short = "; ".join(decision.reasons)[:200]
+    late_txt = f" late={int(late_sec)}s" if late_sec > 90 else ""
     text = (
         f"{utc_now_iso()} {decision.symbol} action={decision.action} setup={decision.setup} "
-        f"leader_score={decision.leader_score:.3f} p_win={decision.p_win_est:.3f} "
+        f"leader_score={decision.leader_score:.3f} p_win={decision.p_win_est:.3f}{late_txt} "
         f"reasons={reasons_short}"
     )
     log_line(text)
@@ -263,6 +332,12 @@ class PaperBasket:
 # ---------------------------------------------------------------------------
 
 
+def _completed_by(bar_ts: str, close_epoch: float, tf_min: int) -> bool:
+    """True when a bar (labeled by open ts) has fully closed by ``close_epoch``."""
+    ts_epoch = _iso_to_epoch(bar_ts)
+    return ts_epoch > 0 and (ts_epoch + tf_min * 60) <= close_epoch + 1e-6
+
+
 def run_symbol_cycle(
     mcp: Dexter3McpClient,
     journal: DecisionJournal,
@@ -270,35 +345,57 @@ def run_symbol_cycle(
     state: dict[str, Any],
     symbol: str,
 ) -> str:
-    """Run one evaluation cycle for ``symbol``. Returns a short status string."""
-    m5_bars = mcp.get_trendbars(symbol, "m5", MIN_M5_BARS)
+    """Run one evaluation cycle for ``symbol``. Returns a short status string.
+
+    Decides EVERY pending completed M5 bar (catch-up), not only the newest.
+    Catch-up decisions use only bars completed by that close (no lookahead in
+    M5 prefix or M15/H1 context) and carry their lateness in the log line.
+    """
+    m5_bars = fetch_fresh_m5(mcp, symbol)
     if len(m5_bars) < MIN_M5_BARS:
         return f"insufficient_m5_bars({len(m5_bars)})"
 
-    is_new, close_ts = is_new_m5_close(state, symbol, m5_bars)
-    if not is_new or close_ts is None:
+    pending = pending_m5_closes(state, symbol, m5_bars)
+    if not pending:
         return "no_new_m5_close"
 
     m15_bars = mcp.get_trendbars(symbol, "m15", M15_BARS_NEEDED)
     h1_bars = mcp.get_trendbars(symbol, "h1", H1_BARS_NEEDED)
 
-    decision = hunter_brain.decide(symbol, None, m5_bars, m15_bars, h1_bars, journal_stats=None)
-    journal.insert_decision(decision)
-    log_decision_line(decision)
+    statuses: list[str] = []
+    for i in pending:
+        bar_ts = str(m5_bars[i].get("ts") or "")
+        close_epoch = _iso_to_epoch(bar_ts) + M5_BAR_SEC
+        late_sec = max(0.0, datetime.now(timezone.utc).timestamp() - close_epoch)
+        prefix = m5_bars[: i + 1]
+        m15_ctx = [b for b in m15_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
+        h1_ctx = [b for b in h1_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
 
-    basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
-    basket.advance_clock(M5_BAR_SEC / 60.0)
-    basket.on_decision(decision)
-    try:
-        spot = mcp.get_spot_price(symbol)
-        mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
-    except (McpClientError, McpZombieError):
-        mid = float(m5_bars[-1].get("close") or 0.0)
-    basket.on_m5_close_tick(mid)
+        decision = hunter_brain.decide(symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=None)
+        journal.insert_decision(decision)
+        log_decision_line(decision, late_sec=late_sec)
 
-    mark_m5_close_seen(state, symbol, close_ts)
-    save_shadow_state(state)
-    return f"decided:{decision.action}:{decision.setup}"
+        basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
+        basket.advance_clock(M5_BAR_SEC / 60.0)
+        basket.on_decision(decision)
+        if i == len(m5_bars) - 1:
+            try:
+                spot = mcp.get_spot_price(symbol)
+                mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
+            except (McpClientError, McpZombieError):
+                mid = float(m5_bars[i].get("close") or 0.0)
+        else:
+            # historical catch-up bar: use that bar's close, never fresh spot (no lookahead)
+            mid = float(m5_bars[i].get("close") or 0.0)
+        basket.on_m5_close_tick(mid)
+
+        mark_m5_close_seen(state, symbol, bar_ts)
+        save_shadow_state(state)
+        status = f"decided:{decision.action}:{decision.setup}"
+        if late_sec > 90:
+            status += f":late{int(late_sec)}s"
+        statuses.append(status)
+    return ";".join(statuses)
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +403,22 @@ def run_symbol_cycle(
 # ---------------------------------------------------------------------------
 
 
+_LAST_STATUS: dict[str, str] = {}
+_STATUS_REPEATS: dict[str, int] = {}
+STATUS_HEARTBEAT_EVERY = 90  # re-log an unchanged status every ~30 min at 20s poll
+
+
 def run_once(symbols: list[str], mcp: Dexter3McpClient, journal: DecisionJournal, baskets: dict[str, PaperBasket]) -> None:
     state = load_shadow_state()
     for symbol in symbols:
         try:
             status = run_symbol_cycle(mcp, journal, baskets, state, symbol)
-            log_line(f"{utc_now_iso()} {symbol} cycle_status={status}")
+            repeats = _STATUS_REPEATS.get(symbol, 0) + 1 if _LAST_STATUS.get(symbol) == status else 0
+            _STATUS_REPEATS[symbol] = repeats
+            _LAST_STATUS[symbol] = status
+            if repeats == 0 or repeats % STATUS_HEARTBEAT_EVERY == 0:
+                suffix = f" (x{repeats + 1})" if repeats else ""
+                log_line(f"{utc_now_iso()} {symbol} cycle_status={status}{suffix}")
         except McpZombieError as exc:
             log_line(f"{utc_now_iso()} {symbol} MCP_ZOMBIE: {exc}")
         except Exception as exc:  # noqa: BLE001 - loop must never die on a per-symbol error
