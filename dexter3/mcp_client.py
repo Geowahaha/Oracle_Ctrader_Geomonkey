@@ -267,10 +267,15 @@ class Dexter3McpClient:
         return bars[-count:] if count and len(bars) > count else bars
 
     def get_spot_price(self, symbol: str) -> dict[str, Any]:
-        """Fetch the current spot snapshot (bid/ask/day high/low) for ``symbol``."""
-        data = self.call("get_spot_price", {"symbolName": symbol})
+        """Fetch the current spot snapshot (bid/ask/day high/low) for ``symbol``.
+
+        Tool name is PLURAL on the Local MCP even for one symbol —
+        "get_spot_price" (singular) returns "Unknown tool" (live-verified
+        2026-07-05; matches scripts/btc_scalp_monitor.py::spot_quote).
+        """
+        data = self.call("get_spot_prices", {"symbolName": symbol})
         if not isinstance(data, dict):
-            raise McpClientError(f"get_spot_price returned unexpected payload: {data!r}")
+            raise McpClientError(f"get_spot_prices returned unexpected payload: {data!r}")
         return data
 
     def get_positions(self) -> list[dict[str, Any]]:

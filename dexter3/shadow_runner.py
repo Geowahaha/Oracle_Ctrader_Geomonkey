@@ -427,7 +427,10 @@ def run_symbol_cycle(
             try:
                 spot = mcp.get_spot_price(symbol)
                 mid = (float(spot.get("bid", 0.0) or 0.0) + float(spot.get("ask", 0.0) or 0.0)) / 2.0
-            except (McpClientError, McpZombieError):
+            except (McpClientError, McpZombieError) as exc:
+                # never silent — a broken quote path hid the wrong-tool-name
+                # bug for hours on 2026-07-05
+                log_line(f"{utc_now_iso()} {symbol} spot_read_failed (paper tick falls back to bar close): {exc}")
                 mid = float(m5_bars[i].get("close") or 0.0)
         else:
             # historical catch-up bar: use that bar's close, never fresh spot (no lookahead)
@@ -450,12 +453,20 @@ def run_symbol_cycle(
 def _execute_live_entry(executor: Dexter3Executor, decision: hunter_brain.Decision) -> dict[str, Any]:
     """Resolve account state and place a live micro-entry. Never raises."""
     account_state: dict[str, Any] = {}
-    try:
-        balance = executor.client.get_balance()
-        account_state = {"traderId": balance.get("traderId")}
-    except (McpClientError, McpZombieError) as exc:
-        log_line(f"{utc_now_iso()} {decision.symbol} live_entry_balance_read_failed: {exc}")
-        account_state = {}
+    # get_balance() intermittently returns without traderId (observed live
+    # 2026-07-05 11:00:21Z → demo gate refused a valid entry). One short
+    # retry before giving the executor a state it will refuse.
+    for attempt in range(2):
+        try:
+            balance = executor.client.get_balance()
+            account_state = {"traderId": balance.get("traderId")}
+        except (McpClientError, McpZombieError) as exc:
+            log_line(f"{utc_now_iso()} {decision.symbol} live_entry_balance_read_failed: {exc}")
+            account_state = {}
+        if account_state.get("traderId") is not None:
+            break
+        if attempt == 0:
+            time.sleep(2)
     try:
         result = executor.execute_entry(decision, account_state)
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
