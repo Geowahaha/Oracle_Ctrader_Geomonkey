@@ -83,7 +83,9 @@ def test_decide_returns_decision_for_every_call_participation_first():
     decision = hunter_brain.decide("XAUUSD", None, bars)
     assert decision.action in ("enter", "skip", "manage")
     assert decision.symbol == "XAUUSD"
-    assert decision.ts_close == bars[-1]["ts"]
+    # bars are labeled by OPEN time; the contract's ts_close is open + 5min
+    assert decision.ts_close == hunter_brain._bar_close_ts(bars[-1]["ts"])
+    assert decision.ts_close > bars[-1]["ts"]
 
 
 def test_decide_insufficient_bars_still_returns_a_decision():

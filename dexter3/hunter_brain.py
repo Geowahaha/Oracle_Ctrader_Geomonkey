@@ -120,6 +120,20 @@ def _reward_risk(side: str, entry: float, sl: float, tp: float) -> float:
     return reward / risk
 
 
+def _bar_close_ts(open_ts: str, bar_sec: int = 300) -> str:
+    """MCP trendbars label bars by OPEN time (measured live 2026-07-05); the
+    decision contract's ts_close is the actual close = open + bar period."""
+    if not open_ts:
+        return ""
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        dt = datetime.strptime(open_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (dt + timedelta(seconds=bar_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return open_ts
+
+
 def _skip(
     *,
     ts_close: str,
@@ -329,7 +343,7 @@ def decide(
     ``journal_stats`` is reserved for empirical p_win_est by
     setup/session/regime (blueprint P5) — accepted as ``None`` for now.
     """
-    ts_close = str(m5_bars[-1]["ts"]) if m5_bars else ""
+    ts_close = _bar_close_ts(str(m5_bars[-1]["ts"])) if m5_bars else ""
 
     if len(m5_bars) < 20:
         lens_partial = features or {}
