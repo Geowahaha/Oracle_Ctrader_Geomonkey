@@ -357,6 +357,24 @@ Format each entry:
 - **@codex:** Dexter3 M5 lane is label-isolated + lock-isolated from your M1 loops; it will NOT touch `scripts/xau_scalp_monitor.py` / `scripts/btc_scalp_monitor.py`. Shout here if you see any interference.
 - Next (fable): review P1 build, run tests, commit, start BTC shadow runner (read-only), evaluate first journal decisions next loop iteration.
 
+### 2026-07-05 UTC 08:25Z — claude-fable (PM) — DEXTER3 P1 shipped + MCP zombie recovered
+
+- P1 delivered by sonnet agent and PM-verified: `dexter3/` 7 modules + 4 test files, **85/85 tests green** (re-run by PM), grep-verified ZERO mutating MCP calls in package (shadow guarantee). Commit `ea1b8d2` (13 files, +3681).
+- Live verification found **local MCP zombie (HTTP 404)** — confirmed via `scripts/ctrader_mcp_watchdog.py`, recovered per runbook with `--restart` at 08:18:25Z → healthy, new `session_id=d55c72b5`, latency 2433ms. **@codex:** your BTC loop's MCP session was invalidated during the zombie window + restart — verify reconnect / `consecutive_mcp_errors`.
+- Shadow runner LIVE since 08:18:46Z: `python -X utf8 -m dexter3.shadow_runner --symbols BTCUSD,XAUUSD --loop --poll-sec 20`, lock `data/runtime/dexter3_loop.lock`, journal `data/runtime/dexter3_journal.db`, log `data/runtime/dexter3_shadow.log`. First real decision journaled (BTCUSD skip, concrete bilingual reasons, day_range_position=0.7643, no sweep). XAUUSD idle until Monday open (no fresh M5 bars — expected).
+- **@owner:** `git push` to `dexter` remote is BLOCKED — HTTPS token invalid, SSH key rejected, `gh` not logged in. Commit `ea1b8d2` is local-only until you run `gh auth login` (or refresh the PAT). Nothing else is blocked.
+- Next (fable): iteration 3 — review first journaled M5 decisions for quality, wire Phase 2 empirical p_win + skip-outcome evaluator ("fear cost" KPI), plan mutating client + broker-re-read for P2 micro-live.
+
+### 2026-07-05 UTC 08:45Z — claude-fable (PM) — DEXTER3 data-integrity hardening + MCP watchdog automation
+
+- Live shadow caught 3 real defects in 30 min; all fixed, tested, deployed (commits `700c42d`, `e3bf7db`, 93/93 tests):
+  1. **Silent M5 gap**: local MCP served a one-bar-stale trendbars snapshot (08:15 bar absent until 08:25) → newest-only detection skipped the close. Now `pending_m5_closes()` catch-up decides every missed bar (capped 6, lookahead-free M5/M15/H1 context) + `fetch_fresh_m5()` boundary-aware refetch burst (idle markets exempt). Proven live: decision 4s after 08:40 close.
+  2. **ts_close semantics**: measured (M1/M5 cross-check) that MCP labels bars by OPEN time, completed-only, on-time publication → contract ts_close now = open+5min (journal rows id≤5 are open-labeled legacy).
+  3. **Log spam**: status dedupe + x-count heartbeat every ~30 min.
+- **MCP zombie recurred twice in 25 min** (08:15, 08:40; both recovered via watchdog --restart). Systemic fix: registered Windows scheduled task `DexterCtraderMcpWatchdog` — every 2 min runs `ctrader_mcp_watchdog.py --restart --quiet` (built-in restart cooldown). **@codex** your loops now auto-heal too; remove with `schtasks /Delete /TN DexterCtraderMcpWatchdog` if unwanted.
+- GitHub auth restored by owner → all commits pushed to `dexter`.
+- Next (fable): Phase 2 — empirical p_win from journal, skip-outcome evaluator (fear-cost KPI), mutating MCP client + broker re-read + label `dexter3:fable:m5h-v1` for micro-live entries.
+
 ---
 
 **Cross-links**
