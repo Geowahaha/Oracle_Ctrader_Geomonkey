@@ -143,6 +143,7 @@ class Dexter3McpClient:
         self.client_version = client_version
         self.timeout_sec = float(timeout_sec)
         self.retry_backoff_sec = float(retry_backoff_sec)
+        self._last_chart_open: dict[str, float] = {}
         self._session = session or requests.Session()
         self.sid: str | None = None
 
@@ -310,17 +311,83 @@ class Dexter3McpClient:
         bars.sort(key=lambda b: b["ts"])
         return bars[-count:] if count and len(bars) > count else bars
 
-    def get_spot_price(self, symbol: str) -> dict[str, Any]:
-        """Fetch the current spot snapshot (bid/ask/day high/low) for ``symbol``.
+    # min seconds between open_chart subscribe attempts per symbol
+    QUOTE_SUBSCRIBE_RETRY_SEC = 60.0
 
-        Tool name is PLURAL on the Local MCP even for one symbol —
-        "get_spot_price" (singular) returns "Unknown tool" (live-verified
-        2026-07-05; matches scripts/btc_scalp_monitor.py::spot_quote).
+    def get_spot_price(self, symbol: str) -> dict[str, Any]:
+        """Live bid/ask for ``symbol`` with the full recovery chain proven by
+        scripts/btc_scalp_monitor.py::ensure_live_quote:
+
+        1. ``get_spot_prices`` (tool name is PLURAL even for one symbol);
+        2. ``get_symbol_details`` bid/ask fields;
+        3. ``open_chart`` to force a market-data subscription (the Local MCP
+           returns "No live quote … symbol is unsubscribed" for symbols with
+           no open chart — hit live on XAUUSD 2026-07-06 05:15Z, 28 vetoed
+           bars), then re-read 1 and 2. Cooldown 60s per symbol.
+
+        Returns a dict with at least bid/ask (+ ``quote_source``); raises
+        McpClientError when every stage fails.
         """
-        data = self.call("get_spot_prices", {"symbolName": symbol})
-        if not isinstance(data, dict):
-            raise McpClientError(f"get_spot_prices returned unexpected payload: {data!r}")
-        return data
+        errors: list[str] = []
+
+        def _ok(d: Any) -> dict[str, Any] | None:
+            if isinstance(d, dict):
+                bid = float(d.get("bid", d.get("bidPrice", 0.0)) or 0.0)
+                ask = float(d.get("ask", d.get("askPrice", 0.0)) or 0.0)
+                if bid > 0 and ask > bid:
+                    out = dict(d)
+                    out["bid"], out["ask"] = bid, ask
+                    return out
+            return None
+
+        try:
+            got = _ok(self.call("get_spot_prices", {"symbolName": symbol}))
+            if got:
+                got["quote_source"] = "get_spot_prices"
+                return got
+            errors.append("get_spot_prices: no usable bid/ask")
+        except McpZombieError:
+            raise
+        except McpClientError as exc:
+            errors.append(f"get_spot_prices: {exc}")
+
+        try:
+            got = _ok(self.call("get_symbol_details", {"symbolName": symbol}))
+            if got:
+                got["quote_source"] = "symbol_details"
+                return got
+            errors.append("symbol_details: no usable bid/ask")
+        except McpZombieError:
+            raise
+        except McpClientError as exc:
+            errors.append(f"symbol_details: {exc}")
+
+        now = time.time()
+        last = self._last_chart_open.get(symbol, 0.0)
+        if now - last >= self.QUOTE_SUBSCRIBE_RETRY_SEC:
+            self._last_chart_open[symbol] = now
+            try:
+                self.call("open_chart", {"symbolName": symbol, "timeframe": "m1"})
+                time.sleep(2.0)
+                for tool, args, src in (
+                    ("get_spot_prices", {"symbolName": symbol}, "open_chart_then_spot"),
+                    ("get_symbol_details", {"symbolName": symbol}, "open_chart_then_details"),
+                ):
+                    try:
+                        got = _ok(self.call(tool, args))
+                        if got:
+                            got["quote_source"] = src
+                            return got
+                    except McpClientError as exc:
+                        errors.append(f"{src}: {exc}")
+            except McpZombieError:
+                raise
+            except McpClientError as exc:
+                errors.append(f"open_chart: {exc}")
+        else:
+            errors.append(f"subscribe_cooldown={int(self.QUOTE_SUBSCRIBE_RETRY_SEC - (now - last))}s")
+
+        raise McpClientError(f"no live quote for {symbol}: " + " | ".join(errors))
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch all open positions across symbols (read-only)."""
