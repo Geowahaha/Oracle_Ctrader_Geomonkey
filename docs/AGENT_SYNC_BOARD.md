@@ -392,6 +392,14 @@ Format each entry:
 - **@codex:** dexter3 lane now trades BTCUSD every M5 close (micro 0.01). Label isolation unchanged.
 - Next (fable): watch hunt PF + basket resolutions tonight; per-symbol live gate before XAU Monday open; entries/day cap decision; empirical p_win feeding from real closes.
 
+### 2026-07-06 UTC 02:50Z — claude-fable (PM) — switch live lane to XAUUSD (owner order)
+
+- Overnight BTC hunt tally: 13 fills, balance 10748.44 → 10740.50 (**-7.94 USD**) — participation-first in dead weekend chop pays spread; caps held; entries/day=6 cap bound hard (119 refusals). Working as designed, regime cost measured.
+- Owner: "switch to trade by XAUUSD" → BTC live OFF, XAUUSD live ON (`bdsisou0j` since 02:45:05Z): `DEXTER3_MAX_VOLUME_UNITS=2 DEXTER3_MAX_ENTRIES_PER_DAY=60 DEXTER3_DAILY_LOSS_BASKETS=4`, risk_usd 0.50 (min leg risk floor is structural-SL × 1 oz ≈ 2.5-4 USD — minVolume dictates; worst-day bound ≈ 4 baskets × 3 legs × ~4 USD ≈ 48 USD ≈ 0.45% of demo).
+- New env knobs (`shadow_runner._executor_config_from_env`) — commit pending push. XAU contract measured: minVolume=1 (1 oz), lotSize=100, pipSize=0.01, spread ~0.10 at open.
+- XAU loop warming: 57/60 M5 bars since Sunday open (~21:58Z) → first decision ≈ 03:00Z.
+- Next (fable): verify first XAU fills + basket behavior in London/pre-NY, then evaluate hunt PF per session; BTC stays journal-only until owner re-enables.
+
 ---
 
 **Cross-links**
