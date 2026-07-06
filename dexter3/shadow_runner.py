@@ -97,6 +97,49 @@ def _hunt_enabled() -> bool:
     return os.environ.get(DEXTER3_HUNT_ENV_VAR) == "1"
 
 
+def _executor_config_from_env() -> "ExecutorConfig":
+    """Operator knobs without code edits — set env before launching the loop.
+
+    XAUUSD REQUIRES DEXTER3_MAX_VOLUME_UNITS>=1: its minVolume is 1 unit
+    (1 oz, lotSize=100 measured 2026-07-06), so the BTC-scale default cap
+    (0.05) refuses every XAU entry via min_volume_exceeds_max_volume_units_cap.
+    """
+    kw: dict[str, Any] = {}
+    for env, field, cast in (
+        ("DEXTER3_RISK_USD", "risk_usd", float),
+        ("DEXTER3_MAX_VOLUME_UNITS", "max_volume_units", float),
+        ("DEXTER3_MAX_ENTRIES_PER_DAY", "max_live_entries_per_day", int),
+        ("DEXTER3_DAILY_LOSS_BASKETS", "stop_after_daily_losses", int),
+        ("DEXTER3_MAX_SPREAD_BPS", "max_spread_bps", float),
+    ):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                kw[field] = cast(raw)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw!r}")
+    cfg = ExecutorConfig(**kw)
+    log_line(
+        f"{utc_now_iso()} executor config: risk_usd={cfg.risk_usd} "
+        f"max_volume_units={cfg.max_volume_units} entries/day={cfg.max_live_entries_per_day} "
+        f"daily_loss_stop={cfg.stop_after_daily_losses} spread_cap_bps={cfg.max_spread_bps}"
+    )
+    return cfg
+
+
+def _basket_config_from_env() -> BasketConfig:
+    """Same DEXTER3_DAILY_LOSS_BASKETS knob drives the basket engine's daily
+    cap so the two layers can never disagree about when the day is over."""
+    kw: dict[str, Any] = {}
+    raw = os.environ.get("DEXTER3_DAILY_LOSS_BASKETS")
+    if raw:
+        try:
+            kw["daily_loss_baskets"] = int(raw)
+        except ValueError:
+            pass
+    return BasketConfig(**kw)
+
+
 def _daily_state(state: dict[str, Any]) -> dict[str, Any]:
     """Per-UTC-day counters persisted in the shadow state file: live entries
     placed + resolved losing baskets. Feeds the executor's daily caps (which
@@ -604,7 +647,7 @@ def _manage_lane_basket(
     basket_side = "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
     evidence = basket_live.structure_evidence(lens, prefix, basket_side, agg.get("weighted_entry"))
     action = basket_live.decide_basket_action(
-        BasketConfig(),
+        _basket_config_from_env(),
         agg,
         evidence,
         now_utc_iso=utc_now_iso(),
@@ -781,7 +824,7 @@ def _resolve_live_executor(mcp: Dexter3McpClient, journal: DecisionJournal, live
         )
         return None
     log_line(f"{utc_now_iso()} DEXTER3 LIVE MODE ENABLED — demo micro-entries may be placed (label={LIVE_ORDER_LABEL})")
-    return Dexter3Executor(mcp, journal, ExecutorConfig())
+    return Dexter3Executor(mcp, journal, _executor_config_from_env())
 
 
 def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
