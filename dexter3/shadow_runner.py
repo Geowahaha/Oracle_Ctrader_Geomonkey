@@ -64,6 +64,7 @@ from dexter3.decision_journal import DecisionJournal
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
+from dexter3.opening_manager import OMConfig, OpeningManager
 
 RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
@@ -77,6 +78,16 @@ MCP_ZOMBIE_SLEEP_SEC = 60
 MIN_M5_BARS = 60
 M15_BARS_NEEDED = 60
 H1_BARS_NEEDED = 60
+
+# -- OPENING MANAGER (owner directive 2026-07-07): fast intrabar defense ----
+# The main loop ticks every DEXTER3_FAST_TICK_SEC (default 4s) instead of
+# sleeping poll_sec as one block. Every fast tick, OM (dexter3.opening_manager)
+# runs on any open lane — Profit Hunter (ratcheting trail) + Basket Doctor
+# (edge-measured repair) — independent of the M5 cadence; the M5 entry/
+# decision path (run_once) still fires only once per ~poll_sec worth of fast
+# ticks. See docs/DEXTER3_M5_HUNTER_BLUEPRINT.md "OPENING MANAGER (OM)".
+DEFAULT_FAST_TICK_SEC = 4
+OM_BAR_REFRESH_SEC = 30  # refetch M5/M15/H1 bars at most this often; spot+positions refetch EVERY tick
 
 # -- Phase 2: live micro-entry double opt-in ---------------------------------
 # Placing a real (demo) order requires BOTH the --live CLI flag AND this env
@@ -159,6 +170,44 @@ def _basket_config_from_env() -> BasketConfig:
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
     return BasketConfig(**kw)
+
+
+def _om_config_from_env() -> OMConfig:
+    """OpeningManager knobs, same "ignored invalid falls back to default"
+    posture as ``_basket_config_from_env``/``_executor_config_from_env``
+    above — a typo'd env var must never crash the live loop.
+
+    Env vars: DEXTER3_OM_ARM_R, DEXTER3_OM_TRAIL_KEEP, DEXTER3_OM_TAKE_R,
+    DEXTER3_OM_SPIKE_R, DEXTER3_OM_REPAIR_TRIGGER_R, DEXTER3_OM_REPAIR_MIN_CONV.
+    """
+    kw: dict[str, Any] = {}
+    for env, field in (
+        ("DEXTER3_OM_ARM_R", "arm_trail_r"),
+        ("DEXTER3_OM_TRAIL_KEEP", "trail_keep_frac"),
+        ("DEXTER3_OM_TAKE_R", "take_r"),
+        ("DEXTER3_OM_SPIKE_R", "spike_take_r"),
+        ("DEXTER3_OM_REPAIR_TRIGGER_R", "repair_trigger_r"),
+        ("DEXTER3_OM_REPAIR_MIN_CONV", "repair_min_conviction"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field] = float(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    return OMConfig(**kw)
+
+
+def _fast_tick_sec_from_env() -> int:
+    raw = os.environ.get("DEXTER3_FAST_TICK_SEC")
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            log_line(f"{utc_now_iso()} ignored invalid DEXTER3_FAST_TICK_SEC={raw!r}")
+    return DEFAULT_FAST_TICK_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +943,210 @@ def run_once(
             _refresh_learning_loops(symbols, journal, mcp)
 
 
+# ---------------------------------------------------------------------------
+# OPENING MANAGER (OM) — fast-tick scheduling + per-tick execution
+# ---------------------------------------------------------------------------
+
+
+def m5_entry_tick_due(tick_count: int, poll_sec: int, fast_tick_sec: int) -> bool:
+    """Pure scheduling decision: should this fast tick also run the M5
+    entry/decision path (``run_once``)?
+
+    ``tick_count`` is the 1-based count of fast ticks since the loop
+    started. The M5 path fires once every ``ceil(poll_sec / fast_tick_sec)``
+    ticks (and always on the very first tick, ``tick_count == 1``, so entries
+    do not wait a full poll_sec before the loop's first M5 evaluation) — this
+    keeps the M5 entry cadence unchanged from the pre-OM behavior (still
+    roughly every ``poll_sec`` seconds) while every OTHER tick in between
+    runs ONLY the OM fast defense path.
+    """
+    if fast_tick_sec <= 0:
+        return True
+    ticks_per_poll = max(1, -(-int(poll_sec) // int(fast_tick_sec)))  # ceil division
+    return tick_count <= 1 or tick_count % ticks_per_poll == 0
+
+
+def om_bars_refresh_due(last_bar_fetch_epoch: float, now_epoch: float, refresh_sec: int = OM_BAR_REFRESH_SEC) -> bool:
+    """Pure: should OM refetch M5/M15/H1 bars this tick?
+
+    Spot + positions are refetched EVERY tick (they drive the trail and must
+    never be stale), but bars (needed only for structure_evidence/hunt_mode
+    in the Basket Doctor path) are refetched at most every ``refresh_sec``
+    seconds to keep MCP read load bounded at a 4s tick cadence.
+    """
+    return last_bar_fetch_epoch <= 0 or (now_epoch - last_bar_fetch_epoch) >= refresh_sec
+
+
+_OM_INSTANCE: OpeningManager | None = None
+_OM_BAR_CACHE: dict[str, dict[str, Any]] = {}  # symbol -> {"epoch":, "m5":, "m15":, "h1":}
+
+
+def _get_opening_manager(executor: Dexter3Executor | None, journal: DecisionJournal) -> OpeningManager:
+    global _OM_INSTANCE
+    if _OM_INSTANCE is None:
+        _OM_INSTANCE = OpeningManager(executor, journal, _om_config_from_env())
+    return _OM_INSTANCE
+
+
+def _om_bars_for(mcp: Dexter3McpClient, symbol: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cached M5/M15/H1 bars for the OM fast tick — refetched at most every
+    ``OM_BAR_REFRESH_SEC`` seconds (see ``om_bars_refresh_due``). Never
+    raises: an MCP read failure leaves the previous cache entry in place (or
+    empty lists on the very first tick) rather than crashing the fast loop.
+    """
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    cached = _OM_BAR_CACHE.get(symbol)
+    if cached is not None and not om_bars_refresh_due(cached.get("epoch", 0.0), now_epoch):
+        return cached["m5"], cached["m15"], cached["h1"]
+    try:
+        m5 = mcp.get_trendbars(symbol, "m5", MIN_M5_BARS)
+        m15 = mcp.get_trendbars(symbol, "m15", M15_BARS_NEEDED)
+        h1 = mcp.get_trendbars(symbol, "h1", H1_BARS_NEEDED)
+        _OM_BAR_CACHE[symbol] = {"epoch": now_epoch, "m5": m5, "m15": m15, "h1": h1}
+        return m5, m15, h1
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} om_bars_refresh_failed (using stale cache if any): {exc}")
+        if cached is not None:
+            return cached["m5"], cached["m15"], cached["h1"]
+        return [], [], []
+
+
+def run_om_tick(
+    mcp: Dexter3McpClient,
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbol: str,
+    *,
+    executor: Dexter3Executor | None,
+) -> str:
+    """One fast-tick OM evaluation for ``symbol``. Never raises — any
+    failure is logged and treated as a no-op tick (the OM must never crash
+    the fast loop, per the blueprint's "never trades blind" / "never dies"
+    posture shared with every other dexter3 loop path).
+
+    Without a live executor (shadow mode), OM still evaluates and journals
+    the would-be action but places/closes NOTHING — gated on
+    ``executor is not None``, identical to every other live-mutation gate in
+    this file.
+    """
+    try:
+        positions = executor.client.get_positions() if executor is not None else mcp.get_positions()
+        lane = basket_live.lane_positions(positions, LIVE_ORDER_LABEL)
+        lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} om_lane_read_failed (no OM action this tick): {exc}")
+        return "om_lane_read_failed"
+
+    if not lane:
+        _clear_basket_runtime(state, symbol)
+        return "om_no_lane"
+
+    m5_bars, m15_bars, h1_bars = _om_bars_for(mcp, symbol)
+
+    spread_abs = 0.0
+    try:
+        spot = mcp.get_spot_price(symbol)
+        spread_abs = max(0.0, _f(spot.get("ask"), 0.0) - _f(spot.get("bid"), 0.0))
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} om_spot_read_failed: {exc}")
+        spot = None
+
+    om = _get_opening_manager(executor, journal)
+    agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_om_base_risk_usd(executor))
+    om_state = {
+        "basket_runtime": (state.get("basket_runtime") or {}).get(symbol),
+        "now_utc_iso": utc_now_iso(),
+        "daily_state": {"daily_loss_baskets": int(_daily_state(state).get("loss_baskets", 0))},
+        "basket_cfg": _basket_config_from_env(),
+        "base_risk_usd": _om_base_risk_usd(executor),
+        "spread_abs": spread_abs,
+    }
+    action = om.evaluate(symbol, lane, spot, m5_bars, m15_bars, h1_bars, om_state)
+
+    new_runtime = action.get("basket_runtime")
+    if new_runtime is not None:
+        state.setdefault("basket_runtime", {})[symbol] = new_runtime
+
+    act = str(action.get("action") or "hold")
+    dry = executor is None
+    executed: dict[str, Any] = {}
+    if act == "close_all":
+        ids = [int(p.get("positionId") or p.get("id") or 0) for p in lane]
+        ids = [x for x in ids if x > 0]
+        if not dry:
+            executed = executor.execute_close_all(ids, reason=f"om_{action.get('reason')}")
+            if action.get("reason") == "cap_stop" and float(agg_probe.get("aggregate_pnl_usd") or 0.0) < 0:
+                daily = _daily_state(state)
+                daily["loss_baskets"] = int(daily.get("loss_baskets", 0)) + 1
+        _clear_basket_runtime(state, symbol)
+    elif act == "add_repair_leg" and not dry:
+        repair_side = str(action.get("side") or "buy")
+        prefix = list(m5_bars or [])
+        if prefix:
+            entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)
+            ts_close = hunter_brain._bar_close_ts(str(prefix[-1].get("ts") or ""))
+            repair_decision = hunter_brain.Decision(
+                ts_close=ts_close,
+                symbol=symbol,
+                action="enter",
+                side=repair_side,
+                entry_type="market",
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                size_class="scout",
+                leader_score=_f(action.get("conviction"), 0.0),
+                p_win_est=0.5,
+                setup="opening_manager_repair",
+                reasons=[
+                    f"OM Basket Doctor: เติมไม้ซ่อมตะกร้า (fast tick) / {action.get('note')}",
+                    f"conviction={action.get('conviction')}",
+                ],
+                features={"om_action": {k: v for k, v in action.items() if k != "basket_runtime"}},
+            )
+            daily = _daily_state(state)
+            executed = _execute_live_entry(
+                executor,
+                repair_decision,
+                today_entry_count=int(daily.get("entries", 0)),
+                today_losing_count=int(daily.get("loss_baskets", 0)),
+                repair=True,
+            )
+            if executed.get("action") == "entered":
+                daily["entries"] = int(daily.get("entries", 0)) + 1
+
+    journal.insert_basket_event(
+        0,
+        "om_action",
+        {
+            "symbol": symbol,
+            "dry_run": dry,
+            "action": act,
+            "reason": action.get("reason"),
+            "peak_r": action.get("peak_r"),
+            "floor_r": action.get("floor_r"),
+            "live_r": action.get("live_r"),
+            "side": action.get("side"),
+            "note": action.get("note"),
+            "conviction": action.get("conviction"),
+            "executed": executed,
+        },
+    )
+    save_shadow_state(state)
+    if act != "hold":
+        log_line(
+            f"{utc_now_iso()} {symbol} OM action={act} reason={action.get('reason')} "
+            f"peak_r={action.get('peak_r')} live_r={action.get('live_r')} dry={dry}"
+        )
+    return f"om_{act}"
+
+
+def _om_base_risk_usd(executor: Dexter3Executor | None) -> float:
+    if executor is not None:
+        return _f(getattr(executor.config, "risk_usd", None), 0.5)
+    return 0.5
+
+
 def _resolve_live_executor(mcp: Dexter3McpClient, journal: DecisionJournal, live_flag: bool) -> Dexter3Executor | None:
     """Double opt-in: --live CLI flag AND DEXTER3_LIVE=1 env var, both required.
 
@@ -915,27 +1168,59 @@ def _resolve_live_executor(mcp: Dexter3McpClient, journal: DecisionJournal, live
 
 
 def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
+    """Main loop — OPENING MANAGER fast tick (owner directive 2026-07-07).
+
+    Instead of sleeping ``poll_sec`` as one block, the loop ticks every
+    ``fast_tick_sec`` (default 4s, env ``DEXTER3_FAST_TICK_SEC``). EVERY
+    tick runs OM (``run_om_tick``) on any open lane per symbol — Profit
+    Hunter + Basket Doctor — so the ratcheting trail and repair decisions
+    are measured against a continuous peak, not a 5-minute-sampled one. The
+    M5 entry/decision path (``run_once``) still fires only once every
+    ``ceil(poll_sec / fast_tick_sec)`` ticks (see ``m5_entry_tick_due``),
+    preserving the pre-OM M5 entry cadence.
+
+    Preserves every existing failure-handling contract: single lock,
+    ``McpZombieError`` -> sleep 60 and continue, any other exception logged
+    and the loop continues, ``KeyboardInterrupt`` -> clean exit. An OM tick
+    failure is caught INSIDE ``run_om_tick``/this loop's per-symbol try block
+    so it can never crash the loop or block the M5 path.
+    """
     acquire_loop_lock()
     mcp = Dexter3McpClient()
     baskets: dict[str, PaperBasket] = {}
+    fast_tick_sec = _fast_tick_sec_from_env()
     try:
         with DecisionJournal() as journal:
             executor = _resolve_live_executor(mcp, journal, live)
             refresh_every_cycles = _learning_refresh_every_cycles(poll_sec)
             log_line(
                 f"{utc_now_iso()} dexter3 shadow loop started symbols={symbols} poll_sec={poll_sec} "
-                f"live={'ON' if executor is not None else 'off'}"
+                f"fast_tick_sec={fast_tick_sec} live={'ON' if executor is not None else 'off'}"
             )
+            tick_count = 0
             while True:
-                try:
-                    run_once(symbols, mcp, journal, baskets, executor=executor, refresh_every_cycles=refresh_every_cycles)
-                except McpZombieError as exc:
-                    log_line(f"{utc_now_iso()} MCP_ZOMBIE (loop-level): {exc}")
-                    time.sleep(MCP_ZOMBIE_SLEEP_SEC)
-                    continue
-                except Exception as exc:  # noqa: BLE001 - loop must never die
-                    log_error("run_loop", exc)
-                time.sleep(max(1, poll_sec))
+                tick_count += 1
+                state = load_shadow_state()
+                for symbol in symbols:
+                    try:
+                        run_om_tick(mcp, journal, state, symbol, executor=executor)
+                    except McpZombieError as exc:
+                        log_line(f"{utc_now_iso()} {symbol} OM MCP_ZOMBIE: {exc}")
+                    except Exception as exc:  # noqa: BLE001 - OM tick must never crash the loop
+                        log_error(f"run_om_tick({symbol})", exc)
+
+                if m5_entry_tick_due(tick_count, poll_sec, fast_tick_sec):
+                    try:
+                        run_once(
+                            symbols, mcp, journal, baskets, executor=executor, refresh_every_cycles=refresh_every_cycles
+                        )
+                    except McpZombieError as exc:
+                        log_line(f"{utc_now_iso()} MCP_ZOMBIE (loop-level): {exc}")
+                        time.sleep(MCP_ZOMBIE_SLEEP_SEC)
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - loop must never die
+                        log_error("run_loop", exc)
+                time.sleep(max(1, fast_tick_sec))
     except KeyboardInterrupt:
         log_line(f"{utc_now_iso()} dexter3 shadow loop stopped (KeyboardInterrupt)")
     finally:

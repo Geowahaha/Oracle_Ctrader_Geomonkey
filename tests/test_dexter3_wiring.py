@@ -28,6 +28,10 @@ class FakeMcp:
         self.calls.append(("get_spot_price", {}))
         return dict(self.spot)
 
+    def get_trendbars(self, symbol: str, period: str, count: int) -> list[dict]:
+        self.calls.append(("get_trendbars", {"period": period, "count": count}))
+        return []
+
     def get_positions(self) -> list[dict]:
         self.calls.append(("get_positions", {}))
         out = list(self._positions)
@@ -366,3 +370,93 @@ def test_basket_config_from_env_ignores_invalid_value(monkeypatch):
     from dexter3.basket_manager import BasketConfig
 
     assert cfg.arm_trail_r == BasketConfig().arm_trail_r  # falls back to default, does not raise
+
+
+# ---------------------------------------------------------------------------
+# OPENING MANAGER (owner directive 2026-07-07) — fast-tick scheduling helpers
+# ---------------------------------------------------------------------------
+
+
+def test_m5_entry_tick_due_fires_on_first_tick():
+    # Entries must not wait a full poll_sec before the loop's first M5 pass.
+    assert sr.m5_entry_tick_due(1, poll_sec=20, fast_tick_sec=4) is True
+
+
+def test_m5_entry_tick_due_fires_every_ceil_poll_over_fast_tick_ticks():
+    # poll_sec=20, fast_tick_sec=4 -> ticks_per_poll=5 -> due on ticks 5, 10, 15...
+    due_ticks = [t for t in range(1, 21) if sr.m5_entry_tick_due(t, poll_sec=20, fast_tick_sec=4)]
+    assert due_ticks == [1, 5, 10, 15, 20]
+
+
+def test_m5_entry_tick_due_handles_non_evenly_divisible_poll_sec():
+    # poll_sec=20, fast_tick_sec=7 -> ceil(20/7)=3 -> due every 3rd tick (+ tick 1)
+    due_ticks = [t for t in range(1, 13) if sr.m5_entry_tick_due(t, poll_sec=20, fast_tick_sec=7)]
+    assert due_ticks == [1, 3, 6, 9, 12]
+
+
+def test_m5_entry_tick_due_true_every_tick_when_fast_tick_sec_zero_or_negative():
+    # Defensive: a misconfigured fast_tick_sec must never silently starve
+    # the M5 entry path — fail open (run every tick) rather than never.
+    assert sr.m5_entry_tick_due(2, poll_sec=20, fast_tick_sec=0) is True
+    assert sr.m5_entry_tick_due(2, poll_sec=20, fast_tick_sec=-1) is True
+
+
+def test_om_bars_refresh_due_first_call_and_after_interval():
+    assert sr.om_bars_refresh_due(0.0, 1000.0, refresh_sec=30) is True
+    assert sr.om_bars_refresh_due(980.0, 1000.0, refresh_sec=30) is False
+    assert sr.om_bars_refresh_due(965.0, 1000.0, refresh_sec=30) is True
+
+
+def test_fast_tick_sec_from_env_default_and_override(monkeypatch):
+    monkeypatch.delenv("DEXTER3_FAST_TICK_SEC", raising=False)
+    assert sr._fast_tick_sec_from_env() == sr.DEFAULT_FAST_TICK_SEC
+    monkeypatch.setenv("DEXTER3_FAST_TICK_SEC", "7")
+    assert sr._fast_tick_sec_from_env() == 7
+    monkeypatch.setenv("DEXTER3_FAST_TICK_SEC", "not_an_int")
+    assert sr._fast_tick_sec_from_env() == sr.DEFAULT_FAST_TICK_SEC
+
+
+def test_om_config_from_env_reads_knobs_and_ignores_invalid(monkeypatch):
+    monkeypatch.setenv("DEXTER3_OM_ARM_R", "0.3")
+    monkeypatch.setenv("DEXTER3_OM_TRAIL_KEEP", "0.8")
+    monkeypatch.setenv("DEXTER3_OM_TAKE_R", "1.5")
+    monkeypatch.setenv("DEXTER3_OM_SPIKE_R", "3.0")
+    monkeypatch.setenv("DEXTER3_OM_REPAIR_TRIGGER_R", "-0.6")
+    monkeypatch.setenv("DEXTER3_OM_REPAIR_MIN_CONV", "0.5")
+    cfg = sr._om_config_from_env()
+    assert cfg.arm_trail_r == pytest.approx(0.3)
+    assert cfg.trail_keep_frac == pytest.approx(0.8)
+    assert cfg.take_r == pytest.approx(1.5)
+    assert cfg.spike_take_r == pytest.approx(3.0)
+    assert cfg.repair_trigger_r == pytest.approx(-0.6)
+    assert cfg.repair_min_conviction == pytest.approx(0.5)
+
+    monkeypatch.setenv("DEXTER3_OM_ARM_R", "garbage")
+    cfg2 = sr._om_config_from_env()
+    from dexter3.opening_manager import OMConfig
+
+    assert cfg2.arm_trail_r == OMConfig().arm_trail_r  # falls back to default, does not raise
+
+
+def test_run_om_tick_dry_mode_never_calls_executor_mutations(journal, monkeypatch):
+    """Shadow mode (executor=None): OM must still evaluate + journal the
+    would-be action, but must place/close NOTHING."""
+    monkeypatch.setattr(sr, "_OM_BAR_CACHE", {})
+    monkeypatch.setattr(sr, "_OM_INSTANCE", None)
+    mcp = FakeMcp(positions=[_lane_pos(1)])
+    state: dict = {}
+    status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
+    assert status.startswith("om_")
+    # dry mode never calls place_market_order / close_position
+    mutating_calls = [c for c in mcp.calls if c[0] in ("place_market_order", "close_position", "amend_position")]
+    assert mutating_calls == []
+
+
+def test_run_om_tick_no_lane_clears_runtime_and_is_noop(journal, monkeypatch):
+    monkeypatch.setattr(sr, "_OM_BAR_CACHE", {})
+    monkeypatch.setattr(sr, "_OM_INSTANCE", None)
+    mcp = FakeMcp(positions=[])
+    state: dict = {"basket_runtime": {"BTCUSD": {"oldest_open_ts": "x", "peak_r": 1.0}}}
+    status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
+    assert status == "om_no_lane"
+    assert "BTCUSD" not in state.get("basket_runtime", {})
