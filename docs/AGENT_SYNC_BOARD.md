@@ -451,5 +451,7 @@ Format each entry:
 
 **Cross-links**
 
+- **`docs/DEXTER3_HANDOFF.md`** ← master handoff: any model reads this FIRST to take over Dexter3 seamlessly (mission, golden rules, live state, design philosophy, forward plan)
+
 - Mission detail: `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md`
 - Session bootstrap: `CLAUDE.md` → Critical Files + Session Startup
