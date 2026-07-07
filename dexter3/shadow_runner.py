@@ -367,7 +367,8 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
         if label_filter not in label:
             continue
         ts = str(
-            deal.get("executionTimestamp")
+            deal.get("time")  # the Local MCP's actual field (live-verified 2026-07-07)
+            or deal.get("executionTimestamp")
             or deal.get("closeTimestamp")
             or deal.get("closingTimestamp")
             or deal.get("utcLastUpdateTimestamp")
@@ -385,7 +386,10 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
                 break
             except (TypeError, ValueError):
                 continue
-        if pnl is None:
+        if pnl is None or pnl == 0.0:
+            # zero-pnl rows are the OPEN side of a deal — including them left
+            # a trailing 0 that zeroed the win streak (live 2026-07-07:
+            # streak=0 through an 11-0 run, ladder never pressed)
             continue
         dated.append((ts, pnl))
 
@@ -922,7 +926,7 @@ def _manage_lane_basket(
     lens = hunter_brain._run_lens(prefix, ts_close)
     daily = _daily_state(state)
 
-    agg = basket_live.aggregate_lane(lane, base_risk_usd=executor.config.risk_usd)
+    agg = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, executor.config.risk_usd))
     agg["lens_liquidity_sweep"] = lens.get("liquidity_sweep")  # sweep-vs-break repair distinction
     sides = agg.get("sides", {}) or {}
     basket_side = "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
@@ -1220,7 +1224,7 @@ def run_om_tick(
         spot = None
 
     om = _get_opening_manager(executor, journal)
-    agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_om_base_risk_usd(executor))
+    agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, _om_base_risk_usd(executor)))
     # Daily Mission Governor (owner directive 2026-07-07): record this
     # symbol's floating PnL for the governor's account-wide floating
     # aggregate — reuses this same aggregate_lane read, no extra MCP calls.
@@ -1232,7 +1236,7 @@ def run_om_tick(
         "now_utc_iso": utc_now_iso(),
         "daily_state": {"daily_loss_baskets": int(_daily_state(state).get("loss_baskets", 0))},
         "basket_cfg": _basket_config_from_env(),
-        "base_risk_usd": _om_base_risk_usd(executor),
+        "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
         "spread_abs": spread_abs,
     }
     action = om.evaluate(symbol, lane, spot, m5_bars, m15_bars, h1_bars, om_state)
@@ -1449,6 +1453,26 @@ def run_governor_tick(
     except Exception as exc:  # noqa: BLE001 - governor tick must never crash the fast loop
         log_error("run_governor_tick", exc)
         return "governor_error"
+
+
+def _lane_actual_risk_usd(lane: list[dict[str, Any]] | None, fallback: float) -> float:
+    """ACTUAL dollar risk of the open lane legs: sum(|entry−SL| × volume).
+
+    The R-base for aggregate_r/trail math. Using the static config risk was
+    a live bug (2026-07-07): governor sized entries at ~$14.4 while the base
+    stayed $0.50 → aggregate_r inflated ~29× → OM 'take' fired at +$0.60 and
+    banked 11 straight winners at ~0.09R of their true risk."""
+    total = 0.0
+    for p in lane or []:
+        try:
+            entry = float(p.get("entryPrice") or p.get("price") or 0.0)
+            sl = float(p.get("stopLoss") or p.get("stopLossPrice") or 0.0)
+            vol = float(p.get("volumeInUnits") or p.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if entry > 0 and sl > 0 and vol > 0:
+            total += abs(entry - sl) * vol
+    return total if total > 0 else float(fallback)
 
 
 def _om_base_risk_usd(executor: Dexter3Executor | None) -> float:
