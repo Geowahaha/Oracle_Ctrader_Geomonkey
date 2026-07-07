@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 HUNT MODE live on XAUUSD** — entry every M5 close + basket peak-R trail + trend-agreement guard (profitability fix deployed 2026-07-07). codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-07T02:20Z |
+| **Phase now** | **DEXTER3 OPENING MANAGER live on XAUUSD** — ~4s fast intrabar defense: continuous peak-R ratchet trail + spike capture + edge-measured Basket Doctor repair. Fixes the M5-only monitoring flaw. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-07T10:00Z |
 | **Last updated by** | claude-fable (PM/Opus) |
 
 ---
@@ -424,6 +424,14 @@ Format each entry:
 - **Design (in blueprint "OPENING MANAGER" section):** ~4s fast tick, separate from M5 cadence. (1) Profit Hunter — continuous peak_r, ratcheting trail (arm 0.4/keep 0.7, floor only rises), spike-capture for news bursts → close all at tick resolution. (2) Basket Doctor — measures which side has edge NOW via hunt committee; opens repair leg in the WINNING direction to drag aggregate net-positive (not blind hedge). Caps unchanged/unbreachable. Single process/lock, no concurrency.
 - Sonnet building `dexter3/opening_manager.py` + surgical shadow_runner wiring + tests. Current M5 loop keeps running meanwhile.
 - Next (fable): review OM tests + smoke proof (ratchet banks a reversing winner), deploy, then answer owner's MCP-vs-SSH/OpenAPI architecture question.
+
+### 2026-07-07 UTC 10:00Z — claude-fable (PM/Opus) — OPENING MANAGER deployed live
+
+- Built + deployed `dexter3/opening_manager.py` (`318f20c`) + observability (`a081470`). 658/659 tests (1 pre-existing skipeval flake). Smoke-proven: continuous peak-R ratchet banks +0.70R on a 1.0R→0.7R reversal that the old 5-min M5 sampling would have ridden to −0.2R.
+- **Live confirmed:** OM ticks every ~4s (verified 09:58:08→:12→:17… in basket_events om_action rows), continuous peak_r tracked (not M5-sampled), hold carries live_r/peak_r + throttled "OM hunting" heartbeat. Currently managing a Sell leg at −0.44R (past repair trigger) — Basket Doctor now evaluating whether buy has edge for a counter-trend recovery leg.
+- Deploy env: DEXTER3_FAST_TICK_SEC=4, OM arm 0.4/keep 0.70/take 1.2/spike 2.5, risk_usd 15 / max_vol 5 (0.05 lot), daily_loss_baskets 3. Caps unbreachable via basket_live.enforce_caps.
+- Architecture now matches production `xau_scalp_monitor`'s scan-loop + defense-loop split (M5 entries + ~4s OM defense), single process/lock.
+- Next (fable): watch OM bank a real winner + execute an edge-repair over the next session; measure PF via `scripts/dexter3_pnl_backtest.py`; answer owner's MCP-vs-SSH/OpenAPI question.
 
 ---
 
