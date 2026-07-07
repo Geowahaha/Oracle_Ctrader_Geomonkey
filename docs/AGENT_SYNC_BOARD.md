@@ -433,6 +433,13 @@ Format each entry:
 - Architecture now matches production `xau_scalp_monitor`'s scan-loop + defense-loop split (M5 entries + ~4s OM defense), single process/lock.
 - Next (fable): watch OM bank a real winner + execute an edge-repair over the next session; measure PF via `scripts/dexter3_pnl_backtest.py`; answer owner's MCP-vs-SSH/OpenAPI question.
 
+### 2026-07-07 UTC 12:05Z — claude-fable (PM) — OWNER MISSION: $100/day on $1000 → Daily Mission Governor
+
+- Owner set the target explicitly: creative, aggressive, $100/day from $1000 capital. PM translation (honest math stated to owner earlier — 10%/day sustained is not promissable; the buildable version is prop-firm discipline that CAPTURES big days and CAPS red days):
+  **Daily Mission Governor** — (1) effective (realized+floating) day PnL ≥ +$100 → close all, 🎯 lock, stop entering till next UTC day; (2) ≤ −$50 → close all, 🛑 stop; (3) anti-martingale ladder ×1.0/1.3/1.6/2.0 on win streaks (streak derived stateless from today's deals), reset on loss; (4) session sizing overlap 1.2/london 1.0/ny 1.1/asian 0.6/off 0.5 on a $1000 virtual capital base (base risk 1.2%≈$12, hard cap 2.5%); governor is a layer ABOVE — can only stop entries/close all/shape size, never raise caps.
+- Sonnet building `dexter3/daily_governor.py` + runner wiring + risk_usd_override (additive) on execute_entry. Loop keeps running meanwhile (OM ticking, London/NY overlap in progress).
+- Next (fable): review + deploy tonight during NY with DEXTER3_CAPITAL_USD=1000 TARGET=100 LOSS=50; measure PF of the fixed stack.
+
 ---
 
 **Cross-links**
