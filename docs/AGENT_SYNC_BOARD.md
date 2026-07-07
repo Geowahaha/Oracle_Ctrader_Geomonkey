@@ -417,6 +417,14 @@ Format each entry:
 - Pre-fix real tally this run: -$118 (PF 0.61) — the config we just replaced.
 - Next (fable): measure real PF via `scripts/dexter3_pnl_backtest.py` after next full session; if live wins keep clustering <0.35R, lower arm further or revisit hunt exit geometry; answer owner's MCP-vs-SSH/OpenAPI architecture question.
 
+### 2026-07-07 UTC 09:45Z — claude-fable (PM/Opus) — OWNER-DIRECTED redesign: Opening Manager (fast intrabar defense)
+
+- Owner reviewed live behavior: "ได้กำไรมากแล้วไม่ปิด รอจนโครงสร้างเปลี่ยนติดลบ = เทรดด้วยความกลัว" + wants edge-measured repair + an opening manager monitoring.
+- **PM confirmed the real bug from live code+logs:** basket mgmt runs ONLY on new M5 close (gated behind `is_newest`); between M5 bars open positions are UNMONITORED and `peak_r` is 5-min-sampled → intrabar profit peaks invisible, so even the new trail can't bank them. Root cause of the fear pattern, not param tuning.
+- **Design (in blueprint "OPENING MANAGER" section):** ~4s fast tick, separate from M5 cadence. (1) Profit Hunter — continuous peak_r, ratcheting trail (arm 0.4/keep 0.7, floor only rises), spike-capture for news bursts → close all at tick resolution. (2) Basket Doctor — measures which side has edge NOW via hunt committee; opens repair leg in the WINNING direction to drag aggregate net-positive (not blind hedge). Caps unchanged/unbreachable. Single process/lock, no concurrency.
+- Sonnet building `dexter3/opening_manager.py` + surgical shadow_runner wiring + tests. Current M5 loop keeps running meanwhile.
+- Next (fable): review OM tests + smoke proof (ratchet banks a reversing winner), deploy, then answer owner's MCP-vs-SSH/OpenAPI architecture question.
+
 ---
 
 **Cross-links**
