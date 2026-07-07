@@ -400,6 +400,15 @@ Format each entry:
 - XAU loop warming: 57/60 M5 bars since Sunday open (~21:58Z) → first decision ≈ 03:00Z.
 - Next (fable): verify first XAU fills + basket behavior in London/pre-NY, then evaluate hunt PF per session; BTC stays journal-only until owner re-enables.
 
+### 2026-07-07 UTC 20:50Z — claude-fable (PM/Opus) — PROFITABILITY DIAGNOSIS + fix in flight
+
+- Owner: "ปรับปรุงให้มีกำไร". Pulled REAL results from MCP `get_deals` (label dexter3:fable, 2026-07-06→07): **Net -$110.77**, WR 56% (28W/22L), avg win +$6.15, avg loss -$12.87, **PF 0.61**. Sell side -$116, Buy +$5.
+- **Root cause 1 (biggest): winner asymmetry.** hunt sets TP 1.2R but `basket_live` closes at `resolve_target_r=0.2R` → winners banked ~$6 while losers run full SL -$13. avg_win/avg_loss=0.48 → math guarantees loss even winning 56%. Classic cut-winners/let-losers-run (same disease as [[project_trailing_brain_peak_r_2026_05_19]]).
+- **Root cause 2: counter-trend Sells.** committee over-weights mean-reversion (day_range_tilt) vs trend (m15_drift/h1_context) → shorts into strength.
+- Fix (Sonnet building, ships as ONE deploy + journal backtest that must show projected PF>1.0 before live): (1) peak-R basket trailing (arm 0.5R, keep 60% of peak, hard take 1.1R) replacing flat 0.2R close; (2) runner wires peak-R state + new DEXTER3_ARM_TRAIL_R/TRAIL_KEEP_FRAC/TAKE_R env knobs; (3) committee reweight m15_drift 1.0→1.3, h1_context 0.6→0.9 + trend-agreement conviction penalty on counter-trend (no skip — reshapes side/size, participation-first stays). Caps unchanged/unbreachable.
+- Live loop still running (bleed ~$2.75/hr on demo, acceptable while fix builds). Not killing it per [[feedback_demo_let_strategies_trade]].
+- Next (fable): review backtest PF, deploy fix live on XAUUSD, re-measure PF over next session.
+
 ---
 
 **Cross-links**
