@@ -309,14 +309,18 @@ def test_veto_reasons_contain_thai() -> None:
 
 
 def test_committee_weights_match_spec_constants() -> None:
+    # FIX 3 (2026-07-07): m15_drift 1.0->1.3, h1_context 0.6->0.9 — trend
+    # members rebalanced upward so day_range_tilt's mean-reversion vote
+    # (w=1.0, unchanged) can no longer out-muscle the trend-following voice
+    # the way it did in the 2026-07-06/07 counter-trend-shorts diagnosis.
     assert hunt_mode.WEIGHT_CLOSE_LOCATION_PRESSURE == 1.0
     assert hunt_mode.WEIGHT_SWING_STRUCTURE == 1.2
     assert hunt_mode.WEIGHT_DAY_RANGE_TILT == 1.0
     assert hunt_mode.WEIGHT_DISPLACEMENT == 0.8
     assert hunt_mode.WEIGHT_COMPRESSION_RELEASE == 0.8
-    assert hunt_mode.WEIGHT_M15_DRIFT == 1.0
+    assert hunt_mode.WEIGHT_M15_DRIFT == 1.3
     assert hunt_mode.WEIGHT_SWEEP_RECLAIM_OVERRIDE == 1.5
-    assert hunt_mode.WEIGHT_H1_CONTEXT == 0.6
+    assert hunt_mode.WEIGHT_H1_CONTEXT == 0.9
 
 
 def test_conviction_size_class_threshold() -> None:
@@ -339,3 +343,190 @@ def test_features_snapshot_includes_full_committee_breakdown() -> None:
         assert "vote" in committee[name]
         assert "weight" in committee[name]
         assert "weighted" in committee[name]
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 (2026-07-07) — trend-agreement conviction guard
+#
+# Diagnosis this fix addresses: the committee shorted INTO strength because
+# day_range_tilt's mean-reversion vote out-muscled the trend-following
+# members (m15_drift, h1_context). This guard halves conviction whenever the
+# chosen side opposes a strong aligned trend, and flips the side toward the
+# trend unless the counter-trend evidence is a confirmed sweep_reclaim or is
+# itself strong enough (>= COUNTER_TREND_OVERRIDE_STRENGTH_MULT x the trend
+# pull). It must NEVER produce a skip — participation-first stays.
+# ---------------------------------------------------------------------------
+
+
+def _committee_stub(
+    *,
+    m15_vote: float = 0.0,
+    h1_vote: float = 0.0,
+    other_vote: float = 0.0,
+    sweep_fired: bool = False,
+    sweep_side: str | None = None,
+) -> dict:
+    """Build a minimal committee dict directly (bypassing _run_committee) so
+    _apply_trend_agreement_guard / _trend_agreement can be unit-tested
+    against exact, hand-picked vote combinations."""
+    names = hunt_mode._COMMITTEE_MEMBER_NAMES
+    weights = {
+        "close_location_pressure": hunt_mode.WEIGHT_CLOSE_LOCATION_PRESSURE,
+        "swing_structure": hunt_mode.WEIGHT_SWING_STRUCTURE,
+        "day_range_tilt": hunt_mode.WEIGHT_DAY_RANGE_TILT,
+        "displacement": hunt_mode.WEIGHT_DISPLACEMENT,
+        "compression_release": hunt_mode.WEIGHT_COMPRESSION_RELEASE,
+        "m15_drift": hunt_mode.WEIGHT_M15_DRIFT,
+        "sweep_reclaim": hunt_mode.WEIGHT_SWEEP_RECLAIM_OVERRIDE,
+        "h1_context": hunt_mode.WEIGHT_H1_CONTEXT,
+    }
+    committee = {}
+    for name in names:
+        if name == "m15_drift":
+            vote = m15_vote
+        elif name == "h1_context":
+            vote = h1_vote
+        elif name == "sweep_reclaim":
+            vote = (1.0 if sweep_side == "buy" else -1.0) if sweep_fired else 0.0
+        else:
+            vote = other_vote
+        weight = weights[name]
+        detail = {"fired": sweep_fired, "side": sweep_side} if name == "sweep_reclaim" else {}
+        committee[name] = {"vote": vote, "weight": weight, "weighted": vote * weight, "detail": detail}
+    return committee
+
+
+def test_trend_agreement_both_members_agree_strong() -> None:
+    committee = _committee_stub(m15_vote=0.7, h1_vote=0.6)
+    agreement, trend_side = hunt_mode._trend_agreement(committee)
+    assert agreement == pytest.approx(0.65)
+    assert trend_side == "buy"
+
+
+def test_trend_agreement_members_disagree_no_trend_side() -> None:
+    committee = _committee_stub(m15_vote=0.7, h1_vote=-0.6)
+    _, trend_side = hunt_mode._trend_agreement(committee)
+    assert trend_side is None
+
+
+def test_guard_does_not_fire_when_no_aligned_trend() -> None:
+    committee = _committee_stub(m15_vote=0.2, h1_vote=-0.1, other_vote=-0.3)
+    side, conviction, detail = hunt_mode._apply_trend_agreement_guard("sell", 0.5, committee)
+    assert side == "sell"
+    assert conviction == 0.5
+    assert detail["fired"] is False
+
+
+def test_guard_does_not_fire_when_side_already_aligned() -> None:
+    # Strong uptrend AND the committee's own side is buy -> no penalty.
+    committee = _committee_stub(m15_vote=0.8, h1_vote=0.7, other_vote=0.5)
+    side, conviction, detail = hunt_mode._apply_trend_agreement_guard("buy", 0.6, committee)
+    assert side == "buy"
+    assert conviction == 0.6
+    assert detail["fired"] is False
+    assert detail["trend_side"] == "buy"
+
+
+def test_guard_penalizes_and_flips_weak_counter_trend_short() -> None:
+    """The core diagnosed bug: a weak mean-reversion short vote opposing a
+    strong aligned uptrend (m15_drift + h1_context both strongly positive)
+    must be penalized AND flipped toward the trend (buy) — no confirmed
+    sweep_reclaim, and the weak short evidence cannot clear the override bar.
+    """
+    # Strong buy trend (m15/h1 both strongly positive); the OTHER 6 members
+    # vote moderately sell (-0.6 each) — enough to tip the raw committee's
+    # weighted_sum negative (side='sell'; verified: weighted_sum=-0.99) but
+    # NOT enough to clear the override bar (trend_pull=0.935,
+    # COUNTER_TREND_OVERRIDE_STRENGTH_MULT x trend_pull=1.122 > 0.99).
+    committee = _committee_stub(m15_vote=0.9, h1_vote=0.8, other_vote=-0.6, sweep_fired=False)
+    side, conviction, detail = hunt_mode._apply_trend_agreement_guard("sell", 0.5, committee)
+    assert detail["fired"] is True
+    assert detail["confirmed_sweep_reclaim_counter_trend"] is False
+    assert detail["strong_enough_to_stand"] is False
+    assert side == "buy", "weak counter-trend evidence must flip toward the aligned trend"
+    assert conviction == pytest.approx(0.5 * hunt_mode.COUNTER_TREND_CONVICTION_PENALTY_MULT)
+
+
+def test_guard_lets_confirmed_sweep_reclaim_stand_counter_trend() -> None:
+    """A confirmed sweep_reclaim in the counter-trend direction is structural
+    reversal evidence, not mean-reversion noise — the side must STAND (not
+    flip), conviction still penalized."""
+    committee = _committee_stub(
+        m15_vote=0.9, h1_vote=0.8, other_vote=-0.1, sweep_fired=True, sweep_side="sell"
+    )
+    side, conviction, detail = hunt_mode._apply_trend_agreement_guard("sell", 0.5, committee)
+    assert detail["fired"] is True
+    assert detail["confirmed_sweep_reclaim_counter_trend"] is True
+    assert side == "sell", "confirmed sweep_reclaim must be allowed to stand against the trend"
+    assert conviction == pytest.approx(0.5 * hunt_mode.COUNTER_TREND_CONVICTION_PENALTY_MULT)
+
+
+def test_guard_lets_strong_counter_trend_evidence_stand_without_sweep() -> None:
+    """Even without a confirmed sweep_reclaim, sufficiently strong
+    counter-trend weighted evidence (>= COUNTER_TREND_OVERRIDE_STRENGTH_MULT
+    x trend_pull) is allowed to stand — conviction still penalized."""
+    # Make every non-trend member vote strongly sell (-1.0) so the counter
+    # side's weighted_sum magnitude dwarfs the trend pull.
+    committee = _committee_stub(m15_vote=0.6, h1_vote=0.55, other_vote=-1.0, sweep_fired=False)
+    side, conviction, detail = hunt_mode._apply_trend_agreement_guard("sell", 0.7, committee)
+    assert detail["fired"] is True
+    assert detail["strong_enough_to_stand"] is True
+    assert side == "sell"
+    assert conviction == pytest.approx(0.7 * hunt_mode.COUNTER_TREND_CONVICTION_PENALTY_MULT)
+
+
+def test_guard_never_produces_a_skip_via_decide_hunt() -> None:
+    """Integration-level: even when the guard fires and flips the side,
+    decide_hunt must still return action='enter' with full geometry —
+    participation-first is never compromised by this fix."""
+    rng = random.Random(4242)
+    m5, m15, h1 = _regime_bars(rng, 0)
+    # Craft m15/h1 into a strong, clearly aligned uptrend to make the guard
+    # deterministic regardless of which side the raw committee first picks.
+    m15_strong_up = _random_bars(rng, 40, start=m15[-1]["close"], trend=2.0, vol=0.3, step_min=15)
+    h1_strong_up = _random_bars(rng, 24, start=h1[-1]["close"], trend=6.0, vol=0.5, step_min=60)
+    decision = hunt_mode.decide_hunt("XAUUSD", m5, m15_strong_up, h1_strong_up, None, spread_abs=0.05)
+    assert decision.action == "enter"
+    assert decision.side in ("buy", "sell")
+    trend_guard = decision.features.get("hunt_trend_guard")
+    assert trend_guard is not None
+
+
+def test_guard_property_conviction_never_increases() -> None:
+    """Across many randomized committee snapshots, the guard must never
+    INCREASE conviction relative to the raw value — it only ever holds it
+    steady or penalizes (halves) it."""
+    rng = random.Random(777)
+    for _ in range(200):
+        m15_vote = rng.uniform(-1.0, 1.0)
+        h1_vote = rng.uniform(-1.0, 1.0)
+        other_vote = rng.uniform(-1.0, 1.0)
+        raw_side = rng.choice(["buy", "sell"])
+        raw_conviction = rng.uniform(0.0, 1.0)
+        sweep_fired = rng.choice([True, False])
+        sweep_side = rng.choice(["buy", "sell"])
+        committee = _committee_stub(
+            m15_vote=m15_vote, h1_vote=h1_vote, other_vote=other_vote,
+            sweep_fired=sweep_fired, sweep_side=sweep_side,
+        )
+        _, conviction, _ = hunt_mode._apply_trend_agreement_guard(raw_side, raw_conviction, committee)
+        assert conviction <= raw_conviction + 1e-9
+
+
+def test_guard_property_never_flips_when_aligned_or_no_trend() -> None:
+    """Across many randomized committee snapshots: if there's no strong
+    aligned trend, or the side already matches the trend, the side returned
+    must be unchanged from the input side."""
+    rng = random.Random(888)
+    for _ in range(200):
+        m15_vote = rng.uniform(-1.0, 1.0)
+        h1_vote = rng.uniform(-1.0, 1.0)
+        other_vote = rng.uniform(-1.0, 1.0)
+        raw_side = rng.choice(["buy", "sell"])
+        committee = _committee_stub(m15_vote=m15_vote, h1_vote=h1_vote, other_vote=other_vote)
+        agreement, trend_side = hunt_mode._trend_agreement(committee)
+        no_aligned_trend = trend_side is None or abs(agreement) < hunt_mode.TREND_AGREEMENT_THRESHOLD
+        already_aligned = trend_side == raw_side
+        side, _, _ = hunt_mode._apply_trend_agreement_guard(raw_side, 0.5, committee)
+        if no_aligned_trend or already_aligned:
+            assert side == raw_side

@@ -438,18 +438,118 @@ def _parse_iso_epoch(ts: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_profit_action(
+    cfg: BasketConfig,
+    aggregate_r: float,
+    basket_runtime: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """FIX 1 (2026-07-07) — peak-R basket trailing. Returns a
+    ``close_all_in_profit`` action dict, or None if the basket should keep
+    running (no resolve-in-profit condition met this bar).
+
+    ``basket_runtime`` is None (backward-compat default, byte-identical to
+    the pre-fix behavior all existing tests assert): resolve fires the
+    instant ``aggregate_r >= cfg.resolve_target_r`` — the flat +0.2R bank
+    this fix retires when the caller opts in.
+
+    ``basket_runtime`` is a dict (peak-R trailing ACTIVE): the caller
+    (``shadow_runner._manage_lane_basket``) is expected to track and pass
+    ``{'peak_r': <float, best aggregate_r ever seen this basket>}`` across
+    M5 closes (see FIX 2). This function is PURE — it does not mutate
+    ``basket_runtime`` or persist anything; the caller owns state, this
+    function only reads ``peak_r`` (already updated by the caller with
+    THIS bar's aggregate_r, i.e. peak_r = max(previous_peak_r, aggregate_r)
+    before calling here) and decides the action:
+
+      1. Hard take: ``aggregate_r >= cfg.take_r`` -> close_all_in_profit
+         unconditionally (this is the ceiling; never trail past it).
+      2. Armed trail: once ``peak_r >= cfg.arm_trail_r``, the basket must
+         give back no more than ``(1 - cfg.trail_keep_frac)`` of its peak —
+         close_all_in_profit fires when
+         ``aggregate_r <= peak_r * cfg.trail_keep_frac``, i.e. we bank
+         ``trail_keep_frac`` of the best R the basket ever reached. The
+         floor is never below ``cfg.resolve_target_r`` (repurposed as the
+         MINIMUM profit ever worth closing for — a basket must never be
+         "closed in profit" below this bar even if trail math would permit
+         a lower number for a very small peak).
+      3. Not yet armed (``peak_r < cfg.arm_trail_r``): resolve-in-profit
+         does NOT fire from this function at all — a green-but-not-yet-
+         armed basket is left running (no premature banking at the old
+         flat +0.2R). Other paths (structure repair, hard caps) still
+         apply as before; this function only ever returns a
+         close_all_in_profit action or None.
+    """
+    if basket_runtime is None:
+        # Pre-fix behavior, preserved exactly for backward compatibility.
+        if aggregate_r >= cfg.resolve_target_r:
+            return {
+                "action": "close_all_in_profit",
+                "reason": f"aggregate_r={aggregate_r:.4f} >= resolve_target_r={cfg.resolve_target_r}",
+            }
+        return None
+
+    peak_r = _f(basket_runtime.get("peak_r"), aggregate_r)
+    # Defensive: peak_r can never be less than this bar's own aggregate_r —
+    # a caller that forgot to update peak_r before calling us must not let
+    # a stale (lower) peak understate how far the basket has actually run.
+    peak_r = max(peak_r, aggregate_r)
+
+    trail_info = {
+        "peak_r": round(peak_r, 4),
+        "arm_trail_r": cfg.arm_trail_r,
+        "trail_keep_frac": cfg.trail_keep_frac,
+        "take_r": cfg.take_r,
+        "resolve_target_r_floor": cfg.resolve_target_r,
+    }
+
+    if aggregate_r >= cfg.take_r:
+        trail_info["close_r"] = round(aggregate_r, 4)
+        trail_info["trigger"] = "take_r"
+        return {
+            "action": "close_all_in_profit",
+            "reason": f"aggregate_r={aggregate_r:.4f} >= take_r={cfg.take_r} (hard take)",
+            "trail": trail_info,
+        }
+
+    if peak_r >= cfg.arm_trail_r:
+        trail_stop_r = max(peak_r * cfg.trail_keep_frac, cfg.resolve_target_r)
+        if aggregate_r <= trail_stop_r:
+            trail_info["close_r"] = round(aggregate_r, 4)
+            trail_info["trail_stop_r"] = round(trail_stop_r, 4)
+            trail_info["trigger"] = "trail_stop"
+            return {
+                "action": "close_all_in_profit",
+                "reason": (
+                    f"aggregate_r={aggregate_r:.4f} retraced to trail_stop_r={trail_stop_r:.4f} "
+                    f"(peak_r={peak_r:.4f} * trail_keep_frac={cfg.trail_keep_frac}, "
+                    f"floor=resolve_target_r={cfg.resolve_target_r})"
+                ),
+                "trail": trail_info,
+            }
+        return None
+
+    # Not yet armed — let the basket run; no resolve-in-profit this bar.
+    return None
+
+
 def decide_basket_action(
     cfg: BasketConfig,
     agg: dict[str, Any],
     evidence: dict[str, Any],
     now_utc_iso: str,
     daily_state: dict[str, Any] | None = None,
+    basket_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Decide what to do with a live lane basket on this M5 close.
 
     Returns exactly one of:
-      - ``{'action': 'close_all_in_profit'}``
-        when ``aggregate_r >= cfg.resolve_target_r``.
+      - ``{'action': 'close_all_in_profit', 'trail': {...}}``
+        See ``_resolve_profit_action`` — either the pre-fix flat
+        ``resolve_target_r`` bar (``basket_runtime is None``, backward
+        compatible) or the FIX 1 peak-R trail / hard take_r (
+        ``basket_runtime`` supplied). The ``trail`` key is present only in
+        the peak-R-trail path so callers/tests can always see WHY it fired
+        (peak_r, close_r, take_r, trigger).
       - ``{'action': 'add_repair_leg', 'side': ..., 'note': ...}``
         ONLY when ``evidence.level_lost`` AND ``evidence.m5_close_beyond``
         AND ``legs < cfg.max_legs`` AND the worst-case total risk after
@@ -487,12 +587,13 @@ def decide_basket_action(
     aggregate_r = _f(agg.get("aggregate_r"), 0.0)
 
     # Resolve-in-profit target takes priority over repair/cap evaluation,
-    # mirroring BasketManager.on_m5_close's ordering.
-    if aggregate_r >= cfg.resolve_target_r:
-        return {
-            "action": "close_all_in_profit",
-            "reason": f"aggregate_r={aggregate_r:.4f} >= resolve_target_r={cfg.resolve_target_r}",
-        }
+    # mirroring BasketManager.on_m5_close's ordering. FIX 1: routed through
+    # _resolve_profit_action so basket_runtime=None stays byte-identical to
+    # the old flat-bar behavior, while a supplied basket_runtime activates
+    # peak-R trailing (see that function's docstring for the full contract).
+    resolve_action = _resolve_profit_action(cfg, aggregate_r, basket_runtime)
+    if resolve_action is not None:
+        return resolve_action
 
     # Cap checks (time stop / daily loss / would-be max-legs / would-be
     # max-risk with a placeholder repair-sized probe) BEFORE evaluating

@@ -129,7 +129,16 @@ def _executor_config_from_env() -> "ExecutorConfig":
 
 def _basket_config_from_env() -> BasketConfig:
     """Same DEXTER3_DAILY_LOSS_BASKETS knob drives the basket engine's daily
-    cap so the two layers can never disagree about when the day is over."""
+    cap so the two layers can never disagree about when the day is over.
+
+    FIX 2 (2026-07-07): also reads the peak-R trailing knobs so the PM can
+    tune the fix live without a code edit — DEXTER3_ARM_TRAIL_R /
+    DEXTER3_TRAIL_KEEP_FRAC / DEXTER3_TAKE_R / DEXTER3_RESOLVE_TARGET_R.
+    Any missing/invalid env var silently falls back to the BasketConfig
+    dataclass default (same "ignored invalid" posture as
+    _executor_config_from_env below) — a typo'd env var must never crash the
+    live loop, only leave that one knob at its default.
+    """
     kw: dict[str, Any] = {}
     raw = os.environ.get("DEXTER3_DAILY_LOSS_BASKETS")
     if raw:
@@ -137,7 +146,70 @@ def _basket_config_from_env() -> BasketConfig:
             kw["daily_loss_baskets"] = int(raw)
         except ValueError:
             pass
+    for env, field in (
+        ("DEXTER3_ARM_TRAIL_R", "arm_trail_r"),
+        ("DEXTER3_TRAIL_KEEP_FRAC", "trail_keep_frac"),
+        ("DEXTER3_TAKE_R", "take_r"),
+        ("DEXTER3_RESOLVE_TARGET_R", "resolve_target_r"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field] = float(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
     return BasketConfig(**kw)
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 (2026-07-07) — per-basket peak-R runtime state (persisted in the
+# shadow state file, keyed by the basket's oldest_open_ts so it survives a
+# loop restart and naturally resets when a brand-new basket opens under a
+# different oldest leg).
+# ---------------------------------------------------------------------------
+
+
+def _basket_runtime_for(
+    state: dict[str, Any], symbol: str, oldest_open_ts: str | None, aggregate_r: float
+) -> dict[str, Any]:
+    """Return the up-to-date basket_runtime dict for ``symbol``'s current
+    lane basket, updating peak_r = max(previous_peak_r, aggregate_r) BEFORE
+    returning it (basket_live._resolve_profit_action expects the caller to
+    have already folded this bar's aggregate_r into peak_r — see its
+    docstring). Persists into ``state`` (caller must still call
+    ``save_shadow_state``); resets to a fresh peak_r=aggregate_r whenever the
+    basket's oldest_open_ts changes (a new basket opened — the previous
+    basket's peak must never leak into a new one) or is absent (lane just
+    went flat then reopened).
+    """
+    runtimes = state.setdefault("basket_runtime", {})
+    existing = runtimes.get(symbol) or {}
+    if not oldest_open_ts or existing.get("oldest_open_ts") != oldest_open_ts:
+        # New basket (or first observation) — fresh peak starting at this bar.
+        runtime = {"oldest_open_ts": oldest_open_ts, "peak_r": aggregate_r}
+    else:
+        runtime = dict(existing)
+        runtime["peak_r"] = max(_f(existing.get("peak_r"), aggregate_r), aggregate_r)
+    runtimes[symbol] = runtime
+    return runtime
+
+
+def _clear_basket_runtime(state: dict[str, Any], symbol: str) -> None:
+    """Reset a symbol's basket_runtime once its lane goes flat (basket
+    resolved — close_all_in_profit or close_all_cap_stop) so the NEXT basket
+    starts its peak-R tracking from zero rather than inheriting a stale
+    peak from the basket that just closed."""
+    runtimes = state.setdefault("basket_runtime", {})
+    runtimes.pop(symbol, None)
+
+
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _daily_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -646,12 +718,23 @@ def _manage_lane_basket(
     sides = agg.get("sides", {}) or {}
     basket_side = "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
     evidence = basket_live.structure_evidence(lens, prefix, basket_side, agg.get("weighted_entry"))
+
+    # FIX 2 (2026-07-07): maintain per-basket peak-R runtime state (keyed by
+    # oldest_open_ts) BEFORE calling decide_basket_action, so the peak-R
+    # trailing path in basket_live._resolve_profit_action activates on the
+    # REAL lane basket (not just in unit tests). aggregate_r is already
+    # broker-derived PnL (aggregate_lane's aggregate_r), so peak_r here
+    # tracks real R, not a simulated proxy.
+    basket_runtime = _basket_runtime_for(
+        state, symbol, agg.get("oldest_open_ts"), _f(agg.get("aggregate_r"), 0.0)
+    )
     action = basket_live.decide_basket_action(
         _basket_config_from_env(),
         agg,
         evidence,
         now_utc_iso=utc_now_iso(),
         daily_state={"daily_loss_baskets": int(daily.get("loss_baskets", 0))},
+        basket_runtime=basket_runtime,
     )
     act = str(action.get("action") or "hold")
     executed: dict[str, Any] = dict(action)
@@ -662,6 +745,10 @@ def _manage_lane_basket(
         executed["exec"] = executor.execute_close_all(ids, reason=act)
         if act == "close_all_cap_stop" and float(agg.get("aggregate_pnl_usd") or 0.0) < 0:
             daily["loss_baskets"] = int(daily.get("loss_baskets", 0)) + 1
+        # Basket resolved (either path) — the lane is now flat; clear the
+        # peak-R runtime so the NEXT basket starts tracking from zero
+        # instead of inheriting this basket's peak.
+        _clear_basket_runtime(state, symbol)
     elif act == "add_repair_leg":
         repair_side = str(action.get("side") or ("sell" if basket_side == "buy" else "buy"))
         entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)

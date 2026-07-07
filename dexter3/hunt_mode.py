@@ -35,9 +35,21 @@ WEIGHT_SWING_STRUCTURE = 1.2
 WEIGHT_DAY_RANGE_TILT = 1.0
 WEIGHT_DISPLACEMENT = 0.8
 WEIGHT_COMPRESSION_RELEASE = 0.8
-WEIGHT_M15_DRIFT = 1.0
+# FIX 3 (2026-07-07): rebalanced 1.0->1.3. Diagnosis: the committee shorted
+# INTO strength (28 of 34 shorts clustered at range tops per the 2026-05-20
+# adversarial-awareness audit; the 2026-07-06/07 real-fill review showed the
+# same pattern — sell side -$116 vs buy +$5) because day_range_tilt's
+# mean-reversion vote (w=1.0) out-muscled the trend-following members. Bumping
+# m15_drift's weight strengthens the trend-following voice in the raw sum
+# (see _run_committee/_committee_side_and_conviction), on top of the new
+# trend_agreement conviction-penalty step below (_apply_trend_agreement_guard)
+# which additionally reshapes side/size when the two are in direct conflict.
+WEIGHT_M15_DRIFT = 1.3
 WEIGHT_SWEEP_RECLAIM_OVERRIDE = 1.5
-WEIGHT_H1_CONTEXT = 0.6
+# FIX 3: rebalanced 0.6->0.9 — same rationale as WEIGHT_M15_DRIFT above; H1
+# context is the higher-timeframe trend voice and was under-weighted enough
+# that day_range_tilt (a pure mean-reversion vote) could dominate it 1:0.6.
+WEIGHT_H1_CONTEXT = 0.9
 
 TOTAL_COMMITTEE_WEIGHT = (
     WEIGHT_CLOSE_LOCATION_PRESSURE
@@ -49,6 +61,30 @@ TOTAL_COMMITTEE_WEIGHT = (
     + WEIGHT_SWEEP_RECLAIM_OVERRIDE
     + WEIGHT_H1_CONTEXT
 )
+
+# ---------------------------------------------------------------------------
+# FIX 3 (2026-07-07) — trend-agreement conviction guard constants
+# ---------------------------------------------------------------------------
+# trend_agreement = the SIGNED average of the m15_drift and h1_context raw
+# vote components (each already in [-1, 1] — see _vote_m15_drift/_vote_h1_context).
+# A "strong ALIGNED trend" means both members agree in sign AND
+# abs(trend_agreement) clears this threshold — the same 0.5 the blueprint
+# uses elsewhere as a "strong signal" bar (see day_range_position shelf
+# thresholds 0.78/0.22, a comparable "clearly one-sided" cutoff).
+TREND_AGREEMENT_THRESHOLD = 0.5
+
+# When the committee's chosen side OPPOSES a strong aligned trend, conviction
+# is halved (this reshapes SIZE — small vs scout — never participation; the
+# blueprint's "participation-first" contract is preserved, see decide_hunt).
+COUNTER_TREND_CONVICTION_PENALTY_MULT = 0.5
+
+# The counter-trend side is only allowed to stand (not flipped toward the
+# trend) when its own weighted evidence is at least this much stronger than
+# the trend's pull, OR a confirmed sweep_reclaim fired in the counter-trend
+# direction (a sweep-reclaim is itself structural evidence of a genuine
+# reversal, not mean-reversion noise — see _vote_sweep_reclaim's docstring:
+# market_lens only reports value=True once the reclaim already confirmed).
+COUNTER_TREND_OVERRIDE_STRENGTH_MULT = 1.2
 
 # ---------------------------------------------------------------------------
 # geometry constants
@@ -336,6 +372,112 @@ def _committee_side_and_conviction(
 
 
 # ---------------------------------------------------------------------------
+# FIX 3 (2026-07-07) — trend-agreement conviction guard
+# ---------------------------------------------------------------------------
+
+
+def _trend_agreement(committee: dict[str, dict[str, Any]]) -> tuple[float, str | None]:
+    """Return (trend_agreement, trend_side) from the m15_drift + h1_context
+    committee members' raw (unweighted) votes.
+
+    trend_agreement = the signed average of the two members' ``vote`` fields
+    (each already in [-1, 1]) — a plain, auditable stat, not an indicator.
+    trend_side is 'buy'/'sell' when BOTH members agree in sign (a real
+    "aligned trend"); None when they disagree (no aligned trend to guard
+    against — day_range_tilt's mean-reversion vote is then free to dominate,
+    per spec: "day_range_tilt ... only let it dominate when NOT against an
+    aligned trend").
+    """
+    m15_vote = _f((committee.get("m15_drift") or {}).get("vote"), 0.0)
+    h1_vote = _f((committee.get("h1_context") or {}).get("vote"), 0.0)
+    agreement = (m15_vote + h1_vote) / 2.0
+    if _sign(m15_vote) != 0 and _sign(m15_vote) == _sign(h1_vote):
+        trend_side = "buy" if m15_vote > 0 else "sell"
+    else:
+        trend_side = None
+    return agreement, trend_side
+
+
+def _apply_trend_agreement_guard(
+    side: str,
+    conviction: float,
+    committee: dict[str, dict[str, Any]],
+) -> tuple[str, float, dict[str, Any]]:
+    """FIX 3: reshape (side, conviction) when the committee's chosen side
+    OPPOSES a strong aligned trend. Never turns into a skip (participation-
+    first stays, per blueprint HUNT MODE contract v2) — this only reshapes
+    side/size, mirroring the FIX 3 spec verbatim.
+
+    A "strong aligned trend" = m15_drift AND h1_context agree in sign AND
+    ``abs(trend_agreement) >= TREND_AGREEMENT_THRESHOLD``. When the
+    committee's ``side`` is the OPPOSITE of that trend_side:
+      1. Conviction is halved (``COUNTER_TREND_CONVICTION_PENALTY_MULT``) —
+         this alone pushes many borderline counter-trend entries from
+         size_class='small' down to 'scout' (see decide_hunt's
+         CONVICTION_SMALL_FLOOR gate), i.e. it "requires the opposing votes
+         to be stronger" to still qualify for full size.
+      2. If the counter-trend evidence is NOT strong enough to justify
+         standing against the trend — defined as: no confirmed
+         ``sweep_reclaim`` fired in the counter-trend (committee's chosen)
+         direction, AND the committee's own weighted_sum magnitude is not
+         at least ``COUNTER_TREND_OVERRIDE_STRENGTH_MULT`` times the raw
+         trend pull — the side is FLIPPED toward the trend instead. This is
+         the "else flip toward trend if the counter-trend evidence isn't a
+         confirmed sweep_reclaim" clause: a confirmed sweep_reclaim is
+         allowed to stand (it IS structural evidence of a genuine reversal,
+         not mean-reversion noise), everything weaker gets flipped.
+
+    Returns (final_side, final_conviction, detail) — detail is always
+    present (even when the guard does not fire) so the decision's features
+    snapshot can show why/why-not for every entry, not just the flipped ones.
+    """
+    agreement, trend_side = _trend_agreement(committee)
+    detail: dict[str, Any] = {
+        "trend_agreement": round(agreement, 6),
+        "trend_side": trend_side,
+        "threshold": TREND_AGREEMENT_THRESHOLD,
+        "fired": False,
+    }
+
+    if trend_side is None or abs(agreement) < TREND_AGREEMENT_THRESHOLD:
+        detail["reason"] = "no_strong_aligned_trend"
+        return side, conviction, detail
+
+    if side == trend_side:
+        detail["reason"] = "side_already_aligned_with_trend"
+        return side, conviction, detail
+
+    # side OPPOSES a strong aligned trend — the counter-trend case.
+    detail["fired"] = True
+    penalized_conviction = round(conviction * COUNTER_TREND_CONVICTION_PENALTY_MULT, 6)
+
+    sweep = committee.get("sweep_reclaim") or {}
+    sweep_detail = sweep.get("detail") or {}
+    confirmed_sweep_reclaim_counter_trend = bool(sweep_detail.get("fired")) and sweep_detail.get("side") == side
+
+    weighted_sum = sum(m["weighted"] for m in committee.values())
+    trend_pull = abs(agreement) * (WEIGHT_M15_DRIFT + WEIGHT_H1_CONTEXT) / 2.0
+    strong_enough_to_stand = abs(weighted_sum) >= COUNTER_TREND_OVERRIDE_STRENGTH_MULT * trend_pull
+
+    detail.update(
+        {
+            "penalized_conviction": penalized_conviction,
+            "confirmed_sweep_reclaim_counter_trend": confirmed_sweep_reclaim_counter_trend,
+            "weighted_sum": round(weighted_sum, 6),
+            "trend_pull": round(trend_pull, 6),
+            "strong_enough_to_stand": strong_enough_to_stand,
+        }
+    )
+
+    if confirmed_sweep_reclaim_counter_trend or strong_enough_to_stand:
+        detail["reason"] = "counter_trend_evidence_strong_enough_to_stand (penalized conviction only)"
+        return side, penalized_conviction, detail
+
+    detail["reason"] = "counter_trend_evidence_too_weak — flipped toward aligned trend"
+    return trend_side, penalized_conviction, detail
+
+
+# ---------------------------------------------------------------------------
 # geometry
 # ---------------------------------------------------------------------------
 
@@ -605,7 +747,11 @@ def decide_hunt(
         return veto
 
     committee = _run_committee(lens_computed, m15, h1)
-    side, conviction, dominant = _committee_side_and_conviction(committee, lens_computed)
+    raw_side, raw_conviction, dominant = _committee_side_and_conviction(committee, lens_computed)
+
+    # FIX 3 (2026-07-07): trend-agreement guard — reshapes side/conviction
+    # only, never participation (see _apply_trend_agreement_guard docstring).
+    side, conviction, trend_guard_detail = _apply_trend_agreement_guard(raw_side, raw_conviction, committee)
 
     entry = _f(m5_bars[-1].get("close"))
     sl, sl_detail = _compute_sl(side, entry, lens_computed, m5_bars, spread_abs)
@@ -616,11 +762,21 @@ def decide_hunt(
     setup = f"hunt_{dominant}"
 
     reasons = _build_reasons(side, conviction, dominant, committee, sl_detail, tp_detail)
+    if trend_guard_detail.get("fired"):
+        reasons.append(
+            "TREND GUARD / ป้องกันสวนเทรนด์: "
+            f"raw_side={raw_side} vs trend_side={trend_guard_detail.get('trend_side')} "
+            f"(agreement={trend_guard_detail.get('trend_agreement')}) -> final_side={side}, "
+            f"conviction {raw_conviction:.3f}->{conviction:.3f} ({trend_guard_detail.get('reason')})"
+        )
 
     features_snapshot["hunt_committee"] = committee
     features_snapshot["hunt_geometry"] = {"sl": sl_detail, "tp": tp_detail}
     features_snapshot["hunt_conviction"] = conviction
     features_snapshot["hunt_dominant_member"] = dominant
+    features_snapshot["hunt_raw_side"] = raw_side
+    features_snapshot["hunt_raw_conviction"] = raw_conviction
+    features_snapshot["hunt_trend_guard"] = trend_guard_detail
 
     return Decision(
         ts_close=ts_close,

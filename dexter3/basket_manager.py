@@ -45,7 +45,42 @@ class BasketConfig:
     max_basket_risk_mult: float = 3.0
     time_stop_min: int = 180
     daily_loss_baskets: int = 2
+    # resolve_target_r: ORIGINAL semantics (BasketManager.on_m5_close, the
+    # paper/simulated path used by shadow_runner.PaperBasket) is unchanged —
+    # "close_all_in_profit fires the instant aggregate_r >= resolve_target_r".
+    # dexter3.basket_live.decide_basket_action (the REAL-position path)
+    # reinterprets this SAME field as documented below once a
+    # ``basket_runtime`` dict is supplied by the caller (peak-R trailing) —
+    # see basket_live.py module docstring "FIX 1" for the full contract.
+    # Backward-compat: BasketManager (this module) and decide_basket_action
+    # called WITHOUT basket_runtime (the default) behave EXACTLY as before —
+    # resolve_target_r is still a flat "close the instant we reach it" bar.
     resolve_target_r: float = 0.2
+
+    # -- FIX 1 (2026-07-07): peak-R basket trailing, real-position path only --
+    # These three constants are read ONLY by dexter3.basket_live.decide_basket_action
+    # when the caller passes a non-None ``basket_runtime`` dict (peak_r state).
+    # They do nothing to BasketManager/PaperBasket (backward-compat).
+    #
+    # arm_trail_r: once the basket's peak aggregate_r (the best R the basket
+    # has ever reached, tracked by the caller across M5 closes) reaches this
+    # threshold, the trailing-stop mechanism "arms" — before that, a small
+    # green basket is left alone (no premature banking at +0.2R, the bug this
+    # fix repairs: hunt_mode's own TP is 1.2R but basket_live used to bank
+    # winners at +0.2R, creating the avg_win/avg_loss=0.48 asymmetry that
+    # produced a 0.61 profit factor despite a 56% win rate).
+    arm_trail_r: float = 0.5
+
+    # trail_keep_frac: once armed, close_all fires when aggregate_r retraces
+    # to peak_r * trail_keep_frac — i.e. we bank this fraction of the best R
+    # the basket ever reached. 0.6 = give back at most 40% of the peak.
+    trail_keep_frac: float = 0.6
+
+    # take_r: hard take-profit — close_all unconditionally once aggregate_r
+    # reaches this, regardless of trailing state. Set just under hunt_mode's
+    # own 1.2R TP (MIN_REWARD_RISK) so the basket engine itself locks the
+    # win before/at the same level the original per-leg TP would.
+    take_r: float = 1.1
 
 
 @dataclass

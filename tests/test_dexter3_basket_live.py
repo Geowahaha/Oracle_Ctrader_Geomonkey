@@ -642,3 +642,183 @@ def test_enforce_caps_unbreachable_time_stop_via_iso_timestamps() -> None:
             )
         else:
             assert result is None, f"trial={trial}: age={age_min:.2f}min < cap={time_stop_min} but a cap fired: {result}"
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 (2026-07-07) — peak-R basket trailing (basket_runtime param)
+#
+# Diagnosis this fix repairs: hunt_mode sets per-leg TP at 1.2R, but the OLD
+# basket_live resolve fired the instant aggregate_r >= resolve_target_r=0.2R
+# — winners were banked at ~+0.2R while losers ran to the full -1R SL,
+# avg_win/avg_loss=0.48 -> PF 0.61 despite a 56% win rate. FIX 1 lets winners
+# run (peak-R tracking) while still banking a defined fraction once armed,
+# or hitting a hard take_r ceiling — see basket_live._resolve_profit_action.
+# ---------------------------------------------------------------------------
+
+
+def test_basket_runtime_none_is_byte_identical_to_pre_fix_flat_bar() -> None:
+    """The backward-compat contract: omitting basket_runtime (the default)
+    must behave EXACTLY like the pre-fix flat resolve_target_r bar — this is
+    what keeps every pre-existing test in this file (and the paper/simulated
+    BasketManager path) green without modification."""
+    cfg = BasketConfig(resolve_target_r=0.2, arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=0.25)
+    result = basket_live.decide_basket_action(cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {})
+    assert result["action"] == "close_all_in_profit"
+    assert "trail" not in result  # pre-fix path never attaches trail detail
+
+
+def test_trail_not_armed_below_arm_trail_r_lets_basket_run() -> None:
+    """A small green basket (peak_r below arm_trail_r) must NOT close —
+    this is the core behavior change: no more banking winners at +0.2R."""
+    cfg = BasketConfig(resolve_target_r=0.2, arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=0.25)  # would have closed under the OLD flat bar
+    runtime = {"peak_r": 0.25}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "hold", "basket must keep running below arm_trail_r, not bank a small green"
+
+
+def test_trail_armed_holds_while_still_near_peak() -> None:
+    """Once armed (peak_r >= arm_trail_r), the basket keeps running as long
+    as aggregate_r has not retraced down to the trail-stop level."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=0.9)  # peak_r=0.9 -> trail_stop = 0.9*0.6=0.54; 0.9 > 0.54
+    runtime = {"peak_r": 0.9}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "hold"
+
+
+def test_trail_closes_when_retraced_to_keep_frac_of_peak() -> None:
+    """The headline behavior: once armed, retracing to peak_r*trail_keep_frac
+    closes the basket, banking that fraction of the best R ever reached."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    peak_r = 0.9
+    trail_stop = peak_r * 0.6  # 0.54
+    agg = _agg(legs=1, aggregate_r=trail_stop)
+    runtime = {"peak_r": peak_r}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "close_all_in_profit"
+    assert result["trail"]["trigger"] == "trail_stop"
+    assert result["trail"]["peak_r"] == pytest.approx(peak_r)
+    assert result["trail"]["trail_stop_r"] == pytest.approx(trail_stop)
+
+
+def test_trail_closes_below_keep_frac_too() -> None:
+    """Retracing PAST the trail-stop level (not just exactly to it) must
+    also close — the trigger is a <=, not an exact-equality tripwire."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=0.3)  # below trail_stop=0.54
+    runtime = {"peak_r": 0.9}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "close_all_in_profit"
+    assert result["trail"]["trigger"] == "trail_stop"
+
+
+def test_trail_stop_never_below_resolve_target_r_floor() -> None:
+    """resolve_target_r is repurposed as the MINIMUM profit ever worth
+    closing for: with a small peak (just above arm_trail_r), keep_frac math
+    alone could imply a trail-stop below the floor — the floor must win."""
+    cfg = BasketConfig(resolve_target_r=0.15, arm_trail_r=0.5, trail_keep_frac=0.2, take_r=1.1)
+    # peak_r=0.5 -> naive trail_stop = 0.5*0.2 = 0.10, but floor=0.15 must apply.
+    agg = _agg(legs=1, aggregate_r=0.12)  # below naive trail_stop but ABOVE the floor's own trigger? check below
+    runtime = {"peak_r": 0.5}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    # aggregate_r=0.12 <= max(0.10, 0.15)=0.15 -> closes at the floor, not the naive lower trail math
+    assert result["action"] == "close_all_in_profit"
+    assert result["trail"]["trail_stop_r"] == pytest.approx(0.15)
+
+
+def test_hard_take_r_closes_unconditionally() -> None:
+    """Reaching take_r closes immediately even if the trail math would have
+    allowed the basket to keep running (peak_r not yet updated past take_r,
+    or trail_keep_frac would have permitted further upside)."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=1.1)
+    runtime = {"peak_r": 1.1}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "close_all_in_profit"
+    assert result["trail"]["trigger"] == "take_r"
+
+
+def test_hard_take_r_takes_priority_over_trail_stop() -> None:
+    """Above take_r, the hard-take path fires even though trail math (peak_r
+    * trail_keep_frac) would also technically not have closed yet."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=1.15)
+    runtime = {"peak_r": 1.15}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["trail"]["trigger"] == "take_r"
+
+
+def test_peak_r_caller_understates_is_corrected_defensively() -> None:
+    """If the caller passes a stale/understated peak_r (e.g. forgot to
+    update it with this bar's own aggregate_r before calling), the function
+    must not let that suppress a legitimate hard-take close."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=1.2)
+    runtime = {"peak_r": 0.3}  # understated vs. this bar's own aggregate_r=1.2
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "close_all_in_profit"
+    assert result["trail"]["trigger"] == "take_r"
+    assert result["trail"]["peak_r"] == pytest.approx(1.2)  # corrected, not the stale 0.3
+
+
+def test_trail_never_bypasses_caps_repair_still_gated() -> None:
+    """Adversarial: even with basket_runtime supplied and the trail NOT
+    firing (basket held below arm_trail_r or negative), repair/cap logic
+    downstream of _resolve_profit_action must still behave exactly as
+    documented — the trail path must never become a second, ungated repair
+    channel. Confirms cap enforcement still fires for a losing, capped-out
+    basket even when basket_runtime is present."""
+    cfg = BasketConfig(max_legs=2, arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=2, aggregate_r=-0.5, sides={"buy": 2, "sell": 0})
+    runtime = {"peak_r": 0.1}  # never armed; basket is currently negative
+    evidence = _evidence(True, True)
+    result = basket_live.decide_basket_action(
+        cfg, agg, evidence, "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "hold"
+    assert result.get("cap") == "max_legs"
+
+
+def test_trail_never_closes_below_arm_threshold_even_if_negative_peak_tracked() -> None:
+    """peak_r tracks the BEST R seen — even if currently negative, a
+    negative peak_r must never satisfy arm_trail_r (a positive threshold)
+    and must never spuriously close."""
+    cfg = BasketConfig(arm_trail_r=0.5, trail_keep_frac=0.6, take_r=1.1)
+    agg = _agg(legs=1, aggregate_r=-0.3)
+    runtime = {"peak_r": -0.1}
+    result = basket_live.decide_basket_action(
+        cfg, agg, _evidence(), "2026-07-05T09:10:00Z", {}, basket_runtime=runtime
+    )
+    assert result["action"] == "hold"
+
+
+def test_resolve_profit_action_directly_backward_compat_none_runtime() -> None:
+    cfg = BasketConfig(resolve_target_r=0.3)
+    assert basket_live._resolve_profit_action(cfg, 0.35, None) is not None
+    assert basket_live._resolve_profit_action(cfg, 0.29, None) is None
+
+
+def test_new_basket_config_defaults_match_spec() -> None:
+    cfg = BasketConfig()
+    assert cfg.arm_trail_r == 0.5
+    assert cfg.trail_keep_frac == 0.6
+    assert cfg.take_r == 1.1
+    assert cfg.resolve_target_r == 0.2  # unchanged default, now dual-purpose

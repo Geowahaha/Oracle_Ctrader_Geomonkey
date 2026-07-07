@@ -269,3 +269,100 @@ def test_repair_geometry_cost_guards(side):
         assert sl < entry < tp
     else:
         assert tp < entry < sl
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 (2026-07-07) — per-basket peak-R runtime state wiring
+# ---------------------------------------------------------------------------
+
+
+def test_basket_runtime_for_fresh_basket_starts_at_this_bars_aggregate_r():
+    state: dict = {}
+    runtime = sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.3)
+    assert runtime["peak_r"] == pytest.approx(0.3)
+    assert runtime["oldest_open_ts"] == "2026-07-06T10:00:00Z"
+    assert state["basket_runtime"]["XAUUSD"] == runtime
+
+
+def test_basket_runtime_for_tracks_peak_across_calls_same_basket():
+    state: dict = {}
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.3)
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.7)  # new high -> peak updates
+    runtime = sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.4)  # retrace -> peak holds
+    assert runtime["peak_r"] == pytest.approx(0.7)
+
+
+def test_basket_runtime_for_resets_on_new_oldest_open_ts():
+    state: dict = {}
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.9)  # basket A peaks at 0.9
+    # Basket A resolved, a brand-new basket B opens with a different oldest leg.
+    runtime = sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T14:00:00Z", 0.1)
+    assert runtime["peak_r"] == pytest.approx(0.1), "new basket must not inherit the old basket's peak"
+    assert runtime["oldest_open_ts"] == "2026-07-06T14:00:00Z"
+
+
+def test_basket_runtime_for_resets_when_oldest_open_ts_missing():
+    state: dict = {}
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.9)
+    runtime = sr._basket_runtime_for(state, "XAUUSD", None, 0.05)
+    assert runtime["peak_r"] == pytest.approx(0.05)
+
+
+def test_basket_runtime_for_per_symbol_isolation():
+    state: dict = {}
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.8)
+    sr._basket_runtime_for(state, "BTCUSD", "2026-07-06T10:00:00Z", 0.1)
+    assert state["basket_runtime"]["XAUUSD"]["peak_r"] == pytest.approx(0.8)
+    assert state["basket_runtime"]["BTCUSD"]["peak_r"] == pytest.approx(0.1)
+
+
+def test_clear_basket_runtime_removes_symbol_entry():
+    state: dict = {}
+    sr._basket_runtime_for(state, "XAUUSD", "2026-07-06T10:00:00Z", 0.8)
+    sr._clear_basket_runtime(state, "XAUUSD")
+    assert "XAUUSD" not in state.get("basket_runtime", {})
+
+
+def test_clear_basket_runtime_noop_when_absent():
+    state: dict = {}
+    sr._clear_basket_runtime(state, "XAUUSD")  # must not raise
+    assert state.get("basket_runtime", {}) == {}
+
+
+def test_basket_config_from_env_reads_new_trail_knobs(monkeypatch):
+    monkeypatch.setenv("DEXTER3_ARM_TRAIL_R", "0.4")
+    monkeypatch.setenv("DEXTER3_TRAIL_KEEP_FRAC", "0.7")
+    monkeypatch.setenv("DEXTER3_TAKE_R", "1.3")
+    monkeypatch.setenv("DEXTER3_RESOLVE_TARGET_R", "0.25")
+    cfg = sr._basket_config_from_env()
+    assert cfg.arm_trail_r == pytest.approx(0.4)
+    assert cfg.trail_keep_frac == pytest.approx(0.7)
+    assert cfg.take_r == pytest.approx(1.3)
+    assert cfg.resolve_target_r == pytest.approx(0.25)
+
+
+def test_basket_config_from_env_defaults_when_unset(monkeypatch):
+    for env in (
+        "DEXTER3_ARM_TRAIL_R",
+        "DEXTER3_TRAIL_KEEP_FRAC",
+        "DEXTER3_TAKE_R",
+        "DEXTER3_RESOLVE_TARGET_R",
+        "DEXTER3_DAILY_LOSS_BASKETS",
+    ):
+        monkeypatch.delenv(env, raising=False)
+    cfg = sr._basket_config_from_env()
+    from dexter3.basket_manager import BasketConfig
+
+    default = BasketConfig()
+    assert cfg.arm_trail_r == default.arm_trail_r
+    assert cfg.trail_keep_frac == default.trail_keep_frac
+    assert cfg.take_r == default.take_r
+    assert cfg.resolve_target_r == default.resolve_target_r
+
+
+def test_basket_config_from_env_ignores_invalid_value(monkeypatch):
+    monkeypatch.setenv("DEXTER3_ARM_TRAIL_R", "not_a_float")
+    cfg = sr._basket_config_from_env()
+    from dexter3.basket_manager import BasketConfig
+
+    assert cfg.arm_trail_r == BasketConfig().arm_trail_r  # falls back to default, does not raise
