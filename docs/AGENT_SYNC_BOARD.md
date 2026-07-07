@@ -440,6 +440,13 @@ Format each entry:
 - Sonnet building `dexter3/daily_governor.py` + runner wiring + risk_usd_override (additive) on execute_entry. Loop keeps running meanwhile (OM ticking, London/NY overlap in progress).
 - Next (fable): review + deploy tonight during NY with DEXTER3_CAPITAL_USD=1000 TARGET=100 LOSS=50; measure PF of the fixed stack.
 
+### 2026-07-07 UTC 16:20Z — claude-fable (PM) — Governor 12-0 run + three live bugs fixed; V1.0/V1.1 tagged
+
+- Governor era results: **12-0 wins** (+~$16) but avg win ~$1.3 on $14.4 risk exposed 3 live bugs, all fixed (`816e7ee`,`b12785c`): (1) aggregate_r used static $0.50 base while governor sized $14.4 → R inflated 29× → OM banked winners at +$0.60; now `_lane_actual_risk_usd()`=Σ|entry−SL|×vol at all 3 sites. (2) deals timestamp key is `time` → governor realized-today was permanently $0. (3) zero-pnl open-side rows zeroed the win streak (ladder never pressed; now streak reads 12 → next entry ×2.0). Deals window 200→500.
+- **Rollback anchors per owner:** tags `v1.0-dexter3-mission` (02be547) + `v1.1-dexter3-truerisk` (b12785c) pushed.
+- V1.1 live 16:18:20Z. Expectation shift: winners now target real 0.4-1.2R ($6-17+) instead of $0.60-2.60; ladder presses streaks; target-lock/loss-stop now on true realized numbers.
+- Next (fable): measure V1.1 PF + governor lock behavior; owner wants ≥10%/day — house-money ratchet (floor at +$100, upside open) is the next candidate, env-flagged.
+
 ---
 
 **Cross-links**
