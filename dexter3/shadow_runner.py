@@ -60,6 +60,7 @@ if str(ROOT) not in sys.path:
 
 from dexter3 import basket_live, empirical_stats, hunt_mode, hunter_brain, market_lens, skip_evaluator
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
+from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
@@ -198,6 +199,39 @@ def _om_config_from_env() -> OMConfig:
     return OMConfig(**kw)
 
 
+def _governor_config_from_env() -> GovernorConfig:
+    """Daily Mission Governor knobs (owner directive 2026-07-07): chase
+    $100/day on a $1000 virtual capital base, aggressively but survivably.
+    Same "ignored invalid falls back to default" posture as every other
+    ``_*_config_from_env`` builder in this file — a typo'd env var must
+    never crash the live loop, only leave that one knob at its default.
+
+    Env vars: DEXTER3_CAPITAL_USD, DEXTER3_DAILY_TARGET_USD,
+    DEXTER3_DAILY_LOSS_USD, DEXTER3_BASE_RISK_FRAC, DEXTER3_MAX_RISK_FRAC.
+    """
+    kw: dict[str, Any] = {}
+    for env, field_name in (
+        ("DEXTER3_CAPITAL_USD", "capital_usd"),
+        ("DEXTER3_DAILY_TARGET_USD", "daily_target_usd"),
+        ("DEXTER3_DAILY_LOSS_USD", "daily_loss_usd"),
+        ("DEXTER3_BASE_RISK_FRAC", "base_risk_frac"),
+        ("DEXTER3_MAX_RISK_FRAC", "max_risk_frac"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field_name] = float(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    cfg = GovernorConfig(**kw)
+    log_line(
+        f"{utc_now_iso()} governor config: capital_usd={cfg.capital_usd} "
+        f"daily_target_usd={cfg.daily_target_usd} daily_loss_usd={cfg.daily_loss_usd} "
+        f"base_risk_frac={cfg.base_risk_frac} max_risk_frac={cfg.max_risk_frac}"
+    )
+    return cfg
+
+
 def _fast_tick_sec_from_env() -> int:
     raw = os.environ.get("DEXTER3_FAST_TICK_SEC")
     if raw:
@@ -271,6 +305,100 @@ def _daily_state(state: dict[str, Any]) -> dict[str, Any]:
         daily.clear()
         daily.update({"date": today, "entries": 0, "loss_baskets": 0})
     return daily
+
+
+def _governor_state_for(state: dict[str, Any]) -> dict[str, Any]:
+    """Per-UTC-day Daily Mission Governor state persisted in the shadow
+    state file: ``{date, state, locked_pnl}``. Once TARGET_LOCKED or
+    LOSS_STOPPED fires it STAYS for the rest of the UTC day even if a later
+    tick's effective PnL would otherwise read back as HUNTING (e.g. floating
+    PnL wobbles back under the target after a close-all) — the day is over,
+    full stop. Automatically re-arms (resets to HUNTING) the moment the UTC
+    date rolls over, same rollover mechanics as ``_daily_state`` above.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    gov = state.setdefault("governor", {})
+    if gov.get("date") != today:
+        gov.clear()
+        gov.update({"date": today, "state": "HUNTING", "locked_pnl": None})
+    return gov
+
+# ---------------------------------------------------------------------------
+# Daily Mission Governor (owner directive 2026-07-07) — realized PnL cache
+# ---------------------------------------------------------------------------
+# get_deals is a real MCP read (network round-trip) and must never be called
+# every ~4s fast tick — it is cached for LANE_REALIZED_CACHE_SEC and reused
+# across ticks, same "cheap by default, refetch only when stale" posture as
+# _OM_BAR_CACHE below. Keyed by nothing (single account) — module-level like
+# every other cross-tick cache in this file.
+LANE_REALIZED_CACHE_SEC = 60
+_LANE_REALIZED_CACHE: dict[str, Any] = {"epoch": 0.0, "sum": 0.0, "pnls": [], "logged_failure": False}
+
+
+def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fable") -> tuple[float, list[float]]:
+    """Sum of today's (UTC) realized netProfit for our lane + the ordered
+    list of those close PnLs (oldest -> newest), both derived from
+    ``get_deals``. Cached for ``LANE_REALIZED_CACHE_SEC`` — callers on the
+    fast (~4s) tick path must never trigger a fresh MCP read every tick.
+
+    On an MCP failure, returns the last cached value; if there has never
+    been a successful read, returns (0.0, []) and logs the failure exactly
+    once (not every tick) so a persistent outage does not spam the log.
+    """
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    cache = _LANE_REALIZED_CACHE
+    if now_epoch - float(cache.get("epoch", 0.0)) < LANE_REALIZED_CACHE_SEC and cache.get("epoch", 0.0) > 0:
+        return float(cache["sum"]), list(cache["pnls"])
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        deals = mcp.get_deals(count=200)
+    except (McpClientError, McpZombieError) as exc:
+        if not cache.get("logged_failure"):
+            log_line(f"{utc_now_iso()} governor lane_realized_today get_deals_failed (using cached/zero): {exc}")
+            cache["logged_failure"] = True
+        return float(cache.get("sum", 0.0)), list(cache.get("pnls", []))
+
+    dated: list[tuple[str, float]] = []
+    for deal in deals:
+        if not isinstance(deal, dict):
+            continue
+        label = str(deal.get("label") or deal.get("comment") or "")
+        if label_filter not in label:
+            continue
+        ts = str(
+            deal.get("executionTimestamp")
+            or deal.get("closeTimestamp")
+            or deal.get("closingTimestamp")
+            or deal.get("utcLastUpdateTimestamp")
+            or ""
+        )
+        if not ts.startswith(today):
+            continue
+        pnl = None
+        for key in ("netProfit", "profit", "grossProfit", "pnl", "closedNetProfit"):
+            raw = deal.get(key)
+            if raw is None:
+                continue
+            try:
+                pnl = float(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+        if pnl is None:
+            continue
+        dated.append((ts, pnl))
+
+    dated.sort(key=lambda pair: pair[0])
+    pnls = [p for _, p in dated]
+    total = sum(pnls)
+
+    cache["epoch"] = now_epoch
+    cache["sum"] = total
+    cache["pnls"] = pnls
+    cache["logged_failure"] = False
+    return float(total), list(pnls)
+
 
 # -- Phase 2: periodic learning-loop refresh ---------------------------------
 # "every N cycles (default every 15 min)" per spec section 5; expressed in
@@ -655,15 +783,23 @@ def run_symbol_cycle(
         if basket_action is not None:
             status += f":basket_{basket_action.get('action', 'unknown')}"
         elif is_newest and executor is not None and decision.action == "enter":
-            if lane is None:
+            gov = state.get("governor") or {}
+            if gov.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+                # Owner's daily mission rule (2026-07-07) outranks
+                # participation-first for EXECUTION only — the decision above
+                # is still journaled; we just do not put money on it today.
+                status += f":governor_{str(gov.get('state')).lower()}"
+            elif lane is None:
                 status += ":live_skipped_lane_unverified"
             else:
                 daily = _daily_state(state)
+                risk_info = _governor_entry_risk(mcp, decision)
                 exec_result = _execute_live_entry(
                     executor,
                     decision,
                     today_entry_count=int(daily.get("entries", 0)),
                     today_losing_count=int(daily.get("loss_baskets", 0)),
+                    risk_usd_override=(risk_info or {}).get("risk_usd"),
                 )
                 if exec_result.get("action") == "entered":
                     daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -677,6 +813,27 @@ def run_symbol_cycle(
     return ";".join(statuses)
 
 
+def _governor_entry_risk(mcp: Dexter3McpClient, decision: hunter_brain.Decision) -> dict[str, Any] | None:
+    """Daily Mission Governor dynamic sizing for one entry: ladder by today's
+    win streak (stateless, derived from today's closed lane deals) × session
+    multiplier, on the owner's virtual capital base. Never raises — a failure
+    falls back to the executor's static config risk (returns None)."""
+    try:
+        _, pnls = _lane_realized_today(mcp)
+        governor = _get_governor()
+        session = str(((decision.features or {}).get("session_context") or {}).get("value") or "unknown")
+        streak = governor.win_streak_from_closes(pnls)
+        info = governor.risk_for_entry(session, streak)
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} governor sizing risk_usd={info.get('risk_usd')} "
+            f"streak={streak} ladder={info.get('ladder_mult')} session={session}x{info.get('session_mult')}"
+        )
+        return info
+    except Exception as exc:  # noqa: BLE001 - sizing must never block an entry
+        log_line(f"{utc_now_iso()} {decision.symbol} governor_sizing_failed (static risk used): {exc}")
+        return None
+
+
 def _execute_live_entry(
     executor: Dexter3Executor,
     decision: hunter_brain.Decision,
@@ -684,6 +841,7 @@ def _execute_live_entry(
     today_entry_count: int = 0,
     today_losing_count: int = 0,
     repair: bool = False,
+    risk_usd_override: float | None = None,
 ) -> dict[str, Any]:
     """Resolve account state and place a live micro-entry. Never raises."""
     account_state: dict[str, Any] = {}
@@ -708,6 +866,7 @@ def _execute_live_entry(
                 account_state,
                 today_entry_count=today_entry_count,
                 today_losing_count=today_losing_count,
+                risk_usd_override=risk_usd_override,
             )
         else:
             result = executor.execute_entry(
@@ -715,6 +874,7 @@ def _execute_live_entry(
                 account_state,
                 today_entry_count=today_entry_count,
                 today_losing_count=today_losing_count,
+                risk_usd_override=risk_usd_override,
             )
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
         log_error(f"execute_entry({decision.symbol})", exc)
@@ -798,6 +958,11 @@ def _manage_lane_basket(
         # peak-R runtime so the NEXT basket starts tracking from zero
         # instead of inheriting this basket's peak.
         _clear_basket_runtime(state, symbol)
+    elif act == "add_repair_leg" and (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+        # governor lock/stop: never ADD exposure after the day is decided —
+        # existing legs are being closed by run_governor_tick anyway.
+        executed["governor_suppressed"] = True
+        act = "hold"
     elif act == "add_repair_leg":
         repair_side = str(action.get("side") or ("sell" if basket_side == "buy" else "buy"))
         entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)
@@ -1041,6 +1206,7 @@ def run_om_tick(
 
     if not lane:
         _clear_basket_runtime(state, symbol)
+        state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = 0.0
         return "om_no_lane"
 
     m5_bars, m15_bars, h1_bars = _om_bars_for(mcp, symbol)
@@ -1055,6 +1221,12 @@ def run_om_tick(
 
     om = _get_opening_manager(executor, journal)
     agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_om_base_risk_usd(executor))
+    # Daily Mission Governor (owner directive 2026-07-07): record this
+    # symbol's floating PnL for the governor's account-wide floating
+    # aggregate — reuses this same aggregate_lane read, no extra MCP calls.
+    state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = _f(
+        agg_probe.get("aggregate_pnl_usd"), 0.0
+    )
     om_state = {
         "basket_runtime": (state.get("basket_runtime") or {}).get(symbol),
         "now_utc_iso": utc_now_iso(),
@@ -1070,6 +1242,11 @@ def run_om_tick(
         state.setdefault("basket_runtime", {})[symbol] = new_runtime
 
     act = str(action.get("action") or "hold")
+    if act == "add_repair_leg" and (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+        # governor lock/stop: never ADD exposure after the day is decided
+        # (close_all actions still pass — they reduce exposure).
+        act = "hold"
+        action = {**action, "action": "hold", "governor_suppressed": True}
     dry = executor is None
     executed: dict[str, Any] = {}
     if act == "close_all":
@@ -1156,6 +1333,124 @@ def run_om_tick(
     return f"om_{act}"
 
 
+_GOVERNOR_INSTANCE: DailyGovernor | None = None
+
+
+def _get_governor() -> DailyGovernor:
+    global _GOVERNOR_INSTANCE
+    if _GOVERNOR_INSTANCE is None:
+        _GOVERNOR_INSTANCE = DailyGovernor(_governor_config_from_env())
+    return _GOVERNOR_INSTANCE
+
+
+def governor_state_snapshot(state: dict[str, Any]) -> str:
+    """Read-only: the governor's persisted state for TODAY (UTC) without
+    mutating anything. Used by the entry-gate check in ``run_symbol_cycle``
+    so the M5 entry path can refuse to trade a locked/stopped day without
+    itself owning governor evaluation (that only happens in
+    ``run_governor_tick``, once per fast tick, before entries are considered
+    on that same tick)."""
+    gov = state.get("governor") or {}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if gov.get("date") != today:
+        return "HUNTING"  # not yet evaluated today (or stale) -> default open
+    return str(gov.get("state") or "HUNTING")
+
+
+def run_governor_tick(
+    mcp: Dexter3McpClient,
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbols: list[str],
+    *,
+    executor: Dexter3Executor | None,
+) -> str:
+    """Daily Mission Governor evaluation — once per fast tick, AFTER the
+    per-symbol OM loop has populated ``state['governor']['floating_by_symbol']``
+    (see ``run_om_tick``). Never raises: any failure is logged and treated as
+    a no-op tick, same posture as every other fast-tick path in this file.
+
+    On TARGET_LOCKED/LOSS_STOPPED with an open lane on ANY symbol: close
+    every lane position across every symbol and journal a 'governor' basket
+    event. The locked/stopped state then persists in shadow state for the
+    rest of the UTC day (``_governor_state_for``) regardless of what a later
+    tick's effective PnL would read back as — the mission is decided once
+    per day, not re-litigated every 4 seconds.
+    """
+    try:
+        gov_state = _governor_state_for(state)
+        realized, pnls = _lane_realized_today(mcp)
+        floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
+        floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
+
+        governor = _get_governor()
+        status = governor.status(realized, floating)
+        new_state = status["state"]
+
+        # Once locked/stopped, it STAYS locked/stopped for the rest of the
+        # UTC day even if this tick's fresh status would read HUNTING again
+        # (e.g. floating PnL wobbled back under target after the close-all
+        # already fired) — the mission is decided once, not re-litigated.
+        if gov_state.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+            effective_state = gov_state["state"]
+            newly_triggered = False
+        else:
+            effective_state = new_state
+            newly_triggered = new_state in ("TARGET_LOCKED", "LOSS_STOPPED")
+
+        if newly_triggered:
+            gov_state["state"] = effective_state
+            gov_state["locked_pnl"] = status["effective_pnl"]
+            gov_state["triggered_at"] = utc_now_iso()
+
+            # Close every lane position across every symbol.
+            closed_summary: dict[str, Any] = {}
+            if executor is not None:
+                for symbol in symbols:
+                    try:
+                        positions = executor.client.get_positions()
+                    except (McpClientError, McpZombieError) as exc:
+                        log_line(f"{utc_now_iso()} governor close_all read_failed {symbol}: {exc}")
+                        continue
+                    lane = basket_live.lane_positions(positions, LIVE_ORDER_LABEL)
+                    lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
+                    if not lane:
+                        continue
+                    ids = [int(p.get("positionId") or p.get("id") or 0) for p in lane]
+                    ids = [x for x in ids if x > 0]
+                    reason = "governor_target_lock" if effective_state == "TARGET_LOCKED" else "governor_loss_stop"
+                    closed_summary[symbol] = executor.execute_close_all(ids, reason=reason)
+                    _clear_basket_runtime(state, symbol)
+
+            if effective_state == "TARGET_LOCKED":
+                log_line(
+                    f"{utc_now_iso()} \U0001F3AF MISSION COMPLETE +${status['effective_pnl']:.2f} locked "
+                    f"(target=${status['target']:.2f})"
+                )
+            else:
+                log_line(
+                    f"{utc_now_iso()} \U0001F6D1 daily loss cap — protecting capital "
+                    f"(effective=${status['effective_pnl']:.2f}, cap=-${status['loss_cap']:.2f})"
+                )
+
+            journal.insert_basket_event(
+                0,
+                "governor",
+                {
+                    "state": effective_state,
+                    "status": status,
+                    "win_streak": DailyGovernor.win_streak_from_closes(pnls),
+                    "closed": closed_summary,
+                },
+            )
+
+        save_shadow_state(state)
+        return f"governor_{gov_state.get('state', 'HUNTING').lower()}"
+    except Exception as exc:  # noqa: BLE001 - governor tick must never crash the fast loop
+        log_error("run_governor_tick", exc)
+        return "governor_error"
+
+
 def _om_base_risk_usd(executor: Dexter3Executor | None) -> float:
     if executor is not None:
         return _f(getattr(executor.config, "risk_usd", None), 0.5)
@@ -1223,6 +1518,12 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
                         log_line(f"{utc_now_iso()} {symbol} OM MCP_ZOMBIE: {exc}")
                     except Exception as exc:  # noqa: BLE001 - OM tick must never crash the loop
                         log_error(f"run_om_tick({symbol})", exc)
+
+                # Daily Mission Governor (owner directive 2026-07-07): runs
+                # AFTER the OM ticks (floating_by_symbol is fresh) and BEFORE
+                # the M5 entry path so a lock/stop suppresses entries on this
+                # very tick. Guards its own exceptions internally.
+                run_governor_tick(mcp, journal, state, symbols, executor=executor)
 
                 if m5_entry_tick_due(tick_count, poll_sec, fast_tick_sec):
                     try:

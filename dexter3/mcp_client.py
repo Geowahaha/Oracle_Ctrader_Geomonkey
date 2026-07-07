@@ -421,6 +421,25 @@ class Dexter3McpClient:
             return data
         raise McpClientError(f"get_pending_orders returned unexpected payload: {data!r}")
 
+    def get_deals(self, count: int = 200) -> list[dict[str, Any]]:
+        """Fetch the most recent realized deals (read-only).
+
+        The Local MCP's ``get_deals`` tool is paged by ``count`` (per-request
+        cap 200 — see the ctrader-mcp-servers skill's local-http-server
+        reference), NOT by ``from``/``to`` timestamps. Mirrors
+        ``scripts/dexter3_pnl_backtest.py::fetch_deals``'s proven envelope
+        exactly — do not invent a from/to-windowed call here; callers that
+        need "today's deals" filter the returned list client-side by each
+        deal's own timestamp field (see ``dexter3.daily_governor`` callers).
+        """
+        data = self.call("get_deals", {"count": max(1, int(count))})
+        if isinstance(data, dict):
+            deals = data.get("deals")
+            return list(deals) if isinstance(deals, list) else []
+        if isinstance(data, list):
+            return data
+        raise McpClientError(f"get_deals returned unexpected payload: {data!r}")
+
     # -- Phase 2 mutating surface (dexter3/executor.py ONLY) -----------------
     #
     # Envelopes copied field-for-field from scripts/btc_scalp_monitor.py —

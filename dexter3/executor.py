@@ -495,6 +495,7 @@ class Dexter3Executor:
         today_entry_count: int = 0,
         today_losing_count: int = 0,
         basket_authorized: bool = False,
+        risk_usd_override: float | None = None,
     ) -> dict[str, Any]:
         """Place a demo micro-entry for an ``enter`` decision.
 
@@ -502,6 +503,15 @@ class Dexter3Executor:
         journals an ``exec_events`` row; callers (shadow_runner) treat any
         non-"entered" action as "no order was placed, reason is in the
         return value and the journal".
+
+        ``risk_usd_override`` (additive, default None): when provided by a
+        caller (the Daily Mission Governor via
+        ``dexter3/shadow_runner.py::_execute_live_entry``), sizing uses this
+        USD risk amount INSTEAD OF ``self.config.risk_usd`` for this single
+        call only — ``self.config`` itself is never mutated. This lets the
+        governor shape per-entry size (streak ladder x session multiplier)
+        without touching ``ExecutorConfig``'s own defaults/caps. Omitting it
+        (the default) is byte-identical to pre-governor behavior.
         """
         symbol = str(decision.symbol)
         if str(decision.action) != "enter":
@@ -537,8 +547,9 @@ class Dexter3Executor:
         sl_distance = abs(entry - sl)
         tp_distance = abs(tp - entry)
 
+        risk_usd = self.config.risk_usd if risk_usd_override is None else float(risk_usd_override)
         volume, volume_meta = planned_volume_units(
-            symbol_details, sl_distance, self.config.risk_usd, self.config.max_volume_units
+            symbol_details, sl_distance, risk_usd, self.config.max_volume_units
         )
         if volume <= 0:
             return self._refuse(symbol, "sizing_refused", volume_meta=volume_meta)
@@ -827,16 +838,21 @@ class Dexter3Executor:
         *,
         today_entry_count: int = 0,
         today_losing_count: int = 0,
+        risk_usd_override: float | None = None,
     ) -> dict[str, Any]:
         """Add a basket repair/hedge leg: the ONLY path that may open a second
         position on a symbol we already hold. All other pre-flight gates
-        (demo, quote, sidedness, sizing, daily caps) still apply unchanged."""
+        (demo, quote, sidedness, sizing, daily caps) still apply unchanged.
+
+        ``risk_usd_override`` is forwarded to ``execute_entry`` unchanged —
+        see its docstring (additive, default None -> existing behavior)."""
         result = self.execute_entry(
             decision,
             account_state,
             today_entry_count=today_entry_count,
             today_losing_count=today_losing_count,
             basket_authorized=True,
+            risk_usd_override=risk_usd_override,
         )
         self._journal(
             str(getattr(decision, "symbol", "unknown")),
