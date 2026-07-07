@@ -262,7 +262,14 @@ class OpeningManager:
                     repair_action["basket_runtime"] = basket_runtime
                     return repair_action
 
-        return {"action": "hold", "reason": "no_condition_met", "basket_runtime": basket_runtime}
+        return {
+            "action": "hold",
+            "reason": "no_condition_met",
+            "live_r": round(live_r, 4),
+            "peak_r": round(peak_r, 4),
+            "floor_r": round(peak_r * cfg.trail_keep_frac, 4) if peak_r >= cfg.arm_trail_r else None,
+            "basket_runtime": basket_runtime,
+        }
 
     # -- Profit Hunter ----------------------------------------------------
 

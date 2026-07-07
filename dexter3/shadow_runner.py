@@ -979,6 +979,8 @@ def om_bars_refresh_due(last_bar_fetch_epoch: float, now_epoch: float, refresh_s
 
 _OM_INSTANCE: OpeningManager | None = None
 _OM_BAR_CACHE: dict[str, dict[str, Any]] = {}  # symbol -> {"epoch":, "m5":, "m15":, "h1":}
+_OM_HOLD_TICKS: dict[str, int] = {}  # symbol -> consecutive hold ticks (heartbeat throttle)
+OM_HOLD_HEARTBEAT_TICKS = 15  # ~1 min at 4s ticks
 
 
 def _get_opening_manager(executor: Dexter3Executor | None, journal: DecisionJournal) -> OpeningManager:
@@ -1138,6 +1140,19 @@ def run_om_tick(
             f"{utc_now_iso()} {symbol} OM action={act} reason={action.get('reason')} "
             f"peak_r={action.get('peak_r')} live_r={action.get('live_r')} dry={dry}"
         )
+    else:
+        # Throttled heartbeat so the owner can watch the profit hunt live
+        # without spamming (every OM_HOLD_HEARTBEAT_TICKS ticks per symbol).
+        global _OM_HOLD_TICKS
+        n = _OM_HOLD_TICKS.get(symbol, 0) + 1
+        _OM_HOLD_TICKS[symbol] = n
+        if action.get("live_r") is not None and n % OM_HOLD_HEARTBEAT_TICKS == 0:
+            floor = action.get("floor_r")
+            armed = " ARMED" if floor is not None else ""
+            log_line(
+                f"{utc_now_iso()} {symbol} OM hunting live_r={action.get('live_r')} "
+                f"peak_r={action.get('peak_r')} floor_r={floor}{armed}"
+            )
     return f"om_{act}"
 
 
