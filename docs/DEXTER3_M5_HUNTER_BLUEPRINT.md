@@ -84,6 +84,42 @@ engine. On every M5 close:
 - Hard caps unchanged and unbreachable (3 legs, 3× base risk, 180 min, 2 basket losses/day).
   At $0.50 base risk the worst day is bounded ≈ $3 — the price of a full day of live evidence.
 
+## OPENING MANAGER (OM) — fast intrabar defense (owner directive 2026-07-07)
+
+**The bug OM fixes:** basket management only ran on NEW M5 closes (every 5 min). Between M5 closes,
+open positions were unmonitored, and `peak_r` was sampled only at M5 boundaries — so an intrabar
+spike to +2R that fell back to −1R was invisible; the trail never saw the peak. Result (owner's
+words): "ได้กำไรมากแล้วไม่ปิด รอจนโครงสร้างเปลี่ยนติดลบถึงปิด" — fear/defensive trading, not
+profit-hunting. OM adds a fast (~4s) monitor that runs EVERY tick, independent of M5 cadence.
+
+**Principle: ความหิวกระหายกำไร — hunger for profit, not defensive fear.** Every open basket is hunted
+toward maximum realized profit with fast protection so a big winner is never given back to breakeven.
+
+### OM part 1 — Profit Hunter (continuous ratcheting trail)
+- Every fast tick: live spot + lane positions → live `aggregate_r` and a CONTINUOUS `peak_r`
+  (true running max, persisted, restart-safe — NOT 5-min sampled).
+- Ratcheting profit lock: once `peak_r >= arm_trail_r`, locked floor = `peak_r × trail_keep_frac`;
+  floor ratchets UP as peak grows (peak 1R→lock 0.7R, peak 2R→lock 1.4R…). If live `aggregate_r`
+  falls to the floor → **CLOSE ALL NOW** at tick resolution, don't wait for M5.
+- Spike capture: `aggregate_r >= spike_take_r` (news/liquidity burst) → take immediately.
+- Hard take at `take_r`. This kills "cut-winner-then-give-back."
+
+### OM part 2 — Basket Doctor (edge-measured repair)
+- When a basket is negative AND structure broke: measure CURRENT edge via the hunt committee (which
+  side has edge NOW).
+- If the WINNING side is OPPOSITE the losing leg AND edge is strong → open a repair leg in the
+  WINNING direction, sized to drag the basket aggregate to net-positive on a modest favorable move
+  ("ถ้ามีแนวโน้มด้านตรงข้ามจะชนะควรเปิดซ้ำ"). If the losing side still holds edge → hold / same-side
+  add at a better level. Never blind-hedge; always edge-measured.
+- Goal: manage the multi-leg basket so the AGGREGATE turns net-positive, then close_all ("รวบยอด").
+- Hard caps UNCHANGED and unbreachable (max_legs, max_basket_risk_mult, time_stop_min,
+  daily_loss_baskets) — enforced at the single choke-point.
+
+### Integration
+- Main loop becomes a fast tick (~4s). Each tick: (1) ALWAYS run OM on any open lane (Profit Hunter
+  + Basket Doctor); (2) on a new M5 close, additionally run the entry decision (hunt). Single
+  process, single lock → no concurrency. When flat, OM is a cheap no-op and entries still fire at M5.
+
 ## Phases
 
 - **P1 (now):** package + tests + shadow runner live on BTCUSD (24/7) and XAUUSD (from Monday open).
