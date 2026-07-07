@@ -352,7 +352,7 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        deals = mcp.get_deals(count=200)
+        deals = mcp.get_deals(count=500)
     except (McpClientError, McpZombieError) as exc:
         if not cache.get("logged_failure"):
             log_line(f"{utc_now_iso()} governor lane_realized_today get_deals_failed (using cached/zero): {exc}")
