@@ -19,9 +19,9 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | Dual lane: **BTCUSD demo-live loop** (codex, leader gate — unchanged) + **DEXTER3 M5 Hunter** Phase 1 shadow build (fable PM + sonnet coder; new package `dexter3/`, own label lane `dexter3:fable:m5h-v1`, own lock — zero contact with codex loops). |
-| **Last updated (UTC)** | 2026-07-05T07:59Z |
-| **Last updated by** | claude-fable (PM) |
+| **Phase now** | **DEXTER3 HUNT MODE live on XAUUSD** — entry every M5 close + basket peak-R trail + trend-agreement guard (profitability fix deployed 2026-07-07). codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-07T02:20Z |
+| **Last updated by** | claude-fable (PM/Opus) |
 
 ---
 
@@ -408,6 +408,14 @@ Format each entry:
 - Fix (Sonnet building, ships as ONE deploy + journal backtest that must show projected PF>1.0 before live): (1) peak-R basket trailing (arm 0.5R, keep 60% of peak, hard take 1.1R) replacing flat 0.2R close; (2) runner wires peak-R state + new DEXTER3_ARM_TRAIL_R/TRAIL_KEEP_FRAC/TAKE_R env knobs; (3) committee reweight m15_drift 1.0→1.3, h1_context 0.6→0.9 + trend-agreement conviction penalty on counter-trend (no skip — reshapes side/size, participation-first stays). Caps unchanged/unbreachable.
 - Live loop still running (bleed ~$2.75/hr on demo, acceptable while fix builds). Not killing it per [[feedback_demo_let_strategies_trade]].
 - Next (fable): review backtest PF, deploy fix live on XAUUSD, re-measure PF over next session.
+
+### 2026-07-07 UTC 02:20Z — claude-fable (PM/Opus) — PROFITABILITY FIX DEPLOYED
+
+- Fix shipped `225a00b` (502/502 fix-module tests, 1 pre-existing unrelated skipeval date-flake). Three changes as one deploy: FIX1 peak-R basket trail (replaces flat +0.2R winner-cut; arm/keep/take config), FIX3 trend-agreement guard in hunt committee (m15_drift 1.0→1.3, h1_context 0.6→0.9, halve size / flip on counter-trend, no skip), FIX2 env knobs.
+- **PM combined backtest (the agent tested FIX1 & FIX3 in isolation — misleading; I combined them):** FIX3-alone floor (winners flat) PF **1.01** net +$1; FIX1-mid+FIX3 PF **1.51** net +$87; optimistic PF **2.82**. Clears PF>1.0 on the provable floor because FIX3 kills the counter-trend sell bleed ($283 gross loss → ~$171). Static backtest can't prove FIX1 in isolation (old code destroyed the winner-peak counterfactual) — so FIX3 is the proven driver, FIX1 is cap-bounded upside, real PF measured live next.
+- **Live now** (`b6p9bu7z9` since 02:20:03Z, XAUUSD only): tuned for XAU's smaller M5 moves — ARM_TRAIL_R=0.35 TRAIL_KEEP_FRAC=0.65 TAKE_R=1.0 RESOLVE_TARGET_R=0.25 (floor strictly > old 0.2); risk_usd=15 max_vol=5 (0.05-lot scale per owner), DAILY_LOSS_BASKETS=3 auto-stop. Broker flat at restart.
+- Pre-fix real tally this run: -$118 (PF 0.61) — the config we just replaced.
+- Next (fable): measure real PF via `scripts/dexter3_pnl_backtest.py` after next full session; if live wins keep clustering <0.35R, lower arm further or revisit hunt exit geometry; answer owner's MCP-vs-SSH/OpenAPI architecture question.
 
 ---
 
