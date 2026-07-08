@@ -112,6 +112,102 @@ def start_ctrader(exe: Path) -> int | None:
     return proc.pid
 
 
+def _find_window_by_pid(target_pids: set[int]):
+    """Enumerate top-level windows and return the first visible one owned by
+    any of ``target_pids`` (ctypes only — no PowerShell/subprocess, works
+    from a windowless pythonw host)."""
+    if sys.platform != "win32" or not target_pids:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in target_pids and user32.GetWindowTextLengthW(hwnd) > 0:
+            found.append(hwnd)
+            return False  # stop at first match
+        return True
+
+    user32.EnumWindows(_enum_proc, 0)
+    return found[0] if found else None
+
+
+def reposition_window_if_offscreen(process_name: str = "cTrader.exe", attempts: int = 12, delay_sec: float = 2.0) -> dict:
+    """Permanent fix for the off-screen-window bug (2026-07-08): repeated
+    watchdog ``taskkill /F`` cycles corrupt the OS-remembered window
+    position, so the next launch can render the window thousands of pixels
+    outside any monitor (observed: Top=-21333). This runs automatically
+    after every restart — the owner should never need to fix it by hand
+    again. Best-effort only: any failure here must never fail the restart
+    (the trading loop's MCP connection does not depend on the window being
+    visible), so every step is wrapped and swallowed.
+    """
+    if sys.platform != "win32":
+        return {"ok": False, "reason": "not_windows"}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        pids = set(list_ctrader_pids())
+        if not pids:
+            return {"ok": False, "reason": "no_process"}
+
+        hwnd = None
+        for _ in range(max(1, attempts)):
+            hwnd = _find_window_by_pid(pids)
+            if hwnd:
+                break
+            time.sleep(delay_sec)
+        if not hwnd:
+            return {"ok": False, "reason": "window_not_found_after_wait"}
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        # SM_XVIRTUALSCREEN=76, SM_YVIRTUALSCREEN=77, SM_CXVIRTUALSCREEN=78,
+        # SM_CYVIRTUALSCREEN=79 — the bounding box of ALL monitors combined,
+        # so a legitimate multi-monitor window (which can have negative
+        # coordinates for a monitor left/above the primary) is never
+        # mistaken for the off-screen bug.
+        vx = user32.GetSystemMetrics(76)
+        vy = user32.GetSystemMetrics(77)
+        vw = user32.GetSystemMetrics(78)
+        vh = user32.GetSystemMetrics(79)
+
+        rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        on_screen = (
+            rect.right > vx and rect.left < vx + vw
+            and rect.bottom > vy and rect.top < vy + vh
+        )
+        was_iconic = bool(user32.IsIconic(hwnd))
+        if on_screen and not was_iconic:
+            return {"ok": True, "action": "already_on_screen", "rect": [rect.left, rect.top, rect.right, rect.bottom]}
+
+        # SW_RESTORE = 9
+        user32.ShowWindow(hwnd, 9)
+        moved = bool(user32.MoveWindow(hwnd, 100, 100, 1400, 900, True))
+        user32.SetForegroundWindow(hwnd)
+        return {
+            "ok": moved,
+            "action": "repositioned",
+            "was_off_screen": not on_screen,
+            "was_minimized": was_iconic,
+            "old_rect": [rect.left, rect.top, rect.right, rect.bottom],
+        }
+    except Exception as exc:  # noqa: BLE001 - never fail the restart over a window cosmetic
+        return {"ok": False, "reason": f"exception:{exc}"}
+
+
 def wait_mcp_ready(wait_sec: int = MCP_READY_WAIT_SEC) -> dict:
     sys.path.insert(0, str(ROOT / "scripts"))
     from ctrader_mcp_client import CtraderMcpClient
@@ -150,6 +246,11 @@ def restart_ctrader(*, force: bool = False, wait_sec: int = MCP_READY_WAIT_SEC) 
     time.sleep(3)
     starter_pid = start_ctrader(launcher)
     health = wait_mcp_ready(wait_sec)
+    # Permanent fix (2026-07-08): always verify/repair the window position
+    # after a restart, whether or not MCP came up healthy — a visible,
+    # on-screen window is part of "restart succeeded" for the owner even if
+    # this repo only strictly needs the MCP connection.
+    window = reposition_window_if_offscreen()
 
     result = {
         "ok": health.get("ok", False),
@@ -157,6 +258,7 @@ def restart_ctrader(*, force: bool = False, wait_sec: int = MCP_READY_WAIT_SEC) 
         "stopped_pids": stopped,
         "starter_pid": starter_pid,
         "mcp": health,
+        "window": window,
         "restarted_at": datetime.now(timezone.utc).isoformat(),
     }
     state["last_restart_ts"] = now
