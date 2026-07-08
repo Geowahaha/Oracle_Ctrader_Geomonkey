@@ -143,6 +143,55 @@ class EdgeGateConfig:
     enabled: bool = True
     chase_size_mult: float = 0.15
     regime_thresh: float = REGIME_THRESH_DEFAULT
+    # -- pullback-resumption entry selector (owner directive 2026-07-08) -----
+    # Backtest (938 decisions): entries taken AFTER a pullback exhausts and
+    # resumes = +0.055R/trade vs +0.003R for chasing every M5 (18x), because
+    # the SL then sits behind a REAL level (structural, not noise). Full size
+    # on a pullback-resumption entry; scout size on everything else — so real
+    # money concentrates on the proven-edge setups while participation-first
+    # is preserved (non-pullback M5s are still entered, just scout-sized).
+    pullback_enabled: bool = True
+    non_pullback_mult: float = 0.35
+
+
+# -- pullback-resumption classifier (mirrors scripts/dexter3_edge_discovery.py
+# ::_pullback_resume exactly — leg -> pullback -> strong resumption close) ----
+PB_LEG = 8
+PB_PULL = 3
+PB_CLP_MIN = 0.60
+
+
+def pullback_resume(m5_bars: list[Bar], side: str | None,
+                    leg: int = PB_LEG, pull: int = PB_PULL, clp_min: float = PB_CLP_MIN) -> bool:
+    if not side or len(m5_bars) < leg + 2:
+        return False
+    cl = [float(b.get("close", 0.0) or 0.0) for b in m5_bars]
+    last = m5_bars[-1]
+    o, c = float(last.get("open", 0.0) or 0.0), float(last.get("close", 0.0) or 0.0)
+    h, l = float(last.get("high", 0.0) or 0.0), float(last.get("low", 0.0) or 0.0)
+    rng = h - l
+    clp = (c - l) / rng if rng > 0 else 0.5
+    leg_move = cl[-pull - 1] - cl[-leg]
+    if side == "buy":
+        return leg_move > 0 and min(cl[-pull:]) < cl[-pull - 1] and c > o and clp >= clp_min
+    return leg_move < 0 and max(cl[-pull:]) > cl[-pull - 1] and c < o and (1 - clp) >= clp_min
+
+
+def pullback_size_mult(
+    side: str | None, m5_bars: list[Bar], cfg: EdgeGateConfig | None = None
+) -> tuple[float, dict[str, Any]]:
+    """Full size (1.0) on a pullback-resumption entry, ``non_pullback_mult``
+    (scout) otherwise. Classification always returned for shadow journaling."""
+    cfg = cfg or EdgeGateConfig()
+    is_pb = pullback_resume(m5_bars, side)
+    applied = (not is_pb) and cfg.pullback_enabled
+    multiplier = cfg.non_pullback_mult if applied else 1.0
+    return multiplier, {
+        "is_pullback": is_pb,
+        "pullback_enabled": cfg.pullback_enabled,
+        "applied_scout": applied,
+        "pullback_multiplier": multiplier,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dexter3 import basket_live, empirical_stats, hunt_mode, hunter_brain, market_lens, skip_evaluator
+from dexter3 import basket_live, edge_buckets, empirical_stats, hunt_mode, hunter_brain, market_lens, skip_evaluator
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
@@ -317,6 +317,7 @@ def _edge_gate_config_from_env() -> EdgeGateConfig:
     for env, field_name in (
         ("DEXTER3_ANTICHASE_MULT", "chase_size_mult"),
         ("DEXTER3_ANTICHASE_REGIME_THRESH", "regime_thresh"),
+        ("DEXTER3_PULLBACK_MULT", "non_pullback_mult"),
     ):
         raw_val = os.environ.get(env)
         if raw_val:
@@ -324,6 +325,11 @@ def _edge_gate_config_from_env() -> EdgeGateConfig:
                 kw[field_name] = float(raw_val)
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    # Pullback-resumption selector (DEXTER3_PULLBACK_ENABLED "0" disables →
+    # non-pullback entries keep full size; classification still journaled).
+    raw_pb = os.environ.get("DEXTER3_PULLBACK_ENABLED")
+    if raw_pb is not None:
+        kw["pullback_enabled"] = raw_pb.strip() not in ("0", "false", "False", "")
     return EdgeGateConfig(**kw)
 
 
@@ -934,6 +940,7 @@ def run_symbol_cycle(
                     if base_risk_usd is None:
                         base_risk_usd = executor.config.risk_usd
                     risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
+                    risk_usd_override = _apply_pullback_gate(decision, prefix, float(risk_usd_override))
                     exec_result = _execute_live_entry(
                         executor,
                         decision,
@@ -1018,6 +1025,32 @@ def _apply_anti_chase_gate(
         return gated_risk_usd
     except Exception as exc:  # noqa: BLE001 - sizing gate must never block an entry
         log_line(f"{utc_now_iso()} {decision.symbol} anti_chase_gate_failed (ungated risk used): {exc}")
+        return base_risk_usd
+
+
+def _apply_pullback_gate(
+    decision: hunter_brain.Decision, m5_prefix: list[dict[str, Any]], base_risk_usd: float
+) -> float:
+    """PULLBACK-RESUMPTION sizing selector (owner directive 2026-07-08 —
+    edge-discovery: pullback entries = +0.055R vs +0.003R baseline, 18x).
+    Full size on a pullback-resumption entry; scout (``non_pullback_mult``)
+    otherwise — so real money concentrates on the proven-edge setups while
+    participation-first holds (non-pullback M5s are still entered, scout-sized).
+    Multiplies the ALREADY anti-chase-gated risk (the two entry selectors
+    compound). Always journals the classification; never raises."""
+    try:
+        cfg = _edge_gate_config_from_env()
+        mult, reason = edge_buckets.pullback_size_mult(decision.side, m5_prefix, cfg)
+        gated = round(base_risk_usd * mult, 4)
+        if isinstance(decision.features, dict):
+            decision.features["pullback_gate"] = {**reason, "base_risk_usd": base_risk_usd, "gated_risk_usd": gated}
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} pullback-gate: is_pullback={reason.get('is_pullback')} "
+            f"mult={mult} risk_usd {base_risk_usd:.2f}->{gated:.2f}"
+        )
+        return gated
+    except Exception as exc:  # noqa: BLE001 - sizing gate must never block an entry
+        log_line(f"{utc_now_iso()} {decision.symbol} pullback_gate_failed (ungated risk used): {exc}")
         return base_risk_usd
 
 
