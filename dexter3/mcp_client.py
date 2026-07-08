@@ -303,14 +303,23 @@ class Dexter3McpClient:
         recent ones) before returning.
         """
         now = _utc_now()
-        safety_margin_bars = max(3, int(count * 0.1))
-        minutes = _period_minutes(period) * (max(int(count), 1) + safety_margin_bars)
+        # Session-gap robustness (fix 2026-07-08): a naive window of
+        # count*period minutes assumes bars are contiguous, but XAUUSD has a
+        # daily ~1h session break (21:00-22:00 UTC) — so a 330-min window for
+        # 60 M5 bars can contain only ~53 real bars around that time, leaving
+        # the loop stuck at insufficient_m5_bars forever during that part of
+        # the day. Request a GENEROUSLY wider time window (2x + pad) and a
+        # matching limit, then trim to the newest ``count`` locally. This
+        # over-fetches a little but guarantees >= count real bars across any
+        # single intraday gap. (get_trendbars is read-only + cheap.)
+        window_bars = max(int(count), 1) * 2 + 10
+        minutes = _period_minutes(period) * window_bars
         args = {
             "symbolName": symbol,
             "timeframe": period,
             "from": _iso_z(now - _timedelta_minutes(minutes)),
             "to": _iso_z(now),
-            "limit": max(int(count), 1) + safety_margin_bars,
+            "limit": window_bars,
         }
         try:
             data = self.call("get_trendbars", args)
