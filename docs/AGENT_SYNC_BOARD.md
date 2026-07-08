@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 V1.4 live on XAUUSD — DRAGON LADDER adaptive exit** (owner directive: small green banks with an unbreakable floor, never rides to full SL; big peak rides full peak-R). Golden Rule 0 verified live: bars OK, OM 4s ticks, decisions firing, ladder floors correct on live data (0.30R→0.18 floor). Rollback tags `v1.0`→`v1.4-dexter3-dragonladder`. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-08T04:50Z |
+| **Phase now** | **DEXTER3 V1.5 live on XAUUSD — first DATA-PROVEN edge deployed.** Edge-discovery found aligned-trending (chase mature H1 trend) = the entire loss (-116R, 43% of entries); anti-chase gate downsizes it to 0.15× scout (verified live 07:30Z: risk 12→1.80 on a chase entry) + fix #1 looser ladder lets winners run. Rollback tags `v1.0`→`v1.5-dexter3-antichase`. Launch MUST include DEXTER3_OM_LADDER_CSV + DEXTER3_ANTICHASE_ENABLED=1. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-08T07:30Z |
 | **Last updated by** | claude-fable (PM) |
 
 ---
@@ -473,6 +473,16 @@ Format each entry:
 - **Self-critique:** my Dragon Ladder (V1.4) made it WORSE — 37% of winners banked <0.3R (win-exit p50 only 0.41R), sharpening the small-win/full-loss asymmetry the owner flagged. The owner's "mirror loss-cutting" idea is one of 3 equivalent payoff levers (bigger wins / smaller losses / higher WR), not the root — exit management can't rescue a -EV geometry.
 - **Fix #1 (live 06:19Z, env `DEXTER3_OM_LADDER_CSV="0.25:0.02,0.50:0.15,0.80:0.40,1.20:0.80,2.00:1.45,3.00:2.25"`):** looser lower ladder tiers = near-breakeven safety net that lets winners RUN to their 1.2R TP instead of banking at 0.2R; dragon upper tiers unchanged; still never gives a green back to a full loss. Verified monotonic + loaded live. **NOTE: this env MUST be on the launch line or the loop reverts to the tight V1.4 curve — promote to OMConfig default (with test updates) is a tracked follow-up.**
 - Next: measure #1's avg-win lift over a session; then #2 = conviction-weighted sizing (calibrated p_win from journal, not raw committee score) — the accuracy lever that resolves "every M5 vs accurate".
+
+---
+
+### 2026-07-08 UTC 07:30Z — claude-fable (PM) — first data-proven edge LIVE (anti-chase gate)
+
+- Edge-discovery L1 (`scripts/dexter3_edge_discovery.py`) swept 938 real M5 decisions: `aligned x trending` (chase a mature H1 trend, 43% of entries) = -116R and the ONLY negative regime bucket, robust across hold 12/24/48; other 57% = +85R. Dropping it flips the system +85R.
+- **Anti-chase gate deployed (`v1.5`, `a076807`):** `dexter3/edge_buckets.py` classifies each entry (align×regime, mirroring the sweep defs); the chase bucket gets risk ×0.15 (scout), all else ×1.0. Participation-first preserved (downsize, not skip). env DEXTER3_ANTICHASE_ENABLED/MULT. Always logs the classification for live shadow-forward confirmation. 745/746 tests.
+- **Golden Rule 0 verified LIVE 07:30:07Z:** `anti-chase: bucket=aligned/trending is_chase=True mult=0.15 risk_usd 12.00->1.80` on a real buy entry (pos 649886584, SL/TP verified); loop healthy, 0 bar errors, ladder+OM ticking.
+- Honest state: system was -EV by construction (129 trades, payoff 0.53:1, breakeven 65% > actual 60.5%); fix #1 (looser ladder, restores geometry payoff toward the 1.35:1 the sweep shows) + anti-chase (starve the -EV bucket) are the two levers now live. **Not yet proven profitable — measuring before/after live is the next step.** Known gap: anti-chase classification hits the log, not yet the journal DB (grep-able only).
+- Next: measure live payoff + per-bucket PnL over a session to CONFIRM the edge holds forward (Layer-2); extend the sweep to more history; if confirmed, tune the chase multiplier / add regime to the ladder.
 
 ---
 
