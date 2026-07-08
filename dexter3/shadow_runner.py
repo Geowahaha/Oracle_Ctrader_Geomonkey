@@ -62,6 +62,7 @@ from dexter3 import basket_live, empirical_stats, hunt_mode, hunter_brain, marke
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
+from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
@@ -293,6 +294,36 @@ def _governor_config_from_env() -> GovernorConfig:
         f"base_risk_frac={cfg.base_risk_frac} max_risk_frac={cfg.max_risk_frac}"
     )
     return cfg
+
+
+def _edge_gate_config_from_env() -> EdgeGateConfig:
+    """ANTI-CHASE sizing gate knobs (owner directive 2026-07-08): the edge-
+    discovery sweep proved the "aligned x trending" bucket (chasing a mature
+    H1 trend) is the ENTIRE system loss (-116R/6d, 43% of entries) while the
+    rest is +85R. Same "ignored invalid falls back to default" posture as
+    every other ``_*_config_from_env`` builder in this file.
+
+    Env vars: DEXTER3_ANTICHASE_ENABLED ("0" disables — multiplier always
+    1.0, classification still journaled for shadow measurement),
+    DEXTER3_ANTICHASE_MULT (downsize factor for the chase bucket, default
+    0.15), DEXTER3_ANTICHASE_REGIME_THRESH (directional-efficiency cutoff,
+    default 0.35, same as the edge-discovery sweep's ``_regime``).
+    """
+    kw: dict[str, Any] = {}
+    raw_enabled = os.environ.get("DEXTER3_ANTICHASE_ENABLED")
+    if raw_enabled is not None:
+        kw["enabled"] = raw_enabled.strip() not in ("0", "false", "False", "")
+    for env, field_name in (
+        ("DEXTER3_ANTICHASE_MULT", "chase_size_mult"),
+        ("DEXTER3_ANTICHASE_REGIME_THRESH", "regime_thresh"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field_name] = float(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    return EdgeGateConfig(**kw)
 
 
 def _fast_tick_sec_from_env() -> int:
@@ -861,12 +892,16 @@ def run_symbol_cycle(
             else:
                 daily = _daily_state(state)
                 risk_info = _governor_entry_risk(mcp, decision)
+                base_risk_usd = (risk_info or {}).get("risk_usd")
+                if base_risk_usd is None:
+                    base_risk_usd = executor.config.risk_usd
+                risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
                 exec_result = _execute_live_entry(
                     executor,
                     decision,
                     today_entry_count=int(daily.get("entries", 0)),
                     today_losing_count=int(daily.get("loss_baskets", 0)),
-                    risk_usd_override=(risk_info or {}).get("risk_usd"),
+                    risk_usd_override=risk_usd_override,
                 )
                 if exec_result.get("action") == "entered":
                     daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -899,6 +934,47 @@ def _governor_entry_risk(mcp: Dexter3McpClient, decision: hunter_brain.Decision)
     except Exception as exc:  # noqa: BLE001 - sizing must never block an entry
         log_line(f"{utc_now_iso()} {decision.symbol} governor_sizing_failed (static risk used): {exc}")
         return None
+
+
+def _apply_anti_chase_gate(
+    decision: hunter_brain.Decision, h1_ctx: list[dict[str, Any]], base_risk_usd: float
+) -> float:
+    """ANTI-CHASE sizing gate (owner directive 2026-07-08 — edge-discovery
+    Layer 1 finding): downsize (never block — participation-first stays) the
+    "aligned x trending" bucket, the ONE bucket the sweep proved is the
+    entire system loss (-116R/6d, 43% of entries) while the rest is +85R.
+
+    Computes the multiplier from the SAME h1_ctx already in scope for this
+    bar (no extra MCP read), multiplies it into ``base_risk_usd`` (the
+    governor's risk_for_entry result, or the executor's static config risk
+    when the governor path failed), and ALWAYS journals the classification —
+    into the decision's own ``features`` dict (so it lands in the journal
+    row DecisionJournal already persists) AND a dedicated log line — even
+    when DEXTER3_ANTICHASE_ENABLED=0, so the shadow record of what the gate
+    WOULD have done exists regardless of the flag. Never raises: any failure
+    here must fall back to the ungated base_risk_usd, not block the entry.
+    """
+    try:
+        cfg = _edge_gate_config_from_env()
+        mult, reason = anti_chase_risk_mult(decision.side, h1_ctx, cfg)
+        gated_risk_usd = round(base_risk_usd * mult, 4)
+        # Journal on the decision itself — DecisionJournal.insert_decision
+        # (called just above this bar's dispatch) already persisted the
+        # Decision's features dict, but that decision object is the SAME
+        # instance the caller holds, so mutating it here before it is
+        # inspected downstream (e.g. by tests or later log lines) still
+        # carries the anti-chase verdict for anyone reading decision.features.
+        if isinstance(decision.features, dict):
+            decision.features["anti_chase"] = {**reason, "base_risk_usd": base_risk_usd, "gated_risk_usd": gated_risk_usd}
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} anti-chase: bucket={reason.get('align')}/{reason.get('regime')} "
+            f"is_chase={reason.get('is_chase')} enabled={reason.get('enabled')} mult={mult} "
+            f"risk_usd {base_risk_usd:.2f}->{gated_risk_usd:.2f}"
+        )
+        return gated_risk_usd
+    except Exception as exc:  # noqa: BLE001 - sizing gate must never block an entry
+        log_line(f"{utc_now_iso()} {decision.symbol} anti_chase_gate_failed (ungated risk used): {exc}")
+        return base_risk_usd
 
 
 def _execute_live_entry(
