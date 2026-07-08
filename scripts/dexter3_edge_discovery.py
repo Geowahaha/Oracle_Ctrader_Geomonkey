@@ -132,6 +132,42 @@ def _simulate(side: str, entry: float, sl: float, tp: float, future: list, max_h
     return ("win" if r > 0 else "loss"), r
 
 
+def _simulate_smart(side: str, entry: float, sl: float, tp: float, future: list, max_hold: int,
+                    disaster_mult: float) -> tuple[str, float]:
+    """SMART exit (owner directive 2026-07-08): the SL level is not a hard
+    wick-triggered line — a wick BEYOND it that CLOSES back inside is NOISE
+    and is survived; we only exit-as-loss when a bar CLOSES beyond the
+    invalidation (a CONFIRMED break). A wide disaster stop (disaster_mult x
+    the SL distance) still hard-cuts a catastrophic wick so tail risk is
+    capped. TP is still wick-triggered (banking a profit spike is fine).
+    R is measured against the original (tight) SL distance for comparability."""
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "skip", 0.0
+    disaster = entry - disaster_mult * risk if side == "buy" else entry + disaster_mult * risk
+    for bar in future[:max_hold]:
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        cl = float(bar.get("close", 0.0))
+        if side == "buy":
+            if lo <= disaster:                    # catastrophic wick — hard cut
+                return "loss", -disaster_mult
+            if hi >= tp:                           # TP spike — bank it
+                return "win", (tp - entry) / risk
+            if cl <= sl:                           # CONFIRMED break (close beyond) — thesis dead
+                return "loss", (cl - entry) / risk
+        else:
+            if hi >= disaster:
+                return "loss", -disaster_mult
+            if lo <= tp:
+                return "win", (entry - tp) / risk
+            if cl >= sl:
+                return "loss", (entry - cl) / risk
+    last = float(future[min(max_hold, len(future)) - 1].get("close", entry)) if future else entry
+    r = (last - entry) / risk if side == "buy" else (entry - last) / risk
+    return ("win" if r > 0 else "loss"), r
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="XAUUSD")
@@ -139,6 +175,9 @@ def main() -> int:
     ap.add_argument("--max-hold", type=int, default=24, help="max M5 bars to hold before mark-to-market")
     ap.add_argument("--spread-abs", type=float, default=0.12, help="assumed XAU spread (price units)")
     ap.add_argument("--commission-r", type=float, default=0.03, help="flat cost per trade in R (commission)")
+    ap.add_argument("--sl-mult", type=float, default=1.0, help="widen SL only (TP price fixed) by this factor")
+    ap.add_argument("--smart-exit", action="store_true", help="close-confirmed SL (survive noise wicks) + wide disaster stop")
+    ap.add_argument("--disaster-mult", type=float, default=2.5, help="disaster hard-stop = this x the SL distance (smart-exit only)")
     args = ap.parse_args()
 
     c = Dexter3McpClient()
@@ -171,7 +210,17 @@ def main() -> int:
             continue
         n_enter += 1
         future = m5[i + 1:]
-        outcome, r = _simulate(str(d.side), float(d.entry), float(d.sl), float(d.tp), future, args.max_hold)
+        # SL-widen experiment: push SL (and TP, keeping RR) further from entry
+        entry_p, sl_p, tp_p = float(d.entry), float(d.sl), float(d.tp)
+        if args.sl_mult != 1.0:
+            # widen SL ONLY (TP price fixed at its structural target) — tests
+            # 'survive noise, reach the SAME target more often'. R is measured
+            # against the NEW (wider) risk, so a loss is still -1R.
+            sl_p = entry_p - (entry_p - sl_p) * args.sl_mult if d.side == "buy" else entry_p + (sl_p - entry_p) * args.sl_mult
+        if args.smart_exit:
+            outcome, r = _simulate_smart(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold, args.disaster_mult)
+        else:
+            outcome, r = _simulate(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold)
         if outcome == "skip":
             continue
         # cost: entry crosses spread (in R) + flat commission R
