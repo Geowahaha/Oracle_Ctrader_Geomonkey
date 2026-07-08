@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 Mission Governor live on XAUUSD, V1.1** — 16-0 win streak since V1.0 start (14:54Z), net +$54.43. Rollback tags `v1.0-dexter3-mission` / `v1.1-dexter3-truerisk`. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-07T23:59Z |
+| **Phase now** | **DEXTER3 V1.2 live on XAUUSD** — CRITICAL fix: OM peak-R trail + time_stop cap were DEAD since deploy (MCP field is `openTime` not `openTimestamp` → oldest_open_ts always null). Now the trail actually banks winners. Rollback tags `v1.0`/`v1.1`/`v1.2-dexter3-trailfix`. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-08T00:54Z |
 | **Last updated by** | claude-fable (PM) |
 
 ---
@@ -454,6 +454,16 @@ Format each entry:
 - **Verified correct numbers** (get_deals(count=500), filtered client-side, cross-checked against real balance delta $10595.50→$10649.19 = +$53.69, matches net almost exactly): **since V1.0 start (2026-07-07T14:54Z UTC / 21:54 Bangkok) to now: 16 closes, 16W/0L, net +$54.43.** Split: V1.0 window 12W/0L +$14.88 (avg win $1.24); V1.1 window 4W/0L +$39.55 (avg win $9.89 — ~8× bigger, consistent with the true-R-base fix letting winners run further).
 - **Lesson for future diagnostics (and future agents):** when pulling `get_deals` ad-hoc, ALWAYS use the wrapper `Dexter3McpClient.get_deals(count=N)` and filter by timestamp client-side — never pass `from`/`to` directly to `call('get_deals', ...)`, it is silently a no-op filter.
 - Sample is still small (16 closes, only 4 in V1.1) — directionally strong, not yet statistically proven. Continue accumulating before declaring PF>1 confirmed.
+
+---
+
+### 2026-07-08 UTC 00:54Z — claude-fable (PM/Opus) — CRITICAL fix: OM trail + time-stop were dead (openTime field)
+
+- Owner audit request: "why did a position that WAS in profit ride back to negative?" Investigated (no changes until approved), found THE root cause: `basket_live._position_open_ts()` read `openTimestamp`/`open_ts`/`openedAt`/`ts`, but the live MCP returns the key as **`openTime`** → `aggregate_lane` reported `oldest_open_ts=None` on every real position. Two dead systems as a result: (1) OM peak-R ratchet reset to live_r EVERY tick (`_basket_runtime_for` treats null oldest_open_ts as a new basket) — the continuous-peak trail never banked a winner; (2) `time_stop_min` cap never fired (age always None).
+- **Smoking gun:** position 649759566 peaked +0.82R (~+$13) at 19:18Z, trail never armed, rode to a full stop loss **-$15.84** at 00:39Z (~$28 give-back). Live log: peak_r==live_r every tick for 5+ hours. The two 19:55Z repair legs DID work correctly (closed +$4.81/+$4.72 via their own TPs) — repair path was never broken, only the trail.
+- Fix (`63c8025`, owner-approved): add `openTime` first in the `_position_open_ts` fallback chain. One-line data-plumbing fix, additive, zero logic change, no other module touched. `_parse_iso_epoch` already handles the millis+Z value. Regression test pins the exact live field name+value. Verified end-to-end: ratchet now holds peak_r=0.82 as live_r falls to -0.10 vs resetting before. 650/650 tests. Tag `v1.2-dexter3-trailfix`.
+- Deployed clean while broker FLAT + MCP healthy. Loop live 00:53:50Z. **Root-cause class = the same MCP-field-name-mismatch that bit us 3× before (get_spot_prices, deals `time`, R-base) — future agents: ALWAYS verify extractor keys against a real get_positions/get_deals dump, never trust mock field names.**
+- Next (fable): verify oldest_open_ts is non-null on the FIRST live position + watch the trail actually fire a close_all on a reversing winner.
 
 ---
 
