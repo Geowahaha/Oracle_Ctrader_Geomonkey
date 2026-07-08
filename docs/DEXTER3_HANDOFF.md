@@ -23,6 +23,17 @@ re-lecture the owner on this — they know; execute and measure.
 
 ## 1. GOLDEN RULES (break these and you break the system)
 
+0. **VERIFY THE HUNTER IS HUNTING AFTER EVERY CHANGE — "done" is not the bar (owner rule 2026-07-08).**
+   A change is not complete when tests pass and the loop restarts. It is complete only when you have
+   CONFIRMED, from live evidence, that the full profit-hunting chain is back and hunting: (a) the loop
+   is fetching M5/M15/H1 bars (no `insufficient_m5_bars`, no `Symbol not available`); (b) it makes a
+   real `action=enter/skip/manage` decision (not stuck); (c) a live entry places with SL+TP attached;
+   (d) `data/runtime/dexter3_shadow_state.json` → `basket_runtime.<sym>.oldest_open_ts` is NON-null and
+   `peak_r` is tracking (the trail is alive); (e) the OM ticks every ~4s. Two silent regressions this
+   session (openTime→dead trail, get_trendbars→1h of no trades) both passed tests and "looked done"
+   while the hunter was actually broken. The goal is a profit-hunter perfect in every dimension, never
+   degraded from the v1.0 foundation — never just "finished."
+
 1. **NEVER modify the live loops of other agents.** `scripts/xau_scalp_monitor.py`,
    `scripts/btc_scalp_monitor.py`, `scheduler.py`, `execution/`, `api/`, `config.py` are OFF-LIMITS.
    Dexter3 is a **standalone additive package `dexter3/`** with its own label + lock. codex owns the
