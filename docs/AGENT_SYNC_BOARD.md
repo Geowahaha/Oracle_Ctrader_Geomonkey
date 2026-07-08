@@ -467,6 +467,15 @@ Format each entry:
 
 ---
 
+### 2026-07-08 UTC 06:20Z — claude-fable (PM) — ROOT-CAUSE: system is -EV by construction; fix #1 (payoff) live
+
+- Rigorous 129-trade audit (owner asked me to challenge his ideas AND mine): **WR 60.5%, avg win +$5.65, avg loss -$10.58, payoff 0.53:1 → breakeven WR needed 65.2% > actual 60.5% → net loser BY CONSTRUCTION (-$0.77/trade).** The system has NO proven edge yet — all prior work was infra/process, the edge itself is negative.
+- **Self-critique:** my Dragon Ladder (V1.4) made it WORSE — 37% of winners banked <0.3R (win-exit p50 only 0.41R), sharpening the small-win/full-loss asymmetry the owner flagged. The owner's "mirror loss-cutting" idea is one of 3 equivalent payoff levers (bigger wins / smaller losses / higher WR), not the root — exit management can't rescue a -EV geometry.
+- **Fix #1 (live 06:19Z, env `DEXTER3_OM_LADDER_CSV="0.25:0.02,0.50:0.15,0.80:0.40,1.20:0.80,2.00:1.45,3.00:2.25"`):** looser lower ladder tiers = near-breakeven safety net that lets winners RUN to their 1.2R TP instead of banking at 0.2R; dragon upper tiers unchanged; still never gives a green back to a full loss. Verified monotonic + loaded live. **NOTE: this env MUST be on the launch line or the loop reverts to the tight V1.4 curve — promote to OMConfig default (with test updates) is a tracked follow-up.**
+- Next: measure #1's avg-win lift over a session; then #2 = conviction-weighted sizing (calibrated p_win from journal, not raw committee score) — the accuracy lever that resolves "every M5 vs accurate".
+
+---
+
 **Cross-links**
 
 - **`docs/DEXTER3_HANDOFF.md`** ← master handoff: any model reads this FIRST to take over Dexter3 seamlessly (mission, golden rules, live state, design philosophy, forward plan)
