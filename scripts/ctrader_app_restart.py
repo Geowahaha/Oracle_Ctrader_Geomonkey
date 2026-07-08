@@ -237,24 +237,44 @@ def reposition_window_if_offscreen(attempts: int = 12, delay_sec: float = 2.0) -
             "rcNormalPosition": [wp.rcNormalPosition.left, wp.rcNormalPosition.top,
                                   wp.rcNormalPosition.right, wp.rcNormalPosition.bottom],
         }
+        # Two independent corruption signals, either one is enough:
+        #  - rcNormalPosition off-screen: the window will restore/render
+        #    off-screen (the "window disappeared" symptom).
+        #  - ptMinPosition off-screen (and not the -1 sentinel): even when the
+        #    window currently LOOKS fine, cTrader's custom maximize control
+        #    recomputes its target from this cached point, so clicking
+        #    maximize snaps the window off-screen (the "opens small, vanishes
+        #    when I maximize" symptom). Fixing it PRE-EMPTIVELY here — before
+        #    the user maximizes — is what makes the guardian a real fix, not
+        #    just an after-the-fact rescue.
         corrupted = (
             not _within_virtual_screen(wp.rcNormalPosition)
             or (wp.ptMinPosition.x != -1 and not _within_virtual_screen(wp.ptMinPosition, is_point=True))
         )
-        if not corrupted and wp.showCmd != 2:  # 2 = SW_SHOWMINIMIZED
-            return {"ok": True, "action": "already_on_screen", "placement": old}
+        # A CLEANLY minimized/maximized window (valid placement) is a
+        # deliberate user state — leave it alone so the guardian never fights
+        # the owner over a window they intentionally minimized.
+        if not corrupted:
+            return {"ok": True, "action": "already_on_screen", "placement": old, "showCmd": wp.showCmd}
 
-        # Rewrite the CACHED placement, not just the live rect — this is
-        # what stops the corruption from resurfacing on the next maximize.
-        wp.showCmd = 1  # SW_SHOWNORMAL
+        # Rewrite the CACHED placement, not just the live rect — this is what
+        # stops the corruption from resurfacing on the next maximize.
+        # Preserve the user's minimized/maximized INTENT when the corruption
+        # is purely in the cached points: only a genuinely off-screen
+        # rcNormalPosition forces a restore-to-normal; otherwise keep showCmd.
+        rc_offscreen = not _within_virtual_screen(wp.rcNormalPosition)
         wp.ptMinPosition = POINT(0, 0)
         wp.ptMaxPosition = POINT(-1, -1)  # -1,-1 = "let Windows decide" (its own default sentinel)
-        wp.rcNormalPosition = RECT(100, 100, 1500, 1000)
+        if rc_offscreen:
+            wp.showCmd = 1  # SW_SHOWNORMAL — the normal rect was bad, bring it back on-screen
+            wp.rcNormalPosition = RECT(100, 100, 1500, 1000)
         applied = bool(user32.SetWindowPlacement(hwnd, ctypes.byref(wp)))
-        user32.SetForegroundWindow(hwnd)
+        if rc_offscreen:
+            user32.SetForegroundWindow(hwnd)
         return {
             "ok": applied,
             "action": "placement_corrected",
+            "restored_normal_rect": rc_offscreen,
             "old_placement": old,
         }
     except Exception as exc:  # noqa: BLE001 - never fail the restart over a window cosmetic
