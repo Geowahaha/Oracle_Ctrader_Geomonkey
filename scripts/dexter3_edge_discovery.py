@@ -87,6 +87,35 @@ def _h1_trend_sign(h1_ctx: list, n: int = 6) -> int:
     return 0
 
 
+def _pullback_resume(bars: list, side: str, leg: int = 8, pull: int = 3, clp_min: float = 0.60) -> bool:
+    """Pullback-exhaustion-resumption setup (owner directive 2026-07-08):
+    a LEG in the entry direction, then a PULLBACK against it, then the last
+    bar RESUMES (closes strongly back in the entry direction = exhaustion of
+    the pullback + resumption). Entering HERE (after the pullback, at the
+    swing that held) instead of chasing momentum puts the SL behind a REAL
+    level, so a tight stop is structural, not noise."""
+    if len(bars) < leg + 2:
+        return False
+    cl = [float(b.get("close", 0.0)) for b in bars]
+    last = bars[-1]
+    o, c = float(last.get("open", 0.0)), float(last.get("close", 0.0))
+    h, l = float(last.get("high", 0.0)), float(last.get("low", 0.0))
+    rng = h - l
+    clp = (c - l) / rng if rng > 0 else 0.5           # 1 = closed at the high
+    leg_move = cl[-pull - 1] - cl[-leg]               # move over the leg window (>0 = up)
+    pull_move = cl[-1] - cl[-pull - 1]                # move over the pullback window
+    if side == "buy":
+        has_leg = leg_move > 0                         # prior up-leg
+        had_pullback = min(cl[-pull:]) < cl[-pull - 1] # dipped during the pullback
+        resumes = c > o and clp >= clp_min             # strong green close near high
+        return has_leg and had_pullback and resumes
+    else:
+        has_leg = leg_move < 0
+        had_pullback = max(cl[-pull:]) > cl[-pull - 1]
+        resumes = c < o and (1 - clp) >= clp_min       # strong red close near low
+        return has_leg and had_pullback and resumes
+
+
 def _regime(h1_ctx: list, n: int = 8, thresh: float = 0.35) -> str:
     """Directional efficiency = |net move| / sum(|bar-to-bar moves|) over the
     last n H1 bars. High = trending (the move went somewhere), low = ranging
@@ -178,6 +207,7 @@ def main() -> int:
     ap.add_argument("--sl-mult", type=float, default=1.0, help="widen SL only (TP price fixed) by this factor")
     ap.add_argument("--smart-exit", action="store_true", help="close-confirmed SL (survive noise wicks) + wide disaster stop")
     ap.add_argument("--disaster-mult", type=float, default=2.5, help="disaster hard-stop = this x the SL distance (smart-exit only)")
+    ap.add_argument("--pullback-only", action="store_true", help="only take pullback-exhaustion-resumption entries (test entry-quality edge)")
     args = ap.parse_args()
 
     c = Dexter3McpClient()
@@ -207,6 +237,8 @@ def main() -> int:
         except Exception:
             continue
         if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
+            continue
+        if args.pullback_only and not _pullback_resume(prefix, str(d.side)):
             continue
         n_enter += 1
         future = m5[i + 1:]
