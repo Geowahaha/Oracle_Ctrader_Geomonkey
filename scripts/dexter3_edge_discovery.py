@@ -87,6 +87,23 @@ def _h1_trend_sign(h1_ctx: list, n: int = 6) -> int:
     return 0
 
 
+def _regime(h1_ctx: list, n: int = 8, thresh: float = 0.35) -> str:
+    """Directional efficiency = |net move| / sum(|bar-to-bar moves|) over the
+    last n H1 bars. High = trending (the move went somewhere), low = ranging
+    (lots of movement, no net progress = chop). This is the dimension that
+    decides whether FADE (mean-reversion) or FOLLOW (trend) should win."""
+    seg = h1_ctx[-n:] if len(h1_ctx) >= 2 else []
+    if len(seg) < 3:
+        return "unknown"
+    closes = [float(b.get("close", 0.0)) for b in seg]
+    net = abs(closes[-1] - closes[0])
+    path = sum(abs(closes[k] - closes[k - 1]) for k in range(1, len(closes)))
+    if path <= 0:
+        return "unknown"
+    eff = net / path
+    return "trending" if eff >= thresh else "ranging"
+
+
 def _simulate(side: str, entry: float, sl: float, tp: float, future: list, max_hold: int) -> tuple[str, float]:
     """Walk future bars, return (outcome, R). Conservative SL-first on same-bar."""
     risk = abs(entry - sl)
@@ -134,6 +151,7 @@ def main() -> int:
     print(f"swept: M5={len(m5)} ({m5[0]['ts']} -> {m5[-1]['ts']}), M15={len(m15)}, H1={len(h1)}")
 
     buckets: dict[tuple, list] = defaultdict(list)   # (align, session) -> [R,...]
+    regime_buckets: dict[tuple, list] = defaultdict(list)  # (align, regime) -> [R,...]
     side_split: dict[str, list] = defaultdict(list)
     n_eval = n_enter = 0
 
@@ -164,7 +182,9 @@ def main() -> int:
         align = "aligned" if (_h1_trend_sign(h1c) == (1 if d.side == "buy" else -1)) else \
                 ("counter" if _h1_trend_sign(h1c) != 0 else "no_trend")
         session = str(market_lens.session_context(ts).get("value") or "unknown")
+        regime = _regime(h1c)
         buckets[(align, session)].append(r_net)
+        regime_buckets[(align, regime)].append(r_net)
         side_split[str(d.side)].append(r_net)
 
     print(f"evaluated {n_eval} M5 closes, {n_enter} entries ({n_enter/max(1,n_eval)*100:.0f}% participation)\n")
@@ -191,6 +211,15 @@ def main() -> int:
         name, n, wr, aw, al, exp, wl, tot = r
         flag = "  <== +EV (proven-ish)" if (exp > 0 and wl > 0.5 and n >= 20) else ("  (thin/uncertain)" if n < 20 else "")
         print(f"{name:32} {n:>4} {wr*100:>4.0f}% {aw:>+6.2f} {al:>+6.2f} {exp:>+7.3f} {wl*100:>6.0f}% {tot:>+7.1f}{flag}")
+
+    print("\n=== HYPOTHESIS TEST: does FADE win in RANGING, FOLLOW win in TRENDING? ===")
+    print(f"{'align x regime':24} {'N':>4} {'WR':>5} {'EXP/tr':>7} {'WR_lo95':>7} {'totR':>7}")
+    print("-" * 58)
+    rrows = [_row(f"{a} x {rg}", rs) for (a, rg), rs in regime_buckets.items()]
+    rrows = [r for r in rrows if r]
+    for r in sorted(rrows, key=lambda x: (x[0].split(' x ')[1], -x[5])):
+        name, n, wr, aw, al, exp, wl, tot = r
+        print(f"{name:24} {n:>4} {wr*100:>4.0f}% {exp:>+7.3f} {wl*100:>6.0f}% {tot:>+7.1f}")
 
     print("\n=== BY SIDE ===")
     for side, rs in side_split.items():
