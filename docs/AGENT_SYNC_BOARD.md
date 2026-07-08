@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 V1.2 live on XAUUSD** — CRITICAL fix: OM peak-R trail + time_stop cap were DEAD since deploy (MCP field is `openTime` not `openTimestamp` → oldest_open_ts always null). Now the trail actually banks winners. Rollback tags `v1.0`/`v1.1`/`v1.2-dexter3-trailfix`. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-08T00:54Z |
+| **Phase now** | **DEXTER3 V1.4 live on XAUUSD — DRAGON LADDER adaptive exit** (owner directive: small green banks with an unbreakable floor, never rides to full SL; big peak rides full peak-R). Golden Rule 0 verified live: bars OK, OM 4s ticks, decisions firing, ladder floors correct on live data (0.30R→0.18 floor). Rollback tags `v1.0`→`v1.4-dexter3-dragonladder`. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-08T04:50Z |
 | **Last updated by** | claude-fable (PM) |
 
 ---
