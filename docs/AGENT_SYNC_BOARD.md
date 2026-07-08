@@ -19,9 +19,9 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 OPENING MANAGER live on XAUUSD** — ~4s fast intrabar defense: continuous peak-R ratchet trail + spike capture + edge-measured Basket Doctor repair. Fixes the M5-only monitoring flaw. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-07T10:00Z |
-| **Last updated by** | claude-fable (PM/Opus) |
+| **Phase now** | **DEXTER3 Mission Governor live on XAUUSD, V1.1** — 16-0 win streak since V1.0 start (14:54Z), net +$54.43. Rollback tags `v1.0-dexter3-mission` / `v1.1-dexter3-truerisk`. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-07T23:59Z |
+| **Last updated by** | claude-fable (PM) |
 
 ---
 
@@ -446,6 +446,14 @@ Format each entry:
 - **Rollback anchors per owner:** tags `v1.0-dexter3-mission` (02be547) + `v1.1-dexter3-truerisk` (b12785c) pushed.
 - V1.1 live 16:18:20Z. Expectation shift: winners now target real 0.4-1.2R ($6-17+) instead of $0.60-2.60; ladder presses streaks; target-lock/loss-stop now on true realized numbers.
 - Next (fable): measure V1.1 PF + governor lock behavior; owner wants ≥10%/day — house-money ratchet (floor at +$100, upside open) is the next candidate, env-flagged.
+
+### 2026-07-07 UTC 23:59Z — claude-fable (PM) — cTrader window-off-screen incident + CORRECTED V1.0→V1.1 stats (16-0)
+
+- **Incident:** owner couldn't open cTrader (icon in taskbar only). Diagnosed: window was positioned at Top=-21333px (off-screen), not minimized/hung — caused by repeated watchdog kill/relaunch cycles. Fixed via Win32 `MoveWindow` API (PowerShell) to reposition on-screen; disabled `DexterCtraderMcpWatchdog` task during the fix, re-enabled once cTrader + MCP confirmed healthy. Open lane position was never at risk (broker-side SL/TP always attached; only the desktop UI was affected, not the account).
+- **Correction — a prior chat report this session was WRONG** (net -$7.36, 32W/18L, PF 0.97 "since V1.0"). Root cause: an ad-hoc diagnostic script called `get_deals` with `from`/`to` params — the Local MCP tool pages by `count` only and silently ignores `from`/`to` (see `dexter3/mcp_client.py::get_deals` docstring), so the script read a stale/wrong window. **Production code (`daily_governor`, `dexter3_pnl_backtest.py`) already avoids this correctly** (`get_deals(count=500)` + client-side timestamp filtering) — this was a diagnostic-script bug only, not a live-trading bug.
+- **Verified correct numbers** (get_deals(count=500), filtered client-side, cross-checked against real balance delta $10595.50→$10649.19 = +$53.69, matches net almost exactly): **since V1.0 start (2026-07-07T14:54Z UTC / 21:54 Bangkok) to now: 16 closes, 16W/0L, net +$54.43.** Split: V1.0 window 12W/0L +$14.88 (avg win $1.24); V1.1 window 4W/0L +$39.55 (avg win $9.89 — ~8× bigger, consistent with the true-R-base fix letting winners run further).
+- **Lesson for future diagnostics (and future agents):** when pulling `get_deals` ad-hoc, ALWAYS use the wrapper `Dexter3McpClient.get_deals(count=N)` and filter by timestamp client-side — never pass `from`/`to` directly to `call('get_deals', ...)`, it is silently a no-op filter.
+- Sample is still small (16 closes, only 4 in V1.1) — directionally strong, not yet statistically proven. Continue accumulating before declaring PF>1 confirmed.
 
 ---
 
