@@ -143,6 +143,33 @@ def test_aggregate_lane_oldest_open_ts() -> None:
     assert agg["oldest_open_ts"] == "2026-07-05T09:00:00Z"
 
 
+def test_aggregate_lane_reads_real_mcp_openTime_field() -> None:
+    """Regression (2026-07-08): the live cTrader MCP returns the open time
+    under the key ``openTime`` (with milliseconds + Z), NOT ``openTimestamp``.
+    Before the fix, aggregate_lane read None for every real position, which
+    silently broke the OM peak-R trail and the time_stop_min cap. This test
+    uses the EXACT field name + value shape the broker sends, so the field
+    can never be dropped again without a red test."""
+    real_position = {
+        "id": 649759566,
+        "symbolName": "XAUUSD",
+        "tradeSide": "Sell",
+        "volumeInUnits": 1,
+        "entryPrice": 4106.21,
+        "netProfit": -0.23,
+        "stopLossPrice": 4122.06,
+        "takeProfitPrice": 4087.17,
+        "openTime": "2026-07-07T19:11:30.337Z",
+        "label": "dexter3:fable:m5h-v1",
+    }
+    assert basket_live._position_open_ts(real_position) == "2026-07-07T19:11:30.337Z"
+    agg = basket_live.aggregate_lane([real_position], base_risk_usd=5.0)
+    assert agg["oldest_open_ts"] == "2026-07-07T19:11:30.337Z"
+    # and the age is computable from it (drives time_stop_min)
+    age = basket_live._age_minutes(agg["oldest_open_ts"], "2026-07-07T22:11:30Z")
+    assert age is not None and age == pytest.approx(180.0, abs=0.05)
+
+
 def test_aggregate_lane_missing_pnl_field_marks_unreliable() -> None:
     positions = [
         _position(net_profit=-3.0, position_id=1),

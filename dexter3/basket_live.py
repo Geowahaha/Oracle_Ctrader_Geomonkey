@@ -99,8 +99,19 @@ def _position_id(position: Position) -> int:
 
 
 def _position_open_ts(position: Position) -> str:
+    # ``openTime`` is the field the live cTrader MCP actually returns
+    # (e.g. "2026-07-07T19:11:30.337Z") — verified against get_positions on
+    # 2026-07-08. It MUST be listed first: without it this returned "" for
+    # every real position, which made aggregate_lane report
+    # oldest_open_ts=None on every tick. That, in turn, (1) made the OM
+    # peak-R ratchet reset to live_r every tick (the trail could never bank
+    # a winner — a position that peaked +0.82R rode all the way back to a
+    # full -1R stop) and (2) permanently disabled the time_stop_min cap
+    # (basket age was always None). The remaining keys are kept for
+    # forward/test compatibility with other envelopes.
     return str(
-        position.get("openTimestamp")
+        position.get("openTime")
+        or position.get("openTimestamp")
         or position.get("open_ts")
         or position.get("openedAt")
         or position.get("ts")
