@@ -112,10 +112,22 @@ def start_ctrader(exe: Path) -> int | None:
     return proc.pid
 
 
-def _find_window_by_pid(target_pids: set[int]):
-    """Enumerate top-level windows and return the first visible one owned by
-    any of ``target_pids`` (ctypes only — no PowerShell/subprocess, works
-    from a windowless pythonw host)."""
+# Substring "ctrader" alone is ambiguous — the process ALSO owns a hidden
+# 1x1 "GDI+ Window (cTrader.exe)" hook window whose title also contains it
+# (live-confirmed 2026-07-08: EnumWindows returned the GDI+ hook BEFORE the
+# real title-bar window, so a first-match-wins scan silently fixed the
+# wrong window while the real one stayed off-screen). The real app window's
+# title is "Raw Trading Ltd cTrader <version>" — anchor on the product name
+# prefix, which no helper/hook window shares.
+_MAIN_WINDOW_TITLE_PREFIX = "raw trading ltd ctrader"
+
+
+def _find_main_window_by_pid(target_pids: set[int]):
+    """Enumerate top-level windows and return the real cTrader application
+    window (title starts with "Raw Trading Ltd cTrader") owned by any of
+    ``target_pids`` — ctypes only, no PowerShell/subprocess, works from a
+    windowless pythonw host.
+    """
     if sys.platform != "win32" or not target_pids:
         return None
     import ctypes
@@ -126,11 +138,16 @@ def _find_window_by_pid(target_pids: set[int]):
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_proc(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value in target_pids and user32.GetWindowTextLengthW(hwnd) > 0:
+        if pid.value not in target_pids:
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        if buf.value.strip().lower().startswith(_MAIN_WINDOW_TITLE_PREFIX):
             found.append(hwnd)
             return False  # stop at first match
         return True
@@ -139,15 +156,26 @@ def _find_window_by_pid(target_pids: set[int]):
     return found[0] if found else None
 
 
-def reposition_window_if_offscreen(process_name: str = "cTrader.exe", attempts: int = 12, delay_sec: float = 2.0) -> dict:
-    """Permanent fix for the off-screen-window bug (2026-07-08): repeated
-    watchdog ``taskkill /F`` cycles corrupt the OS-remembered window
-    position, so the next launch can render the window thousands of pixels
-    outside any monitor (observed: Top=-21333). This runs automatically
-    after every restart — the owner should never need to fix it by hand
-    again. Best-effort only: any failure here must never fail the restart
-    (the trading loop's MCP connection does not depend on the window being
-    visible), so every step is wrapped and swallowed.
+def reposition_window_if_offscreen(attempts: int = 12, delay_sec: float = 2.0) -> dict:
+    """Permanent fix for the off-screen-window bug (2026-07-08).
+
+    Root cause (confirmed via ``GetWindowPlacement``, not guessed): repeated
+    watchdog ``taskkill /F`` cycles corrupt the window's cached
+    ``WINDOWPLACEMENT.ptMinPosition`` (observed: ``(-21333, -21333)``, same
+    magic offset every time). This value is NOT the live on-screen rect — a
+    plain ``MoveWindow`` call (the first attempt at this fix) changes the
+    live rect but leaves ``ptMinPosition`` corrupted, and cTrader's own
+    custom "maximize" control recomputes its target from that same
+    corrupted placement state, snapping the window back off-screen the next
+    time the owner clicks maximize. The real fix is ``SetWindowPlacement``,
+    which rewrites the cached placement (``ptMinPosition``, ``ptMaxPosition``,
+    ``rcNormalPosition``) directly, not just the live rect — verified live
+    2026-07-08 that this survives where a plain move did not.
+
+    Runs automatically after every restart. Best-effort only: any failure
+    here must never fail the restart (the trading loop's MCP connection
+    does not depend on the window being visible), so every step is wrapped
+    and swallowed.
     """
     if sys.platform != "win32":
         return {"ok": False, "reason": "not_windows"}
@@ -162,7 +190,7 @@ def reposition_window_if_offscreen(process_name: str = "cTrader.exe", attempts: 
 
         hwnd = None
         for _ in range(max(1, attempts)):
-            hwnd = _find_window_by_pid(pids)
+            hwnd = _find_main_window_by_pid(pids)
             if hwnd:
                 break
             time.sleep(delay_sec)
@@ -172,6 +200,20 @@ def reposition_window_if_offscreen(process_name: str = "cTrader.exe", attempts: 
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                         ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
+                ("ptMinPosition", POINT), ("ptMaxPosition", POINT), ("rcNormalPosition", RECT),
+            ]
+
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+            return {"ok": False, "reason": "GetWindowPlacement_failed"}
 
         # SM_XVIRTUALSCREEN=76, SM_YVIRTUALSCREEN=77, SM_CXVIRTUALSCREEN=78,
         # SM_CYVIRTUALSCREEN=79 — the bounding box of ALL monitors combined,
@@ -183,26 +225,37 @@ def reposition_window_if_offscreen(process_name: str = "cTrader.exe", attempts: 
         vw = user32.GetSystemMetrics(78)
         vh = user32.GetSystemMetrics(79)
 
-        rect = RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        on_screen = (
-            rect.right > vx and rect.left < vx + vw
-            and rect.bottom > vy and rect.top < vy + vh
-        )
-        was_iconic = bool(user32.IsIconic(hwnd))
-        if on_screen and not was_iconic:
-            return {"ok": True, "action": "already_on_screen", "rect": [rect.left, rect.top, rect.right, rect.bottom]}
+        def _within_virtual_screen(r: "RECT | POINT", is_point: bool = False) -> bool:
+            if is_point:
+                return vx <= r.x <= vx + vw and vy <= r.y <= vy + vh
+            return r.right > vx and r.left < vx + vw and r.bottom > vy and r.top < vy + vh
 
-        # SW_RESTORE = 9
-        user32.ShowWindow(hwnd, 9)
-        moved = bool(user32.MoveWindow(hwnd, 100, 100, 1400, 900, True))
+        old = {
+            "showCmd": wp.showCmd,
+            "ptMinPosition": [wp.ptMinPosition.x, wp.ptMinPosition.y],
+            "ptMaxPosition": [wp.ptMaxPosition.x, wp.ptMaxPosition.y],
+            "rcNormalPosition": [wp.rcNormalPosition.left, wp.rcNormalPosition.top,
+                                  wp.rcNormalPosition.right, wp.rcNormalPosition.bottom],
+        }
+        corrupted = (
+            not _within_virtual_screen(wp.rcNormalPosition)
+            or (wp.ptMinPosition.x != -1 and not _within_virtual_screen(wp.ptMinPosition, is_point=True))
+        )
+        if not corrupted and wp.showCmd != 2:  # 2 = SW_SHOWMINIMIZED
+            return {"ok": True, "action": "already_on_screen", "placement": old}
+
+        # Rewrite the CACHED placement, not just the live rect — this is
+        # what stops the corruption from resurfacing on the next maximize.
+        wp.showCmd = 1  # SW_SHOWNORMAL
+        wp.ptMinPosition = POINT(0, 0)
+        wp.ptMaxPosition = POINT(-1, -1)  # -1,-1 = "let Windows decide" (its own default sentinel)
+        wp.rcNormalPosition = RECT(100, 100, 1500, 1000)
+        applied = bool(user32.SetWindowPlacement(hwnd, ctypes.byref(wp)))
         user32.SetForegroundWindow(hwnd)
         return {
-            "ok": moved,
-            "action": "repositioned",
-            "was_off_screen": not on_screen,
-            "was_minimized": was_iconic,
-            "old_rect": [rect.left, rect.top, rect.right, rect.bottom],
+            "ok": applied,
+            "action": "placement_corrected",
+            "old_placement": old,
         }
     except Exception as exc:  # noqa: BLE001 - never fail the restart over a window cosmetic
         return {"ok": False, "reason": f"exception:{exc}"}
