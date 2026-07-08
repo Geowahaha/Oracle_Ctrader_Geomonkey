@@ -41,6 +41,7 @@ from dexter3.mcp_client import (
     McpMutationUncertain,
     McpZombieError,
 )
+from dexter3.smart_exit import disaster_stop_distance
 
 LABEL = "dexter3:fable:m5h-v1"
 
@@ -496,6 +497,7 @@ class Dexter3Executor:
         today_losing_count: int = 0,
         basket_authorized: bool = False,
         risk_usd_override: float | None = None,
+        smart_exit: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Place a demo micro-entry for an ``enter`` decision.
 
@@ -512,6 +514,20 @@ class Dexter3Executor:
         governor shape per-entry size (streak ladder x session multiplier)
         without touching ``ExecutorConfig``'s own defaults/caps. Omitting it
         (the default) is byte-identical to pre-governor behavior.
+
+        ``smart_exit`` (additive, default None -> byte-identical pre-smart-
+        exit behavior): a dict shaped like
+        ``dexter3.smart_exit.resolve_stop_regime``'s return value. When
+        ``smart_exit['regime'] == 'disaster'``, the BROKER stop is placed at
+        ``smart_exit['disaster_mult'] x sl_distance`` (WIDE — survives noise
+        wicks per the proven backtest, see ``dexter3/smart_exit.py``) and
+        sizing (``planned_volume_units``) is computed against THAT wider
+        distance using the SAME ``risk_usd`` — this is what shrinks volume by
+        ~``1/disaster_mult`` so $ risk to the disaster stop stays equal to
+        the intended risk (never larger). TP is untouched either way. Any
+        other value (None, missing, or ``regime == 'tight'``) places the
+        stop at the decision's own tight ``sl`` exactly as before smart exit
+        existed.
         """
         symbol = str(decision.symbol)
         if str(decision.action) != "enter":
@@ -547,9 +563,24 @@ class Dexter3Executor:
         sl_distance = abs(entry - sl)
         tp_distance = abs(tp - entry)
 
+        # -- smart exit (additive, default None -> unchanged behavior) ------
+        # 'disaster' regime: broker stop widens to disaster_mult x sl_distance
+        # and BOTH sizing and the pip distance sent to the broker use that
+        # wider distance (with the SAME risk_usd) — this is what keeps $ risk
+        # to the disaster stop equal to the intended tight-stop risk (size
+        # shrinks ~1/disaster_mult). TP distance/price is never touched. A
+        # 'tight' regime (or smart_exit=None/missing) keeps sl_distance as-is,
+        # byte-identical to pre-smart-exit behavior.
+        smart_exit_regime = str((smart_exit or {}).get("regime") or "tight")
+        disaster_mult = float((smart_exit or {}).get("disaster_mult") or 1.0)
+        if smart_exit_regime == "disaster" and disaster_mult > 1.0:
+            broker_sl_distance = disaster_stop_distance(sl_distance, disaster_mult)
+        else:
+            broker_sl_distance = sl_distance
+
         risk_usd = self.config.risk_usd if risk_usd_override is None else float(risk_usd_override)
         volume, volume_meta = planned_volume_units(
-            symbol_details, sl_distance, risk_usd, self.config.max_volume_units
+            symbol_details, broker_sl_distance, risk_usd, self.config.max_volume_units
         )
         if volume <= 0:
             return self._refuse(symbol, "sizing_refused", volume_meta=volume_meta)
@@ -565,9 +596,21 @@ class Dexter3Executor:
             )
 
         pip_size = float(symbol_details.get("pipSize", 0.01) or 0.01)
-        sl_pips = _to_pips(sl_distance, pip_size)
+        sl_pips = _to_pips(broker_sl_distance, pip_size)
         tp_pips = _to_pips(tp_distance, pip_size)
         comment = f"{decision.setup}|{'|'.join(decision.reasons)}"[:55] if decision.reasons else str(decision.setup)
+        self._journal(
+            symbol,
+            "smart_exit_classified",
+            payload={
+                "regime": smart_exit_regime,
+                "disaster_mult": disaster_mult,
+                "tight_sl": sl,
+                "tight_sl_distance": round(sl_distance, 6),
+                "broker_sl_distance": round(broker_sl_distance, 6),
+                "smart_exit_meta": smart_exit or {},
+            },
+        )
 
         known_ids = {position_id_of(p) for p in open_positions if position_id_of(p) > 0}
         reconciled_pid = 0
@@ -601,6 +644,17 @@ class Dexter3Executor:
             self._journal(symbol, "entry_rejected_by_broker", verified=False, payload={"order": order})
             return {"action": "rejected", "order": order}
 
+        # The actual broker-side stop PRICE for this entry — tight sl for the
+        # 'tight' regime (byte-identical to pre-smart-exit), or the widened
+        # disaster price when this entry is under the 'disaster' regime. Used
+        # for naked-position repair (must repair to what was INTENDED, not
+        # the tight structural sl) and for journaling/OM regime lookups.
+        broker_sl = (
+            (entry - broker_sl_distance if side == "buy" else entry + broker_sl_distance)
+            if smart_exit_regime == "disaster" and disaster_mult > 1.0
+            else sl
+        )
+
         pid = reconciled_pid or self._resolve_new_position(symbol, known_ids)
         post_positions = self._safe_get_positions()
         new_pos = next(
@@ -613,7 +667,7 @@ class Dexter3Executor:
             sl_missing = position_stop_loss_of(new_pos) <= 0
             tp_missing = position_take_profit_of(new_pos) <= 0
             if sl_missing or tp_missing:
-                repair = self._repair_naked_position(symbol, pid, side, entry, sl, tp, volume)
+                repair = self._repair_naked_position(symbol, pid, side, entry, broker_sl, tp, volume)
                 verified = bool(repair.get("verified"))
                 verification = dict(repair.get("verification") or verification)
 
@@ -632,6 +686,9 @@ class Dexter3Executor:
             "sl": sl,
             "tp": tp,
             "setup": decision.setup,
+            "smart_exit_regime": smart_exit_regime,
+            "broker_sl": round(broker_sl, 6),
+            "broker_sl_distance": round(broker_sl_distance, 6),
         }
         self._journal(symbol, "entry_executed", position_id=pid, verified=verified, payload=out)
         return out

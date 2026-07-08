@@ -67,6 +67,7 @@ from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 from dexter3.opening_manager import OMConfig, OpeningManager
+from dexter3.smart_exit import SmartExitConfig, resolve_stop_regime
 
 RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
@@ -324,6 +325,36 @@ def _edge_gate_config_from_env() -> EdgeGateConfig:
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
     return EdgeGateConfig(**kw)
+
+
+def _smart_exit_config_from_env() -> SmartExitConfig:
+    """SMART ADAPTIVE EXIT knobs (owner directive 2026-07-08): the backtest
+    (``scripts/dexter3_edge_discovery.py --smart-exit``, 938 decisions)
+    proved a close-confirmed exit (survive noise wicks, cut only on a bar
+    CLOSE beyond the structural invalidation, wide disaster hard-stop for
+    tail risk) amplifies edge on non-chase buckets but amplifies the LOSS on
+    the chase bucket — so it is gated OFF for chase entries (see
+    ``dexter3/smart_exit.py``, reuses ``edge_buckets.classify_bucket``'s
+    ``is_chase``). Same "ignored invalid falls back to default" posture as
+    every other ``_*_config_from_env`` builder in this file.
+
+    Env vars: DEXTER3_SMART_EXIT_ENABLED ("0" disables — every entry keeps
+    the tight hard SL regardless of chase classification, but the
+    would-have-applied classification is still journaled for shadow
+    measurement), DEXTER3_SMART_EXIT_DISASTER_MULT (wide hard-stop
+    multiplier on the structural SL distance, default 2.0).
+    """
+    kw: dict[str, Any] = {}
+    raw_enabled = os.environ.get("DEXTER3_SMART_EXIT_ENABLED")
+    if raw_enabled is not None:
+        kw["enabled"] = raw_enabled.strip() not in ("0", "false", "False", "")
+    raw_mult = os.environ.get("DEXTER3_SMART_EXIT_DISASTER_MULT")
+    if raw_mult:
+        try:
+            kw["disaster_mult"] = float(raw_mult)
+        except ValueError:
+            log_line(f"{utc_now_iso()} ignored invalid DEXTER3_SMART_EXIT_DISASTER_MULT={raw_mult!r}")
+    return SmartExitConfig(**kw)
 
 
 def _fast_tick_sec_from_env() -> int:
@@ -880,32 +911,45 @@ def run_symbol_cycle(
         status = f"decided:{decision.action}:{decision.setup}"
         if basket_action is not None:
             status += f":basket_{basket_action.get('action', 'unknown')}"
-        elif is_newest and executor is not None and decision.action == "enter":
-            gov = state.get("governor") or {}
-            if gov.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
-                # Owner's daily mission rule (2026-07-07) outranks
-                # participation-first for EXECUTION only — the decision above
-                # is still journaled; we just do not put money on it today.
-                status += f":governor_{str(gov.get('state')).lower()}"
-            elif lane is None:
-                status += ":live_skipped_lane_unverified"
-            else:
-                daily = _daily_state(state)
-                risk_info = _governor_entry_risk(mcp, decision)
-                base_risk_usd = (risk_info or {}).get("risk_usd")
-                if base_risk_usd is None:
-                    base_risk_usd = executor.config.risk_usd
-                risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
-                exec_result = _execute_live_entry(
-                    executor,
-                    decision,
-                    today_entry_count=int(daily.get("entries", 0)),
-                    today_losing_count=int(daily.get("loss_baskets", 0)),
-                    risk_usd_override=risk_usd_override,
-                )
-                if exec_result.get("action") == "entered":
-                    daily["entries"] = int(daily.get("entries", 0)) + 1
-                status += f":live_{exec_result.get('action', 'unknown')}"
+        elif is_newest and decision.action == "enter":
+            # Journal the smart-exit stop-regime classification for EVERY
+            # fresh-entry decision on the newest bar, live or shadow (owner
+            # directive 2026-07-08 "always journal, even when disabled" —
+            # this is the Layer-2 shadow record the PM needs regardless of
+            # whether --live/DEXTER3_LIVE is even on).
+            smart_exit_meta = _apply_smart_exit_gate(decision, h1_ctx, state)
+            if executor is not None:
+                gov = state.get("governor") or {}
+                if gov.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+                    # Owner's daily mission rule (2026-07-07) outranks
+                    # participation-first for EXECUTION only — the decision above
+                    # is still journaled; we just do not put money on it today.
+                    status += f":governor_{str(gov.get('state')).lower()}"
+                elif lane is None:
+                    status += ":live_skipped_lane_unverified"
+                else:
+                    daily = _daily_state(state)
+                    risk_info = _governor_entry_risk(mcp, decision)
+                    base_risk_usd = (risk_info or {}).get("risk_usd")
+                    if base_risk_usd is None:
+                        base_risk_usd = executor.config.risk_usd
+                    risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
+                    exec_result = _execute_live_entry(
+                        executor,
+                        decision,
+                        today_entry_count=int(daily.get("entries", 0)),
+                        today_losing_count=int(daily.get("loss_baskets", 0)),
+                        risk_usd_override=risk_usd_override,
+                        smart_exit=smart_exit_meta,
+                    )
+                    if exec_result.get("action") == "entered":
+                        daily["entries"] = int(daily.get("entries", 0)) + 1
+                        # oldest_open_ts stays None here (the position was
+                        # just placed; its broker-side open timestamp is not
+                        # yet known) — run_om_tick backfills it with the real
+                        # lane timestamp on the first fast tick that observes
+                        # this basket (see its own smart-exit backfill block).
+                    status += f":live_{exec_result.get('action', 'unknown')}"
 
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
@@ -977,6 +1021,58 @@ def _apply_anti_chase_gate(
         return base_risk_usd
 
 
+def _apply_smart_exit_gate(
+    decision: hunter_brain.Decision, h1_ctx: list[dict[str, Any]], state: dict[str, Any]
+) -> dict[str, Any]:
+    """SMART ADAPTIVE EXIT stop-regime classification (owner directive
+    2026-07-08 — see ``dexter3/smart_exit.py`` for the full design and the
+    backtest that proved it). Classifies this entry's stop regime ('tight'
+    vs 'disaster') from the SAME ``h1_ctx`` already in scope for this bar
+    (no extra MCP read, and — critically — the SAME chase classification the
+    anti-chase gate just computed, via ``edge_buckets.classify_bucket``, so
+    the two gates can never disagree about which bucket this entry is in).
+
+    ALWAYS journals the classification (decision.features + a dedicated log
+    line), even when ``DEXTER3_SMART_EXIT_ENABLED=0`` or the entry is a
+    chase (regime stays 'tight' either way) — shadow measurement per the
+    module's own contract. Also persists the regime into
+    ``state['smart_exit_regime'][symbol]`` so the OM fast-tick path
+    (``run_om_tick``) can look it up once this entry becomes an open lane
+    position; the caller is responsible for calling ``save_shadow_state``
+    afterward (same ownership pattern as ``basket_runtime``). Never raises:
+    any failure here degrades to the 'tight' regime (today's unchanged
+    behavior), never blocks the entry.
+    """
+    try:
+        cfg = _smart_exit_config_from_env()
+        classification = resolve_stop_regime(decision.side, h1_ctx, cfg)
+        if isinstance(decision.features, dict):
+            decision.features["smart_exit"] = dict(classification)
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} smart-exit: bucket={classification.get('align')}/"
+            f"{classification.get('h1_regime')} "
+            f"is_chase={classification.get('is_chase')} enabled={classification.get('enabled')} "
+            f"stop_regime={classification.get('regime')} disaster_mult={classification.get('disaster_mult')}"
+        )
+        # Persist keyed by symbol (mirrors state['basket_runtime'][symbol]) so
+        # the OM tick can look this up once the entry becomes an open lane —
+        # oldest_open_ts is stamped once the position actually opens (this
+        # function runs BEFORE the order is placed, so we stamp None here and
+        # let the OM tick's own basket-reset guard tolerate the first read;
+        # run_om_tick backfills oldest_open_ts on its first observation of
+        # this lane via the same regime dict object).
+        state.setdefault("smart_exit_regime", {})[decision.symbol] = {
+            "regime": classification.get("regime"),
+            "disaster_mult": classification.get("disaster_mult"),
+            "oldest_open_ts": None,
+            "classified_at": utc_now_iso(),
+        }
+        return classification
+    except Exception as exc:  # noqa: BLE001 - classification must never block an entry
+        log_line(f"{utc_now_iso()} {decision.symbol} smart_exit_gate_failed (tight regime used): {exc}")
+        return {"regime": "tight", "disaster_mult": 1.0, "enabled": False, "is_chase": None}
+
+
 def _execute_live_entry(
     executor: Dexter3Executor,
     decision: hunter_brain.Decision,
@@ -985,6 +1081,7 @@ def _execute_live_entry(
     today_losing_count: int = 0,
     repair: bool = False,
     risk_usd_override: float | None = None,
+    smart_exit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve account state and place a live micro-entry. Never raises."""
     account_state: dict[str, Any] = {}
@@ -1018,6 +1115,7 @@ def _execute_live_entry(
                 today_entry_count=today_entry_count,
                 today_losing_count=today_losing_count,
                 risk_usd_override=risk_usd_override,
+                smart_exit=smart_exit,
             )
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
         log_error(f"execute_entry({decision.symbol})", exc)
@@ -1370,6 +1468,17 @@ def run_om_tick(
     state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = _f(
         agg_probe.get("aggregate_pnl_usd"), 0.0
     )
+    # SMART EXIT (owner directive 2026-07-08): backfill the regime record's
+    # oldest_open_ts with the REAL lane timestamp the first tick that
+    # observes this basket (it is stamped None/placeholder at classification
+    # time in _apply_smart_exit_gate, before the position exists) so
+    # OpeningManager._smart_loss_exit's stale-basket guard can match it
+    # against agg['oldest_open_ts'] on every subsequent tick.
+    regime_map = state.setdefault("smart_exit_regime", {})
+    regime_entry = regime_map.get(symbol)
+    lane_oldest_ts = agg_probe.get("oldest_open_ts")
+    if isinstance(regime_entry, dict) and lane_oldest_ts and regime_entry.get("oldest_open_ts") != lane_oldest_ts:
+        regime_entry["oldest_open_ts"] = lane_oldest_ts
     om_state = {
         "basket_runtime": (state.get("basket_runtime") or {}).get(symbol),
         "now_utc_iso": utc_now_iso(),
@@ -1377,6 +1486,7 @@ def run_om_tick(
         "basket_cfg": _basket_config_from_env(),
         "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
         "spread_abs": spread_abs,
+        "smart_exit_regime": regime_map,
     }
     action = om.evaluate(symbol, lane, spot, m5_bars, m15_bars, h1_bars, om_state)
 

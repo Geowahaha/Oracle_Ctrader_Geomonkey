@@ -311,13 +311,17 @@ class OpeningManager:
           - ``{'action': 'hold', 'reason': 'unreliable_pnl'}`` (never trade
             blind — see ``basket_live.aggregate_lane``'s ``unreliable`` flag)
           - ``{'action': 'close_all', 'reason':
-            'spike'|'take'|'ladder_floor'|'stall_take'|'cap_stop',
+            'spike'|'take'|'ladder_floor'|'stall_take'|'cap_stop'|
+            'smart_confirmed_break',
             'peak_r':.., 'floor_r':.., 'live_r':.., 'basket_runtime': {...}}``
           - ``{'action': 'add_repair_leg', 'side':.., 'note':.., 'basket_runtime': {...}}``
 
-        Priority order every tick (highest first, DRAGON LADDER owner
-        directive 2026-07-08): cap-stop > spike/hard-take > ladder-floor
-        close > stall-take > pyramid-add > basket-doctor repair > hold. An
+        Priority order every tick (highest first, DRAGON LADDER + SMART LOSS
+        EXIT owner directive 2026-07-08): cap-stop > smart-loss-exit
+        (disaster-regime lanes only, underwater only) > spike/hard-take >
+        ladder-floor close > stall-take > pyramid-add > basket-doctor repair
+        > hold. Smart-loss-exit and the profit-side branches are naturally
+        disjoint (the former only ever fires while ``live_r < 0``). An
         ``unreliable`` aggregate always degrades to hold before any of this
         is evaluated.
         """
@@ -364,6 +368,22 @@ class OpeningManager:
                 "live_r": round(live_r, 4),
                 "basket_runtime": basket_runtime,
             }
+
+        # -- step b2: SMART LOSS EXIT (owner directive 2026-07-08, loss-side
+        # mirror of the DRAGON LADDER — evidence-gated, NOT a panic cut).
+        # Only engages a lane the entry side classified into the 'disaster'
+        # stop regime (non-chase entries with smart exit enabled — see
+        # dexter3/smart_exit.py); a 'tight'-regime lane (chase entry, or
+        # smart exit disabled) never reaches this branch and keeps its
+        # broker-side tight hard SL as the entire exit mechanism, unchanged.
+        # Checked BEFORE hard-take/ladder (naturally disjoint anyway — this
+        # only ever fires on an underwater lane) so a confirmed structural
+        # break cuts immediately rather than waiting on a profit-side branch
+        # that can never fire while live_r is negative. -----------------
+        smart_exit_action = self._smart_loss_exit(symbol, agg, live_r, positions, m5_bars, st, basket_runtime)
+        if smart_exit_action is not None:
+            smart_exit_action["basket_runtime"] = basket_runtime
+            return smart_exit_action
 
         # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
         # ceiling captures — never wait on giveback math once the move is
@@ -612,6 +632,65 @@ class OpeningManager:
             "side": basket_side,
             "conviction": round(conviction, 4),
             "note": "pyramid_add",
+        }
+
+    # -- Smart Loss Exit (owner directive 2026-07-08) -----------------------
+
+    def _smart_loss_exit(
+        self,
+        symbol: str,
+        agg: dict[str, Any],
+        live_r: float,
+        positions: list[Position],
+        m5_bars: list[Bar] | None,
+        st: dict[str, Any],
+        basket_runtime: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Loss-side mirror of the DRAGON LADDER: cut a NON-chase ('disaster'
+        regime) lane at market ONLY when an M5 bar has CLOSED beyond the
+        original tight structural invalidation (confirmed break) — a wick
+        beyond it that closes back inside is noise and is survived, exactly
+        as ``scripts/dexter3_edge_discovery.py::_simulate_smart`` proved.
+
+        Never fires on a lane that is not underwater (``live_r >= 0``) — no
+        reason to evaluate a cut on a lane that is not losing. Never fires on
+        a 'tight'-regime lane (chase entry, or smart exit globally disabled)
+        — that lane's only exit mechanism is its broker-side tight hard SL,
+        unchanged. Reuses ``basket_live.structure_evidence`` (via
+        ``_structure_evidence``) for the confirmed-break read — never
+        reimplemented. Returns None (fall through to hard-take/ladder/etc.)
+        whenever the regime lookup is absent/stale or the evidence does not
+        show a confirmed break; the wide disaster stop already resting at
+        the broker is the only hard floor in between, per the proven design.
+        """
+        if live_r >= 0:
+            return None
+
+        regime_map = st.get("smart_exit_regime") or {}
+        entry = regime_map.get(symbol) if isinstance(regime_map, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        oldest_open_ts = agg.get("oldest_open_ts")
+        if oldest_open_ts and entry.get("oldest_open_ts") not in (None, oldest_open_ts):
+            # A different basket than the one this regime was recorded for —
+            # never let a stale regime from a resolved basket drive a cut on
+            # a brand-new one (mirrors _update_peak_r's own reset guard).
+            return None
+        regime = str(entry.get("regime") or "tight")
+
+        from dexter3.smart_exit import should_smart_exit
+
+        evidence = self._structure_evidence(agg, positions, m5_bars)
+        verdict = should_smart_exit(regime, evidence)
+        if not bool(verdict.get("fire")):
+            return None
+
+        return {
+            "action": "close_all",
+            "reason": "smart_confirmed_break",
+            "smart_exit_regime": regime,
+            "evidence": evidence,
+            "live_r": round(live_r, 4),
         }
 
     # -- Basket Doctor ------------------------------------------------------

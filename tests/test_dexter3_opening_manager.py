@@ -926,3 +926,153 @@ def test_pyramid_add_adversarial_sequence_never_exceeds_caps():
             assert legs < basket_cfg.max_legs, (
                 f"trial={trial} legs={legs}: pyramid add permitted at/over max_legs={basket_cfg.max_legs}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SMART LOSS EXIT (owner directive 2026-07-08) — loss-side mirror of the
+# DRAGON LADDER. Only engages a lane classified into the 'disaster' stop
+# regime (see dexter3/smart_exit.py); cuts ONLY on a confirmed structural
+# break (bar CLOSED beyond the tight invalidation), survives noise wicks.
+# ---------------------------------------------------------------------------
+
+
+def _smart_exit_state(
+    *, regime: str = "disaster", oldest_open_ts: str | None = "2026-07-07T09:00:00Z", disaster_mult: float = 2.0
+) -> dict:
+    return {
+        "base_risk_usd": 1.0,
+        "smart_exit_regime": {
+            "XAUUSD": {
+                "regime": regime,
+                "disaster_mult": disaster_mult,
+                "oldest_open_ts": oldest_open_ts,
+            }
+        },
+    }
+
+
+def test_smart_loss_exit_fires_on_confirmed_break_disaster_regime():
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))  # disable basket doctor so only smart-exit is under test
+    state = _smart_exit_state()
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "close_all"
+    assert action["reason"] == "smart_confirmed_break"
+    assert action["smart_exit_regime"] == "disaster"
+
+
+def test_smart_loss_exit_survives_noise_wick_holds():
+    """A wick beyond the tight invalidation that CLOSES back inside
+    (level_lost True, m5_close_beyond False) must be survived — hold, not
+    close — exactly the backtest-proven 'survive noise' behavior."""
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))
+    state = _smart_exit_state()
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": False}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "hold"
+
+
+def test_smart_loss_exit_never_fires_on_tight_regime_chase_entry():
+    """A 'tight'-regime lane (chase entry, or smart exit disabled) never
+    fires the smart cut regardless of how confirmed the break is — its
+    broker-side tight hard SL is the only exit mechanism, unchanged."""
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))
+    state = _smart_exit_state(regime="tight")
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "hold"
+
+
+def test_smart_loss_exit_never_fires_when_lane_is_green():
+    """live_r >= 0 must never trigger a loss-side cut — the branch is
+    disjoint from the profit side by construction."""
+    om = _new_om(OMConfig(repair_trigger_r=-999.0, take_r=50.0, spike_take_r=100.0))
+    state = _smart_exit_state()
+    lane = _lane_at_r(0.3, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "hold"
+
+
+def test_smart_loss_exit_holds_when_regime_missing_falls_through():
+    """No smart_exit_regime entry for this symbol at all (e.g. an entry
+    placed before this feature existed, or state was never populated) ->
+    smart-loss-exit never fires; falls through to the rest of the pipeline
+    (which, with basket doctor disabled and no ladder engagement on a loser,
+    settles at hold)."""
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))
+    state = {"base_risk_usd": 1.0}  # no smart_exit_regime key at all
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "hold"
+
+
+def test_smart_loss_exit_ignores_stale_regime_from_different_basket():
+    """A regime dict recorded for a DIFFERENT basket (different
+    oldest_open_ts) must never drive a cut on the current one — same
+    stale-state guard philosophy as _update_peak_r's own basket reset."""
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))
+    state = _smart_exit_state(oldest_open_ts="2020-01-01T00:00:00Z")  # stale, unrelated basket
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "hold"
+
+
+def test_smart_loss_exit_takes_priority_over_basket_doctor_when_confirmed():
+    """Both smart-loss-exit and basket doctor could theoretically fire on
+    the same evidence (level_lost AND m5_close_beyond); smart-loss-exit
+    (checked earlier in evaluate()'s priority order) must win, closing the
+    lane outright rather than adding a repair leg on top of a confirmed
+    structural break."""
+    om = _new_om(OMConfig(repair_trigger_r=-0.3, repair_min_conviction=0.0))
+    state = _smart_exit_state()
+    lane = _lane_at_r(-0.5, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ), patch("dexter3.opening_manager.hunt_mode.decide_hunt", return_value=_FakeHuntDecision("sell", 0.9)):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "close_all"
+    assert action["reason"] == "smart_confirmed_break"
+
+
+def test_smart_loss_exit_cap_stop_still_outranks_it():
+    """Hard caps (time stop / daily loss) remain the highest-priority branch
+    — a capped-out basket resolves via cap_stop even under the disaster
+    regime with confirmed-break evidence."""
+    basket_cfg = BasketConfig(time_stop_min=30.0)
+    om = _new_om(OMConfig(repair_trigger_r=-999.0))
+    state = _smart_exit_state(oldest_open_ts="2026-07-07T09:00:00Z")
+    state["basket_cfg"] = basket_cfg
+    state["now_utc_iso"] = "2026-07-07T09:45:00Z"  # 45min > 30min time_stop_min
+    lane = _lane_at_r(-0.6, side="buy")
+    bars = _m5_bars()
+    with patch.object(
+        basket_live, "structure_evidence", return_value={"level_lost": True, "m5_close_beyond": True}
+    ):
+        action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
+    assert action["action"] == "close_all"
+    assert action["reason"] == "cap_stop"

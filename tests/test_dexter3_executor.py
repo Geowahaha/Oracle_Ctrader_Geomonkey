@@ -653,3 +653,150 @@ def test_exec_events_roundtrip_with_thai_text(journal_conn):
     assert len(events) == 1
     assert events[0]["payload"]["reason"] == "บัญชีไม่ใช่ demo"
     assert events[0]["verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# SMART EXIT (owner directive 2026-07-08) — disaster-stop sizing + regime
+# ---------------------------------------------------------------------------
+#
+# The backtest proved a gated smart adaptive exit amplifies edge on
+# non-chase entries but amplifies loss on chase entries — see
+# dexter3/smart_exit.py. execute_entry's new `smart_exit` kwarg (additive,
+# default None) widens the BROKER stop to disaster_mult x sl_distance and
+# scales sizing down proportionally so $ risk to the wide stop stays equal
+# to the tight-stop risk; TP is untouched. These tests assert that
+# equal-risk invariant plus the byte-identical-when-omitted contract.
+
+
+def test_execute_entry_omitting_smart_exit_is_byte_identical_to_tight(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0))
+    result = ex.execute_entry(FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"), DEMO_ACCOUNT)
+    assert result["action"] == "entered"
+    assert result["smart_exit_regime"] == "tight"
+    order_call = next(c for c in mcp.calls if c[0] == "place_market_order")
+    kwargs = order_call[1]
+    # sl_distance = 100, pipSize 0.01 -> 10000 pips (tight, unwidened)
+    assert kwargs["stop_loss_pips"] == 10000
+    assert result["broker_sl_distance"] == pytest.approx(100.0)
+
+
+def test_execute_entry_tight_regime_explicit_matches_omitted(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "tight", "disaster_mult": 2.0},
+    )
+    assert result["smart_exit_regime"] == "tight"
+    assert result["broker_sl_distance"] == pytest.approx(100.0)
+
+
+def test_execute_entry_disaster_regime_widens_broker_stop_distance(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    assert result["action"] == "entered"
+    assert result["smart_exit_regime"] == "disaster"
+    # tight sl_distance=100 -> disaster broker distance = 200
+    assert result["broker_sl_distance"] == pytest.approx(200.0)
+    assert result["sl"] == pytest.approx(61900.0)  # tight sl still recorded (journal truth)
+    order_call = next(c for c in mcp.calls if c[0] == "place_market_order")
+    assert order_call[1]["stop_loss_pips"] == 20000  # 200 / 0.01
+
+
+def test_execute_entry_disaster_regime_risk_usd_equals_tight_regime_risk_usd(journal_conn):
+    """THE core invariant: $ risk to the disaster stop must equal $ risk to
+    the tight stop — NOT disaster_mult x bigger. Sizing shrinks ~1/mult."""
+    risk_usd = 2.0
+    symbol_details = {"minVolume": 0.0001, "maxVolume": 10.0, "volumeStep": 0.0001, "lotSize": 1.0, "pipSize": 0.01}
+
+    mcp_tight = FakeMcp(symbol_details=symbol_details, post_entry_position=_filled_position())
+    ex_tight = Dexter3Executor(mcp_tight, journal_conn, ExecutorConfig(risk_usd=risk_usd, max_volume_units=10.0))
+    result_tight = ex_tight.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"), DEMO_ACCOUNT
+    )
+    tight_volume = result_tight["volume"]
+    tight_distance = result_tight["broker_sl_distance"]
+    tight_risk_usd = tight_volume * tight_distance
+
+    mcp_disaster = FakeMcp(symbol_details=symbol_details, post_entry_position=_filled_position(position_id=556))
+    ex_disaster = Dexter3Executor(mcp_disaster, journal_conn, ExecutorConfig(risk_usd=risk_usd, max_volume_units=10.0))
+    result_disaster = ex_disaster.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    disaster_volume = result_disaster["volume"]
+    disaster_distance = result_disaster["broker_sl_distance"]
+    disaster_risk_usd = disaster_volume * disaster_distance
+
+    assert disaster_distance == pytest.approx(tight_distance * 2.0)
+    assert disaster_volume == pytest.approx(tight_volume / 2.0, rel=1e-3)
+    # the actual $ risk to each stop must match — never bigger under disaster.
+    assert disaster_risk_usd == pytest.approx(tight_risk_usd, rel=1e-3)
+    assert disaster_risk_usd == pytest.approx(risk_usd, rel=1e-3)
+
+
+def test_execute_entry_disaster_regime_tp_unchanged(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    result_tight = ex.execute_entry(FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"), DEMO_ACCOUNT)
+    mcp2 = FakeMcp(post_entry_position=_filled_position(position_id=557))
+    ex2 = Dexter3Executor(mcp2, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    result_disaster = ex2.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    tp_call_tight = next(c for c in mcp.calls if c[0] == "place_market_order")[1]
+    tp_call_disaster = next(c for c in mcp2.calls if c[0] == "place_market_order")[1]
+    assert tp_call_tight["take_profit_pips"] == tp_call_disaster["take_profit_pips"]
+    assert result_tight["tp"] == result_disaster["tp"] == pytest.approx(62150.0)
+
+
+def test_execute_entry_disaster_regime_sell_side_broker_sl_price_above_entry(journal_conn):
+    mcp = FakeMcp(
+        post_entry_position=_filled_position(side="Sell", stop_loss=62300.0, take_profit=61700.0),
+    )
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=62100.0, tp=61700.0, side="sell"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    assert result["action"] == "entered"
+    # tight distance = 100 -> disaster distance 200 -> broker_sl = entry + 200 = 62200
+    assert result["broker_sl"] == pytest.approx(62200.0)
+    assert result["broker_sl_distance"] == pytest.approx(200.0)
+
+
+def test_execute_entry_smart_exit_classification_always_journaled(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
+        DEMO_ACCOUNT,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    assert any(e["event"] == "smart_exit_classified" for e in events)
+    classified = next(e for e in events if e["event"] == "smart_exit_classified")
+    assert classified["payload"]["regime"] == "disaster"
+    assert classified["payload"]["disaster_mult"] == pytest.approx(2.0)
+
+
+def test_execute_entry_smart_exit_classification_journaled_even_when_none(journal_conn):
+    # smart_exit=None (omitted) still journals the 'tight' classification —
+    # shadow measurement per the module contract, no special-casing needed.
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0))
+    ex.execute_entry(FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"), DEMO_ACCOUNT)
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    classified = next(e for e in events if e["event"] == "smart_exit_classified")
+    assert classified["payload"]["regime"] == "tight"
