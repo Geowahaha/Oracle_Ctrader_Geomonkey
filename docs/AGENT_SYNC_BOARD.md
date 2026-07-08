@@ -19,8 +19,8 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 V1.5 live on XAUUSD — first DATA-PROVEN edge deployed.** Edge-discovery found aligned-trending (chase mature H1 trend) = the entire loss (-116R, 43% of entries); anti-chase gate downsizes it to 0.15× scout (verified live 07:30Z: risk 12→1.80 on a chase entry) + fix #1 looser ladder lets winners run. Rollback tags `v1.0`→`v1.5-dexter3-antichase`. Launch MUST include DEXTER3_OM_LADDER_CSV + DEXTER3_ANTICHASE_ENABLED=1. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-08T07:30Z |
+| **Phase now** | **DEXTER3 V1.6 live on XAUUSD — entry-selection edge stack.** Two proven entry selectors compound on risk sizing: pullback-resumption = full size (+0.055R vs +0.003R baseline, 18×), anti-chase = 0.15× scout on aligned-trending chase (-116R bucket); looser ladder lets winners run; smart-exit built but OFF (data: hurts good entries). Rollback tags `v1.0`→`v1.6-dexter3-pullback`. Launch env: DEXTER3_OM_LADDER_CSV + ANTICHASE_ENABLED=1 + PULLBACK_ENABLED=1 + SMART_EXIT_ENABLED=0. codex BTC M1 loop unchanged. |
+| **Last updated (UTC)** | 2026-07-08T10:40Z |
 | **Last updated by** | claude-fable (PM) |
 
 ---
