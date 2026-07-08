@@ -72,6 +72,15 @@ class McpClientError(RuntimeError):
     """Raised for any other MCP transport/protocol failure (not a zombie)."""
 
 
+def _is_symbol_unavailable(exc: Exception) -> bool:
+    """True when an MCP tool error means the symbol lost its subscription
+    (recoverable via open_chart), e.g. 'Symbol not available: XAUUSD' /
+    'Symbol not found'. Matches on message text since the Local MCP returns
+    these as plain tool-error strings."""
+    msg = str(exc).lower()
+    return "symbol not available" in msg or "symbol not found" in msg
+
+
 class McpTransportError(McpClientError):
     """HTTP layer failed (timeout/connection) — the server may or may not
     have processed the request. Distinct from a tool-level error, where the
@@ -296,20 +305,51 @@ class Dexter3McpClient:
         now = _utc_now()
         safety_margin_bars = max(3, int(count * 0.1))
         minutes = _period_minutes(period) * (max(int(count), 1) + safety_margin_bars)
-        data = self.call(
-            "get_trendbars",
-            {
-                "symbolName": symbol,
-                "timeframe": period,
-                "from": _iso_z(now - _timedelta_minutes(minutes)),
-                "to": _iso_z(now),
-                "limit": max(int(count), 1) + safety_margin_bars,
-            },
-        )
+        args = {
+            "symbolName": symbol,
+            "timeframe": period,
+            "from": _iso_z(now - _timedelta_minutes(minutes)),
+            "to": _iso_z(now),
+            "limit": max(int(count), 1) + safety_margin_bars,
+        }
+        try:
+            data = self.call("get_trendbars", args)
+        except McpClientError as exc:
+            # "Symbol not available/not found" means the symbol lost its
+            # subscription in the cTrader session — happens after a cTrader
+            # restart (the entry path calls get_trendbars BEFORE any
+            # get_spot_price, so without this the loop can silently stop
+            # trading forever — live incident 2026-07-08 00:07Z→01:08Z,
+            # ~1h no entries, missed the whole 4130→4100 move). Force a
+            # chart subscription (same open_chart path get_spot_price uses)
+            # and retry once. Zombie/other errors are NOT swallowed here.
+            if _is_symbol_unavailable(exc) and self._subscribe_symbol(symbol):
+                data = self.call("get_trendbars", args)
+            else:
+                raise
         bars_raw = data.get("bars", []) if isinstance(data, dict) else []
         bars = [_normalize_bar(b) for b in bars_raw]
         bars.sort(key=lambda b: b["ts"])
         return bars[-count:] if count and len(bars) > count else bars
+
+    def _subscribe_symbol(self, symbol: str) -> bool:
+        """Force a market-data subscription for ``symbol`` via ``open_chart``
+        (the same mechanism get_spot_price uses). Cooldown-gated per symbol
+        so a persistently-missing symbol can't spam open_chart every tick.
+        Returns True if a subscription attempt was made (caller may retry)."""
+        now = time.time()
+        last = self._last_chart_open.get(symbol, 0.0)
+        if now - last < self.QUOTE_SUBSCRIBE_RETRY_SEC:
+            return False
+        self._last_chart_open[symbol] = now
+        try:
+            self.call("open_chart", {"symbolName": symbol, "timeframe": "m1"})
+            time.sleep(2.0)
+            return True
+        except McpZombieError:
+            raise
+        except McpClientError:
+            return False
 
     # min seconds between open_chart subscribe attempts per symbol
     QUOTE_SUBSCRIBE_RETRY_SEC = 60.0

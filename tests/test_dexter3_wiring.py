@@ -176,6 +176,60 @@ def _chop_bars(n: int = 50, base: float = 62000.0) -> list[dict[str, Any]]:
     return bars
 
 
+# -- get_trendbars symbol-resubscribe (no-trades incident 2026-07-08) -----------
+
+
+def test_get_trendbars_resubscribes_on_symbol_unavailable(monkeypatch):
+    """After a cTrader restart the symbol can lose its subscription; the entry
+    path calls get_trendbars FIRST, so without a self-heal the loop silently
+    stops trading (live: ~1h of no entries). get_trendbars must force an
+    open_chart subscribe and retry once on 'Symbol not available'."""
+    from dexter3.mcp_client import Dexter3McpClient, McpClientError
+
+    c = Dexter3McpClient()
+    calls = []
+
+    def fake_call(name, args=None):
+        calls.append(name)
+        if name == "get_trendbars":
+            # fail until an open_chart has happened
+            if "open_chart" not in calls:
+                raise McpClientError("MCP tool get_trendbars returned error: Symbol not available: XAUUSD")
+            return {"bars": [{"open": 1, "high": 2, "low": 1, "close": 1.5, "ts": "2026-07-08T00:00:00Z"}]}
+        if name == "open_chart":
+            return {"ok": True}
+        return {}
+
+    monkeypatch.setattr(c, "call", fake_call)
+    monkeypatch.setattr("dexter3.mcp_client.time.sleep", lambda s: None)
+
+    bars = c.get_trendbars("XAUUSD", "m5", 1)
+    assert len(bars) == 1
+    assert "open_chart" in calls  # it subscribed
+    assert calls.count("get_trendbars") == 2  # failed once, retried after subscribe
+
+
+def test_get_trendbars_does_not_resubscribe_on_other_errors(monkeypatch):
+    from dexter3.mcp_client import Dexter3McpClient, McpClientError
+
+    c = Dexter3McpClient()
+    calls = []
+
+    def fake_call(name, args=None):
+        calls.append(name)
+        if name == "get_trendbars":
+            raise McpClientError("some other MCP failure")
+        return {}
+
+    monkeypatch.setattr(c, "call", fake_call)
+    monkeypatch.setattr("dexter3.mcp_client.time.sleep", lambda s: None)
+
+    with pytest.raises(McpClientError):
+        c.get_trendbars("XAUUSD", "m5", 1)
+    assert "open_chart" not in calls  # a non-symbol error must NOT trigger subscribe
+    assert calls.count("get_trendbars") == 1  # no retry
+
+
 # -- mutation-uncertainty (double-fill guard) -----------------------------------
 
 
