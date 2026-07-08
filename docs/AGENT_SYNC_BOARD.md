@@ -486,6 +486,18 @@ Format each entry:
 
 ---
 
+### 2026-07-08 UTC ~10:30Z — claude-fable (PM) — entry-quality edge proven: pullback-resumption + SL/exit myth-busting
+
+- Owner: SL "fast but not accurate" (noise-stopped then reverses); static TP/SL = dumb bot; upgrade entry (enter after pullback exhausts + resumes, not chasing momentum). Tested ALL of it in `scripts/dexter3_edge_discovery.py` (938 decisions, added `--sl-mult`, `--smart-exit`, `--pullback-only` diagnostics):
+  - **Widening SL: raises WR 42→49% (noise-stops are REAL — owner right) but WORSENS expectancy (RR punished). Naive fix rejected.**
+  - **Smart exit (survive wicks, cut on confirmed M5 close-beyond + wide disaster stop): DOUBLE-EDGED by bucket — amplifies good buckets (aligned-ranging +0.254→+0.320R) but amplifies the chase bucket's loss (-0.285→-0.469R). Only pays GATED by entry quality.**
+  - **Pullback-resumption ENTRY: the biggest lever — 15% of M5s, expectancy +0.003→+0.055R (18×), WR 42→47%; with anti-chase the good buckets ≈ +0.27R/trade. Smart-exit HURTS pullback entries (+0.055→-0.014R) — a good entry's tight SL is already structural. CONFIRMS edge is in ENTRY SELECTION, exits are secondary.**
+- Concurrent Sonnet build: gated smart-adaptive-exit (non-chase only) — will be env-flagged; data says leave it OFF by default (pullback entries don't need it), keep for A/B.
+- **Deploy plan (after the smart-exit build lands, to avoid shadow_runner merge conflict):** wire a pullback-resumption SIZING selector (pullback = full size, non-pullback = scout) alongside the anti-chase gate — both entry-selection multipliers on risk_usd_override. Thin sample (139) → sizing selector not hard gate, shadow-measure forward. Then Golden Rule 0 live-verify + before/after payoff.
+- Commits: `e1f00c8` (sl/smart diagnostics), `3030724` (pullback diagnostic).
+
+---
+
 **Cross-links**
 
 - **`docs/DEXTER3_HANDOFF.md`** ← master handoff: any model reads this FIRST to take over Dexter3 seamlessly (mission, golden rules, live state, design philosophy, forward plan)
