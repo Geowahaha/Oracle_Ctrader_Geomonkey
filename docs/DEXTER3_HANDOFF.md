@@ -70,6 +70,15 @@ re-lecture the owner on this — they know; execute and measure.
   A Windows scheduled task `DexterCtraderMcpWatchdog` auto-restarts cTrader every 2 min, windowless
   (runs via `pythonw.exe`; `ctrader_app_restart.py` uses `CREATE_NO_WINDOW`). Manual:
   `python scripts/ctrader_mcp_watchdog.py --restart`. Runbook: `docs/MCP_ZOMBIE_RECOVERY_RUNBOOK.md`.
+- **cTrader off-screen-window bug (permanent fix in place):** cTrader on this box continuously
+  corrupts its own `WINDOWPLACEMENT.ptMinPosition` to `(-21333,-21333)` (persists across cTrader
+  version updates), which makes the window render off-screen and VANISH on maximize. Scheduled task
+  `DexterCtraderWindowGuardian` runs `scripts/ctrader_window_guardian.py` every 1 min (windowless
+  pythonw) and repairs the placement via `SetWindowPlacement` (`ctrader_app_restart.
+  reposition_window_if_offscreen`), respecting a deliberately-minimized window. Corrections are logged
+  to `data/runtime/ctrader_window_guardian.log` (only real corrections, so every line = a caught
+  corruption). If the owner still sees a rare glitch, the window self-heals within ≤1 min; manual
+  one-shot: `python scripts/ctrader_window_guardian.py`. Do NOT delete this task.
 
 **To restart the loop safely:** (1) `taskkill /PID <lock pid> /F`; (2) verify broker flat/known via
 `get_positions`; (3) relaunch with the env block above. The loop auto-adopts any open lane basket and
