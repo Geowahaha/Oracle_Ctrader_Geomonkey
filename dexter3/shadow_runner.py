@@ -173,13 +173,51 @@ def _basket_config_from_env() -> BasketConfig:
     return BasketConfig(**kw)
 
 
+def _parse_ladder_csv(raw: str) -> tuple[tuple[float, float], ...] | None:
+    """Parse ``DEXTER3_OM_LADDER_CSV`` ("peak:floor,peak:floor,...") into the
+    ``OMConfig.ladder_points`` tuple shape. Returns ``None`` (caller keeps the
+    default) on ANY malformed input — a typo'd override must never crash the
+    live loop or silently install a broken (non-monotonic) ladder.
+    """
+    points: list[tuple[float, float]] = []
+    try:
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            peak_txt, floor_txt = chunk.split(":")
+            points.append((float(peak_txt), float(floor_txt)))
+    except (ValueError, TypeError):
+        return None
+    if len(points) < 2:
+        return None
+    # Must be strictly ascending in peak and non-decreasing in floor, and
+    # every floor must stay <= its own peak (a floor above its own peak
+    # would violate "never give back more than the peak reached").
+    for (p_prev, f_prev), (p_next, f_next) in zip(points, points[1:]):
+        if p_next <= p_prev or f_next < f_prev or f_prev > p_prev or f_next > p_next:
+            return None
+    return tuple(points)
+
+
 def _om_config_from_env() -> OMConfig:
     """OpeningManager knobs, same "ignored invalid falls back to default"
     posture as ``_basket_config_from_env``/``_executor_config_from_env``
     above — a typo'd env var must never crash the live loop.
 
-    Env vars: DEXTER3_OM_ARM_R, DEXTER3_OM_TRAIL_KEEP, DEXTER3_OM_TAKE_R,
-    DEXTER3_OM_SPIKE_R, DEXTER3_OM_REPAIR_TRIGGER_R, DEXTER3_OM_REPAIR_MIN_CONV.
+    Legacy flat-trail env vars (kept for A/B / override use, no longer the
+    default profit exit — see the DRAGON LADDER section of
+    ``docs/DEXTER3_M5_HUNTER_BLUEPRINT.md``): DEXTER3_OM_ARM_R,
+    DEXTER3_OM_TRAIL_KEEP, DEXTER3_OM_TAKE_R, DEXTER3_OM_SPIKE_R,
+    DEXTER3_OM_REPAIR_TRIGGER_R, DEXTER3_OM_REPAIR_MIN_CONV.
+
+    DRAGON LADDER env vars (owner directive 2026-07-08):
+    DEXTER3_OM_LADDER_CSV ("peak:floor,peak:floor,..." optional override of
+    the default ladder_points table), DEXTER3_OM_STALL_TICKS,
+    DEXTER3_OM_STALL_MAX_PEAK_R, DEXTER3_OM_PYRAMID_MIN_R,
+    DEXTER3_OM_PYRAMID_MIN_CONV, DEXTER3_OM_PYRAMID_TIER_STEP, and the master
+    switch DEXTER3_OM_PYRAMID_ENABLED (default "1"; "0" disables ONLY the
+    pyramid-add path — ladder + stall-take stay on).
     """
     kw: dict[str, Any] = {}
     for env, field in (
@@ -189,6 +227,11 @@ def _om_config_from_env() -> OMConfig:
         ("DEXTER3_OM_SPIKE_R", "spike_take_r"),
         ("DEXTER3_OM_REPAIR_TRIGGER_R", "repair_trigger_r"),
         ("DEXTER3_OM_REPAIR_MIN_CONV", "repair_min_conviction"),
+        ("DEXTER3_OM_STALL_MAX_PEAK_R", "stall_max_peak_r"),
+        ("DEXTER3_OM_STALL_DECAY_FRAC", "stall_decay_frac"),
+        ("DEXTER3_OM_PYRAMID_MIN_R", "pyramid_min_live_r"),
+        ("DEXTER3_OM_PYRAMID_MIN_CONV", "pyramid_min_conv"),
+        ("DEXTER3_OM_PYRAMID_TIER_STEP", "pyramid_tier_step"),
     ):
         raw_val = os.environ.get(env)
         if raw_val:
@@ -196,6 +239,26 @@ def _om_config_from_env() -> OMConfig:
                 kw[field] = float(raw_val)
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+
+    raw_stall_ticks = os.environ.get("DEXTER3_OM_STALL_TICKS")
+    if raw_stall_ticks:
+        try:
+            kw["stall_ticks"] = int(raw_stall_ticks)
+        except ValueError:
+            log_line(f"{utc_now_iso()} ignored invalid DEXTER3_OM_STALL_TICKS={raw_stall_ticks!r}")
+
+    raw_pyramid_enabled = os.environ.get("DEXTER3_OM_PYRAMID_ENABLED")
+    if raw_pyramid_enabled is not None:
+        kw["pyramid_enabled"] = raw_pyramid_enabled.strip() not in ("0", "false", "False", "")
+
+    raw_ladder_csv = os.environ.get("DEXTER3_OM_LADDER_CSV")
+    if raw_ladder_csv:
+        parsed = _parse_ladder_csv(raw_ladder_csv)
+        if parsed is not None:
+            kw["ladder_points"] = parsed
+        else:
+            log_line(f"{utc_now_iso()} ignored invalid DEXTER3_OM_LADDER_CSV={raw_ladder_csv!r}")
+
     return OMConfig(**kw)
 
 
