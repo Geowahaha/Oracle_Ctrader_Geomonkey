@@ -642,6 +642,13 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Stability instrumentation armed:** persistent monitor on watchdog log `ok:false` — any future zombie event is caught and timestamped. Honest claim protocol: "stable" = zombie rate drops from ~61/day to ~0 over a multi-hour window; measurement ongoing, will be reported. Live loops (Fable 22000 / Grok 4804) still run pre-fix client code (leak ≈1 session per process — negligible vs 645/day) and inherit hygiene at their next natural restart.
 - Watchdog `--restart` self-heal stays as defense-in-depth; expectation after this fix is it stops firing.
 
+### 2026-07-10 UTC 18:55Z — claude-fable (Fable 5) — SECURITY INCIDENT resolved: Telegram bot hijack ("CHUPEP")
+
+- **Incident:** attacker obtained the bot token (was HARDCODED in config.py since forever — in git history + printed in logs) and used `setMyName`/`setMyProfilePhoto` to rebrand @mrgeon8n_bot as "CHUPEP". No webhook interception was set (verified); trading systems unaffected throughout.
+- **Response:** name reclaimed via API → owner revoked token via BotFather (**old token verified DEAD, 401**) → new token installed in PC + VM `.env.local` → `dexter-monitor` restarted (active) + telegram watcher restarted → owner unblocked bot + send verified OK → CHUPEP photo overwritten with a Dexter Pro avatar via `setMyProfilePhoto` (the same API the attacker used).
+- **Root-cause fix (`7688ad2`):** token purged from config.py (env-only, no default) and from the watcher (reads `.env.local`). **Rule for all agents: NEVER hardcode secrets in code — .env.local only (it's gitignored).** Anything already in git history must be treated as leaked and rotated.
+- Residual: old token appears throughout git history — harmless now (revoked). If any other secrets are hardcoded anywhere, treat as leaked: grep + rotate.
+
 ### 2026-07-10 UTC 18:25Z — claude-fable (Fable 5, CEO) + Sonnet builder — VM MIGRATION P1 SHIPPED + P2 truths
 
 - Owner goal: PC on/off must not matter. Decision doc `docs/DEXTER3_VM_MIGRATION_DESIGN.md`: local MCP = PC-bound (dev only); remote MCP workers = just proxies BACK to a desktop MCP (verified in dexter-mcp/src/ctrader-proxy.ts — not a path); **OpenAPI on VM = the home**.
