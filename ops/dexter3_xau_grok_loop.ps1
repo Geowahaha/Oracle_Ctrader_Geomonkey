@@ -50,6 +50,10 @@ $env:DEXTER3_DAILY_TARGET_USD = "30"
 $env:DEXTER3_DAILY_LOSS_USD = "15"
 $env:DEXTER3_BASE_RISK_FRAC = "0.004"
 $env:DEXTER3_MAX_RISK_FRAC = "0.010"
+# Supplement guard (2026-07-09): skip entries whose XAU 1-oz min-volume floor
+# would risk >1.5x the designed risk (losses were paying $7-11 on a $4.8
+# design while small-lock wins banked ~0.35R of design — structural skew).
+$env:DEXTER3_MIN_VOLUME_RISK_RATIO_CAP = "1.5"
 $env:DEXTER3_MODE = "grok"
 
 Write-Host "[dexter3-grok] MCP health check (auto-restart if down)..."

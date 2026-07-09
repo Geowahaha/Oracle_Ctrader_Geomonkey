@@ -29,6 +29,7 @@ happens on the live micro-entry path is silent.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -303,6 +304,21 @@ def planned_volume_units(
         rounded = min_volume
         meta["rounded_units"] = rounded
         meta["min_volume_clamped_up"] = True
+        # DEXTER3_MIN_VOLUME_RISK_RATIO_CAP (default 0 = off, byte-identical
+        # legacy accept): when the min-volume floor inflates actual risk beyond
+        # ratio_cap x the designed risk_usd, REFUSE instead of silently
+        # accepting. Found 2026-07-09 on the Grok scalp lane: design risk $4.8
+        # but 1-oz XAU floor paid -$7..-$11 on losses while small-lock wins
+        # banked ~0.35R of the DESIGN risk — a structural negative skew that
+        # only exists because of this clamp-up.
+        try:
+            ratio_cap = float(os.environ.get("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", "0") or 0.0)
+        except ValueError:
+            ratio_cap = 0.0
+        if ratio_cap > 0 and estimated_min_volume_risk_usd > float(risk_usd) * ratio_cap:
+            meta["refuse_reason"] = "min_volume_risk_exceeds_ratio_cap"
+            meta["min_volume_risk_ratio_cap"] = ratio_cap
+            return 0.0, meta
     if rounded > float(max_volume_units):
         meta["refuse_reason"] = "min_volume_exceeds_max_volume_units_cap"
         return 0.0, meta

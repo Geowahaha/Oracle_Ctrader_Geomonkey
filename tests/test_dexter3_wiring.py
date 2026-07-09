@@ -691,3 +691,48 @@ def test_v18_size_levers_rescue_floor():
 
 def test_v18_b_tier_mult_halves_chain_risk():
     assert sr._apply_v18_size_levers({"size_mult": 0.5}, 14.4, 5.04) == pytest.approx(2.52)
+
+
+# -- min-volume risk ratio cap (Grok supplement guard 2026-07-09) ------------
+
+
+XAU_DETAILS = {"minVolume": 1.0, "maxVolume": 100.0, "volumeStep": 1.0, "lotSize": 100.0, "pipSize": 0.01}
+
+
+def test_min_volume_ratio_cap_off_by_default_accepts_clamp_up(monkeypatch):
+    monkeypatch.delenv("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", raising=False)
+    from dexter3.executor import planned_volume_units
+    # design $4.8 risk, SL 11 pts -> raw 0.43oz -> clamped UP to 1oz = $11 risk
+    vol, meta = planned_volume_units(XAU_DETAILS, sl_distance=11.0, risk_usd=4.8, max_volume_units=10.0)
+    assert vol == pytest.approx(1.0)
+    assert meta.get("min_volume_clamped_up") is True
+    assert meta.get("refuse_reason") is None
+    assert meta["estimated_min_volume_risk_usd"] == pytest.approx(11.0)
+
+
+def test_min_volume_ratio_cap_refuses_oversized_floor(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", "1.5")
+    from dexter3.executor import planned_volume_units
+    # $11 floor risk > 1.5 x $4.8 = $7.2 -> refuse
+    vol, meta = planned_volume_units(XAU_DETAILS, sl_distance=11.0, risk_usd=4.8, max_volume_units=10.0)
+    assert vol == 0.0
+    assert meta["refuse_reason"] == "min_volume_risk_exceeds_ratio_cap"
+
+
+def test_min_volume_ratio_cap_allows_within_ratio(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", "1.5")
+    from dexter3.executor import planned_volume_units
+    # SL 6 pts -> floor risk $6 <= 1.5 x $4.8 = $7.2 -> accepted clamp-up
+    vol, meta = planned_volume_units(XAU_DETAILS, sl_distance=6.0, risk_usd=4.8, max_volume_units=10.0)
+    assert vol == pytest.approx(1.0)
+    assert meta.get("refuse_reason") is None
+
+
+def test_min_volume_ratio_cap_irrelevant_without_clamp_up(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", "1.5")
+    from dexter3.executor import planned_volume_units
+    # $17.5 risk, SL 5 pts -> raw 3.5oz, no clamp-up -> cap never fires (V1.8 lane unaffected)
+    vol, meta = planned_volume_units(XAU_DETAILS, sl_distance=5.0, risk_usd=17.5, max_volume_units=10.0)
+    assert vol == pytest.approx(3.0)
+    assert meta.get("min_volume_clamped_up") is None
+    assert meta.get("refuse_reason") is None
