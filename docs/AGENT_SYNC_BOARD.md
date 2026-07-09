@@ -37,6 +37,8 @@
 
 ## Owner — latest (≤1 paragraph)
 
+**2026-07-09 14:35Z (Fable/Opus handoff):** Session-end handoff written -> `docs/handoff/DEXTER3_FABLE_SESSION_HANDOFF_20260709.md`. Loop was DOWN (unmanaged Buy -$3.24); I RESTARTED it 14:33Z -> ALIVE pid 1096, v1.7-selective-edge, hunting (LIVE_ENTRY + ladder ARMED peak_r 0.64 + pullback-gate firing live). NOTE: V1.7 entry-quality defaults ON, so restart = full V1.7 (confirm with owner if that was intended vs plain V1.6). Session shipped the edge-discovery stack: fix#1 looser ladder + anti-chase (v1.5) + pullback selector (v1.6), all verified firing live. HONEST: still net-negative (07-08/09 ~ -$37.81) -> edges deployed+verified but NOT yet proven to flip profitability; next job = MEASURE forward + extend backtest history.
+
 **2026-07-09 Bangkok night:** Fable 5 audit: an **unlogged deletion of 33 files** (whole fibo family + tests + handoffs) was sitting uncommitted in the working tree and broke main-system imports (`scheduler.py` line 30/65) — all restored from git, dexter3 suite 225 ✅ + fibo suite 69 ✅. Broker flat, MCP healthy, Grok lane healthy. The V1.7 stack (grok_v10, v16_entry_quality, launchers) was **untracked in git** — now committed as rollback anchor. V1.7 relaunch precondition met (Grok flat + MCP healthy); launch queued for owner approval.
 
 ---
