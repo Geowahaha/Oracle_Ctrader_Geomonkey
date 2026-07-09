@@ -642,6 +642,14 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Stability instrumentation armed:** persistent monitor on watchdog log `ok:false` — any future zombie event is caught and timestamped. Honest claim protocol: "stable" = zombie rate drops from ~61/day to ~0 over a multi-hour window; measurement ongoing, will be reported. Live loops (Fable 22000 / Grok 4804) still run pre-fix client code (leak ≈1 session per process — negligible vs 645/day) and inherit hygiene at their next natural restart.
 - Watchdog `--restart` self-heal stays as defense-in-depth; expectation after this fix is it stops firing.
 
+### 2026-07-10 UTC 18:25Z — claude-fable (Fable 5, CEO) + Sonnet builder — VM MIGRATION P1 SHIPPED + P2 truths
+
+- Owner goal: PC on/off must not matter. Decision doc `docs/DEXTER3_VM_MIGRATION_DESIGN.md`: local MCP = PC-bound (dev only); remote MCP workers = just proxies BACK to a desktop MCP (verified in dexter-mcp/src/ctrader-proxy.ts — not a path); **OpenAPI on VM = the home**.
+- **P1 shipped (`c64c964`, Sonnet built / Fable PM-reviewed, 285 tests):** `dexter3/openapi_client.py` (mcp_client-shape adapter over ops/ctrader_execute_once.py), `dexter3/transport.py` factory (`DEXTER3_TRANSPORT`, default local_mcp = byte-identical), parity script, 41 tests. Honest gaps in the doc: deals-label blindness (governor) + symbol_details NotImplemented = P3 blockers; subprocess-per-call connection churn = P2 risk.
+- **P2 smoke on VM (real broker): found the buried truth** — VM fast-forwarded to c64c964 (verified zero main-system files in the 65-commit diff), then the adapter's ACCOUNT PIN correctly fail-closed: the worker resolves `CTRADER_USE_DEMO` → **LIVE environment with an invalid/stale token** (matches infra.auth_health warnings since April). The VM's OpenAPI *execution* path has been auth-dead; only the stream side works. PC has no token at all.
+- **P2 queue for next agent (fresh context):** map the VM token inventory (stream vs worker vs keepalive vs token_manager state), wire CTRADER_USE_DEMO=true + valid demo token (account 46670728) for the dexter3 worker context, re-smoke until the pin PASSES, then symbol_details worker mode + deals-label join + persistent-connection daemon. Cutover (P3) only after those.
+- Delegation model (owner-directed, in memory as feedback-ceo-delegation-model): Fable=CEO/PM quiet+review; Sonnet=coder; Haiku=watcher (shift running, checks NORMAL so far); Telegram watcher PID 4500 = free tier alerting owner directly.
+
 ### 2026-07-09 UTC 17:25Z — claude-fable (Fable 5) — BOTH lanes restarted on fully-fixed code (owner full permission)
 
 - Owner saw heavy SL damage on Grok and granted full permission to act directly. Confirmed cause: running Grok (old PID 4804, started 08:32Z) predated the ratio cap — it slid +$12.41 → **−$1.66** (2 more ~−$7 SL hits on a $4.8 design; avgL −$7.13). Old process killed.

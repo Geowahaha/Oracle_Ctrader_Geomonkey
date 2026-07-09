@@ -71,6 +71,36 @@ shadow_runner wired through factory (3-line diff), 41 new tests,
    ctrader-stream.service or a small local socket service) that the adapter
    calls instead of spawning workers.
 
+## P2 smoke findings (2026-07-10 ~18:20Z — VM, real broker)
+
+1. VM fast-forwarded a8498ab→c64c964 (65 commits; verified ZERO main-system
+   files in the diff before pulling; dexter-monitor untouched/not restarted).
+2. Adapter smoke on VM FAILED at the account pin — **by design** (fail-closed
+   worked): `ops/ctrader_execute_once.py --mode accounts` returns
+   `{"ok":false,"message":"Invalid access token","environment":"live",
+   token_refresh: refresh_failed}`.
+3. **Root discovery: the worker resolves environment from
+   `config.CTRADER_USE_DEMO` (ops/ctrader_execute_once.py:168-174) — on the
+   VM this resolves to LIVE, and the LIVE token is invalid/stale** (matches
+   the `infra.auth_health` stale-token warnings on the board since April).
+   The running `ctrader-stream.service` + token-keepalive presumably serve a
+   different token path — must be mapped before P2 continues.
+4. PC has no OpenAPI token at all ("No access token available") — parity
+   script can only pass after a PC demo token exists OR parity moves to
+   golden-sample mode.
+
+**P2 queue (next Sonnet task, fresh session):**
+- Map the VM token inventory: which token does ctrader-stream.service use,
+  which does the worker use, where does scripts/refresh_ctrader_token.py +
+  api/ctrader_token_manager.py read/write state, and what does
+  ctrader-token-keepalive actually refresh.
+- Wire the DEMO path: CTRADER_USE_DEMO=true for the dexter3 worker context +
+  a valid demo-scoped token (account 46670728) with keepalive.
+- Re-run the VM smoke: pin must PASS (traderId/account 46670728), then
+  balance/positions/trendbars shapes vs golden samples.
+- Only then: gaps #1/#2 (symbol_details worker mode, deals-label join) and
+  the persistent-connection daemon (risk #4).
+
 ## Risks / notes
 - VM RAM 956MB, ~229MB free + 2GB swap: two loops ≈ 100-120MB — fits; watch OOM.
 - OpenAPI symbol/volume conventions differ from local MCP (pipettes, cents on
