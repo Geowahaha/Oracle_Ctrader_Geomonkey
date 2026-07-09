@@ -157,6 +157,83 @@ def test_account_pin_cached_after_first_success(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# diagnose_account_pin — non-raising preflight (added 2026-07-10, P2 token
+# investigation: distinguishes "worker/token broken" from "account not in
+# token's list" without reading logs)
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_account_pin_ok_fresh(monkeypatch):
+    c = _client()
+    router = _InvokeRouter({})
+    monkeypatch.setattr(c, "_invoke", router)
+    result = c.diagnose_account_pin()
+    assert result == {
+        "ok": True,
+        "reason": "pin_ok",
+        "configured_account_id": DEFAULT_ACCOUNT_ID_PIN,
+        "seen_account_ids": [DEFAULT_ACCOUNT_ID_PIN],
+        "error_type": None,
+        "message": f"account {DEFAULT_ACCOUNT_ID_PIN} confirmed among token accounts [{DEFAULT_ACCOUNT_ID_PIN}]",
+    }
+    assert c._pin_verified is True
+    assert [call[0] for call in router.calls] == ["accounts"]
+
+
+def test_diagnose_account_pin_never_raises_and_does_not_repeat_network_call(monkeypatch):
+    c = _client()
+    router = _InvokeRouter({})
+    monkeypatch.setattr(c, "_invoke", router)
+    first = c.diagnose_account_pin()
+    second = c.diagnose_account_pin()
+    assert first["reason"] == "pin_ok"
+    assert second["reason"] == "pin_ok_cached"
+    assert second["ok"] is True
+    assert len(router.calls) == 1  # second call made no network round trip
+
+
+def test_diagnose_account_pin_account_not_in_token_list(monkeypatch):
+    c = _client(account_id=999999)
+    router = _InvokeRouter({"accounts": _accounts_ok(account_id=46670728)})
+    monkeypatch.setattr(c, "_invoke", router)
+    result = c.diagnose_account_pin()
+    assert result["ok"] is False
+    assert result["reason"] == "account_not_in_token_list"
+    assert result["seen_account_ids"] == [46670728]
+    assert result["error_type"] is None
+    assert c._pin_verified is False  # never raises, but also never falsely marks verified
+
+
+def test_diagnose_account_pin_worker_call_failed_tool_error(monkeypatch):
+    c = _client()
+
+    def _raise_invalid_token(mode, payload, *, mutating=False, timeout_sec=None):
+        raise McpClientError("openapi worker mode=accounts failed status=accounts_failed: Invalid access token")
+
+    monkeypatch.setattr(c, "_invoke", _raise_invalid_token)
+    result = c.diagnose_account_pin()
+    assert result["ok"] is False
+    assert result["reason"] == "worker_call_failed"
+    assert result["error_type"] == "McpClientError"
+    assert "Invalid access token" in result["message"]
+    assert c._pin_verified is False
+
+
+def test_diagnose_account_pin_worker_call_failed_transport_error(monkeypatch):
+    c = _client()
+
+    def _raise_transport(mode, payload, *, mutating=False, timeout_sec=None):
+        raise Dexter3OpenApiTransportError("worker transport failed twice for mode=accounts: timeout")
+
+    monkeypatch.setattr(c, "_invoke", _raise_transport)
+    result = c.diagnose_account_pin()
+    assert result["ok"] is False
+    assert result["reason"] == "worker_call_failed"
+    assert result["error_type"] == "Dexter3OpenApiTransportError"
+    assert c._pin_verified is False
+
+
+# ---------------------------------------------------------------------------
 # positions normalization
 # ---------------------------------------------------------------------------
 

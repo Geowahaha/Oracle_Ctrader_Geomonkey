@@ -101,6 +101,150 @@ shadow_runner wired through factory (3-line diff), 41 new tests,
 - Only then: gaps #1/#2 (symbol_details worker mode, deals-label join) and
   the persistent-connection daemon (risk #4).
 
+## P2 token/account investigation (2026-07-10 — Sonnet, read-only on VM)
+
+**Q1 — the environment="live" contradiction, SOLVED, not a bug:**
+`ops/ctrader_execute_once.py:390-392` hardcodes `mode == "accounts"` to
+always use `EndPoints.PROTOBUF_LIVE_HOST` + report `environment="live"`,
+**regardless of `CTRADER_USE_DEMO`** — this is deliberate and matches
+cTrader's OpenAPI protocol requirement that `ProtoOAGetAccountListByAccessTokenReq`
+(and app-auth) go over the Live host even for demo-account tokens; the
+DEMO/LIVE branch in `_resolve_host()` (:161-174) and in
+`execution/ctrader_stream.py:354-358` (the live stream service — confirmed
+correctly branching on `CTRADER_USE_DEMO`) is unaffected. So `"environment":
+"live"` in the earlier smoke failure said nothing about demo/live routing —
+it is the *fixed* label for `mode=accounts` specifically. `sudo` was not the
+cause either (config loads fine under sudo — confirmed via keepalive service
+journal showing `[Config] Loaded: .env.local` every run).
+
+**The REAL cause of "Invalid access token" — found via VM read-only checks:**
+```
+data/runtime/ctrader_token_state.json (redacted): last_refresh_utc=2026-07-01
+06:01:51 UTC, refresh_count=3, consecutive_failures=1, saved_utc=2026-07-09
+19:25:40 UTC (i.e. a refresh was ATTEMPTED and FAILED ~9 days after the last
+SUCCESS — saved_utc moved, last_refresh_utc did not).
+```
+`sudo journalctl -u ctrader-token-keepalive.service` shows the SAME failure
+every ~30 min since the timer last (re)started (`ctrader-token-keepalive.timer`
+active since 2026-07-01 04:31:29 UTC, "1 week 1 day ago"):
+`[TokenManager] refresh attempt 1-5/5: Access denied. Make sure the
+credentials are valid.` — this is `Auth.refreshToken(refresh_token)` itself
+being rejected by Spotware, i.e. **the persisted `refresh_token` is dead**
+(revoked/rotated-away/expired), not a demo/live mismatch. App-level
+credentials (client_id/secret) are fine — the earlier smoke test got past
+`ProtoOAApplicationAuthReq` and failed specifically at
+`ProtoOAGetAccountListByAccessTokenReq`, and the keepalive failure is at
+`Auth.refreshToken`, both consistent with one root cause: this refresh_token
+no longer works. This is chronic — the design doc's own note that this
+"matches the `infra.auth_health` stale-token warnings on the board since
+April" now has a concrete mechanism, not just a symptom.
+
+**Token/account map (definitive parts; one part still unknown):**
+- `api/ctrader_token_manager.py` is a **single process-wide singleton**,
+  imported identically by `execution/ctrader_stream.py:37` (the live stream
+  service) and `ops/ctrader_execute_once.py:27` (the worker dexter3's
+  `openapi_client.py` shells out to) — there is only ONE token, not
+  per-service tokens. `ctrader-stream.service` has been connected since
+  `2026-07-01 05:18:47 UTC` (confirmed via `systemctl status`, "1 week 1 day
+  ago") — i.e. it authenticated successfully using the token from just
+  *before* it went stale, and has stayed up on that live TCP session ever
+  since. It has NOT needed to re-authenticate. `dexter-monitor.service`
+  restarted more recently (`2026-07-09 18:42:11 UTC`, ~50 min before this
+  check) and is reported `active (running)` — but a restart does not prove
+  it successfully re-authenticated a NEW cTrader OpenAPI session; it may
+  simply not have needed one yet (MT5 path, or no cTrader order attempted
+  since restart). **This is flagged as the single biggest risk below.**
+- The static `Ctrader_accounts` / `CTRADER_ACCOUNTS_JSON` registry in
+  `.env.local` (what `config.find_ctrader_account` searches) lists exactly
+  4 accounts: `11955075`, `13079658`, `43880642` (all `live:true`, EUR/USD)
+  and `46552794`/login `9900897` (`live:false`, the demo the earlier smoke
+  test pinned against). **`46670728` (mission demo, login `9922808`) is NOT
+  in this registry.** This is suggestive but NOT definitive proof the
+  current OAuth token can't see it — this registry is a static cache (was
+  populated at some past "accounts" call, unknown when) and the live,
+  authoritative answer requires a fresh `ProtoOAGetAccountListByAccessTokenReq`
+  call with a WORKING token, which we don't have right now (see above).
+  **Cannot be determined until the refresh_token is replaced.**
+
+**Q4 — account pin/selection code gap: DOES NOT EXIST, already shipped in P1.**
+Re-verified every read/write method on `Dexter3OpenApiClient`
+(`get_trendbars`, `get_spot_price`, `get_positions`, `get_balance`,
+`get_pending_orders`, `get_deals`, `place_market_order`, `amend_position`,
+`close_position`) routes through `self._payload()` (dexter3/openapi_client.py:395-399
+pre-existing), which injects `account_id: self.account_id` into every
+worker payload and calls `_ensure_account_pin()` first — none bypass it.
+`self.account_id` already resolves from `DEXTER3_OPENAPI_ACCOUNT_ID` (env
+override) or `DEFAULT_ACCOUNT_ID_PIN = 46670728` (:141-142, :257-261,
+tests at `tests/test_dexter3_openapi_client.py:108-156`), and this is passed
+via the worker's `--payload-file` JSON, which `ops/ctrader_execute_once.py::
+_account_id_from_payload` reads as FIRST priority (:127-130) — ahead of
+`config.CTRADER_ACCOUNT_LOGIN`/`CTRADER_ACCOUNT_ID`. **This means dexter3
+can already select account 46670728 on a shared VM worker WITHOUT touching
+the VM's global `CTRADER_ACCOUNT_ID`/`CTRADER_ACCOUNT_LOGIN` (which stays
+pinned to 46552794 for the live main system).** No code change was needed
+for the pin/selection mechanism itself.
+
+**New code (additive, this session):** `Dexter3OpenApiClient.diagnose_account_pin()`
+(dexter3/openapi_client.py, +76 lines) — a read-only, NEVER-raising preflight
+that distinguishes the three failure shapes that were previously indistinguishable
+without reading logs: `reason="pin_ok"`/`"pin_ok_cached"` (pin confirmed,
+also caches like a real pin check), `reason="account_not_in_token_list"`
+(broker reachable, token valid, but `account_id` isn't among the token's
+accounts — a genuine mismatch), `reason="worker_call_failed"` with
+`error_type` (`Dexter3OpenApiTransportError` vs plain `McpClientError` —
+the "Invalid access token" case). Run it on the VM as a safe preflight
+before starting any live/shadow loop:
+```
+sudo .venv/bin/python -c "from dexter3.openapi_client import Dexter3OpenApiClient as C; import json; print(json.dumps(C().diagnose_account_pin()))"
+```
+5 new tests (`tests/test_dexter3_openapi_client.py`, +77 lines): fresh
+success, cached success skips the network round-trip, account-not-in-list,
+tool-failure (`McpClientError`), transport-failure (`Dexter3OpenApiTransportError`).
+**162/162 dexter3-related tests green** (`test_dexter3_openapi_client.py`,
+`test_dexter3_wiring.py`, `test_dexter3_opening_manager.py`); full
+`tests/test_dexter3_*.py` sweep: 878 passed, 1 pre-existing unrelated
+failure (`test_dexter3_skipeval.py::test_fear_cost_summary_aggregates_evaluated_rows_only`
+— date-hardcoded fixture now outside its 24h window as time has moved past
+2026-07-05; reproduces identically on `git stash` with none of this
+session's changes applied, so **not** a regression from this work).
+
+**Q5 — P1 gaps #1 (symbol_details) / #2+#4 (deals label) phasing:**
+- Gap #1 (`get_symbol_details` `NotImplementedError`) only blocks
+  `place_market_order`/live entries (P3). **Does not block a decision-only
+  P2 shadow run.**
+- Gap #4 (`get_deals` label-blind) DOES corrupt P2's core purpose — a
+  decision comparison — for any decision path that reads
+  `dexter3.shadow_runner._lane_realized_today` (confirmed used at
+  `shadow_runner.py:543-547` lane PnL, `:1360-1366` sizing multiplier,
+  `:2171-2177` governor state): under `DEXTER3_TRANSPORT=openapi` this
+  ALWAYS returns `realized=0` regardless of actual closed trades, so
+  session-sizing/target-lock/ladder decisions WILL diverge from the
+  `local_mcp` reference lane by design, not by bug. **Recommendation:**
+  proceed with P2 shadow now, but treat any divergence traced to
+  governor realized-PnL/sizing as EXPECTED and out-of-scope for the P2
+  comparison (don't debug it as a P2 defect) until gap #4's
+  `ProtoOAOrderListReq` label-join is built; entry-signal/technical
+  decisions that don't touch the governor are valid to compare today.
+
+**Biggest risk (this session's finding, not originally in scope but
+surfaced by the read-only investigation):** the refresh_token used by
+`api.ctrader_token_manager` (shared by the LIVE main system's
+`ctrader-stream.service` and every `ops/ctrader_execute_once.py` worker
+call, dexter3 included) has been rejected by Spotware every ~30 minutes for
+at least 9 days (`Access denied. Make sure the credentials are valid.`).
+The live stream is only alive because its TCP session pre-dates the
+breakage and has never needed to re-authenticate. **If that session ever
+drops (VM reboot, service restart, network blip) or if `dexter-monitor`
+ever needs a fresh cTrader OpenAPI auth (e.g. to place a cTrader order),
+reconnection will fail with the same "Access denied" the smoke test hit —
+this threatens the LIVE main system, independent of dexter3.** Recommended
+safest first step: PM/owner runs the manual re-authorization fallback in
+`scripts/refresh_ctrader_token.py` (browser OAuth consent → paste code) to
+mint a fresh access+refresh token pair, which `on_token_refreshed()`
+persists to `data/runtime/ctrader_token_state.json` for every consumer to
+pick up. This is a live-shared-credential change and is explicitly a
+PM/owner action, not something this investigation executed.
+
 ## Risks / notes
 - VM RAM 956MB, ~229MB free + 2GB swap: two loops ≈ 100-120MB — fits; watch OOM.
 - OpenAPI symbol/volume conventions differ from local MCP (pipettes, cents on

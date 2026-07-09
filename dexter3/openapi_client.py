@@ -392,6 +392,82 @@ class Dexter3OpenApiClient:
             )
         self._pin_verified = True
 
+    def diagnose_account_pin(self) -> dict[str, Any]:
+        """Read-only, NEVER-raising preflight for the account pin.
+
+        Added 2026-07-10 during the P2 VM token/account investigation: the
+        VM smoke test (``docs/DEXTER3_VM_MIGRATION_DESIGN.md`` P2 findings)
+        surfaced ``{"ok": false, "message": "Invalid access token"}`` from
+        the SAME "accounts" call ``_ensure_account_pin`` makes, and there
+        was no way to tell, without reading logs, whether that meant (a)
+        the shared token/worker is broken outright or (b) the token is
+        fine but simply does not include this pin's ``ctidTraderAccountId``.
+        This method makes that distinction a structured, scriptable
+        artifact instead of a log-reading exercise — run it on the VM
+        BEFORE starting a live/shadow loop:
+
+            python -c "from dexter3.openapi_client import Dexter3OpenApiClient as C; \\
+                import json; print(json.dumps(C().diagnose_account_pin()))"
+
+        Returns one of three shapes (never raises):
+          - ``reason="pin_ok"`` / ``"pin_ok_cached"``: pin confirmed; on a
+            fresh check this also marks the instance's pin verified so a
+            subsequent real call does not repeat the network round-trip.
+          - ``reason="account_not_in_token_list"``: the worker answered
+            (broker reachable, token accepted) but ``account_id`` isn't
+            among the accounts the token can see — a genuine account/token
+            mismatch, not a transport problem.
+          - ``reason="worker_call_failed"``: the worker/broker never gave a
+            usable answer (missing worker, timeout, OR a broker-level
+            rejection such as "Invalid access token" — ``error_type`` tells
+            you which: ``Dexter3OpenApiTransportError`` for the former,
+            plain ``McpClientError`` for the latter). This is the case that
+            was previously indistinguishable from (b) without reading logs.
+        """
+        if self._pin_verified:
+            return {
+                "ok": True,
+                "reason": "pin_ok_cached",
+                "configured_account_id": self.account_id,
+                "seen_account_ids": None,
+                "error_type": None,
+                "message": "pin already verified earlier in this instance's lifetime",
+            }
+        try:
+            raw = self._invoke("accounts", {}, mutating=False, timeout_sec=self.health_timeout_sec)
+        except McpClientError as exc:
+            return {
+                "ok": False,
+                "reason": "worker_call_failed",
+                "configured_account_id": self.account_id,
+                "seen_account_ids": None,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+        accounts = raw.get("accounts") or []
+        seen_ids = sorted({int(a.get("accountId", 0) or 0) for a in accounts if isinstance(a, dict)})
+        if self.account_id not in seen_ids:
+            return {
+                "ok": False,
+                "reason": "account_not_in_token_list",
+                "configured_account_id": self.account_id,
+                "seen_account_ids": seen_ids,
+                "error_type": None,
+                "message": (
+                    f"configured ctidTraderAccountId={self.account_id} not found among "
+                    f"token accounts {seen_ids}"
+                ),
+            }
+        self._pin_verified = True
+        return {
+            "ok": True,
+            "reason": "pin_ok",
+            "configured_account_id": self.account_id,
+            "seen_account_ids": seen_ids,
+            "error_type": None,
+            "message": f"account {self.account_id} confirmed among token accounts {seen_ids}",
+        }
+
     def _payload(self, **kwargs: Any) -> dict[str, Any]:
         self._ensure_account_pin()
         out: dict[str, Any] = {"account_id": self.account_id}
