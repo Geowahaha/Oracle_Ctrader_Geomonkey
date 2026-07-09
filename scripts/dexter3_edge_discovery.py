@@ -40,7 +40,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dexter3 import hunt_mode, market_lens
+from dexter3 import edge_buckets
 from dexter3.mcp_client import Dexter3McpClient
+from dexter3.v16_entry_quality import V16EntryQualityConfig, evaluate_v16_entry_gate
 
 MIN_M5 = 60          # bars of context the committee needs
 M15_CTX = 60
@@ -197,6 +199,56 @@ def _simulate_smart(side: str, entry: float, sl: float, tp: float, future: list,
     return ("win" if r > 0 else "loss"), r
 
 
+def _entry_gate_config(mode: str) -> V16EntryQualityConfig:
+    """Config snapshots for exact production-gate replay.
+
+    Cool-down is disabled here because the replay does not reconstruct live OM
+    close stamps. That matches the current launcher for V1.7 mission control.
+    """
+    common = {"cooldown_enabled": False}
+    if mode == "v16":
+        return V16EntryQualityConfig(
+            **common,
+            a_plus_bypasses_chase=False,
+            block_chase_bypass_on_aligned_trending=False,
+        )
+    if mode == "v17":
+        return V16EntryQualityConfig(
+            **common,
+            a_plus_bypasses_chase=True,
+            block_chase_bypass_on_aligned_trending=False,
+        )
+    if mode == "v17-mission":
+        return V16EntryQualityConfig(
+            **common,
+            a_plus_bypasses_chase=True,
+            block_chase_bypass_on_aligned_trending=True,
+        )
+    raise ValueError(f"unknown entry gate mode: {mode}")
+
+
+def _stamp_entry_gate_features(decision, m5_prefix: list, h1_ctx: list) -> None:
+    """Mirror live shadow_runner feature stamping before entry-quality gate."""
+    if not isinstance(getattr(decision, "features", None), dict):
+        decision.features = {}
+    _, anti = edge_buckets.anti_chase_risk_mult(decision.side, h1_ctx)
+    _, pullback = edge_buckets.pullback_size_mult(decision.side, m5_prefix)
+    decision.features["anti_chase"] = anti
+    decision.features["pullback_gate"] = pullback
+
+
+def _apply_entry_gate(decision, mode: str, now_iso: str) -> dict:
+    if mode == "none":
+        return {"allow": True, "reason": "gate_disabled", "features": {}}
+    return evaluate_v16_entry_gate(
+        decision=decision,
+        state={},
+        mcp_consec_errors=0,
+        now_iso=now_iso,
+        cfg=_entry_gate_config(mode),
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="XAUUSD")
@@ -208,6 +260,12 @@ def main() -> int:
     ap.add_argument("--smart-exit", action="store_true", help="close-confirmed SL (survive noise wicks) + wide disaster stop")
     ap.add_argument("--disaster-mult", type=float, default=2.5, help="disaster hard-stop = this x the SL distance (smart-exit only)")
     ap.add_argument("--pullback-only", action="store_true", help="only take pullback-exhaustion-resumption entries (test entry-quality edge)")
+    ap.add_argument(
+        "--entry-gate",
+        choices=("none", "v16", "v17", "v17-mission"),
+        default="none",
+        help="replay production entry-quality gate before simulating accepted trades",
+    )
     args = ap.parse_args()
 
     c = Dexter3McpClient()
@@ -222,7 +280,8 @@ def main() -> int:
     buckets: dict[tuple, list] = defaultdict(list)   # (align, session) -> [R,...]
     regime_buckets: dict[tuple, list] = defaultdict(list)  # (align, regime) -> [R,...]
     side_split: dict[str, list] = defaultdict(list)
-    n_eval = n_enter = 0
+    gate_blocks: dict[str, list] = defaultdict(list)
+    n_eval = n_candidates = n_enter = 0
 
     # walk forward: decision uses [:i+1], outcome uses [i+1:]
     for i in range(MIN_M5, len(m5) - 2):
@@ -238,9 +297,10 @@ def main() -> int:
             continue
         if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
             continue
+        _stamp_entry_gate_features(d, prefix, h1c)
         if args.pullback_only and not _pullback_resume(prefix, str(d.side)):
             continue
-        n_enter += 1
+        n_candidates += 1
         future = m5[i + 1:]
         # SL-widen experiment: push SL (and TP, keeping RR) further from entry
         entry_p, sl_p, tp_p = float(d.entry), float(d.sl), float(d.tp)
@@ -259,6 +319,11 @@ def main() -> int:
         risk = abs(float(d.entry) - float(d.sl))
         cost_r = (args.spread_abs / risk if risk > 0 else 0.0) + args.commission_r
         r_net = r - cost_r
+        gate = _apply_entry_gate(d, args.entry_gate, str(d.ts_close or ts))
+        if not bool(gate.get("allow", True)):
+            gate_blocks[str(gate.get("reason") or "blocked")].append(r_net)
+            continue
+        n_enter += 1
         # bucket dims
         align = "aligned" if (_h1_trend_sign(h1c) == (1 if d.side == "buy" else -1)) else \
                 ("counter" if _h1_trend_sign(h1c) != 0 else "no_trend")
@@ -268,7 +333,10 @@ def main() -> int:
         regime_buckets[(align, regime)].append(r_net)
         side_split[str(d.side)].append(r_net)
 
-    print(f"evaluated {n_eval} M5 closes, {n_enter} entries ({n_enter/max(1,n_eval)*100:.0f}% participation)\n")
+    print(
+        f"evaluated {n_eval} M5 closes, {n_candidates} candidates, {n_enter} accepted entries "
+        f"({n_enter/max(1,n_eval)*100:.0f}% participation), entry_gate={args.entry_gate}\n"
+    )
 
     def _row(name, rs):
         n = len(rs)
@@ -307,6 +375,13 @@ def main() -> int:
         r = _row(side, rs)
         if r:
             print(f"  {side:6} N={r[1]:>4} WR={r[2]*100:.0f}% exp/tr={r[5]:+.3f}R totR={r[7]:+.1f}")
+
+    if gate_blocks:
+        print("\n=== ENTRY GATE BLOCKS (counterfactual R avoided if negative) ===")
+        print(f"{'reason':32} {'N':>4} {'avgR':>7} {'totR':>7}")
+        print("-" * 54)
+        for reason, rs in sorted(gate_blocks.items(), key=lambda kv: sum(kv[1])):
+            print(f"{reason:32} {len(rs):>4} {sum(rs)/len(rs):>+7.3f} {sum(rs):>+7.1f}")
 
     allr = [x for rs in buckets.values() for x in rs]
     if allr:

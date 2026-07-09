@@ -19,9 +19,9 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **DEXTER3 V1.6 live on XAUUSD — entry-selection edge stack.** Two proven entry selectors compound on risk sizing: pullback-resumption = full size (+0.055R vs +0.003R baseline, 18×), anti-chase = 0.15× scout on aligned-trending chase (-116R bucket); looser ladder lets winners run; smart-exit built but OFF (data: hurts good entries). Rollback tags `v1.0`→`v1.6-dexter3-pullback`. Launch env: DEXTER3_OM_LADDER_CSV + ANTICHASE_ENABLED=1 + PULLBACK_ENABLED=1 + SMART_EXIT_ENABLED=0. codex BTC M1 loop unchanged. |
-| **Last updated (UTC)** | 2026-07-08T10:40Z |
-| **Last updated by** | claude-fable (PM) |
+| **Phase now** | **Repo integrity restored + V1.7 relaunch precondition MET.** Unlogged fibo purge (33 files) restored — scheduler imports fixed; dexter3 suite 225 passed + fibo 69 passed. Broker FLAT @ 14:26Z, MCP healthy, Grok lane healthy (21 entries, 0 loss baskets). V1.7 launch awaiting owner approval (permission-gated). V1.7 stack committed to git (was untracked). |
+| **Last updated (UTC)** | 2026-07-09T14:40Z |
+| **Last updated by** | claude-fable (Fable 5) |
 
 ---
 
@@ -37,7 +37,7 @@
 
 ## Owner — latest (≤1 paragraph)
 
-**2026-07-05 Bangkok PM:** Two lanes now. (1) codex BTC demo-live loop unchanged — leader price-action gate live, correctly waiting (`wait_leader_confirmation`, score 0.46 < 0.64 floor), broker flat, balance ~10749. (2) **DEXTER3 kicked off per owner goal**: M5-close forced-evaluation hunter engine (XAU+BTC) + basket repair→close-all-in-profit, as NEW additive package `dexter3/` (own label `dexter3:fable:m5h-v1`, own lock, shadow-first — no orders in P1). Blueprint: `docs/DEXTER3_M5_HUNTER_BLUEPRINT.md`. Sonnet agent building P1 now; /loop active until sustained profit.
+**2026-07-09 Bangkok night:** Fable 5 audit: an **unlogged deletion of 33 files** (whole fibo family + tests + handoffs) was sitting uncommitted in the working tree and broke main-system imports (`scheduler.py` line 30/65) — all restored from git, dexter3 suite 225 ✅ + fibo suite 69 ✅. Broker flat, MCP healthy, Grok lane healthy. The V1.7 stack (grok_v10, v16_entry_quality, launchers) was **untracked in git** — now committed as rollback anchor. V1.7 relaunch precondition met (Grok flat + MCP healthy); launch queued for owner approval.
 
 ---
 
@@ -290,7 +290,8 @@ Format each entry:
 ### 2026-07-04 UTC 04:07Z — codex — MCP zombie permanent know-how
 
 - Owner requested permanent know-how for the recurring cTrader MCP zombie issue. Added `docs/MCP_ZOMBIE_RECOVERY_RUNBOOK.md` and updated `AGENTS.md`: local MCP HTTP `404` while port `9876` is open means cTrader Desktop MCP handler is zombie; do not rely on client session reset alone, use `python scripts\ctrader_mcp_watchdog.py --restart`.
-- Added memory extension note `C:\Users\mrgeo\.codex\memories\extensions\ad_hoc\notes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit the recovery rule.
+- Added memory extension note `C:\Users\mrgeo\.codex\memories\extensions\ad_hoc
+otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit the recovery rule.
 - Patched `scripts/btc_scalp_monitor.py`: when consecutive MCP errors reach `MCP_CIRCUIT_BREAKER_ERRORS`, BTC loop now calls `restart_ctrader()`, resets its MCP session only when restart returns `ok`, preserves the error counter on failed/skipped restart, logs `mcp_circuit_breaker`, and sleeps for `MCP_CIRCUIT_BREAKER_SLEEP_SEC`.
 - Patched `ops/btc_scalp_loop.ps1` to run `python scripts\ctrader_mcp_watchdog.py --quiet --restart` before launching the loop, matching the hardened XAU launcher pattern.
 - Validation: `python -m py_compile scripts\btc_scalp_monitor.py scripts\ctrader_mcp_watchdog.py scripts\ctrader_app_restart.py`; `python -m pytest tests\test_btc_scalp_monitor.py tests\test_ctrader_mcp_client.py -q` -> `26 passed`.
@@ -498,9 +499,96 @@ Format each entry:
 
 ---
 
+### 2026-07-09 UTC 04:07Z — codex — Governor V1.0→V1.6 + Grok_v1.0 parallel audit
+
+- Reviewed rollback tags `v1.0-dexter3-mission` through `v1.6-dexter3-pullback`, Grok_v1.0 code, OM lane filtering, governor PnL logic, and executor label isolation.
+- Finding: V1.6 is still the winner edge by evidence (pullback-resumption + anti-chase). Initial Grok_v1.0 parallel patch was not independently safe: `dexter3/shadow_runner.py` failed `py_compile`, normal V1.6 OM could route into Grok small-lock, and OM/governor paths could combine or count the wrong label.
+- Fix: repaired `shadow_runner.py` syntax, made active label mode-specific, keyed realized-PnL cache by label, restricted governor close-all to the active label, made Grok small-lock explicit via `GrokV10OpeningManager`, and added focused regression tests.
+- Verification: `python -m py_compile dexter3\shadow_runner.py dexter3\grok_v10.py dexter3\opening_manager.py dexter3\daily_governor.py dexter3\edge_buckets.py dexter3\basket_live.py dexter3\executor.py tests\test_dexter3_opening_manager.py tests\test_dexter3_wiring.py`; `python -m pytest -q tests\test_dexter3_opening_manager.py tests\test_dexter3_governor.py tests\test_dexter3_basket_live.py tests\test_dexter3_wiring.py` -> `167 passed`.
+- No live loop was started/restarted and no MCP order mutation was sent.
+
+### 2026-07-09 UTC 04:53Z — codex — Dexter3 V1.6 + Grok_v1.0 parallel launch
+
+- Fixed and verified parallel isolation before launch: V1.6 and Grok_v1.0 use separate labels, locks, state files, and Grok-only small-lock sizing. Verification: `py_compile` plus focused Dexter3 suite `168 passed`.
+- Preflight cTrader MCP was healthy, but first launch exposed a Desktop MCP zombie/timeout. Codex stopped both lane workers, ran `python scripts\ctrader_mcp_watchdog.py --restart`, and recovered MCP (`session_id=871d7710`).
+- Relaunched both live demo managers on XAUUSD: V1.6 wrapper/Python `3080`/`23676` with lock `data/runtime/dexter3_loop.lock`; Grok wrapper/Python `11404`/`11208` with lock `data/runtime/dexter3_grok_loop.lock`.
+- Broker proof after relaunch: no pending orders. Grok owns open short position `650189853` label `dexter3:grok-v1.0:scalper`; V1.6 closed its prior short `650189854` at `2026-07-09T04:51:56Z` for `-0.70` and opened buy position `650195955` label `dexter3:fable:m5h-v1`.
+- Next peer: do not merge the labels into one manager lane; identify open/close ownership by broker `label` and `positionId`, then confirm realized close events via `get_deals`.
+
+### 2026-07-09 UTC 05:30Z — codex — pre-work handoff for next agent
+
+- Owner requested explicit before/after handoffs before further work. Created `docs/handoff/DEXTER3_V16_GROK_PARALLEL_HANDOFF_20260709.md`.
+- Handoff records live MCP health (`session_id=4a0c8d7d`), running loop PIDs (`23676` V1.6, `11208` Grok), current open positions, V1.6 profit audit summary, and the requested next upgrade plan.
+- Next agent should treat the next changes as strategy upgrades, not bug fixes: daily green threshold before scaling, winner-bucket-only scaling, weak-bucket downsize/block, and house-money mode. Preferred implementation point is when broker is flat unless owner explicitly accepts live handoff risk.
+
+### 2026-07-09 UTC 05:36Z — codex — before-work handoff for V1.6 profit-control patch
+
+- Owner reported no open position and requested the V1.6 fixes now. Current locks still point to V1.6 PID `23676` and Grok PID `11208`; local cTrader MCP is in zombie state (`python scripts\ctrader_mcp_watchdog.py` -> HTTP 404), so broker flatness must be re-read after MCP recovery before relaunch.
+- Safety sequence for this patch: stop both Dexter3 workers first to prevent new entries during MCP recovery, run `python scripts\ctrader_mcp_watchdog.py --restart`, verify positions/orders/balance, then patch daily-green scaling, winner-only scaling, weak-bucket downsize, and house-money floor.
+- No strategy code changes have been made at this handoff point.
+
+### 2026-07-09 UTC 05:42Z — codex — after-work handoff for V1.6 profit-control patch
+
+- Stopped V1.6 PID `23676` and Grok PID `11208`, removed stale locks, recovered cTrader MCP with `python scripts\ctrader_mcp_watchdog.py --restart`, and verified broker flat before edits (`balance/equity=10612.51`, no positions, no pending orders).
+- Implemented V1.6-only profit controls in `dexter3/shadow_runner.py`: weak setup scout sizing (`hunt_m15_drift`, `hunt_day_range_tilt`, `hunt_sweep_reclaim`), green-day winner scaling (`hunt_h1_context`, `hunt_swing_structure`, `basket_repair`, `opening_manager_repair`), and house-money floor arming/lock. Grok mode bypasses this layer.
+- Verification: `python -m py_compile ...` passed; `python -m pytest -q tests\test_dexter3_opening_manager.py tests\test_dexter3_governor.py tests\test_dexter3_basket_live.py tests\test_dexter3_wiring.py` -> `174 passed`.
+- Relaunched both live demo managers: V1.6 PID `1772` (`data/runtime/dexter3_loop.lock`) and Grok PID `22404` (`data/runtime/dexter3_grok_loop.lock`). MCP health OK (`session_id=0c75b2ad`), no pending orders.
+- Live broker state after restart initially had separate V1.6 and Grok buys. Final verification at `05:43Z`: V1.6 position `650208638` was closed by its own OM `stall_take`; only Grok position `650208650` remains open, XAUUSD BUY 0.01 lot, label `dexter3:grok-v1.0:scalper`, entry `4074.35`, SL `4059.41`, TP `4092.30`, net about `-0.31`. No pending orders.
+- Live log proof of new rule: V1.6 entry `hunt_h1_context` logged `v16-profit-control ... reason=winner_waiting_for_green_day effective=-2.15 mult=1.0`, so it did not scale before the daily green threshold.
+
+---
+
 **Cross-links**
 
 - **`docs/DEXTER3_HANDOFF.md`** ← master handoff: any model reads this FIRST to take over Dexter3 seamlessly (mission, golden rules, live state, design philosophy, forward plan)
 
 - Mission detail: `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md`
 - Session bootstrap: `CLAUDE.md` → Critical Files + Session Startup
+
+### 2026-07-09 UTC 06:15 — grok — ops autostart
+- Added parallel XAU Dexter3 autostart for **V1.6** + **Grok v1.0** only (not codex XAU scalp / BTC).
+- Scripts: ops/dexter3_xau_v16_loop.ps1, ops/dexter3_xau_grok_loop.ps1, ops/dexter3_xau_parallel_watchdog.ps1, ops/register_dexter3_xau_parallel_tasks.ps1, ops/uninstall_dexter3_xau_parallel_autostart.ps1.
+- Watchdog verified both locks alive (v16 pid 1772, grok pid 22404).
+- Installed user Startup VBS Dexter3-XAU-Parallel-Autostart.vbs (90s delay). Task Scheduler register returned Access Denied without elevation.
+- Disable: DEXTER3_XAU_PARALLEL_AUTOSTART=0 in .env.local, or run uninstall script.
+- Next: owner may run register script **elevated** for 1-min Health revive; otherwise Startup covers logon only.
+
+### 2026-07-09 UTC 06:40 — grok — cTrader-open watcher
+- Added long-running ops/dexter3_xau_ctrader_open_watcher.ps1: polls for cTrader process, waits MCP (120s warm-up, then optional mcp --restart), starts missing V1.6+Grok lanes via parallel watchdog.
+- Startup VBS now launches the watcher (15s delay) instead of one-shot watchdog only.
+- Install: ops/install_dexter3_xau_ctrader_open_watcher.ps1. Uninstall: ops/uninstall_dexter3_xau_parallel_autostart.ps1.
+- Once-test: detected cTrader OPEN + both lanes already alive (1772/22404).
+
+### 2026-07-09 UTC 07:30 — grok — V1.6 Fable full pro-pack
+- OM stall retune: min_peak=0.12, min_hold_ticks=25, ticks=22, decay=0.45, max_peak=0.35 (opening_manager.py + env).
+- Entry quality V1.6-only (dexter3/v16_entry_quality.py): min score 0.18, chase hard-block, weak hard-skip, MCP pause.
+- Smart same-side cool-down after noise exits only; **A+ always bypasses** (elite score / winner+pullback / exceptional pullback). Owner rule: no dumb cool-down blocking good setups.
+- Wired in shadow_runner live entry path + noise stamp on OM close. Grok bypasses all of this.
+- Tests: 112 passed (entry_quality + opening_manager + wiring).
+- Next: restart V1.6 loop only to load code (Grok can stay).
+
+### 2026-07-09 UTC 08:30 — codex — V1.7 selective-edge patch + live relaunch
+- Owner asked to compare original Fable/V1.1/V1.6/Grok and build V1.7 from the best edges. Finding: V1.1's profitable improvement was true-R accounting and real governor sizing; V1.6 added the right entry edge, but the later entry-quality layer over-blocked A+ winner-pullback setups when the anti-chase classifier also marked them as chase.
+- Patched V1.7 selective edge:
+  - `dexter3/v16_entry_quality.py`: A+ pullback/winner setups now bypass the chase hard-block (`pass_a_plus_chase_bypass`) while MCP pause, min score, weak hard-skip, and anti-chase risk downsize remain active.
+  - `dexter3/grok_v10.py`: Grok no longer scalps high-score pullback winners by default, and the Grok OM wrapper respects the entry-time `is_grok_scalp` classifier instead of forcing every Grok position into the small-lock path.
+  - `dexter3/shadow_runner.py` now logs `version=v1.7-selective-edge` and V1.6/V1.7 entry-quality config at startup. `ops/dexter3_xau_v16_loop.ps1` sets `DEXTER3_FABLE_VERSION=v1.7-selective-edge` and keeps `DEXTER3_V16_COOLDOWN_ENABLED=0`.
+- Verification: `python -m py_compile dexter3\shadow_runner.py dexter3\grok_v10.py dexter3\v16_entry_quality.py dexter3\opening_manager.py tests\test_dexter3_v16_entry_quality.py tests\test_dexter3_opening_manager.py`; focused suite `python -m pytest -q tests\test_dexter3_v16_entry_quality.py tests\test_dexter3_opening_manager.py tests\test_dexter3_wiring.py tests\test_dexter3_governor.py tests\test_dexter3_basket_live.py` -> `189 passed`.
+- Live relaunch test: V1.7 and Grok both started and V1.7 startup log proved `version=v1.7-selective-edge` plus `cooldown_enabled=False`.
+- Final safe operating state: both-loop load repeatedly made local cTrader MCP return HTTP 404 to fresh audit clients, so Codex stopped V1.7 and the cTrader-open watcher, recovered MCP, and relaunched **Grok only** to manage its already-open position. Final verified Grok PID `4804`, open XAUUSD BUY `650252269`, label `dexter3:grok-v1.0:scalper`, no pending orders.
+- Residual risk / next step: V1.7 code is ready but should be relaunched only after the Grok position is flat or after the local MCP session-pressure issue is fixed. Do not claim both-loop readiness until a fresh broker audit succeeds while both lanes are alive for several minutes.
+
+### 2026-07-09 UTC 09:35 — codex — V1.7 mission-control exact replay
+- Added exact production entry-gate replay to `scripts/dexter3_edge_discovery.py` via `--entry-gate none|v16|v17|v17-mission`. The replay stamps the same `anti_chase` and `pullback_gate` features that live `shadow_runner.py` uses before calling `evaluate_v16_entry_gate`.
+- Tested a stricter optional guard (`block_chase_bypass_on_aligned_trending`) but **did not enable it by default** because it lost edge. Exact latest 1,000 M5 replay: V1.6 gate accepted 112 entries, +28.4R, +0.253R/trade; current V1.7 gate accepted 127 entries, +32.3R, +0.255R/trade; strict V1.7 mission guard accepted 106 entries, +24.1R, +0.227R/trade. Winner remains current `v1.7-selective-edge`.
+- Verification: `python -m py_compile dexter3\v16_entry_quality.py dexter3\shadow_runner.py scripts\dexter3_edge_discovery.py tests\test_dexter3_v16_entry_quality.py`; `python -m pytest -q tests\test_dexter3_v16_entry_quality.py tests\test_dexter3_edge_gate.py` -> 49 passed; broader focused suite `tests\test_dexter3_v16_entry_quality.py tests\test_dexter3_opening_manager.py tests\test_dexter3_wiring.py tests\test_dexter3_governor.py tests\test_dexter3_basket_live.py tests\test_dexter3_edge_gate.py` -> 225 passed.
+- During final replay MCP hit known local HTTP 404 zombie. Recovered with `python scripts\ctrader_mcp_watchdog.py --restart`; MCP healthy session `7fe552ce`. Final broker read: balance 10634.50, equity 10627.17, one Grok BUY `650252269` label `dexter3:grok-v1.0:scalper`, entry 4115.50, current 4108.41, SL 4104.51, TP 4128.70, net about -7.33, no pending orders. V1.7 lock remains absent; Grok PID `4804` remains live.
+
+### 2026-07-09 UTC 14:40Z — claude-fable (Fable 5) — repo integrity restore + V1.7 relaunch prep
+
+- **CRITICAL repair: unlogged 33-file deletion restored.** The working tree carried uncommitted deletions of the entire fibo family (`analysis/fibonacci.py`, `analysis/fibo_mtf_trade_planner.py`, `analysis/fibo_tf_telemetry.py`, `analysis/fibo_confluence_reclaim.py`, `scanners/fibo_mtf_shadow.py`, 4 ops scripts, 18 test files, 5 handoff docs). NO board entry logged this as a decision — treated as accidental/uncoordinated. `scheduler.py:30` + `scheduler.py:65` + `scanners/fibo_advance.py:50-51` still imported the deleted modules → the main system could not even import. Restored ALL via `git restore` (deletions were uncommitted, so restore is exact). **Any agent who intentionally wants the fibo family removed: log it here first, then remove the imports in the same change.**
+- Verification: `py_compile` on scheduler + fibo + dexter3 modules OK; `pytest` dexter3 focused suite (`test_dexter3_v16_entry_quality/opening_manager/wiring/governor/basket_live/edge_gate`) → **225 passed** (matches codex 09:35Z exactly); restored fibo subset (`hardening/mtf_trade_planner/mtf_shadow/mtf_scheduler_invariant`) → **69 passed**.
+- **Git protection for the mission stack:** `dexter3/grok_v10.py`, `dexter3/v16_entry_quality.py`, all `ops/dexter3_xau_*.ps1` launchers, `tests/test_dexter3_v16_entry_quality.py`, and the parallel handoff doc were UNTRACKED (a `git clean -fd` would have destroyed the live V1.7+Grok stack — same accident class as the fibo purge). Committed the dexter3-scoped files as a rollback anchor. Other agents' unrelated in-flight modifications (api/, execution/, infra/, notifier/, agent/brain.py) deliberately left uncommitted.
+- Live audit 14:26Z (read-only): MCP healthy (`session d7bbfad3`, 121ms); Grok lane PID `4804` healthy — state ticking, 21 entries today, 0 loss baskets, governor HUNTING; shared sizing chain verified live in Grok stdout (governor 4.8 → anti-chase ×0.15 → pullback-gate ×0.35 → 0.25 risk on a chase entry). **Broker FLAT: balance=equity=10616.70, no positions, no pending.** `DexterCtraderMcpWatchdog` schtask active (2-min cadence, last result 0).
+- **V1.7 relaunch precondition (per codex 08:30Z caveat) is MET** — Grok flat + MCP healthy. Launch of `ops/dexter3_xau_v16_loop.ps1` was permission-gated in this harness; queued for owner approval. After launch: verify `version=v1.7-selective-edge` in `dexter3_v16_stdout.log`, then fresh-client broker audit while BOTH lanes alive ≥5 min (the codex two-loop MCP-pressure test).
+- Next (owner or peer): launch V1.7, run the two-loop audit, then measure V1.7 live payoff vs the +0.255R/trade replay expectation over the next session.

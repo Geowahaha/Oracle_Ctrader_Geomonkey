@@ -48,6 +48,12 @@ from typing import Any
 from dexter3 import basket_live, hunt_mode
 from dexter3.basket_manager import BasketConfig
 
+# Grok_v1.0 parallel micro-scalp lock (independent, optional)
+try:
+    from dexter3 import grok_v10 as _grok_v10
+except Exception:  # pragma: no cover
+    _grok_v10 = None  # type: ignore
+
 Bar = dict[str, Any]
 Position = dict[str, Any]
 
@@ -123,9 +129,19 @@ class OMConfig:
     # ``stall_decay_frac`` of its peak, bank it now rather than wait for the
     # (much looser, near-breakeven) ladder floor — small edges decay fast and
     # the owner wants the hunt hungrier than the floor alone would be.
-    stall_max_peak_r: float = 0.5
-    stall_ticks: int = 12
-    stall_decay_frac: float = 0.6
+    #
+    # Pro-pack defaults (2026-07-09 audit): XAU noise routinely prints 0.05-0.15R
+    # peaks; the old (0.5 / 12 ticks / 0.6) cut winners at ~48s mean peak 0.13R.
+    # New defaults require a real micro-edge (min peak), a minimum hold, longer
+    # stall window, and deeper decay before banking.
+    stall_max_peak_r: float = 0.35
+    stall_ticks: int = 22
+    stall_decay_frac: float = 0.45
+    # Peak must reach this before stall-take can fire (noise floor).
+    stall_min_peak_r: float = 0.12
+    # Minimum fast ticks since basket open before stall-take (default ~100s
+    # at 4s tick). Prevents 89-94s noise exits seen in live audit.
+    stall_min_hold_ticks: int = 25
 
     # -- Opportunity add — pyramid the dragon (owner directive 2026-07-08) ---
     # Master kill switch: pyramid path is fully disabled when False (ladder +
@@ -237,6 +253,7 @@ def _update_peak_r(
             "oldest_open_ts": oldest_open_ts,
             "peak_r": live_r,
             "ticks_since_peak": 0,
+            "ticks_open": 0,
             "last_pyramid_peak": None,
         }
     runtime = dict(existing)
@@ -247,6 +264,7 @@ def _update_peak_r(
     else:
         runtime["peak_r"] = prev_peak
         runtime["ticks_since_peak"] = int(_f(existing.get("ticks_since_peak"), 0)) + 1
+    runtime["ticks_open"] = int(_f(existing.get("ticks_open"), 0)) + 1
     runtime.setdefault("last_pyramid_peak", None)
     return runtime
 
@@ -349,6 +367,26 @@ class OpeningManager:
         # bug fix — this is called every fast tick, not once per M5 close) --
         basket_runtime = _update_peak_r(st.get("basket_runtime"), oldest_open_ts, live_r)
         peak_r = _f(basket_runtime.get("peak_r"), live_r)
+        floor_r = None  # may be set by V1.6 ladder; Grok path uses its own band
+
+        # Grok scalping mode must be explicit. Recomputing it here would make
+        # normal V1.6 lanes inherit Grok's broad "use on high score" default.
+        is_grok_scalp = bool(st.get("is_grok_scalp", False))
+        grok_cfg = None
+        if is_grok_scalp and _grok_v10 is not None:
+            try:
+                grok_cfg = _grok_v10.get_grok_v10_config_from_env()
+                grok_act = _grok_v10.grok_v10_close_action(peak_r, live_r, grok_cfg)
+                if grok_act:
+                    grok_act["basket_runtime"] = basket_runtime
+                    return grok_act
+            except Exception:
+                is_grok_scalp = False
+
+        # ------------------------------------------------------------------
+        # General monitoring (caps, smart loss, repair) applies to BOTH modes.
+        # Profit exit logic below is mode-specific for independence.
+        # ------------------------------------------------------------------
 
         # -- step e: time-stop / cap-stop (hard caps take priority over
         # profit-hunting so a capped-out basket always resolves) ------------
@@ -385,67 +423,79 @@ class OpeningManager:
             smart_exit_action["basket_runtime"] = basket_runtime
             return smart_exit_action
 
-        # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
-        # ceiling captures — never wait on giveback math once the move is
-        # this big) ------------------------------------------------------
-        hard_take_action = self._hard_take(live_r, peak_r, cfg)
-        if hard_take_action is not None:
-            hard_take_action["basket_runtime"] = basket_runtime
-            return hard_take_action
+        # V1.6 profit exits (hard_take, ladder, stall, pyramid) are skipped for
+        # Grok_v1.0 scalping entries so the two systems run independently.
+        # Only Grok small-lock handles profit taking for scalps.
+        if not is_grok_scalp:
+            # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
+            # ceiling captures — never wait on giveback math once the move is
+            # this big) ------------------------------------------------------
+            hard_take_action = self._hard_take(live_r, peak_r, cfg)
+            if hard_take_action is not None:
+                hard_take_action["basket_runtime"] = basket_runtime
+                return hard_take_action
 
-        # -- step c2: DRAGON LADDER floor close (the new default profit
-        # exit — see ``ladder_floor_r``) -----------------------------------
-        floor_r = ladder_floor_r(peak_r, cfg)
-        if floor_r is not None and live_r <= floor_r:
-            return {
-                "action": "close_all",
-                "reason": "ladder_floor",
-                "peak_r": round(peak_r, 4),
-                "floor_r": round(floor_r, 4),
-                "live_r": round(live_r, 4),
-                "basket_runtime": basket_runtime,
-            }
-
-        # -- step c3: stall-take (hungry scalp) — a small winner that has
-        # stopped making new peaks and is decaying back toward the (much
-        # looser) ladder floor gets banked now instead of waiting. Only
-        # applies below ``stall_max_peak_r`` — above that tier the ladder
-        # itself is already tight enough to ride.
-        if 0.0 < peak_r < cfg.stall_max_peak_r:
-            ticks_since_peak = int(_f(basket_runtime.get("ticks_since_peak"), 0))
-            if ticks_since_peak >= cfg.stall_ticks and live_r <= peak_r * cfg.stall_decay_frac:
+            # -- step c2: DRAGON LADDER floor close (the new default profit
+            # exit — see ``ladder_floor_r``) -----------------------------------
+            floor_r = ladder_floor_r(peak_r, cfg)
+            if floor_r is not None and live_r <= floor_r:
                 return {
                     "action": "close_all",
-                    "reason": "stall_take",
+                    "reason": "ladder_floor",
                     "peak_r": round(peak_r, 4),
-                    "floor_r": floor_r if floor_r is None else round(floor_r, 4),
+                    "floor_r": round(floor_r, 4),
                     "live_r": round(live_r, 4),
-                    "ticks_since_peak": ticks_since_peak,
                     "basket_runtime": basket_runtime,
                 }
 
-        # -- step c4: opportunity add — pyramid the dragon (winners-only,
-        # capped, one add per peak-tier crossed) -----------------------------
-        if cfg.pyramid_enabled:
-            pyramid_action = self._pyramid_add(
-                symbol,
-                agg,
-                live_r,
-                peak_r,
-                floor_r,
-                basket_runtime,
-                m5_bars,
-                m15_bars,
-                h1_bars,
-                basket_cfg,
-                cfg,
-                now_utc_iso,
-                daily_state,
-                _f(st.get("spread_abs"), 0.0),
-            )
-            if pyramid_action is not None:
-                pyramid_action["basket_runtime"] = basket_runtime
-                return pyramid_action
+            # -- step c3: stall-take (hungry scalp) — a small winner that has
+            # stopped making new peaks and is decaying back toward the (much
+            # looser) ladder floor gets banked now instead of waiting. Only
+            # applies below ``stall_max_peak_r`` — above that tier the ladder
+            # itself is already tight enough to ride.
+            # Pro-pack: also require min peak (noise floor) + min hold ticks.
+            if cfg.stall_min_peak_r <= peak_r < cfg.stall_max_peak_r:
+                ticks_since_peak = int(_f(basket_runtime.get("ticks_since_peak"), 0))
+                ticks_open = int(_f(basket_runtime.get("ticks_open"), 0))
+                min_hold = max(0, int(cfg.stall_min_hold_ticks))
+                if (
+                    ticks_open >= min_hold
+                    and ticks_since_peak >= cfg.stall_ticks
+                    and live_r <= peak_r * cfg.stall_decay_frac
+                ):
+                    return {
+                        "action": "close_all",
+                        "reason": "stall_take",
+                        "peak_r": round(peak_r, 4),
+                        "floor_r": floor_r if floor_r is None else round(floor_r, 4),
+                        "live_r": round(live_r, 4),
+                        "ticks_since_peak": ticks_since_peak,
+                        "ticks_open": ticks_open,
+                        "basket_runtime": basket_runtime,
+                    }
+
+            # -- step c4: opportunity add — pyramid the dragon (winners-only,
+            # capped, one add per peak-tier crossed) -----------------------------
+            if cfg.pyramid_enabled:
+                pyramid_action = self._pyramid_add(
+                    symbol,
+                    agg,
+                    live_r,
+                    peak_r,
+                    floor_r,
+                    basket_runtime,
+                    m5_bars,
+                    m15_bars,
+                    h1_bars,
+                    basket_cfg,
+                    cfg,
+                    now_utc_iso,
+                    daily_state,
+                    _f(st.get("spread_abs"), 0.0),
+                )
+                if pyramid_action is not None:
+                    pyramid_action["basket_runtime"] = basket_runtime
+                    return pyramid_action
 
         # -- step d: Basket Doctor (edge-measured repair) --------------------
         if live_r <= cfg.repair_trigger_r:

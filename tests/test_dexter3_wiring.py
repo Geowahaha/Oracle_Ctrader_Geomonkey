@@ -514,3 +514,99 @@ def test_run_om_tick_no_lane_clears_runtime_and_is_noop(journal, monkeypatch):
     status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
     assert status == "om_no_lane"
     assert "BTCUSD" not in state.get("basket_runtime", {})
+
+
+def test_active_order_label_selects_v16_or_grok_label():
+    from dexter3.grok_v10 import GROK_LABEL
+
+    assert sr._active_order_label("v16") == LABEL
+    assert sr._active_order_label("grok") == GROK_LABEL
+
+
+def test_active_state_file_selects_separate_v16_and_grok_files():
+    assert sr._active_state_file("v16").name == "dexter3_shadow_state.json"
+    assert sr._active_state_file("grok").name == "dexter3_grok_shadow_state.json"
+    assert sr._active_state_file("v16") != sr._active_state_file("grok")
+
+
+def test_grok_runtime_clear_does_not_touch_v16_runtime():
+    state = {
+        "basket_runtime": {"XAUUSD": {"peak_r": 1.2}},
+        "grok_v10_basket_runtime": {"XAUUSD": {"peak_r": 0.4}},
+    }
+    sr._clear_basket_runtime(state, "XAUUSD", grok=True)
+    assert state["basket_runtime"]["XAUUSD"]["peak_r"] == pytest.approx(1.2)
+    assert "XAUUSD" not in state["grok_v10_basket_runtime"]
+
+
+# ---------------------------------------------------------------------------
+# V1.6 profit controls (2026-07-09) — green-day scaling + weak-bucket scout
+# ---------------------------------------------------------------------------
+
+
+def _profit_control_decision(setup: str) -> EnterDecision:
+    d = EnterDecision()
+    d.symbol = "XAUUSD"
+    d.setup = setup
+    d.features = {}
+    return d
+
+
+def test_v16_profit_controls_downsize_weak_bucket_before_green(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (0.0, []))
+    d = _profit_control_decision("hunt_m15_drift")
+    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
+    assert risk == pytest.approx(3.0)
+    assert d.features["v16_profit_control"]["reason"] == "weak_bucket_downsize"
+
+
+def test_v16_profit_controls_do_not_scale_winner_before_green(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (19.0, []))
+    d = _profit_control_decision("hunt_h1_context")
+    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
+    assert risk == pytest.approx(12.0)
+    assert d.features["v16_profit_control"]["reason"] == "winner_waiting_for_green_day"
+
+
+def test_v16_profit_controls_scale_winner_after_green(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (22.0, []))
+    d = _profit_control_decision("hunt_swing_structure")
+    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
+    assert risk == pytest.approx(24.0)
+    assert d.features["v16_profit_control"]["reason"] == "green_day_winner_scale"
+
+
+def test_v16_profit_controls_house_money_scale_after_cushion(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (35.0, []))
+    d = _profit_control_decision("basket_repair")
+    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
+    assert risk == pytest.approx(36.0)
+    assert d.features["v16_profit_control"]["reason"] == "house_money_winner_scale"
+
+
+def test_v16_profit_controls_skip_grok_mode(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "grok")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (100.0, []))
+    d = _profit_control_decision("hunt_m15_drift")
+    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
+    assert risk == pytest.approx(12.0)
+    assert "v16_profit_control" not in d.features
+
+
+def test_v16_house_money_arms_then_locks_floor(monkeypatch):
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.setenv("DEXTER3_V16_HOUSE_THRESHOLD_USD", "30")
+    monkeypatch.setenv("DEXTER3_V16_HOUSE_FLOOR_USD", "20")
+    gov_state: dict[str, Any] = {}
+    armed = sr._apply_v16_house_money_status(gov_state, {"state": "HUNTING", "effective_pnl": 35.0})
+    assert armed["state"] == "HUNTING"
+    assert gov_state["house_money_armed"] is True
+    assert gov_state["house_money_floor_usd"] == pytest.approx(20.0)
+
+    locked = sr._apply_v16_house_money_status(gov_state, {"state": "HUNTING", "effective_pnl": 19.5})
+    assert locked["state"] == "TARGET_LOCKED"
+    assert locked["house_money_floor_triggered"] is True

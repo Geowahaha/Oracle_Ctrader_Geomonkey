@@ -67,12 +67,28 @@ from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 from dexter3.opening_manager import OMConfig, OpeningManager
+
+# Grok_v1.0 (optional import for docs / direct use)
+try:
+    from dexter3 import grok_v10 as grok_v10  # independent parallel scalping
+    from dexter3.grok_v10 import GROK_LABEL, GrokV10OpeningManager
+except Exception:
+    grok_v10 = None  # type: ignore
+    GROK_LABEL = None
+    GrokV10OpeningManager = None  # type: ignore
 from dexter3.smart_exit import SmartExitConfig, resolve_stop_regime
+from dexter3.v16_entry_quality import (
+    V16EntryQualityConfig,
+    evaluate_v16_entry_gate,
+    record_noise_close,
+)
 
 RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
+GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
+GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -109,6 +125,23 @@ DEXTER3_HUNT_ENV_VAR = "DEXTER3_HUNT"
 
 def _hunt_enabled() -> bool:
     return os.environ.get(DEXTER3_HUNT_ENV_VAR) == "1"
+
+
+def _active_order_label(mode: str | None = None) -> str:
+    """Broker label owned by the current Dexter3 process.
+
+    V1.6 and Grok v1.0 must never share lane reads or close-all operations.
+    The process mode selects exactly one label.
+    """
+    current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "grok" and GROK_LABEL:
+        return GROK_LABEL
+    return LIVE_ORDER_LABEL
+
+
+def _active_state_file(mode: str | None = None) -> Path:
+    current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    return GROK_STATE_FILE if current_mode == "grok" else STATE_FILE
 
 
 def _executor_config_from_env() -> "ExecutorConfig":
@@ -231,6 +264,7 @@ def _om_config_from_env() -> OMConfig:
         ("DEXTER3_OM_REPAIR_MIN_CONV", "repair_min_conviction"),
         ("DEXTER3_OM_STALL_MAX_PEAK_R", "stall_max_peak_r"),
         ("DEXTER3_OM_STALL_DECAY_FRAC", "stall_decay_frac"),
+        ("DEXTER3_OM_STALL_MIN_PEAK_R", "stall_min_peak_r"),
         ("DEXTER3_OM_PYRAMID_MIN_R", "pyramid_min_live_r"),
         ("DEXTER3_OM_PYRAMID_MIN_CONV", "pyramid_min_conv"),
         ("DEXTER3_OM_PYRAMID_TIER_STEP", "pyramid_tier_step"),
@@ -248,6 +282,13 @@ def _om_config_from_env() -> OMConfig:
             kw["stall_ticks"] = int(raw_stall_ticks)
         except ValueError:
             log_line(f"{utc_now_iso()} ignored invalid DEXTER3_OM_STALL_TICKS={raw_stall_ticks!r}")
+
+    raw_stall_min_hold = os.environ.get("DEXTER3_OM_STALL_MIN_HOLD_TICKS")
+    if raw_stall_min_hold:
+        try:
+            kw["stall_min_hold_ticks"] = int(raw_stall_min_hold)
+        except ValueError:
+            log_line(f"{utc_now_iso()} ignored invalid DEXTER3_OM_STALL_MIN_HOLD_TICKS={raw_stall_min_hold!r}")
 
     raw_pyramid_enabled = os.environ.get("DEXTER3_OM_PYRAMID_ENABLED")
     if raw_pyramid_enabled is not None:
@@ -408,12 +449,13 @@ def _basket_runtime_for(
     return runtime
 
 
-def _clear_basket_runtime(state: dict[str, Any], symbol: str) -> None:
-    """Reset a symbol's basket_runtime once its lane goes flat (basket
-    resolved — close_all_in_profit or close_all_cap_stop) so the NEXT basket
-    starts its peak-R tracking from zero rather than inheriting a stale
-    peak from the basket that just closed."""
-    runtimes = state.setdefault("basket_runtime", {})
+def _clear_basket_runtime(state: dict[str, Any], symbol: str, grok: bool = False) -> None:
+    """Reset a symbol's basket_runtime once its lane goes flat.
+
+    Supports independent state for Grok v1.0 vs V1.6.
+    """
+    key = "grok_v10_basket_runtime" if grok else "basket_runtime"
+    runtimes = state.setdefault(key, {})
     runtimes.pop(symbol, None)
 
 
@@ -454,6 +496,265 @@ def _governor_state_for(state: dict[str, Any]) -> dict[str, Any]:
         gov.update({"date": today, "state": "HUNTING", "locked_pnl": None})
     return gov
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log_line(f"{utc_now_iso()} ignored invalid {name}={raw!r}")
+        return default
+
+
+def _env_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return set(default)
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _is_grok_mode() -> bool:
+    return os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "grok"
+
+
+V16_WINNER_SETUPS_DEFAULT: set[str] = {
+    "hunt_h1_context",
+    "hunt_swing_structure",
+    "basket_repair",
+    "opening_manager_repair",
+}
+V16_WEAK_SETUPS_DEFAULT: set[str] = {
+    "hunt_m15_drift",
+    "hunt_day_range_tilt",
+    "hunt_sweep_reclaim",
+}
+
+
+def _effective_lane_pnl_today(mcp: Dexter3McpClient, state: dict[str, Any]) -> tuple[float, float, float]:
+    realized, _ = _lane_realized_today(mcp, label_filter=_active_order_label())
+    floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
+    floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
+    return realized + floating, realized, floating
+
+
+def _v16_entry_quality_config_from_env() -> V16EntryQualityConfig:
+    """V1.6 entry-quality pro-pack knobs. Grok mode never consults this."""
+    kw: dict[str, Any] = {}
+    raw_enabled = os.environ.get("DEXTER3_V16_ENTRY_QUALITY_ENABLED")
+    if raw_enabled is not None:
+        kw["enabled"] = raw_enabled.strip() not in ("0", "false", "False", "")
+    raw_chase = os.environ.get("DEXTER3_V16_CHASE_HARD_BLOCK")
+    if raw_chase is not None:
+        kw["chase_hard_block"] = raw_chase.strip() not in ("0", "false", "False", "")
+    raw_chase_bucket = os.environ.get("DEXTER3_V17_BLOCK_ALIGNED_TRENDING_CHASE_BYPASS")
+    if raw_chase_bucket is not None:
+        kw["block_chase_bypass_on_aligned_trending"] = raw_chase_bucket.strip() not in (
+            "0",
+            "false",
+            "False",
+        )
+    raw_weak = os.environ.get("DEXTER3_V16_WEAK_HARD_SKIP")
+    if raw_weak is not None:
+        kw["weak_hard_skip"] = raw_weak.strip() not in ("0", "false", "False", "")
+    raw_cd = os.environ.get("DEXTER3_V16_COOLDOWN_ENABLED")
+    if raw_cd is not None:
+        kw["cooldown_enabled"] = raw_cd.strip() not in ("0", "false", "False", "")
+    for env, field_name in (
+        ("DEXTER3_V16_MIN_LEADER_SCORE", "min_leader_score"),
+        ("DEXTER3_V16_CHASE_BYPASS_SCORE", "chase_bypass_score"),
+        ("DEXTER3_V16_WEAK_MIN_SCORE", "weak_min_score"),
+        ("DEXTER3_V16_COOLDOWN_BYPASS_SCORE", "bypass_score"),
+        ("DEXTER3_V16_COOLDOWN_BYPASS_WINNER_SCORE", "bypass_winner_score"),
+        ("DEXTER3_V16_COOLDOWN_BYPASS_EXCEPTIONAL", "bypass_exceptional_score"),
+        ("DEXTER3_V16_COOLDOWN_NOISE_LIVE_R", "cooldown_noise_live_r"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field_name] = float(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    for env, field_name in (
+        ("DEXTER3_V16_COOLDOWN_SEC", "cooldown_sec"),
+        ("DEXTER3_V16_MCP_MAX_CONSEC_ERRORS", "mcp_max_consec_errors"),
+    ):
+        raw_val = os.environ.get(env)
+        if raw_val:
+            try:
+                kw[field_name] = int(raw_val)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    return V16EntryQualityConfig(**kw)
+
+
+def _note_mcp_error(state: dict[str, Any], *, ok: bool = False) -> int:
+    """Track consecutive MCP failures for entry pause. Returns current count."""
+    if ok:
+        state["mcp_consec_errors"] = 0
+        return 0
+    n = int(state.get("mcp_consec_errors") or 0) + 1
+    state["mcp_consec_errors"] = n
+    return n
+
+
+def _apply_v16_entry_quality_gate(
+    state: dict[str, Any],
+    decision: hunter_brain.Decision,
+) -> dict[str, Any]:
+    """V1.6-only entry gate. Grok always passes. Journals features on decision."""
+    if _is_grok_mode():
+        return {
+            "allow": True,
+            "reason": "grok_bypass",
+            "a_plus": False,
+            "a_plus_reason": "",
+            "cooldown_bypassed": False,
+            "features": {"grok_bypass": True},
+        }
+    cfg = _v16_entry_quality_config_from_env()
+    result = evaluate_v16_entry_gate(
+        decision=decision,
+        state=state,
+        mcp_consec_errors=int(state.get("mcp_consec_errors") or 0),
+        now_iso=utc_now_iso(),
+        cfg=cfg,
+    )
+    if isinstance(decision.features, dict):
+        decision.features["v16_entry_quality"] = result.get("features") or {}
+        decision.features["v16_entry_quality"]["gate_reason"] = result.get("reason")
+        decision.features["v16_entry_quality"]["allow"] = result.get("allow")
+        decision.features["v16_entry_quality"]["cooldown_bypassed"] = result.get("cooldown_bypassed")
+    log_line(
+        f"{utc_now_iso()} {decision.symbol} v16-entry-quality: allow={result.get('allow')} "
+        f"reason={result.get('reason')} a_plus={result.get('a_plus')} "
+        f"a_plus_reason={result.get('a_plus_reason') or '-'} "
+        f"cooldown_bypassed={result.get('cooldown_bypassed')} "
+        f"score={getattr(decision, 'leader_score', 0):.3f} setup={getattr(decision, 'setup', '')}"
+    )
+    return result
+
+
+def _apply_v16_profit_controls(
+    mcp: Dexter3McpClient,
+    state: dict[str, Any],
+    decision: hunter_brain.Decision,
+    base_risk_usd: float,
+) -> float:
+    """V1.6-only profit controls.
+
+    Rules, from the 2026-07-09 owner audit:
+    - weak buckets are scout-sized immediately;
+    - winner buckets scale only after the lane's realized+floating day PnL is green;
+    - house-money mode presses winners harder only after a larger green cushion;
+    - Grok mode bypasses this layer completely.
+    """
+    if _is_grok_mode() or not _env_bool("DEXTER3_V16_PROFIT_CONTROLS_ENABLED", True):
+        return base_risk_usd
+    try:
+        setup = str(getattr(decision, "setup", "") or "")
+        winner_setups = _env_csv_set("DEXTER3_V16_WINNER_SETUPS", V16_WINNER_SETUPS_DEFAULT)
+        weak_setups = _env_csv_set("DEXTER3_V16_WEAK_SETUPS", V16_WEAK_SETUPS_DEFAULT)
+        green_threshold = _env_float("DEXTER3_V16_GREEN_THRESHOLD_USD", 20.0)
+        house_threshold = _env_float("DEXTER3_V16_HOUSE_THRESHOLD_USD", 30.0)
+        weak_mult = max(0.0, _env_float("DEXTER3_V16_WEAK_MULT", 0.25))
+        winner_mult = max(0.0, _env_float("DEXTER3_V16_WINNER_MULT", 2.0))
+        house_mult = max(0.0, _env_float("DEXTER3_V16_HOUSE_MULT", 3.0))
+        max_mult = max(0.0, _env_float("DEXTER3_V16_MAX_EDGE_MULT", 3.0))
+        effective, realized, floating = _effective_lane_pnl_today(mcp, state)
+
+        reason = "neutral_no_scale"
+        mult = 1.0
+        if setup in weak_setups:
+            mult = weak_mult
+            reason = "weak_bucket_downsize"
+        elif setup in winner_setups:
+            if effective >= house_threshold:
+                mult = house_mult
+                reason = "house_money_winner_scale"
+            elif effective >= green_threshold:
+                mult = winner_mult
+                reason = "green_day_winner_scale"
+            else:
+                reason = "winner_waiting_for_green_day"
+
+        mult = min(mult, max_mult)
+        risk = round(float(base_risk_usd) * mult, 4)
+        meta = {
+            "setup": setup,
+            "reason": reason,
+            "effective_pnl": round(effective, 4),
+            "realized_pnl": round(realized, 4),
+            "floating_pnl": round(floating, 4),
+            "green_threshold": green_threshold,
+            "house_threshold": house_threshold,
+            "mult": mult,
+            "base_risk_usd": base_risk_usd,
+            "gated_risk_usd": risk,
+        }
+        if isinstance(decision.features, dict):
+            decision.features["v16_profit_control"] = meta
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} v16-profit-control: setup={setup} "
+            f"reason={reason} effective={effective:.2f} mult={mult} "
+            f"risk_usd {base_risk_usd:.2f}->{risk:.2f}"
+        )
+        return risk
+    except Exception as exc:  # noqa: BLE001 - risk shaping must never block an entry
+        log_line(f"{utc_now_iso()} {decision.symbol} v16_profit_controls_failed (ungated risk used): {exc}")
+        return base_risk_usd
+
+
+def _apply_v16_house_money_status(gov_state: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
+    """Arm a green-day floor and lock the day if giveback reaches it.
+
+    This is deliberately outside DailyGovernor's pure $100 target / $50 loss
+    contract so V1.6 can run the house-money experiment without changing Grok
+    or the base governor semantics.
+    """
+    if _is_grok_mode() or not _env_bool("DEXTER3_V16_HOUSE_MONEY_ENABLED", True):
+        return status
+    effective = float(status.get("effective_pnl") or 0.0)
+    house_threshold = _env_float("DEXTER3_V16_HOUSE_THRESHOLD_USD", 30.0)
+    floor_usd = _env_float("DEXTER3_V16_HOUSE_FLOOR_USD", 20.0)
+    if effective >= house_threshold:
+        if not gov_state.get("house_money_armed"):
+            log_line(
+                f"{utc_now_iso()} governor house-money armed: effective={effective:.2f} "
+                f"threshold={house_threshold:.2f} floor={floor_usd:.2f}"
+            )
+        gov_state["house_money_armed"] = True
+        gov_state["house_money_floor_usd"] = max(float(gov_state.get("house_money_floor_usd") or 0.0), floor_usd)
+    if (
+        gov_state.get("house_money_armed")
+        and str(status.get("state")) == "HUNTING"
+        and effective <= float(gov_state.get("house_money_floor_usd") or floor_usd)
+    ):
+        floor = float(gov_state.get("house_money_floor_usd") or floor_usd)
+        locked = dict(status)
+        locked.update(
+            {
+                "state": "TARGET_LOCKED",
+                "target": floor,
+                "house_money_floor_triggered": True,
+                "house_money_floor_usd": floor,
+                "reason": (
+                    f"effective_pnl {effective:.2f} <= house_money_floor {floor:.2f} "
+                    "-> locking green day floor"
+                ),
+            }
+        )
+        return locked
+    return status
+
 # ---------------------------------------------------------------------------
 # Daily Mission Governor (owner directive 2026-07-07) — realized PnL cache
 # ---------------------------------------------------------------------------
@@ -463,7 +764,7 @@ def _governor_state_for(state: dict[str, Any]) -> dict[str, Any]:
 # _OM_BAR_CACHE below. Keyed by nothing (single account) — module-level like
 # every other cross-tick cache in this file.
 LANE_REALIZED_CACHE_SEC = 60
-_LANE_REALIZED_CACHE: dict[str, Any] = {"epoch": 0.0, "sum": 0.0, "pnls": [], "logged_failure": False}
+_LANE_REALIZED_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fable") -> tuple[float, list[float]]:
@@ -477,7 +778,9 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
     once (not every tick) so a persistent outage does not spam the log.
     """
     now_epoch = datetime.now(timezone.utc).timestamp()
-    cache = _LANE_REALIZED_CACHE
+    cache = _LANE_REALIZED_CACHE.setdefault(
+        label_filter, {"epoch": 0.0, "sum": 0.0, "pnls": [], "logged_failure": False}
+    )
     if now_epoch - float(cache.get("epoch", 0.0)) < LANE_REALIZED_CACHE_SEC and cache.get("epoch", 0.0) > 0:
         return float(cache["sum"]), list(cache["pnls"])
 
@@ -565,27 +868,30 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def acquire_loop_lock() -> None:
+def acquire_loop_lock(mode: str = "v16") -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    if LOCK_FILE.exists():
+    lock_file = GROK_LOCK_FILE if mode == "grok" else LOCK_FILE
+    lock_name = "grok-v1.0" if mode == "grok" else "dexter3"
+    if lock_file.exists():
         try:
-            old_pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
+            old_pid = int(lock_file.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             old_pid = 0
         if old_pid > 0 and _pid_alive(old_pid):
-            raise SystemExit(f"another dexter3 shadow loop is running (pid={old_pid})")
+            raise SystemExit(f"another {lock_name} shadow loop is running (pid={old_pid})")
         # stale lock (pid dead or unreadable) — take it over
         try:
-            LOCK_FILE.unlink(missing_ok=True)
+            lock_file.unlink(missing_ok=True)
         except OSError:
             pass
-    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    lock_file.write_text(str(os.getpid()), encoding="utf-8")
 
 
-def release_loop_lock() -> None:
+def release_loop_lock(mode: str = "v16") -> None:
+    lock_file = GROK_LOCK_FILE if mode == "grok" else LOCK_FILE
     try:
-        if LOCK_FILE.exists() and LOCK_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
-            LOCK_FILE.unlink(missing_ok=True)
+        if lock_file.exists() and lock_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            lock_file.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -596,10 +902,11 @@ def release_loop_lock() -> None:
 
 
 def load_shadow_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
+    state_file = _active_state_file()
+    if not state_file.exists():
         return {"symbols": {}}
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(state_file.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return {"symbols": {}}
         data.setdefault("symbols", {})
@@ -610,9 +917,10 @@ def load_shadow_state() -> dict[str, Any]:
 
 def save_shadow_state(state: dict[str, Any]) -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
+    state_file = _active_state_file()
+    tmp = state_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    tmp.replace(state_file)
 
 
 def is_new_m5_close(state: dict[str, Any], symbol: str, bars_m5: list[dict[str, Any]]) -> tuple[bool, str | None]:
@@ -767,13 +1075,14 @@ class PaperBasket:
             return
         risk_usd = abs(decision.entry - decision.sl)
         if self.manager.state.state == "FLAT":
+            grok_active = os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "grok"
             leg = Leg(
                 side=str(decision.side),
                 entry=float(decision.entry),
                 sl=float(decision.sl),
                 risk_usd=risk_usd,
                 opened_at_min=self._now_min,
-                label=f"dexter3:fable:m5h-v1:{decision.setup}",
+                label=GROK_LABEL if (grok_active and GROK_LABEL) else f"dexter3:fable:m5h-v1:{decision.setup}",
             )
             result = self.manager.on_entry(leg)
             self.journal.insert_basket_event(
@@ -881,7 +1190,7 @@ def run_symbol_cycle(
         lane: list[dict[str, Any]] | None = []
         if is_newest and executor is not None:
             try:
-                lane = basket_live.lane_positions(executor.client.get_positions(), LIVE_ORDER_LABEL)
+                lane = basket_live.lane_positions(executor.client.get_positions(), _active_order_label())
                 lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
             except (McpClientError, McpZombieError) as exc:
                 log_line(f"{utc_now_iso()} {symbol} lane_read_failed (no live action this bar): {exc}")
@@ -941,22 +1250,56 @@ def run_symbol_cycle(
                         base_risk_usd = executor.config.risk_usd
                     risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
                     risk_usd_override = _apply_pullback_gate(decision, prefix, float(risk_usd_override))
-                    exec_result = _execute_live_entry(
-                        executor,
-                        decision,
-                        today_entry_count=int(daily.get("entries", 0)),
-                        today_losing_count=int(daily.get("loss_baskets", 0)),
-                        risk_usd_override=risk_usd_override,
-                        smart_exit=smart_exit_meta,
+                    risk_usd_override = _apply_v16_profit_controls(
+                        mcp, state, decision, float(risk_usd_override)
                     )
-                    if exec_result.get("action") == "entered":
-                        daily["entries"] = int(daily.get("entries", 0)) + 1
-                        # oldest_open_ts stays None here (the position was
-                        # just placed; its broker-side open timestamp is not
-                        # yet known) — run_om_tick backfills it with the real
-                        # lane timestamp on the first fast tick that observes
-                        # this basket (see its own smart-exit backfill block).
-                    status += f":live_{exec_result.get('action', 'unknown')}"
+
+                    # Stamp Grok_v1.0 scalping mode for this entry (independent parallel path)
+                    # leader_score high is good. This entry will use fast Grok small-lock (0.25-0.45R)
+                    # while V1.6 logic is bypassed for its profit exits.
+                    grok_cfg = grok_v10.get_grok_v10_config_from_env() if grok_v10 else None
+                    ls = float(getattr(decision, "leader_score", 0.0) or 0.0)
+                    ch = bool((getattr(decision, "features", {}) or {}).get("anti_chase", {}).get("is_chase", False))
+                    pb = bool((getattr(decision, "features", {}) or {}).get("pullback_gate", {}).get("is_pullback", True))
+                    grok_mode = os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "grok"
+                    is_grok = (
+                        bool(grok_mode and grok_v10 and grok_v10.is_grok_scalp_candidate(ls, ch, pb, grok_cfg))
+                        if grok_v10
+                        else False
+                    )
+                    state.setdefault("grok_v10_flags", {}).update({
+                        "leader_score": ls,
+                        "is_chase": ch,
+                        "is_pullback": pb,
+                        "is_grok_scalp": is_grok,
+                    })
+
+                    # V1.6 entry-quality pro-pack (Grok bypasses). A+ setups
+                    # bypass cool-down; MCP pause / min score still apply.
+                    quality = _apply_v16_entry_quality_gate(state, decision)
+                    if not quality.get("allow", True):
+                        status += f":live_blocked_{quality.get('reason', 'quality')}"
+                    else:
+                        exec_result = _execute_live_entry(
+                            executor,
+                            decision,
+                            today_entry_count=int(daily.get("entries", 0)),
+                            today_losing_count=int(daily.get("loss_baskets", 0)),
+                            risk_usd_override=risk_usd_override,
+                            smart_exit=smart_exit_meta,
+                        )
+                        if exec_result.get("action") == "entered":
+                            daily["entries"] = int(daily.get("entries", 0)) + 1
+                            # Clear cool-down after a real fill so A+ / allowed
+                            # entries do not leave a stale same-side stamp.
+                            if not _is_grok_mode():
+                                state.pop("v16_entry_cooldown", None)
+                            # oldest_open_ts stays None here (the position was
+                            # just placed; its broker-side open timestamp is not
+                            # yet known) — run_om_tick backfills it with the real
+                            # lane timestamp on the first fast tick that observes
+                            # this basket (see its own smart-exit backfill block).
+                        status += f":live_{exec_result.get('action', 'unknown')}"
 
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
@@ -972,7 +1315,7 @@ def _governor_entry_risk(mcp: Dexter3McpClient, decision: hunter_brain.Decision)
     multiplier, on the owner's virtual capital base. Never raises — a failure
     falls back to the executor's static config risk (returns None)."""
     try:
-        _, pnls = _lane_realized_today(mcp)
+        _, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
         governor = _get_governor()
         session = str(((decision.features or {}).get("session_context") or {}).get("value") or "unknown")
         streak = governor.win_streak_from_closes(pnls)
@@ -1231,7 +1574,8 @@ def _manage_lane_basket(
         # Basket resolved (either path) — the lane is now flat; clear the
         # peak-R runtime so the NEXT basket starts tracking from zero
         # instead of inheriting this basket's peak.
-        _clear_basket_runtime(state, symbol)
+        is_grok_close = "grok" in str(action.get("reason", "")).lower()
+        _clear_basket_runtime(state, symbol, grok=is_grok_close)
     elif act == "add_repair_leg" and (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
         # governor lock/stop: never ADD exposure after the day is decided —
         # existing legs are being closed by run_governor_tick anyway.
@@ -1265,6 +1609,12 @@ def _manage_lane_basket(
             today_entry_count=int(daily.get("entries", 0)),
             today_losing_count=int(daily.get("loss_baskets", 0)),
             repair=True,
+            risk_usd_override=_apply_v16_profit_controls(
+                executor.client,
+                state,
+                repair_decision,
+                _f(agg.get("base_risk_usd"), executor.config.risk_usd),
+            ),
         )
         if executed["exec"].get("action") == "entered":
             daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -1417,6 +1767,7 @@ def om_bars_refresh_due(last_bar_fetch_epoch: float, now_epoch: float, refresh_s
 
 
 _OM_INSTANCE: OpeningManager | None = None
+_GROK_OM_INSTANCE: "GrokV10OpeningManager | None" = None
 _OM_BAR_CACHE: dict[str, dict[str, Any]] = {}  # symbol -> {"epoch":, "m5":, "m15":, "h1":}
 _OM_HOLD_TICKS: dict[str, int] = {}  # symbol -> consecutive hold ticks (heartbeat throttle)
 OM_HOLD_HEARTBEAT_TICKS = 15  # ~1 min at 4s ticks
@@ -1427,6 +1778,14 @@ def _get_opening_manager(executor: Dexter3Executor | None, journal: DecisionJour
     if _OM_INSTANCE is None:
         _OM_INSTANCE = OpeningManager(executor, journal, _om_config_from_env())
     return _OM_INSTANCE
+
+
+def _get_grok_opening_manager(executor: Dexter3Executor | None, journal: DecisionJournal) -> "GrokV10OpeningManager":
+    """Separate OM instance for Grok v1.0 for 100% independent monitoring."""
+    global _GROK_OM_INSTANCE
+    if _GROK_OM_INSTANCE is None and GrokV10OpeningManager is not None:
+        _GROK_OM_INSTANCE = GrokV10OpeningManager(executor, journal, _om_config_from_env())
+    return _GROK_OM_INSTANCE if _GROK_OM_INSTANCE is not None else _get_opening_manager(executor, journal)
 
 
 def _om_bars_for(mcp: Dexter3McpClient, symbol: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1472,14 +1831,21 @@ def run_om_tick(
     """
     try:
         positions = executor.client.get_positions() if executor is not None else mcp.get_positions()
-        lane = basket_live.lane_positions(positions, LIVE_ORDER_LABEL)
+        # Manage exactly one lane per process. Combining V1.6 and Grok labels
+        # would merge PnL/runtime state and let one manager close the other.
+        active_label = _active_order_label()
+        lane = basket_live.lane_positions(positions, active_label)
         lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
     except (McpClientError, McpZombieError) as exc:
+        _note_mcp_error(state, ok=False)
         log_line(f"{utc_now_iso()} {symbol} om_lane_read_failed (no OM action this tick): {exc}")
         return "om_lane_read_failed"
 
+    _note_mcp_error(state, ok=True)
+
     if not lane:
-        _clear_basket_runtime(state, symbol)
+        is_grok = bool((state.get("grok_v10_flags") or {}).get("is_grok_scalp"))
+        _clear_basket_runtime(state, symbol, grok=is_grok)
         state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = 0.0
         return "om_no_lane"
 
@@ -1493,7 +1859,19 @@ def run_om_tick(
         log_line(f"{utc_now_iso()} {symbol} om_spot_read_failed: {exc}")
         spot = None
 
-    om = _get_opening_manager(executor, journal)
+    # Determine mode from lane label for 100% independent monitoring
+    lane_labels = [str(p.get("label") or p.get("comment") or "") for p in lane]
+    is_grok_lane = any("grok-v1.0" in lbl.lower() for lbl in lane_labels) or bool((state.get("grok_v10_flags") or {}).get("is_grok_scalp"))
+
+    if is_grok_lane and GrokV10OpeningManager is not None:
+        om = _get_grok_opening_manager(executor, journal)
+        runtime_key = "grok_v10_basket_runtime"
+        regime_key = "grok_v10_smart_exit_regime"
+    else:
+        om = _get_opening_manager(executor, journal)
+        runtime_key = "basket_runtime"
+        regime_key = "smart_exit_regime"
+
     agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, _om_base_risk_usd(executor)))
     # Daily Mission Governor (owner directive 2026-07-07): record this
     # symbol's floating PnL for the governor's account-wide floating
@@ -1507,25 +1885,27 @@ def run_om_tick(
     # time in _apply_smart_exit_gate, before the position exists) so
     # OpeningManager._smart_loss_exit's stale-basket guard can match it
     # against agg['oldest_open_ts'] on every subsequent tick.
-    regime_map = state.setdefault("smart_exit_regime", {})
+    regime_map = state.setdefault(regime_key, {})
     regime_entry = regime_map.get(symbol)
     lane_oldest_ts = agg_probe.get("oldest_open_ts")
     if isinstance(regime_entry, dict) and lane_oldest_ts and regime_entry.get("oldest_open_ts") != lane_oldest_ts:
         regime_entry["oldest_open_ts"] = lane_oldest_ts
     om_state = {
-        "basket_runtime": (state.get("basket_runtime") or {}).get(symbol),
+        "basket_runtime": (state.get(runtime_key) or {}).get(symbol),
         "now_utc_iso": utc_now_iso(),
         "daily_state": {"daily_loss_baskets": int(_daily_state(state).get("loss_baskets", 0))},
         "basket_cfg": _basket_config_from_env(),
         "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
         "spread_abs": spread_abs,
         "smart_exit_regime": regime_map,
+        # Grok_v1.0 flags (populated at entry time)
+        **(state.get("grok_v10_flags") or {}),
     }
     action = om.evaluate(symbol, lane, spot, m5_bars, m15_bars, h1_bars, om_state)
 
     new_runtime = action.get("basket_runtime")
     if new_runtime is not None:
-        state.setdefault("basket_runtime", {})[symbol] = new_runtime
+        state.setdefault(runtime_key, {})[symbol] = new_runtime
 
     act = str(action.get("action") or "hold")
     if act == "add_repair_leg" and (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
@@ -1538,12 +1918,39 @@ def run_om_tick(
     if act == "close_all":
         ids = [int(p.get("positionId") or p.get("id") or 0) for p in lane]
         ids = [x for x in ids if x > 0]
+        # Side for smart cool-down (noise serial re-entry filter, V1.6 only).
+        close_side = ""
+        for p in lane:
+            t = str(p.get("tradeSide") or p.get("side") or "").upper()
+            if t in ("BUY", "LONG"):
+                close_side = "buy"
+                break
+            if t in ("SELL", "SHORT"):
+                close_side = "sell"
+                break
         if not dry:
             executed = executor.execute_close_all(ids, reason=f"om_{action.get('reason')}")
             if action.get("reason") == "cap_stop" and float(agg_probe.get("aggregate_pnl_usd") or 0.0) < 0:
                 daily = _daily_state(state)
                 daily["loss_baskets"] = int(daily.get("loss_baskets", 0)) + 1
-        _clear_basket_runtime(state, symbol)
+        is_grok_close = "grok" in str(action.get("reason", "")).lower() or is_grok_lane
+        if not is_grok_close and not _is_grok_mode():
+            stamp = record_noise_close(
+                state,
+                symbol=symbol,
+                side=close_side or str((state.get("grok_v10_flags") or {}).get("side") or ""),
+                reason=str(action.get("reason") or ""),
+                peak_r=_f(action.get("peak_r"), 0.0),
+                live_r=_f(action.get("live_r"), _f(agg_probe.get("aggregate_r"), 0.0)),
+                now_iso=utc_now_iso(),
+                cfg=_v16_entry_quality_config_from_env(),
+            )
+            if stamp:
+                log_line(
+                    f"{utc_now_iso()} {symbol} v16-noise-cooldown armed side={stamp.get('side')} "
+                    f"reason={stamp.get('reason')} peak_r={stamp.get('peak_r')} live_r={stamp.get('live_r')}"
+                )
+        _clear_basket_runtime(state, symbol, grok=is_grok_close)
     elif act == "add_repair_leg" and not dry:
         repair_side = str(action.get("side") or "buy")
         prefix = list(m5_bars or [])
@@ -1576,6 +1983,12 @@ def run_om_tick(
                 today_entry_count=int(daily.get("entries", 0)),
                 today_losing_count=int(daily.get("loss_baskets", 0)),
                 repair=True,
+                risk_usd_override=_apply_v16_profit_controls(
+                    executor.client,
+                    state,
+                    repair_decision,
+                    _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
+                ),
             )
             if executed.get("action") == "entered":
                 daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -1665,12 +2078,13 @@ def run_governor_tick(
     """
     try:
         gov_state = _governor_state_for(state)
-        realized, pnls = _lane_realized_today(mcp)
+        realized, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
         floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
         floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
 
         governor = _get_governor()
         status = governor.status(realized, floating)
+        status = _apply_v16_house_money_status(gov_state, status)
         new_state = status["state"]
 
         # Once locked/stopped, it STAYS locked/stopped for the rest of the
@@ -1692,13 +2106,14 @@ def run_governor_tick(
             # Close every lane position across every symbol.
             closed_summary: dict[str, Any] = {}
             if executor is not None:
+                active_label = _active_order_label()
                 for symbol in symbols:
                     try:
                         positions = executor.client.get_positions()
                     except (McpClientError, McpZombieError) as exc:
                         log_line(f"{utc_now_iso()} governor close_all read_failed {symbol}: {exc}")
                         continue
-                    lane = basket_live.lane_positions(positions, LIVE_ORDER_LABEL)
+                    lane = basket_live.lane_positions(positions, active_label)
                     lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
                     if not lane:
                         continue
@@ -1706,9 +2121,14 @@ def run_governor_tick(
                     ids = [x for x in ids if x > 0]
                     reason = "governor_target_lock" if effective_state == "TARGET_LOCKED" else "governor_loss_stop"
                     closed_summary[symbol] = executor.execute_close_all(ids, reason=reason)
-                    _clear_basket_runtime(state, symbol)
+                    _clear_basket_runtime(state, symbol, grok=active_label == GROK_LABEL)
 
-            if effective_state == "TARGET_LOCKED":
+            if effective_state == "TARGET_LOCKED" and status.get("house_money_floor_triggered"):
+                log_line(
+                    f"{utc_now_iso()} house-money floor locked +${status['effective_pnl']:.2f} "
+                    f"(floor=${status.get('house_money_floor_usd', status.get('target')):.2f})"
+                )
+            elif effective_state == "TARGET_LOCKED":
                 log_line(
                     f"{utc_now_iso()} \U0001F3AF MISSION COMPLETE +${status['effective_pnl']:.2f} locked "
                     f"(target=${status['target']:.2f})"
@@ -1779,29 +2199,36 @@ def _resolve_live_executor(mcp: Dexter3McpClient, journal: DecisionJournal, live
             "staying in shadow mode (double opt-in required, see blueprint P2)"
         )
         return None
-    log_line(f"{utc_now_iso()} DEXTER3 LIVE MODE ENABLED — demo micro-entries may be placed (label={LIVE_ORDER_LABEL})")
+    log_line(
+        f"{utc_now_iso()} DEXTER3 LIVE MODE ENABLED — demo micro-entries may be placed "
+        f"(label={_active_order_label()})"
+    )
     return Dexter3Executor(mcp, journal, _executor_config_from_env())
 
 
 def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     """Main loop — OPENING MANAGER fast tick (owner directive 2026-07-07).
 
-    Instead of sleeping ``poll_sec`` as one block, the loop ticks every
-    ``fast_tick_sec`` (default 4s, env ``DEXTER3_FAST_TICK_SEC``). EVERY
-    tick runs OM (``run_om_tick``) on any open lane per symbol — Profit
-    Hunter + Basket Doctor — so the ratcheting trail and repair decisions
-    are measured against a continuous peak, not a 5-minute-sampled one. The
-    M5 entry/decision path (``run_once``) still fires only once every
-    ``ceil(poll_sec / fast_tick_sec)`` ticks (see ``m5_entry_tick_due``),
-    preserving the pre-OM M5 entry cadence.
-
-    Preserves every existing failure-handling contract: single lock,
-    ``McpZombieError`` -> sleep 60 and continue, any other exception logged
-    and the loop continues, ``KeyboardInterrupt`` -> clean exit. An OM tick
-    failure is caught INSIDE ``run_om_tick``/this loop's per-symbol try block
-    so it can never crash the loop or block the M5 path.
+    Supports DEXTER3_MODE=grok for independent Grok_v1.0 scalping process.
+    Use separate processes + different MODE for full isolation (recommended).
     """
-    acquire_loop_lock()
+    mode = os.environ.get("DEXTER3_MODE", "v16").lower().strip()
+    is_grok = mode == "grok"
+
+    # Force Grok label early for order creation (live entries)
+    if is_grok and GROK_LABEL:
+        import dexter3.executor as _ex
+        _ex.LABEL = GROK_LABEL
+        print(f"[Grok] Forced executor LABEL to {GROK_LABEL}", flush=True)
+
+    active_label = GROK_LABEL if (is_grok and GROK_LABEL) else LIVE_ORDER_LABEL
+    active_lock_name = "grok-v1.0" if is_grok else "dexter3"
+    fable_version = os.environ.get("DEXTER3_FABLE_VERSION", "v1.7-selective-edge")
+
+    # The loop ticks every fast_tick_sec. Every fast tick runs OM on the
+    # active lane; the M5 entry path still runs only on poll cadence.
+    mode = os.environ.get("DEXTER3_MODE", "v16").lower()
+    acquire_loop_lock(mode)
     mcp = Dexter3McpClient()
     baskets: dict[str, PaperBasket] = {}
     fast_tick_sec = _fast_tick_sec_from_env()
@@ -1811,8 +2238,20 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
             refresh_every_cycles = _learning_refresh_every_cycles(poll_sec)
             log_line(
                 f"{utc_now_iso()} dexter3 shadow loop started symbols={symbols} poll_sec={poll_sec} "
-                f"fast_tick_sec={fast_tick_sec} live={'ON' if executor is not None else 'off'}"
+                f"fast_tick_sec={fast_tick_sec} mode={mode} label={active_label} "
+                f"version={fable_version if not is_grok else 'grok-v1.0'} "
+                f"live={'ON' if executor is not None else 'off'}"
             )
+            if not is_grok:
+                entry_cfg = _v16_entry_quality_config_from_env()
+                log_line(
+                    f"{utc_now_iso()} v16 entry-quality config: enabled={entry_cfg.enabled} "
+                    f"cooldown_enabled={entry_cfg.cooldown_enabled} "
+                    f"chase_hard_block={entry_cfg.chase_hard_block} "
+                    f"block_chase_bypass_on_aligned_trending={entry_cfg.block_chase_bypass_on_aligned_trending} "
+                    f"weak_hard_skip={entry_cfg.weak_hard_skip} "
+                    f"min_leader_score={entry_cfg.min_leader_score}"
+                )
             tick_count = 0
             while True:
                 tick_count += 1
@@ -1846,7 +2285,8 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     except KeyboardInterrupt:
         log_line(f"{utc_now_iso()} dexter3 shadow loop stopped (KeyboardInterrupt)")
     finally:
-        release_loop_lock()
+        mode = os.environ.get("DEXTER3_MODE", "v16").lower()
+        release_loop_lock(mode)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1865,7 +2305,18 @@ def main(argv: list[str] | None = None) -> int:
             "default is OFF/shadow-only."
         ),
     )
+    parser.add_argument(
+        "--grok",
+        action="store_true",
+        help="Run in Grok_v1.0 scalping mode (forces GROK_LABEL when creating orders, uses separate OM + state keys + lock). Recommended: run in a separate terminal for 100%% independence from V1.6.",
+    )
     args = parser.parse_args(argv)
+
+    if args.grok:
+        os.environ.setdefault("DEXTER3_MODE", "grok")
+        if GROK_LABEL:
+            import dexter3.executor as _ex
+            _ex.LABEL = GROK_LABEL
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
@@ -1873,14 +2324,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.loop:
+        if args.grok:
+            os.environ["DEXTER3_MODE"] = "grok"
         run_loop(symbols, args.poll_sec, live=args.live)
         return 0
 
+    if args.grok:
+        os.environ["DEXTER3_MODE"] = "grok"
+
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.
-    if LOCK_FILE.exists():
+    once_lock_file = GROK_LOCK_FILE if args.grok else LOCK_FILE
+    if once_lock_file.exists():
         try:
-            old_pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
+            old_pid = int(once_lock_file.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             old_pid = 0
         if old_pid > 0 and _pid_alive(old_pid):

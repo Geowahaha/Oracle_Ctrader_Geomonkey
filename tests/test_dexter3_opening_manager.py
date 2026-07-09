@@ -642,7 +642,15 @@ def test_stall_take_fires_on_stalled_small_winner():
     floor, which for peak=0.25 (below the first 0.15 breakpoint's floor
     interpolation range) is very close to breakeven."""
     om = _new_om(
-        OMConfig(take_r=50.0, spike_take_r=100.0, stall_max_peak_r=0.5, stall_ticks=3, stall_decay_frac=0.6)
+        OMConfig(
+            take_r=50.0,
+            spike_take_r=100.0,
+            stall_max_peak_r=0.5,
+            stall_ticks=3,
+            stall_decay_frac=0.6,
+            stall_min_peak_r=0.0,
+            stall_min_hold_ticks=0,
+        )
     )
     state: dict = {"base_risk_usd": 1.0}
     # Peak at 0.25R on tick 1, then hold flat/decaying reads with NO new peak.
@@ -666,7 +674,15 @@ def test_stall_take_does_not_fire_when_new_peaks_keep_coming():
     stalls) -- stall-take must never fire (ticks_since_peak resets to 0 every
     tick)."""
     om = _new_om(
-        OMConfig(take_r=50.0, spike_take_r=100.0, stall_max_peak_r=0.5, stall_ticks=3, stall_decay_frac=0.6)
+        OMConfig(
+            take_r=50.0,
+            spike_take_r=100.0,
+            stall_max_peak_r=0.5,
+            stall_ticks=3,
+            stall_decay_frac=0.6,
+            stall_min_peak_r=0.0,
+            stall_min_hold_ticks=0,
+        )
     )
     state: dict = {"base_risk_usd": 1.0}
     r_path = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35]  # strictly increasing -> always a new peak
@@ -686,7 +702,15 @@ def test_stall_take_does_not_fire_above_stall_max_peak_r_tier():
     """Above the stall tier (peak >= stall_max_peak_r), a stall must NOT
     trigger stall-take -- the (tighter, table-driven) ladder governs instead."""
     om = _new_om(
-        OMConfig(take_r=50.0, spike_take_r=100.0, stall_max_peak_r=0.5, stall_ticks=2, stall_decay_frac=0.9)
+        OMConfig(
+            take_r=50.0,
+            spike_take_r=100.0,
+            stall_max_peak_r=0.5,
+            stall_ticks=2,
+            stall_decay_frac=0.9,
+            stall_min_peak_r=0.0,
+            stall_min_hold_ticks=0,
+        )
     )
     state: dict = {"base_risk_usd": 1.0}
     # Peak 0.6R (above stall_max_peak_r=0.5), then stalls + decays a little
@@ -1076,3 +1100,47 @@ def test_smart_loss_exit_cap_stop_still_outranks_it():
         action = om.evaluate("XAUUSD", lane, None, bars, bars, bars, state)
     assert action["action"] == "close_all"
     assert action["reason"] == "cap_stop"
+
+
+def test_grok_v10_wrapper_uses_small_lock_without_changing_v16_default():
+    """Default V1.6 OM should keep ladder behavior; the Grok wrapper should
+    explicitly opt into the separate small-profit lock."""
+    from dexter3.grok_v10 import GrokV10OpeningManager
+
+    lane = _lane_at_r(0.4, side="buy")
+    v16 = _new_om(OMConfig(take_r=50.0, spike_take_r=100.0))
+    v16_action = v16.evaluate("XAUUSD", lane, None, [], [], [], {"base_risk_usd": 1.0})
+    assert v16_action["action"] == "hold"
+
+    grok = GrokV10OpeningManager(config=OMConfig(take_r=50.0, spike_take_r=100.0))
+    grok_action = grok.evaluate("XAUUSD", lane, None, [], [], [], {"base_risk_usd": 1.0})
+    assert grok_action["action"] == "close_all"
+    assert grok_action["reason"] == "grok_v10_small_lock"
+
+
+def test_grok_v10_wrapper_respects_non_scalp_classifier():
+    """V1.7: high-quality Grok pullback winners must not be force-cut small."""
+    from dexter3.grok_v10 import GrokV10OpeningManager
+
+    lane = _lane_at_r(0.4, side="buy")
+    grok = GrokV10OpeningManager(config=OMConfig(take_r=50.0, spike_take_r=100.0))
+    action = grok.evaluate(
+        "XAUUSD",
+        lane,
+        None,
+        [],
+        [],
+        [],
+        {"base_risk_usd": 1.0, "is_grok_scalp": False},
+    )
+    assert action["action"] == "hold"
+    assert action["reason"] == "no_condition_met"
+
+
+def test_grok_v10_default_classifier_does_not_scalp_high_score_pullback_only():
+    from dexter3.grok_v10 import GrokV10Config, is_grok_scalp_candidate
+
+    cfg = GrokV10Config()
+    assert is_grok_scalp_candidate(leader_score=0.30, is_chase=False, is_pullback=True, cfg=cfg) is False
+    assert is_grok_scalp_candidate(leader_score=0.30, is_chase=True, is_pullback=True, cfg=cfg) is True
+    assert is_grok_scalp_candidate(leader_score=0.30, is_chase=False, is_pullback=False, cfg=cfg) is True
