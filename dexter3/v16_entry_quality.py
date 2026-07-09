@@ -83,7 +83,9 @@ class V16EntryQualityConfig:
     winner_setups: frozenset[str] = field(default_factory=lambda: DEFAULT_WINNER_SETUPS)
 
     # -- smart cool-down (noise serial re-entry only) ------------------------
-    cooldown_enabled: bool = True
+    # Default OFF per committed V1.7 spec (ops/dexter3_xau_v16_loop.ps1 sets
+    # DEXTER3_V16_COOLDOWN_ENABLED=0) so bare launches match the launcher.
+    cooldown_enabled: bool = False
     cooldown_sec: int = 600  # 10 min after a noise same-side exit
     # Treat exit as "noise" when stall_take (or live_r below this) / loss.
     cooldown_noise_live_r: float = 0.08

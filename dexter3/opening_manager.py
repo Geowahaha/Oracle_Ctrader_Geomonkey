@@ -109,12 +109,16 @@ class OMConfig:
     # start, generous further out" shape the blueprint table specifies).
     # Below the first threshold: no floor yet (``ladder_floor_r`` -> None).
     # Beyond the last point: floor = ``ladder_tail_keep_frac`` * peak_r.
+    # Loose mission ladder promoted to DEFAULT 2026-07-09 (was launch-line-only
+    # env DEXTER3_OM_LADDER_CSV; a bare launch silently reverted to the tight
+    # V1.4 curve — the winner-cutting geometry the 2026-07-08 129-trade audit
+    # identified as the -EV root cause). Near-breakeven lower tiers let winners
+    # run to their 1.2R TP; a green never ladders back to a full loss.
     ladder_points: tuple[tuple[float, float], ...] = (
-        (0.15, 0.00),
-        (0.30, 0.18),
-        (0.50, 0.32),
-        (0.80, 0.55),
-        (1.20, 0.85),
+        (0.25, 0.02),
+        (0.50, 0.15),
+        (0.80, 0.40),
+        (1.20, 0.80),
         (2.00, 1.45),
         (3.00, 2.25),
     )

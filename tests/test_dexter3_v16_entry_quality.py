@@ -30,8 +30,14 @@ def _decision(**kwargs):
     return SimpleNamespace(**base)
 
 
+def test_default_cooldown_disabled_per_v17_spec():
+    """Committed V1.7 spec runs cooldown OFF (launcher sets
+    DEXTER3_V16_COOLDOWN_ENABLED=0); bare launches must match."""
+    assert V16EntryQualityConfig().cooldown_enabled is False
+
+
 def test_a_plus_elite_score_bypasses_cooldown():
-    cfg = V16EntryQualityConfig(cooldown_sec=600)
+    cfg = V16EntryQualityConfig(cooldown_enabled=True, cooldown_sec=600)
     state = {
         "v16_entry_cooldown": {
             "symbol": "XAUUSD",
@@ -57,7 +63,7 @@ def test_a_plus_elite_score_bypasses_cooldown():
 
 
 def test_noise_cooldown_blocks_low_quality_same_side():
-    cfg = V16EntryQualityConfig(cooldown_sec=600, min_leader_score=0.10)
+    cfg = V16EntryQualityConfig(cooldown_enabled=True, cooldown_sec=600, min_leader_score=0.10)
     state = {
         "v16_entry_cooldown": {
             "symbol": "XAUUSD",
@@ -98,7 +104,7 @@ def test_cooldown_disabled_allows_low_quality_same_side():
 
 
 def test_cooldown_does_not_block_opposite_side():
-    cfg = V16EntryQualityConfig(cooldown_sec=600, min_leader_score=0.10)
+    cfg = V16EntryQualityConfig(cooldown_enabled=True, cooldown_sec=600, min_leader_score=0.10)
     state = {
         "v16_entry_cooldown": {
             "symbol": "XAUUSD",
@@ -218,8 +224,9 @@ def test_mcp_unhealthy_blocks_even_a_plus():
 
 
 def test_noise_exit_and_record():
-    assert is_noise_exit(reason="stall_take", live_r=-0.02, peak_r=0.1) is True
-    assert is_noise_exit(reason="ladder_floor", live_r=0.50, peak_r=0.80) is False
+    cd_cfg = V16EntryQualityConfig(cooldown_enabled=True)
+    assert is_noise_exit(reason="stall_take", live_r=-0.02, peak_r=0.1, cfg=cd_cfg) is True
+    assert is_noise_exit(reason="ladder_floor", live_r=0.50, peak_r=0.80, cfg=cd_cfg) is False
     state: dict = {}
     stamp = record_noise_close(
         state,
@@ -229,6 +236,7 @@ def test_noise_exit_and_record():
         peak_r=0.1,
         live_r=-0.01,
         now_iso="2026-07-09T07:00:00Z",
+        cfg=cd_cfg,
     )
     assert stamp is not None
     assert state["v16_entry_cooldown"]["side"] == "buy"

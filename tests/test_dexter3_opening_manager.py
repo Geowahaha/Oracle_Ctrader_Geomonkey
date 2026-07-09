@@ -128,8 +128,9 @@ def _feed_path(om: OpeningManager, symbol: str, r_path: list[float], *, side: st
 
 def test_ratchet_closes_at_floor_not_at_m5_sampled_value():
     """+0.5R -> +1.5R -> +0.9R must close at the DRAGON LADDER floor derived
-    from the 1.5R peak (default ladder interpolates between the 1.20->0.85
-    and 2.00->1.45 points: floor=0.85+((1.5-1.2)/(2.0-1.2))*(1.45-0.85)=1.075),
+    from the 1.5R peak (default mission ladder interpolates between the
+    1.20->0.80 and 2.00->1.45 points:
+    floor=0.80+((1.5-1.2)/(2.0-1.2))*(1.45-0.80)=1.04375),
     proving the close reflects the PEAK, not the final +0.9R sample an
     M5-only sampler would have recorded as the "peak". As of the 2026-07-08
     DRAGON LADDER directive the ladder (not the legacy flat arm/keep trail)
@@ -142,7 +143,7 @@ def test_ratchet_closes_at_floor_not_at_m5_sampled_value():
     close = closed[0]
     assert close["reason"] == "ladder_floor"
     assert close["peak_r"] == pytest.approx(1.5)
-    assert close["floor_r"] == pytest.approx(1.075, abs=1e-4)
+    assert close["floor_r"] == pytest.approx(1.04375, abs=1e-4)
     # The close fires on the FIRST tick where live_r (0.9) <= floor (1.075) —
     # i.e. immediately at the 0.9 tick, not waiting for a lower M5 sample.
     assert close["live_r"] == pytest.approx(0.9)
@@ -447,11 +448,10 @@ def test_continuous_tick_peak_catches_what_m5_sampling_would_miss():
 
 
 LADDER_TABLE = [
-    (0.15, 0.00),
-    (0.30, 0.18),
-    (0.50, 0.32),
-    (0.80, 0.55),
-    (1.20, 0.85),
+    (0.25, 0.02),
+    (0.50, 0.15),
+    (0.80, 0.40),
+    (1.20, 0.80),
     (2.00, 1.45),
     (3.00, 2.25),
 ]
@@ -461,12 +461,12 @@ def test_ladder_floor_none_below_first_threshold():
     cfg = OMConfig()
     assert ladder_floor_r(0.0, cfg) is None
     assert ladder_floor_r(0.10, cfg) is None
-    assert ladder_floor_r(0.1499, cfg) is None
+    assert ladder_floor_r(0.2499, cfg) is None
 
 
-def test_ladder_floor_breakeven_at_exactly_015():
+def test_ladder_floor_near_breakeven_at_exactly_025():
     cfg = OMConfig()
-    assert ladder_floor_r(0.15, cfg) == pytest.approx(0.0)
+    assert ladder_floor_r(0.25, cfg) == pytest.approx(0.02)
 
 
 @pytest.mark.parametrize("peak,expected_floor", LADDER_TABLE)
@@ -477,9 +477,9 @@ def test_ladder_floor_matches_table_at_breakpoints(peak, expected_floor):
 
 def test_ladder_floor_interpolates_between_breakpoints():
     cfg = OMConfig()
-    # Midpoint of (0.50, 0.32) -> (0.80, 0.55): peak=0.65 -> floor halfway.
+    # Midpoint of (0.50, 0.15) -> (0.80, 0.40): peak=0.65 -> floor halfway.
     mid_floor = ladder_floor_r(0.65, cfg)
-    assert mid_floor == pytest.approx((0.32 + 0.55) / 2, abs=1e-6)
+    assert mid_floor == pytest.approx((0.15 + 0.40) / 2, abs=1e-6)
 
 
 def test_ladder_floor_tail_beyond_last_point():
@@ -523,12 +523,14 @@ def test_ladder_floor_never_exceeds_peak():
 
 def test_owner_scenario_small_peak_then_decay_closes_at_or_above_breakeven():
     """The exact bug the owner reported: a position that peaks at 0.30R then
-    decays must NOT ride back to a full stop loss. The ladder must close it
-    at/above breakeven (0.15R tier's floor=0.00) — never negative."""
+    decays must NOT ride back to a full stop loss. The mission ladder must
+    close it at/above breakeven (0.25R tier's floor=0.02) — never negative.
+    The mission ladder's lower tiers are deliberately near-breakeven (let
+    winners run to TP), so the decay must dip below ~0.046 to trigger."""
     om = _new_om(OMConfig(take_r=50.0, spike_take_r=100.0))
-    # Peaks at 0.30R, then decays through the 0.30 tier's floor (0.18) down
+    # Peaks at 0.30R, then decays through the interpolated floor (~0.046)
     # toward zero and beyond -- the ladder must catch it at/above breakeven.
-    r_path = [0.10, 0.22, 0.30, 0.25, 0.20, 0.15, 0.10]
+    r_path = [0.10, 0.22, 0.30, 0.25, 0.15, 0.08, 0.04]
     actions = _feed_path(om, "XAUUSD", r_path)
     closed = [a for a in actions if a["action"] == "close_all"]
     assert closed, "the ladder must close this position once it breaches its own floor"
@@ -555,14 +557,14 @@ def test_owner_scenario_never_rides_all_the_way_to_full_stop():
 
 
 def test_owner_scenario_082_peak_closes_at_or_above_080_tier_floor():
-    """peak 0.82R reversing must close >= the 0.80-tier table floor (0.55R,
-    i.e. the WORST-case protection the table guarantees once peak_r has
-    cleared 0.80R) — never allowed to ride all the way back to -1R. The
+    """peak 0.82R reversing must close >= the 0.80-tier table floor (0.40R,
+    i.e. the WORST-case protection the mission table guarantees once peak_r
+    has cleared 0.80R) — never allowed to ride all the way back to -1R. The
     actual interpolated floor at peak=0.82 (just past the 0.80 breakpoint,
-    approaching 1.20->0.85) is somewhat higher than the raw 0.80-tier value,
+    approaching 1.20->0.80) is somewhat higher than the raw 0.80-tier value,
     which only strengthens the guarantee."""
     om = _new_om(OMConfig(take_r=50.0, spike_take_r=100.0))
-    r_path = [0.3, 0.6, 0.82, 0.7, 0.6, 0.5]
+    r_path = [0.3, 0.6, 0.82, 0.7, 0.55, 0.41]
     actions = _feed_path(om, "XAUUSD", r_path)
     closed = [a for a in actions if a["action"] == "close_all"]
     assert closed, "ladder must fire on the 0.82R peak's reversal"
@@ -570,10 +572,10 @@ def test_owner_scenario_082_peak_closes_at_or_above_080_tier_floor():
     assert close["reason"] == "ladder_floor"
     assert close["peak_r"] == pytest.approx(0.82)
     # The FLOOR itself must be at/above the 0.80-tier table guarantee
-    # (0.55R) — the trigger tick's live_r is naturally just under the floor
+    # (0.40R) — the trigger tick's live_r is naturally just under the floor
     # by definition (that is what makes it fire), but the floor the ladder
     # protected this peak with must never be weaker than the table promises.
-    assert close["floor_r"] >= 0.55 - 1e-9, f"floor weaker than the 0.80-tier table guarantee: {close}"
+    assert close["floor_r"] >= 0.40 - 1e-9, f"floor weaker than the 0.80-tier table guarantee: {close}"
     # Never allowed to ride anywhere near a full -1R loss.
     assert close["live_r"] > -0.5
 
