@@ -43,3 +43,8 @@ trading_ai/.env.*
 trading_ai/.venv/
 trading_ai/data/
 trading_ai/logs/
+
+# never commit env backups (CHUPEP incident 2026-07-10)
+.env.local.backup*
+*.env.backup*
+.env.*.backup*
