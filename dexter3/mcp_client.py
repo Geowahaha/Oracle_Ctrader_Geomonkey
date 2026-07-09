@@ -41,7 +41,9 @@ call, then it raises.
 """
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import time
 from typing import Any
 
@@ -155,6 +157,7 @@ class Dexter3McpClient:
         self._last_chart_open: dict[str, float] = {}
         self._session = session or requests.Session()
         self.sid: str | None = None
+        self._atexit_registered = False
 
     # -- low-level transport -------------------------------------------------
 
@@ -222,6 +225,36 @@ class Dexter3McpClient:
         except McpClientError:
             # cTrader may return an empty 200/202 body for this notification.
             pass
+        # SESSION HYGIENE (root cause of the recurring 404 zombie, found
+        # 2026-07-09): every client used to create a session and NEVER delete
+        # it — 2,940 distinct session ids in the watchdog log alone, 61 zombie
+        # events in one day. The cTrader plugin's session table exhausts and
+        # the handler 404s everything until an app restart wipes it. Deleting
+        # our own session at process exit keeps the table at the handful of
+        # live consumers. Disable with DEXTER3_MCP_SESSION_AUTODELETE=0.
+        if not self._atexit_registered and os.environ.get(
+            "DEXTER3_MCP_SESSION_AUTODELETE", "1"
+        ).strip() not in ("0", "false", "False"):
+            atexit.register(self.close_session)
+            self._atexit_registered = True
+
+    def close_session(self) -> None:
+        """DELETE our MCP session server-side (idempotent, never raises).
+
+        Safe at any time: the client re-initializes transparently on the next
+        call. Called automatically at process exit (see _initialize)."""
+        sid = self.sid
+        if not sid:
+            return
+        self.sid = None
+        try:
+            self._session.delete(
+                self.url,
+                headers={"Mcp-Session-Id": sid},
+                timeout=min(5.0, self.timeout_sec),
+            )
+        except Exception:  # noqa: BLE001 - best-effort cleanup only
+            pass
 
     def call(self, name: str, args: dict[str, Any] | None = None) -> Any:
         """Call an MCP tool. READ tools get one retry + short backoff;
@@ -252,7 +285,7 @@ class Dexter3McpClient:
                 raise  # zombie is not retryable here — caller must recover
             except McpClientError as exc:
                 last_exc = exc
-                self.sid = None  # force a fresh session on retry
+                self.close_session()  # delete server-side too — a bare sid=None leaked the session
                 if attempt == 0:
                     time.sleep(self.retry_backoff_sec)
         assert last_exc is not None

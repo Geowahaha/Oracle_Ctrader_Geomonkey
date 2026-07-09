@@ -736,3 +736,40 @@ def test_min_volume_ratio_cap_irrelevant_without_clamp_up(monkeypatch):
     assert vol == pytest.approx(3.0)
     assert meta.get("min_volume_clamped_up") is None
     assert meta.get("refuse_reason") is None
+
+
+# -- MCP session hygiene (root-cause fix for the 404 zombie, 2026-07-09) -----
+
+
+def test_mcp_client_close_session_deletes_server_side():
+    from dexter3.mcp_client import Dexter3McpClient
+
+    class FakeHttp:
+        def __init__(self):
+            self.deleted = []
+        def delete(self, url, headers=None, timeout=None):
+            self.deleted.append(headers.get("Mcp-Session-Id"))
+            class R: status_code = 200
+            return R()
+
+    c = Dexter3McpClient(session=FakeHttp())
+    c.sid = "abc123"
+    c.close_session()
+    assert c.sid is None
+    assert c._session.deleted == ["abc123"]
+    # idempotent: second close is a no-op
+    c.close_session()
+    assert c._session.deleted == ["abc123"]
+
+
+def test_mcp_client_close_session_never_raises():
+    from dexter3.mcp_client import Dexter3McpClient
+
+    class BrokenHttp:
+        def delete(self, *a, **k):
+            raise RuntimeError("network down")
+
+    c = Dexter3McpClient(session=BrokenHttp())
+    c.sid = "abc123"
+    c.close_session()  # must swallow
+    assert c.sid is None

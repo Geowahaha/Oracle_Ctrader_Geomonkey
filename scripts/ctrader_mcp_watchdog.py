@@ -116,6 +116,16 @@ def main() -> int:
             print(json.dumps(payload, indent=2))
         append_log(payload)
         return 0 if payload.get("ok") else 1
+    finally:
+        # SESSION HYGIENE (2026-07-09 root-cause fix): this watchdog runs every
+        # 2 min from schtask and used to LEAK its MCP session every run — 645
+        # sessions/day from this script alone. The cTrader plugin's session
+        # table exhausts and 404s everything (the recurring "zombie"). Delete
+        # our session on the way out; best-effort, never raises.
+        try:
+            client._delete_session()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
