@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from dexter3.opening_manager import OMConfig, OpeningManager, _update_peak_r
 from dexter3.v16_entry_quality import (
     V16EntryQualityConfig,
@@ -272,3 +274,68 @@ def test_update_peak_tracks_ticks_open():
     assert rt["ticks_open"] == 1
     rt = _update_peak_r(rt, "t1", 0.1)
     assert rt["ticks_open"] == 2
+
+
+# -- V1.8 size-the-edge levers (size-policy race 2026-07-09) -----------------
+
+
+def _v18_cfg(**kw):
+    base = dict(winner_boost_enabled=True, chase_rescue_enabled=True, b_tier_enabled=True)
+    base.update(kw)
+    return V16EntryQualityConfig(**base)
+
+
+def test_v18_defaults_off_keep_v17_behavior():
+    cfg = V16EntryQualityConfig()
+    assert cfg.winner_boost_enabled is False
+    assert cfg.chase_rescue_enabled is False
+    assert cfg.b_tier_enabled is False
+    # near-miss non-chase still blocked with levers off
+    d = _decision(leader_score=0.16)
+    out = evaluate_v16_entry_gate(decision=d, state={}, cfg=cfg)
+    assert out["allow"] is False and out["reason"] == "min_leader_score"
+
+
+def test_v18_b_tier_accepts_near_miss_non_chase_at_reduced_size():
+    d = _decision(leader_score=0.16)
+    out = evaluate_v16_entry_gate(decision=d, state={}, cfg=_v18_cfg())
+    assert out["allow"] is True
+    assert out["reason"] == "pass_b_tier_scout"
+    assert out["size_mult"] == pytest.approx(0.5)
+    assert out["size_floor_frac"] == 0.0
+
+
+def test_v18_b_tier_never_rescues_chase_or_below_band():
+    chase = _decision(
+        leader_score=0.16,
+        features={"anti_chase": {"is_chase": True}, "pullback_gate": {"is_pullback": False}},
+    )
+    out = evaluate_v16_entry_gate(decision=chase, state={}, cfg=_v18_cfg())
+    assert out["allow"] is False and out["reason"] == "min_leader_score"
+    low = _decision(leader_score=0.14)
+    out2 = evaluate_v16_entry_gate(decision=low, state={}, cfg=_v18_cfg())
+    assert out2["allow"] is False
+
+
+def test_v18_winner_boost_on_a_plus_non_chase_pullback():
+    d = _decision(
+        leader_score=0.32,
+        setup="hunt_h1_context",
+        features={"anti_chase": {"is_chase": False}, "pullback_gate": {"is_pullback": True}},
+    )
+    out = evaluate_v16_entry_gate(decision=d, state={}, cfg=_v18_cfg())
+    assert out["allow"] is True and out["a_plus"] is True
+    assert out["size_mult"] == pytest.approx(1.6)
+    assert out["size_floor_frac"] == 0.0
+
+
+def test_v18_chase_rescue_floors_a_plus_chase():
+    d = _decision(
+        leader_score=0.40,
+        setup="hunt_h1_context",
+        features={"anti_chase": {"is_chase": True}, "pullback_gate": {"is_pullback": True}},
+    )
+    out = evaluate_v16_entry_gate(decision=d, state={}, cfg=_v18_cfg())
+    assert out["allow"] is True
+    assert out["size_floor_frac"] == pytest.approx(0.5)
+    assert out["size_mult"] == pytest.approx(1.0)  # boost requires NON-chase

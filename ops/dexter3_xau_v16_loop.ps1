@@ -37,7 +37,7 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:DEXTER3_LIVE = "1"
 $env:DEXTER3_HUNT = "1"
-$env:DEXTER3_FABLE_VERSION = "v1.7-selective-edge"
+$env:DEXTER3_FABLE_VERSION = "v1.8-size-the-edge"
 $env:DEXTER3_FAST_TICK_SEC = "8"
 $env:DEXTER3_MAX_VOLUME_UNITS = "10"
 $env:DEXTER3_MAX_ENTRIES_PER_DAY = "60"
@@ -58,6 +58,13 @@ $env:DEXTER3_V16_WEAK_MULT = "0.25"
 $env:DEXTER3_V16_WINNER_MULT = "2.0"
 $env:DEXTER3_V16_HOUSE_MULT = "3.0"
 $env:DEXTER3_V16_MAX_EDGE_MULT = "3.0"
+# V1.8 size-the-edge (size-policy race 2026-07-09: P0 $42.9/day -> P5 $68.6/day
+# at base $12; base 1.75% of $1000 = $17.5 lifts P5 to ~$100/day expected.
+# Downside stays bounded by DAILY_LOSS_USD=50 + max_risk_frac 2.5% cap).
+$env:DEXTER3_V18_WINNER_BOOST_ENABLED = "1"
+$env:DEXTER3_V18_CHASE_RESCUE_ENABLED = "1"
+$env:DEXTER3_V18_B_TIER_ENABLED = "1"
+$env:DEXTER3_BASE_RISK_FRAC = "0.0175"
 Remove-Item Env:DEXTER3_MODE -ErrorAction SilentlyContinue
 
 Write-Host "[dexter3-v16] MCP health check (auto-restart if down)..."

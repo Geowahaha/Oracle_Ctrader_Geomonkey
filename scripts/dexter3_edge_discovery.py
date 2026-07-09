@@ -224,6 +224,17 @@ def _entry_gate_config(mode: str) -> V16EntryQualityConfig:
             a_plus_bypasses_chase=True,
             block_chase_bypass_on_aligned_trending=True,
         )
+    if mode == "v18":
+        # Live V1.8 size-the-edge launcher config (size-policy race P5):
+        # V1.7 selection + B-tier scout band; boost/rescue affect SIZE only.
+        return V16EntryQualityConfig(
+            **common,
+            a_plus_bypasses_chase=True,
+            block_chase_bypass_on_aligned_trending=False,
+            winner_boost_enabled=True,
+            chase_rescue_enabled=True,
+            b_tier_enabled=True,
+        )
     raise ValueError(f"unknown entry gate mode: {mode}")
 
 
@@ -262,10 +273,17 @@ def main() -> int:
     ap.add_argument("--pullback-only", action="store_true", help="only take pullback-exhaustion-resumption entries (test entry-quality edge)")
     ap.add_argument(
         "--entry-gate",
-        choices=("none", "v16", "v17", "v17-mission"),
+        choices=("none", "v16", "v17", "v17-mission", "v18"),
         default="none",
         help="replay production entry-quality gate before simulating accepted trades",
     )
+    ap.add_argument(
+        "--size-policy-race",
+        action="store_true",
+        help="race sizing policies (winner-boost / A+ chase rescue / B-tier scout) on the "
+        "gate-accepted set — reports $-weighted totals so policies compare in money, not R",
+    )
+    ap.add_argument("--base-risk-usd", type=float, default=12.0, help="full-size $ risk for the policy race")
     args = ap.parse_args()
 
     c = Dexter3McpClient()
@@ -281,6 +299,8 @@ def main() -> int:
     regime_buckets: dict[tuple, list] = defaultdict(list)  # (align, regime) -> [R,...]
     side_split: dict[str, list] = defaultdict(list)
     gate_blocks: dict[str, list] = defaultdict(list)
+    accepted_records: list[dict] = []   # size-policy race: gate-accepted trades
+    b_pool: list[dict] = []             # size-policy race: near-miss (0.15-0.18) non-chase skips
     n_eval = n_candidates = n_enter = 0
 
     # walk forward: decision uses [:i+1], outcome uses [i+1:]
@@ -319,10 +339,32 @@ def main() -> int:
         risk = abs(float(d.entry) - float(d.sl))
         cost_r = (args.spread_abs / risk if risk > 0 else 0.0) + args.commission_r
         r_net = r - cost_r
-        gate = _apply_entry_gate(d, args.entry_gate, str(d.ts_close or ts))
-        if not bool(gate.get("allow", True)):
+        gate = gate_features = None
+        if args.entry_gate != "none" or args.size_policy_race:
+            gate = _apply_entry_gate(d, args.entry_gate if args.entry_gate != "none" else "v17", str(d.ts_close or ts))
+            gate_features = gate.get("features") or {}
+        if gate is not None and not bool(gate.get("allow", True)):
             gate_blocks[str(gate.get("reason") or "blocked")].append(r_net)
+            # B-tier candidate pool: blocked ONLY by min score, near-miss band,
+            # non-chase (the +EV bucket family) — the race prices these.
+            if (
+                args.size_policy_race
+                and str(gate.get("reason")) == "min_leader_score"
+                and not bool(gate_features.get("is_chase", False))
+                and float(gate_features.get("leader_score") or 0.0) >= 0.15
+            ):
+                b_pool.append({"r": r_net, "pull": bool(gate_features.get("is_pullback", False))})
             continue
+        if args.size_policy_race and gate_features is not None:
+            accepted_records.append(
+                {
+                    "r": r_net,
+                    "chase": bool(gate_features.get("is_chase", False)),
+                    "pull": bool(gate_features.get("is_pullback", False)),
+                    "a_plus": bool(gate.get("a_plus", False)),
+                    "score": float(gate_features.get("leader_score") or 0.0),
+                }
+            )
         n_enter += 1
         # bucket dims
         align = "aligned" if (_h1_trend_sign(h1c) == (1 if d.side == "buy" else -1)) else \
@@ -382,6 +424,63 @@ def main() -> int:
         print("-" * 54)
         for reason, rs in sorted(gate_blocks.items(), key=lambda kv: sum(kv[1])):
             print(f"{reason:32} {len(rs):>4} {sum(rs)/len(rs):>+7.3f} {sum(rs):>+7.1f}")
+
+    if args.size_policy_race and accepted_records:
+        # -- SIZE POLICY RACE ------------------------------------------------
+        # Same entry selection (v17 gate), different SIZING. Weight = the live
+        # sizing chain (chase 0.15 / non-pullback 0.35) with each policy's
+        # modification on top. $-weighted total = sum(r * weight) * base_risk.
+        hours = max(1.0, (len(m5) * 5.0) / 60.0)
+        cap_mult = 25.0 / max(1e-9, args.base_risk_usd)  # governor hard cap 2.5% of $1000
+
+        def _chain(rec: dict) -> float:
+            return (0.15 if rec["chase"] else 1.0) * (1.0 if rec["pull"] else 0.35)
+
+        def _policy_total(name: str, boost: bool, rescue: bool, b_tier: bool) -> tuple:
+            wtot = 0.0
+            n = 0
+            for rec in accepted_records:
+                w = _chain(rec)
+                if boost and rec["a_plus"] and not rec["chase"] and rec["pull"]:
+                    w = min(w * 1.6, cap_mult)
+                if rescue and rec["a_plus"] and rec["chase"]:
+                    w = max(w, 0.5)
+                wtot += rec["r"] * w
+                n += 1
+            if b_tier:
+                for rec in b_pool:
+                    w = 0.5 * (1.0 if rec["pull"] else 0.35)
+                    wtot += rec["r"] * w
+                    n += 1
+            usd = wtot * args.base_risk_usd
+            return (name, n, wtot, usd, usd / hours * 24.0)
+
+        print("\n=== SIZE POLICY RACE ($-weighted; same v17 entry edge, different sizing) ===")
+        print(f"window={hours:.0f}h  base_risk=${args.base_risk_usd:.0f}  cap=2.5%/$1000")
+        print(f"{'policy':44} {'N':>4} {'wR':>8} {'$window':>9} {'$/day':>8}")
+        print("-" * 78)
+        for row in (
+            _policy_total("P0 current (chase .15 / non-pull .35)", False, False, False),
+            _policy_total("P1 winner-boost x1.6 (A+ non-chase pull)", True, False, False),
+            _policy_total("P2 A+ chase rescue -> 0.5x", False, True, False),
+            _policy_total("P3 = P1 + P2", True, True, False),
+            _policy_total("P4 B-tier scout 0.5x (0.15-0.18 non-chase)", False, False, True),
+            _policy_total("P5 = P1 + P2 + B-tier", True, True, True),
+        ):
+            name, n, wtot, usd, per_day = row
+            print(f"{name:44} {n:>4} {wtot:>+8.2f} {usd:>+9.2f} {per_day:>+8.2f}")
+
+        def _grp(name, recs):
+            if not recs:
+                return
+            rs = [x["r"] for x in recs]
+            print(f"  {name:38} N={len(rs):>3} avgR={sum(rs)/len(rs):+.3f} totR={sum(rs):+.1f}")
+
+        print("\n--- accepted-set anatomy (unweighted R — is each lever's premise true?) ---")
+        _grp("A+ non-chase pullback (boost target)", [x for x in accepted_records if x["a_plus"] and not x["chase"] and x["pull"]])
+        _grp("A+ chase (rescue target)", [x for x in accepted_records if x["a_plus"] and x["chase"]])
+        _grp("other accepted", [x for x in accepted_records if not (x["a_plus"] and not x["chase"] and x["pull"]) and not (x["a_plus"] and x["chase"])])
+        _grp("B-pool near-miss non-chase (b-tier target)", b_pool)
 
     allr = [x for rs in buckets.values() for x in rs]
     if allr:

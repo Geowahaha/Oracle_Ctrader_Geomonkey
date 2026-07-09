@@ -103,6 +103,20 @@ class V16EntryQualityConfig:
     # -- MCP pause -----------------------------------------------------------
     mcp_max_consec_errors: int = 2
 
+    # -- V1.8 size-the-edge levers (size-policy race, 2026-07-09) -------------
+    # Race on 1000 real M5 (v17 entry set, $-weighted): P0 current $42.9/day →
+    # P5 all-three $68.6/day. Premises measured true on the accepted set:
+    # A+ chase avgR +0.329 (was scouted 0.15x), near-miss 0.15-0.18 non-chase
+    # avgR +0.320 over 53 skipped trades, A+ non-chase pullback avgR +0.204.
+    # All default OFF -> byte-identical V1.7 behavior until env-enabled.
+    winner_boost_enabled: bool = False
+    winner_boost_mult: float = 1.6      # A+ non-chase pullback: post-chain boost
+    chase_rescue_enabled: bool = False
+    chase_rescue_floor_frac: float = 0.5  # A+ chase: floor at this frac of governor risk
+    b_tier_enabled: bool = False
+    b_tier_min_score: float = 0.15      # accept [this, min_leader_score) non-chase...
+    b_tier_mult: float = 0.5            # ...at this multiple of chain risk
+
 
 def classify_a_plus(
     *,
@@ -269,8 +283,23 @@ def evaluate_v16_entry_gate(
             "features": features,
         }
 
-    # 2) Min leader score
+    # 2) Min leader score — V1.8 B-tier: the near-miss band [b_tier_min_score,
+    # min_leader_score) on NON-chase entries measured avgR +0.320 over 53
+    # skipped trades in the race window; take them at reduced size instead of
+    # skipping. Chase near-misses stay blocked (that bucket is the proven -EV).
     if ls < cfg.min_leader_score:
+        if cfg.b_tier_enabled and not is_chase and ls >= cfg.b_tier_min_score:
+            features["b_tier"] = True
+            return {
+                "allow": True,
+                "reason": "pass_b_tier_scout",
+                "a_plus": a_plus,
+                "a_plus_reason": a_plus_reason,
+                "cooldown_bypassed": False,
+                "size_mult": cfg.b_tier_mult,
+                "size_floor_frac": 0.0,
+                "features": features,
+            }
         return {
             "allow": False,
             "reason": "min_leader_score",
@@ -345,6 +374,19 @@ def evaluate_v16_entry_gate(
                         "features": features,
                     }
 
+    # V1.8 sizing levers on the allowed entry (post-chain semantics: the
+    # anti-chase/pullback chain has already shaped risk upstream; size_mult
+    # multiplies that result, size_floor_frac floors it at a fraction of the
+    # RAW governor risk — see shadow_runner._apply_v18_size_levers).
+    size_mult = 1.0
+    size_floor_frac = 0.0
+    if cfg.winner_boost_enabled and a_plus and not is_chase and is_pullback:
+        size_mult = float(cfg.winner_boost_mult)
+        features["v18_winner_boost"] = size_mult
+    if cfg.chase_rescue_enabled and a_plus and is_chase:
+        size_floor_frac = float(cfg.chase_rescue_floor_frac)
+        features["v18_chase_rescue_floor"] = size_floor_frac
+
     return {
         "allow": True,
         "reason": (
@@ -357,5 +399,7 @@ def evaluate_v16_entry_gate(
         "a_plus": a_plus,
         "a_plus_reason": a_plus_reason,
         "cooldown_bypassed": cooldown_bypassed,
+        "size_mult": size_mult,
+        "size_floor_frac": size_floor_frac,
         "features": features,
     }

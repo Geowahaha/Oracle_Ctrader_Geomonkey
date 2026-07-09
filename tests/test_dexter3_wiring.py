@@ -665,3 +665,29 @@ def test_account_guard_never_raises_when_notification_fails():
     client = _GuardClient(fail=True)
     result = {"action": "refused", "reason": "account_not_confirmed_demo"}
     assert sr._maybe_alert_account_guard(client, result) is False
+
+
+# -- V1.8 size lever application (shadow_runner._apply_v18_size_levers) ------
+
+
+def test_v18_size_levers_noop_when_defaults():
+    assert sr._apply_v18_size_levers({}, 14.4, 5.04) == pytest.approx(5.04)
+    assert sr._apply_v18_size_levers({"size_mult": 1.0, "size_floor_frac": 0.0}, 14.4, 5.04) == pytest.approx(5.04)
+
+
+def test_v18_size_levers_boost_and_cap():
+    # boost 1.6 on full-size chain risk
+    assert sr._apply_v18_size_levers({"size_mult": 1.6}, 14.4, 14.4) == pytest.approx(23.04)
+    # cap at governor capital*max_risk_frac (default 1000*0.025=25)
+    assert sr._apply_v18_size_levers({"size_mult": 1.6}, 20.0, 20.0) == pytest.approx(25.0)
+
+
+def test_v18_size_levers_rescue_floor():
+    # A+ chase: chain crushed risk to 2.16; floor lifts to 0.5 x governor 14.4
+    assert sr._apply_v18_size_levers({"size_floor_frac": 0.5}, 14.4, 2.16) == pytest.approx(7.2)
+    # floor never lowers a larger chain risk
+    assert sr._apply_v18_size_levers({"size_floor_frac": 0.5}, 14.4, 10.0) == pytest.approx(10.0)
+
+
+def test_v18_b_tier_mult_halves_chain_risk():
+    assert sr._apply_v18_size_levers({"size_mult": 0.5}, 14.4, 5.04) == pytest.approx(2.52)

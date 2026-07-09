@@ -569,6 +569,14 @@ def _v16_entry_quality_config_from_env() -> V16EntryQualityConfig:
     if raw_cd is not None:
         kw["cooldown_enabled"] = raw_cd.strip() not in ("0", "false", "False", "")
     for env, field_name in (
+        ("DEXTER3_V18_WINNER_BOOST_ENABLED", "winner_boost_enabled"),
+        ("DEXTER3_V18_CHASE_RESCUE_ENABLED", "chase_rescue_enabled"),
+        ("DEXTER3_V18_B_TIER_ENABLED", "b_tier_enabled"),
+    ):
+        raw_v18 = os.environ.get(env)
+        if raw_v18 is not None:
+            kw[field_name] = raw_v18.strip() not in ("0", "false", "False", "")
+    for env, field_name in (
         ("DEXTER3_V16_MIN_LEADER_SCORE", "min_leader_score"),
         ("DEXTER3_V16_CHASE_BYPASS_SCORE", "chase_bypass_score"),
         ("DEXTER3_V16_WEAK_MIN_SCORE", "weak_min_score"),
@@ -576,6 +584,10 @@ def _v16_entry_quality_config_from_env() -> V16EntryQualityConfig:
         ("DEXTER3_V16_COOLDOWN_BYPASS_WINNER_SCORE", "bypass_winner_score"),
         ("DEXTER3_V16_COOLDOWN_BYPASS_EXCEPTIONAL", "bypass_exceptional_score"),
         ("DEXTER3_V16_COOLDOWN_NOISE_LIVE_R", "cooldown_noise_live_r"),
+        ("DEXTER3_V18_WINNER_BOOST_MULT", "winner_boost_mult"),
+        ("DEXTER3_V18_CHASE_RESCUE_FLOOR", "chase_rescue_floor_frac"),
+        ("DEXTER3_V18_B_TIER_MIN_SCORE", "b_tier_min_score"),
+        ("DEXTER3_V18_B_TIER_MULT", "b_tier_mult"),
     ):
         raw_val = os.environ.get(env)
         if raw_val:
@@ -594,6 +606,35 @@ def _v16_entry_quality_config_from_env() -> V16EntryQualityConfig:
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
     return V16EntryQualityConfig(**kw)
+
+
+def _apply_v18_size_levers(
+    quality: dict[str, Any], governor_risk_usd: float, chain_risk_usd: float
+) -> float:
+    """V1.8 size-the-edge: apply the gate's size_mult / size_floor_frac to the
+    post-chain risk, hard-capped at the governor's max risk fraction of
+    capital. Returns chain_risk_usd unchanged when the levers are off (their
+    defaults) — byte-identical V1.7 sizing."""
+    mult = float(quality.get("size_mult") or 1.0)
+    floor_frac = float(quality.get("size_floor_frac") or 0.0)
+    risk = float(chain_risk_usd)
+    if mult == 1.0 and floor_frac <= 0.0:
+        return risk
+    risk = risk * mult
+    if floor_frac > 0.0:
+        risk = max(risk, float(governor_risk_usd) * floor_frac)
+    try:
+        gcfg = _get_governor().config
+        cap = float(gcfg.capital_usd) * float(gcfg.max_risk_frac)
+    except Exception:  # noqa: BLE001 - cap fallback must never block sizing
+        cap = 25.0
+    risk = min(risk, cap)
+    if risk != float(chain_risk_usd):
+        log_line(
+            f"{utc_now_iso()} v18-size: mult={mult} floor_frac={floor_frac} "
+            f"risk_usd {chain_risk_usd:.2f}->{risk:.2f} (cap={cap:.2f})"
+        )
+    return risk
 
 
 def _note_mcp_error(state: dict[str, Any], *, ok: bool = False) -> int:
@@ -1280,6 +1321,9 @@ def run_symbol_cycle(
                     if not quality.get("allow", True):
                         status += f":live_blocked_{quality.get('reason', 'quality')}"
                     else:
+                        risk_usd_override = _apply_v18_size_levers(
+                            quality, float(base_risk_usd), float(risk_usd_override)
+                        )
                         exec_result = _execute_live_entry(
                             executor,
                             decision,
