@@ -1419,10 +1419,10 @@ class Config:
     MT5_READINESS_CHECK_TIME_UTC: str = os.getenv("MT5_READINESS_CHECK_TIME_UTC", "00:02")
 
     # ── Telegram ───────────────────────────────────────────────────────────────
-    TELEGRAM_BOT_TOKEN: str = os.getenv(
-        "TELEGRAM_BOT_TOKEN",
-        "8536612154:AAGMbUo2mH45TSyWV1Eq22NX_-M_ZnlnPwA"   # @mrgeon8n_bot default
-    )
+    # SECURITY (2026-07-10): the bot token was hardcoded here, leaked, and the
+    # bot was hijacked (renamed "CHUPEP" by an attacker). Token now comes from
+    # .env.local ONLY — never commit a default. Old token revoked via BotFather.
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
     TELEGRAM_ADMIN_IDS: str = os.getenv("TELEGRAM_ADMIN_IDS", "")  # comma-separated user IDs
     MONITOR_DISABLE_TELEGRAM: bool = os.getenv("MONITOR_DISABLE_TELEGRAM", "0").strip().lower() in ("1", "true", "yes", "on")

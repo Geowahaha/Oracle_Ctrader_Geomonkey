@@ -34,10 +34,21 @@ RUNTIME = ROOT / "data" / "runtime"
 LOCK = RUNTIME / "dexter3_telegram_watcher.lock"
 SELF_LOG = RUNTIME / "dexter3_telegram_watcher.log"
 
-BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8536612154:AAGMbUo2mH45TSyWV1Eq22NX_-M_ZnlnPwA"
-)
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1585019324")
+def _env_local(key: str) -> str:
+    """Read a key from .env.local (never hardcode secrets — the previous
+    hardcoded bot token leaked and the bot was hijacked, 2026-07-10)."""
+    try:
+        for line in (ROOT / ".env.local").read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith(f"{key}=") and not line.startswith("#"):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or _env_local("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or _env_local("TELEGRAM_CHAT_ID") or "1585019324"
 POLL_SEC = float(os.environ.get("DEXTER3_TG_WATCH_POLL_SEC", "2"))
 COOLDOWN_SEC = float(os.environ.get("DEXTER3_TG_WATCH_COOLDOWN_SEC", "300"))
 
