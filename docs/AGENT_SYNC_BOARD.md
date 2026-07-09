@@ -641,3 +641,11 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - Tests: 2 new hygiene tests; focused suite **244 passed**. Soak test running: 40 sequential fresh clients (the exact churn pattern that killed the plugin) against the live MCP.
 - **Stability instrumentation armed:** persistent monitor on watchdog log `ok:false` — any future zombie event is caught and timestamped. Honest claim protocol: "stable" = zombie rate drops from ~61/day to ~0 over a multi-hour window; measurement ongoing, will be reported. Live loops (Fable 22000 / Grok 4804) still run pre-fix client code (leak ≈1 session per process — negligible vs 645/day) and inherit hygiene at their next natural restart.
 - Watchdog `--restart` self-heal stays as defense-in-depth; expectation after this fix is it stops firing.
+
+### 2026-07-09 UTC 17:25Z — claude-fable (Fable 5) — BOTH lanes restarted on fully-fixed code (owner full permission)
+
+- Owner saw heavy SL damage on Grok and granted full permission to act directly. Confirmed cause: running Grok (old PID 4804, started 08:32Z) predated the ratio cap — it slid +$12.41 → **−$1.66** (2 more ~−$7 SL hits on a $4.8 design; avgL −$7.13). Old process killed.
+- **Grok relaunched PID 9208** (17:20:22Z): `version=grok-v1.0`, governor 30/15/0.4% verified, `DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=1.5` on the launch line, hygienic mcp_client. Both open positions (Sell/Buy repair pair) re-adopted by label.
+- **Fable relaunched PID 10208** (17:21:23Z, book was flat): `version=v1.8-size-the-edge`, governor 100/50/1.75% verified — now also on the hygienic client. **Zero-churn architecture is now live across every MCP consumer** (both loops + watchdog + all scripts).
+- One more zombie occurred at ~17:12Z (pre-hygiene loops still leaking + possibly my 40-session soak burst) — schtask healed it. With all consumers hygienic, the zombie detector monitor now measures the true post-fix rate; watch for it to hit ~0.
+- Next: first `min_volume_risk_exceeds_ratio_cap` refusal in grok log = ratio cap live-verified (monitor armed); measure Fable V1.8 forward PF + Grok supplement over the next session via `ops/dexter3_lane_tally.py`.
