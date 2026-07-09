@@ -47,6 +47,30 @@ protocol, no split-brain risk: ONE home (VM), labels unchanged
 - **P4:** Telegram watcher moves to VM (systemd) so alerts survive PC off;
   Haiku watch brief updated to read via SSH or bridge.
 
+## P1 status (2026-07-10 — built by Sonnet, PM-reviewed by Fable, 285 tests green)
+
+Shipped: `dexter3/openapi_client.py` (770L), `dexter3/transport.py` factory
+(`DEXTER3_TRANSPORT=local_mcp|openapi`, default local_mcp = byte-identical),
+shadow_runner wired through factory (3-line diff), 41 new tests,
+`scripts/dexter3_transport_parity.py` (read-only live diff, not yet run).
+
+**Known gaps (P3 BLOCKERS until fixed):**
+1. `get_deals` has NO label under OpenAPI (`ProtoOADeal` has no label field) →
+   the Daily Mission Governor's per-label realized PnL is BLIND on this
+   transport (target-lock/loss-stop/ladder dead). Fix: join via
+   `ProtoOAOrderListReq` (orders carry the label). **Must fix before P3.**
+2. `get_symbol_details` NotImplemented → `execute_entry` fail-closes (no
+   entries possible) — safe for P2 shadow, blocker for P3.
+3. `get_positions` lacks netProfit (no PnL field in proto) → basket manage
+   degrades to hold (`unreliable=True`).
+4. PM risk (Fable): adapter runs `ops/ctrader_execute_once.py` as a
+   subprocess PER CALL = fresh OpenAPI TCP+OAuth connect per read. At 8s
+   fast-tick this is connection churn against Spotware rate limits — the same
+   churn antipattern as the MCP session zombie, one layer down. P2 must
+   measure; the durable fix is a persistent OpenAPI daemon (extend
+   ctrader-stream.service or a small local socket service) that the adapter
+   calls instead of spawning workers.
+
 ## Risks / notes
 - VM RAM 956MB, ~229MB free + 2GB swap: two loops ≈ 100-120MB — fits; watch OOM.
 - OpenAPI symbol/volume conventions differ from local MCP (pipettes, cents on

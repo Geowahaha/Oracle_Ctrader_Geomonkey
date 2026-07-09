@@ -67,6 +67,7 @@ from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 from dexter3.opening_manager import OMConfig, OpeningManager
+from dexter3.transport import make_client
 
 # Grok_v1.0 (optional import for docs / direct use)
 try:
@@ -2321,7 +2322,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     # active lane; the M5 entry path still runs only on poll cadence.
     mode = os.environ.get("DEXTER3_MODE", "v16").lower()
     acquire_loop_lock(mode)
-    mcp = Dexter3McpClient()
+    mcp = make_client()
     baskets: dict[str, PaperBasket] = {}
     fast_tick_sec = _fast_tick_sec_from_env()
     try:
@@ -2436,7 +2437,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dexter3 shadow loop already running (pid={old_pid}) — skipping --once", file=sys.stderr)
             return 1
 
-    mcp = Dexter3McpClient()
+    mcp = make_client()
     baskets: dict[str, PaperBasket] = {}
     try:
         with DecisionJournal() as journal:
