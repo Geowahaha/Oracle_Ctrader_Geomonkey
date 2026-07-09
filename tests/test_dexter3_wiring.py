@@ -610,3 +610,58 @@ def test_v16_house_money_arms_then_locks_floor(monkeypatch):
     locked = sr._apply_v16_house_money_status(gov_state, {"state": "HUNTING", "effective_pnl": 19.5})
     assert locked["state"] == "TARGET_LOCKED"
     assert locked["house_money_floor_triggered"] is True
+
+
+# -- account guard alarm (owner directive 2026-07-09: force demo 9922808) ----
+
+
+class _GuardClient:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def call(self, name: str, args: dict[str, Any] | None = None) -> Any:
+        if self.fail:
+            raise RuntimeError("mcp down")
+        self.calls.append((name, dict(args or {})))
+        return {"ok": True}
+
+
+def _reset_guard_throttle() -> None:
+    sr._account_guard_last_notify = 0.0
+
+
+def test_account_guard_alerts_on_demo_refusal():
+    _reset_guard_throttle()
+    client = _GuardClient()
+    result = {"action": "refused", "reason": "account_not_confirmed_demo", "trader_id": 2017746}
+    assert sr._maybe_alert_account_guard(client, result) is True
+    assert client.calls and client.calls[0][0] == "show_notification"
+    payload = client.calls[0][1]
+    assert "9922808" in payload["description"]
+    assert payload["type"] == "error"
+
+
+def test_account_guard_throttles_repeat_notifications():
+    _reset_guard_throttle()
+    client = _GuardClient()
+    result = {"action": "refused", "reason": "account_not_confirmed_demo"}
+    assert sr._maybe_alert_account_guard(client, result) is True
+    assert sr._maybe_alert_account_guard(client, result) is False
+    assert len(client.calls) == 1
+
+
+def test_account_guard_ignores_other_refusals_and_entries():
+    _reset_guard_throttle()
+    client = _GuardClient()
+    assert sr._maybe_alert_account_guard(client, {"action": "refused", "reason": "spread_too_wide"}) is False
+    assert sr._maybe_alert_account_guard(client, {"action": "entered", "position_id": 1}) is False
+    assert sr._maybe_alert_account_guard(client, None) is False
+    assert client.calls == []
+
+
+def test_account_guard_never_raises_when_notification_fails():
+    _reset_guard_throttle()
+    client = _GuardClient(fail=True)
+    result = {"action": "refused", "reason": "account_not_confirmed_demo"}
+    assert sr._maybe_alert_account_guard(client, result) is False

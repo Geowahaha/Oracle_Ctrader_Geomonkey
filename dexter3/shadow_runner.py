@@ -1449,6 +1449,53 @@ def _apply_smart_exit_gate(
         return {"regime": "tight", "disaster_mult": 1.0, "enabled": False, "is_chase": None}
 
 
+# -- account guard alarm (owner directive 2026-07-09: force demo 9922808) ----
+# The executor's demo gate (ExecutorConfig.demo_trader_ids, fail-closed on
+# get_balance().traderId) is what BLOCKS entries on a wrong/unverified
+# account. This alarm makes that state loud instead of silent: without it a
+# wrong active account in cTrader just looks like an idle loop.
+_ACCOUNT_GUARD_NOTIFY_THROTTLE_SEC = 300.0
+_account_guard_last_notify = 0.0
+
+
+def _maybe_alert_account_guard(client: Any, result: dict[str, Any] | None) -> bool:
+    """In-app popup + loud log when an entry was refused by the demo gate.
+
+    Best-effort and throttled (one popup per 5 min); NEVER raises — the live
+    loop must not die because a notification failed. Returns True when a
+    notification was sent (test hook)."""
+    global _account_guard_last_notify
+    try:
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("reason") or "") != "account_not_confirmed_demo":
+            return False
+        log_line(
+            f"{utc_now_iso()} ACCOUNT GUARD: entry refused — active cTrader account is not "
+            f"the required demo (trader_id={result.get('trader_id')}, "
+            f"expected demo_trader_ids={result.get('demo_trader_ids')}). "
+            f"Switch cTrader to demo 9922808; entries stay blocked until then."
+        )
+        now = time.time()
+        if now - _account_guard_last_notify < _ACCOUNT_GUARD_NOTIFY_THROTTLE_SEC:
+            return False
+        client.call(
+            "show_notification",
+            {
+                "caption": "DEXTER3 ACCOUNT GUARD",
+                "description": (
+                    "Wrong/unverified trading account active. Switch cTrader to "
+                    "demo 9922808 — all Dexter3 entries are blocked until then."
+                ),
+                "type": "error",
+            },
+        )
+        _account_guard_last_notify = now
+        return True
+    except Exception:  # noqa: BLE001 - alarm must never break the loop
+        return False
+
+
 def _execute_live_entry(
     executor: Dexter3Executor,
     decision: hunter_brain.Decision,
@@ -1496,6 +1543,7 @@ def _execute_live_entry(
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
         log_error(f"execute_entry({decision.symbol})", exc)
         return {"action": "exception"}
+    _maybe_alert_account_guard(executor.client, result)
     log_line(
         f"{utc_now_iso()} {decision.symbol} LIVE_ENTRY action={result.get('action')} "
         f"position_id={result.get('position_id')} verified={result.get('verified')}"
