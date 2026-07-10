@@ -808,9 +808,11 @@ class Dexter3OpenApiClient:
             "grossProfit": float(d.get("gross_profit_usd", 0.0) or 0.0),
             "swap": float(d.get("swap_usd", 0.0) or 0.0),
             "commission": float(d.get("commission_usd", 0.0) or 0.0),
-            # label/comment always "" — see module docstring gap #4.
-            "label": "",
-            "comment": "",
+            # Gap #4 CLOSED (daemon mode): the daemon's _mode_reconcile joins
+            # each deal to its order's label via ProtoOAOrderListReq. Subprocess
+            # mode still has no join -> stays "" (governor degrades as before).
+            "label": str(d.get("label", "") or ""),
+            "comment": str(d.get("comment", "") or ""),
         }
 
     @staticmethod

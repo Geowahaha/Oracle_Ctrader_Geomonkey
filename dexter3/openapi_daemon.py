@@ -762,6 +762,12 @@ def _normalize_deal(deal: Any, symbol_map: dict[int, str]) -> dict:
         "deal_id": _safe_int(raw.get("dealId"), 0),
         "order_id": _safe_int(raw.get("orderId"), 0),
         "position_id": _safe_int(raw.get("positionId"), 0),
+        "order_id": _safe_int(raw.get("orderId"), 0),
+        # Filled by _mode_reconcile's order-list join (ProtoOADeal has no label
+        # field — the label lives on the order that produced the deal). Closes
+        # migration gap #1: the governor's per-label realized-PnL tracking.
+        "label": "",
+        "comment": "",
         "symbol_id": symbol_id,
         "symbol": str(symbol_map.get(symbol_id, "") or "").strip().upper(),
         "direction": "long" if side_token == "BUY" else ("short" if side_token == "SELL" else ""),
@@ -1409,6 +1415,42 @@ class OpenApiDaemon:
         positions = [_normalize_position(x, symbol_map) for x in list(getattr(reconcile_payload, "position", []) or [])]
         orders = [_proto_to_dict(x) for x in list(getattr(reconcile_payload, "order", []) or [])]
         deals = [_normalize_deal(x, symbol_map) for x in list(getattr(deal_payload, "deal", []) or [])]
+        # -- deal->order label join (closes migration gap #1) -----------------
+        # ProtoOADeal carries no label; the label lives on the order that
+        # produced it. Fetch the historical order list for the SAME window and
+        # stamp each deal with its order's label so the governor's per-label
+        # realized-PnL tracking works on the OpenAPI transport. Best-effort:
+        # a failed/empty order-list leaves labels blank (governor degrades to
+        # the pre-join behavior — no worse than before this join existed).
+        try:
+            order_msg = yield self.client.send(
+                pb.ProtoOAOrderListReq(
+                    ctidTraderAccountId=int(account_id),
+                    fromTimestamp=int(from_ts),
+                    toTimestamp=int(to_ts),
+                ),
+                responseTimeoutInSeconds=int(REQUEST_TIMEOUT_HEAVY_SEC),
+            )
+            order_payload = Protobuf.extract(order_msg)
+            label_by_order_id: dict[int, tuple[str, str]] = {}
+            for o in list(getattr(order_payload, "order", []) or []):
+                od = _proto_to_dict(o)
+                oid = _safe_int(od.get("orderId"), 0)
+                if oid <= 0:
+                    continue
+                trade = dict(od.get("tradeData") or {})
+                label_by_order_id[oid] = (
+                    str(trade.get("label", "") or "").strip(),
+                    str(trade.get("comment", "") or "").strip(),
+                )
+            for d in deals:
+                lbl, cmt = label_by_order_id.get(int(d.get("order_id", 0) or 0), ("", ""))
+                if lbl:
+                    d["label"] = lbl
+                if cmt:
+                    d["comment"] = cmt
+        except Exception as exc:  # noqa: BLE001 - label join is best-effort
+            logger.warning("deal->order label join failed (deals unlabeled this cycle): %s", exc)
         defer.returnValue({
             "ok": True,
             "status": "reconciled",
