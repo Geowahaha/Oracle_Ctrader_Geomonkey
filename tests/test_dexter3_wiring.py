@@ -91,6 +91,14 @@ def journal(tmp_path: Path):
     j.close()
 
 
+def _isolate_shadow_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep runner-glue tests from touching the live lane's state or log."""
+    monkeypatch.setattr(sr, "STATE_FILE", tmp_path / "dexter3_shadow_state.json")
+    monkeypatch.setattr(sr, "GROK_STATE_FILE", tmp_path / "dexter3_grok_shadow_state.json")
+    monkeypatch.setattr(sr, "log_line", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sr, "log_error", lambda *_args, **_kwargs: None)
+
+
 # -- execute_close_all ---------------------------------------------------------
 
 
@@ -492,11 +500,12 @@ def test_om_config_from_env_reads_knobs_and_ignores_invalid(monkeypatch):
     assert cfg2.arm_trail_r == OMConfig().arm_trail_r  # falls back to default, does not raise
 
 
-def test_run_om_tick_dry_mode_never_calls_executor_mutations(journal, monkeypatch):
+def test_run_om_tick_dry_mode_never_calls_executor_mutations(journal, monkeypatch, tmp_path):
     """Shadow mode (executor=None): OM must still evaluate + journal the
     would-be action, but must place/close NOTHING."""
     monkeypatch.setattr(sr, "_OM_BAR_CACHE", {})
     monkeypatch.setattr(sr, "_OM_INSTANCE", None)
+    _isolate_shadow_runtime(monkeypatch, tmp_path)
     mcp = FakeMcp(positions=[_lane_pos(1)])
     state: dict = {}
     status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
@@ -506,9 +515,10 @@ def test_run_om_tick_dry_mode_never_calls_executor_mutations(journal, monkeypatc
     assert mutating_calls == []
 
 
-def test_run_om_tick_no_lane_clears_runtime_and_is_noop(journal, monkeypatch):
+def test_run_om_tick_no_lane_clears_runtime_and_is_noop(journal, monkeypatch, tmp_path):
     monkeypatch.setattr(sr, "_OM_BAR_CACHE", {})
     monkeypatch.setattr(sr, "_OM_INSTANCE", None)
+    _isolate_shadow_runtime(monkeypatch, tmp_path)
     mcp = FakeMcp(positions=[])
     state: dict = {"basket_runtime": {"BTCUSD": {"oldest_open_ts": "x", "peak_r": 1.0}}}
     status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
