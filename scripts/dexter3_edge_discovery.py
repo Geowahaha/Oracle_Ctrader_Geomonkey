@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dexter3 import hunt_mode, market_lens
+from dexter3 import empirical_stats, hunt_mode, market_lens
 from dexter3 import edge_buckets
 from dexter3.mcp_client import Dexter3McpClient
 from dexter3.v16_entry_quality import V16EntryQualityConfig, evaluate_v16_entry_gate
@@ -135,36 +135,41 @@ def _regime(h1_ctx: list, n: int = 8, thresh: float = 0.35) -> str:
     return "trending" if eff >= thresh else "ranging"
 
 
-def _simulate(side: str, entry: float, sl: float, tp: float, future: list, max_hold: int) -> tuple[str, float]:
-    """Walk future bars, return (outcome, R). Conservative SL-first on same-bar."""
+def _simulate(side: str, entry: float, sl: float, tp: float, future: list, max_hold: int) -> tuple[str, float, int]:
+    """Walk future bars, return (outcome, R, bars_held). Conservative SL-first
+    on same-bar. ``bars_held`` = 0-based offset into ``future`` where the trade
+    RESOLVED — the walk-forward empirical mode needs it for temporal honesty
+    (an outcome is knowable only from its resolution bar onward, not from its
+    entry bar)."""
     risk = abs(entry - sl)
     if risk <= 0:
-        return "skip", 0.0
-    for bar in future[:max_hold]:
+        return "skip", 0.0, 0
+    for held, bar in enumerate(future[:max_hold]):
         hi = float(bar.get("high", 0.0))
         lo = float(bar.get("low", 0.0))
         if side == "buy":
             hit_sl = lo <= sl
             hit_tp = hi >= tp
             if hit_sl:                       # conservative: SL wins ties
-                return "loss", -1.0
+                return "loss", -1.0, held
             if hit_tp:
-                return "win", (tp - entry) / risk
+                return "win", (tp - entry) / risk, held
         else:  # sell
             hit_sl = hi >= sl
             hit_tp = lo <= tp
             if hit_sl:
-                return "loss", -1.0
+                return "loss", -1.0, held
             if hit_tp:
-                return "win", (entry - tp) / risk
+                return "win", (entry - tp) / risk, held
     # timed out — mark to the last bar's close
+    held = min(max_hold, len(future)) - 1
     last = float(future[max_hold - 1].get("close", entry)) if len(future) >= max_hold else float(future[-1].get("close", entry)) if future else entry
     r = (last - entry) / risk if side == "buy" else (entry - last) / risk
-    return ("win" if r > 0 else "loss"), r
+    return ("win" if r > 0 else "loss"), r, max(0, held)
 
 
 def _simulate_smart(side: str, entry: float, sl: float, tp: float, future: list, max_hold: int,
-                    disaster_mult: float) -> tuple[str, float]:
+                    disaster_mult: float) -> tuple[str, float, int]:
     """SMART exit (owner directive 2026-07-08): the SL level is not a hard
     wick-triggered line — a wick BEYOND it that CLOSES back inside is NOISE
     and is survived; we only exit-as-loss when a bar CLOSES beyond the
@@ -174,29 +179,29 @@ def _simulate_smart(side: str, entry: float, sl: float, tp: float, future: list,
     R is measured against the original (tight) SL distance for comparability."""
     risk = abs(entry - sl)
     if risk <= 0:
-        return "skip", 0.0
+        return "skip", 0.0, 0
     disaster = entry - disaster_mult * risk if side == "buy" else entry + disaster_mult * risk
-    for bar in future[:max_hold]:
+    for held, bar in enumerate(future[:max_hold]):
         hi = float(bar.get("high", 0.0))
         lo = float(bar.get("low", 0.0))
         cl = float(bar.get("close", 0.0))
         if side == "buy":
             if lo <= disaster:                    # catastrophic wick — hard cut
-                return "loss", -disaster_mult
+                return "loss", -disaster_mult, held
             if hi >= tp:                           # TP spike — bank it
-                return "win", (tp - entry) / risk
+                return "win", (tp - entry) / risk, held
             if cl <= sl:                           # CONFIRMED break (close beyond) — thesis dead
-                return "loss", (cl - entry) / risk
+                return "loss", (cl - entry) / risk, held
         else:
             if hi >= disaster:
-                return "loss", -disaster_mult
+                return "loss", -disaster_mult, held
             if lo <= tp:
-                return "win", (entry - tp) / risk
+                return "win", (entry - tp) / risk, held
             if cl >= sl:
-                return "loss", (entry - cl) / risk
+                return "loss", (entry - cl) / risk, held
     last = float(future[min(max_hold, len(future)) - 1].get("close", entry)) if future else entry
     r = (last - entry) / risk if side == "buy" else (entry - last) / risk
-    return ("win" if r > 0 else "loss"), r
+    return ("win" if r > 0 else "loss"), r, max(0, min(max_hold, len(future)) - 1)
 
 
 def _entry_gate_config(mode: str) -> V16EntryQualityConfig:
@@ -284,9 +289,27 @@ def main() -> int:
         "gate-accepted set — reports $-weighted totals so policies compare in money, not R",
     )
     ap.add_argument("--base-risk-usd", type=float, default=12.0, help="full-size $ risk for the policy race")
+    ap.add_argument(
+        "--walkforward-empirical",
+        action="store_true",
+        help=(
+            "PROMOTION GATE for learner sizing (2026-07-11): before each decision, "
+            "empirical (setup, session) stats are built from outcomes RESOLVED strictly "
+            "before that bar (temporal honesty — resolution bar, not entry bar); a "
+            "DOWNSIZE-ONLY policy (blend can only shrink size, never boost) is measured "
+            "against the full-size baseline on the SAME accepted trades: net R, PF, max "
+            "drawdown. Learner sizing may go live only if the policy wins here."
+        ),
+    )
+    ap.add_argument("--wf-size-floor", type=float, default=0.25, help="downsize-only policy floor multiplier")
     args = ap.parse_args()
 
-    c = Dexter3McpClient()
+    # DEXTER3_TRANSPORT-aware (2026-07-11): local_mcp on the PC (default,
+    # byte-identical), openapi+daemon on the VM — same pattern as
+    # ops/dexter3_lane_tally.py.
+    from dexter3.transport import make_client
+
+    c = make_client()
     m5 = c.get_trendbars(args.symbol, "m5", args.count)
     m15 = c.get_trendbars(args.symbol, "m15", args.count)
     h1 = c.get_trendbars(args.symbol, "h1", max(200, args.count // 4))
@@ -303,8 +326,24 @@ def main() -> int:
     b_pool: list[dict] = []             # size-policy race: near-miss (0.15-0.18) non-chase skips
     n_eval = n_candidates = n_enter = 0
 
+    # --walkforward-empirical rolling state: an outcome becomes KNOWN only at
+    # its RESOLUTION bar (entry bar would be look-ahead — the exact trap the
+    # fear-cost P0 removed elsewhere). wf_stats is rebuilt only when new
+    # outcomes mature, and always from wf_known (strictly-prior resolutions).
+    wf_pending: list[dict] = []          # {resolve_i, setup, session, pnl}
+    wf_known: list[dict] = []
+    wf_stats: dict = {}
+    wf_records: list[tuple[float, float]] = []   # (r_net, policy_mult)
+    wf_downsized = 0
+
     # walk forward: decision uses [:i+1], outcome uses [i+1:]
     for i in range(MIN_M5, len(m5) - 2):
+        if args.walkforward_empirical and wf_pending:
+            matured = [p for p in wf_pending if p["resolve_i"] <= i]
+            if matured:
+                wf_pending = [p for p in wf_pending if p["resolve_i"] > i]
+                wf_known.extend(matured)
+                wf_stats = empirical_stats.p_win_estimates(wf_known, args.symbol)
         prefix = m5[: i + 1]
         ts = str(m5[i].get("ts") or "")
         close_epoch = _epoch(ts) + 300
@@ -330,9 +369,9 @@ def main() -> int:
             # against the NEW (wider) risk, so a loss is still -1R.
             sl_p = entry_p - (entry_p - sl_p) * args.sl_mult if d.side == "buy" else entry_p + (sl_p - entry_p) * args.sl_mult
         if args.smart_exit:
-            outcome, r = _simulate_smart(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold, args.disaster_mult)
+            outcome, r, held = _simulate_smart(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold, args.disaster_mult)
         else:
-            outcome, r = _simulate(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold)
+            outcome, r, held = _simulate(str(d.side), entry_p, sl_p, tp_p, future, args.max_hold)
         if outcome == "skip":
             continue
         # cost: entry crosses spread (in R) + flat commission R
@@ -371,6 +410,21 @@ def main() -> int:
                 ("counter" if _h1_trend_sign(h1c) != 0 else "no_trend")
         session = str(market_lens.session_context(ts).get("value") or "unknown")
         regime = _regime(h1c)
+        if args.walkforward_empirical:
+            # DOWNSIZE-ONLY policy: mature-bucket blend may shrink size toward
+            # the floor, never boost above 1.0 (codex promotion-gate spec).
+            base_p = float(d.p_win_est or 0.0)
+            blended_p = empirical_stats.blended_p_win(base_p, str(d.setup), session, wf_stats)
+            mult = 1.0
+            if base_p > 0 and blended_p < base_p:
+                mult = max(float(args.wf_size_floor), blended_p / base_p)
+                if mult < 1.0:
+                    wf_downsized += 1
+            wf_records.append((r_net, mult))
+            # this trade's outcome becomes knowable only from its resolution bar
+            wf_pending.append(
+                {"resolve_i": i + 1 + int(held), "setup": str(d.setup), "session": session, "pnl": r_net}
+            )
         buckets[(align, session)].append(r_net)
         regime_buckets[(align, regime)].append(r_net)
         side_split[str(d.side)].append(r_net)
@@ -379,6 +433,36 @@ def main() -> int:
         f"evaluated {n_eval} M5 closes, {n_candidates} candidates, {n_enter} accepted entries "
         f"({n_enter/max(1,n_eval)*100:.0f}% participation), entry_gate={args.entry_gate}\n"
     )
+
+    if args.walkforward_empirical:
+        def _equity_stats(rs: list[float]) -> tuple[float, float, float]:
+            """(net, PF, max drawdown) of an R-sequence in trade order."""
+            gw = sum(x for x in rs if x > 0)
+            gl = sum(x for x in rs if x <= 0)
+            pf = (gw / abs(gl)) if gl < 0 else float("inf")
+            eq = peak = maxdd = 0.0
+            for x in rs:
+                eq += x
+                peak = max(peak, eq)
+                maxdd = max(maxdd, peak - eq)
+            return sum(rs), pf, maxdd
+
+        base_rs = [r for r, _ in wf_records]
+        pol_rs = [r * m for r, m in wf_records]
+        b_net, b_pf, b_dd = _equity_stats(base_rs)
+        p_net, p_pf, p_dd = _equity_stats(pol_rs)
+        mature = sum(1 for v in wf_stats.values() if not v.get("below_min_samples", True))
+        print("== WALK-FORWARD EMPIRICAL (downsize-only promotion gate) ==")
+        print(f"trades={len(wf_records)} downsized={wf_downsized} "
+              f"mature_buckets={mature}/{len(wf_stats)} (MIN_SAMPLES={empirical_stats.MIN_SAMPLES}) "
+              f"size_floor={args.wf_size_floor}")
+        print(f"baseline : net={b_net:+.2f}R PF={b_pf:.2f} maxDD={b_dd:.2f}R")
+        print(f"policy   : net={p_net:+.2f}R PF={p_pf:.2f} maxDD={p_dd:.2f}R")
+        wins = p_net >= b_net and p_dd <= b_dd and wf_downsized > 0
+        verdict = "PASS (policy >= baseline net AND <= baseline maxDD, with real downsizes)" if wins else \
+                  ("INSUFFICIENT (no mature bucket ever downsized — need more history)" if wf_downsized == 0 else
+                   "FAIL (policy loses on this window — do NOT promote learner sizing)")
+        print(f"verdict  : {verdict}\n")
 
     def _row(name, rs):
         n = len(rs)
