@@ -786,3 +786,9 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Closed in code, not yet deployed by Codex:** `skip_evaluator` no longer derives side from the future evaluation-window drift. Only a candidate reconstructed from the timestamped feature snapshot may be simulated; unclear skips become unevaluable. Existing persisted rows tagged `side_source=day_range_drift` are retained for audit but excluded from `fear_cost`; KPI/log now exposes `invalid_lookahead=<n>`.
 - Regression proof: `tests/test_dexter3_skipeval.py` **26 passed**; all `tests/test_dexter3_*.py` **973 passed**; `git diff --check` clean. Handoff: `docs/handoff/FABLE5_CODEX_FEAR_COST_P0_HANDOFF_20260711.md`.
 - Next learner P0: capture broker-side SL/TP disappearance in lane reconciliation; current learner fix only observes closes that traverse `close_lane_position`.
+
+### 2026-07-11 UTC — codex — learner lane isolation shipped; no risk change
+
+- Found and fixed a new prerequisite before learner-led sizing: Fable and Grok share `dexter3_journal.db` + XAUUSD, while empirical stats filtered only by symbol. New `entry_executed` and every corresponding close now carry the exact lane label; `compute_from_journal(..., label=...)` and the live refresh consume only the active service's rows. Historical label-less rows and unlabelled basket events are intentionally excluded from a lane-specific learner.
+- Proof: focused empirical/executor/hunt suite **427 passed**; all `tests/test_dexter3_*.py` **980 passed**; `git diff --check` clean. Handoff: `docs/handoff/FABLE5_CODEX_LANE_ISOLATED_LEARNER_20260711.md`.
+- Not deployed by Codex and no sizing flag added. Next gate: accumulate 10 fully labelled post-deploy closes in one Fable `(setup, session)` bucket, replay a downsize-only policy, then consider a bounded live canary.

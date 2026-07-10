@@ -1774,7 +1774,7 @@ def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: D
     for symbol in symbols:
         try:
             _JOURNAL_STATS_CACHE[symbol] = empirical_stats.stats_to_journal_stats_arg(
-                empirical_stats.compute_from_journal(journal, symbol)
+                empirical_stats.compute_from_journal(journal, symbol, label=_active_order_label())
             ) or None
         except Exception as exc:  # noqa: BLE001 - stats refresh must never break the loop
             log_error(f"empirical_stats.compute_from_journal({symbol})", exc)

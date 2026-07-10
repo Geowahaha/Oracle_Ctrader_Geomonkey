@@ -122,7 +122,7 @@ def blended_p_win(base_p_win: float, setup: str, session: str, stats: dict[tuple
 # -- DB-facing wrapper (thin; core logic above stays DB-free) ---------------
 
 
-def _closed_outcome_rows(conn: sqlite3.Connection, symbol: str) -> list[dict[str, Any]]:
+def _closed_outcome_rows(conn: sqlite3.Connection, symbol: str, label: str | None = None) -> list[dict[str, Any]]:
     """Pull closed-outcome rows for ``symbol`` from exec_events + basket_events.
 
     Both tables may or may not exist yet (exec_events is created lazily by
@@ -132,8 +132,12 @@ def _closed_outcome_rows(conn: sqlite3.Connection, symbol: str) -> list[dict[str
     closed.
     """
     rows: list[dict[str, Any]] = []
-    rows.extend(_exec_events_outcome_rows(conn, symbol))
-    rows.extend(_basket_events_outcome_rows(conn, symbol))
+    rows.extend(_exec_events_outcome_rows(conn, symbol, label=label))
+    # Basket events have no lane label, so including them would reintroduce
+    # cross-lane contamination in the shared Fable/Grok journal. They remain
+    # available for legacy/no-label analysis only.
+    if label is None:
+        rows.extend(_basket_events_outcome_rows(conn, symbol))
     return rows
 
 
@@ -142,7 +146,9 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _exec_events_outcome_rows(conn: sqlite3.Connection, symbol: str) -> list[dict[str, Any]]:
+def _exec_events_outcome_rows(
+    conn: sqlite3.Connection, symbol: str, *, label: str | None = None
+) -> list[dict[str, Any]]:
     if not _table_exists(conn, "exec_events"):
         return []
     import json
@@ -162,9 +168,12 @@ def _exec_events_outcome_rows(conn: sqlite3.Connection, symbol: str) -> list[dic
         setup = payload.get("setup") or result.get("setup")
         session = payload.get("session") or result.get("session")
         pnl = payload.get("pnl", result.get("pnl"))
+        row_label = payload.get("label") or result.get("label")
+        if label is not None and str(row_label or "") != str(label):
+            continue
         if setup is None or session is None or pnl is None:
             continue
-        out.append({"symbol": symbol, "setup": setup, "session": session, "pnl": pnl})
+        out.append({"symbol": symbol, "setup": setup, "session": session, "pnl": pnl, "label": row_label})
     return out
 
 
@@ -196,7 +205,9 @@ def _basket_events_outcome_rows(conn: sqlite3.Connection, symbol: str) -> list[d
     return out
 
 
-def compute_from_journal(journal: Any, symbol: str) -> dict[tuple[str, str], dict[str, Any]]:
+def compute_from_journal(
+    journal: Any, symbol: str, *, label: str | None = None
+) -> dict[tuple[str, str], dict[str, Any]]:
     """DB-facing wrapper: fetch closed outcomes for ``symbol`` and compute stats.
 
     Accepts a ``dexter3.decision_journal.DecisionJournal`` (reads its
@@ -205,7 +216,7 @@ def compute_from_journal(journal: Any, symbol: str) -> dict[tuple[str, str], dic
     ``{}``).
     """
     conn: sqlite3.Connection = getattr(journal, "_conn", journal)
-    rows = _closed_outcome_rows(conn, symbol)
+    rows = _closed_outcome_rows(conn, symbol, label=label)
     return p_win_estimates(rows, symbol)
 
 

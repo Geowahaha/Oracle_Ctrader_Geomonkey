@@ -215,6 +215,25 @@ def test_compute_from_journal_ignores_other_symbols(journal: DecisionJournal):
     assert es.compute_from_journal(journal, "BTCUSD") == {}
 
 
+def test_compute_from_journal_filters_outcomes_to_the_requested_lane(journal: DecisionJournal):
+    ensure_exec_events_table(journal._conn)
+    for pnl, label in ((2.0, "dexter3:fable:m5h-v1"), (-3.0, "dexter3:grok-v1.0:scalper")):
+        insert_exec_event(
+            journal._conn,
+            symbol="XAUUSD",
+            event="lane_position_closed",
+            verified=True,
+            payload={"setup": "hunt_h1_context", "session": "london", "pnl": pnl, "label": label},
+        )
+
+    fable = es.compute_from_journal(journal, "XAUUSD", label="dexter3:fable:m5h-v1")
+    grok = es.compute_from_journal(journal, "XAUUSD", label="dexter3:grok-v1.0:scalper")
+    assert fable[("hunt_h1_context", "london")]["wins"] == 1
+    assert fable[("hunt_h1_context", "london")]["losses"] == 0
+    assert grok[("hunt_h1_context", "london")]["wins"] == 0
+    assert grok[("hunt_h1_context", "london")]["losses"] == 1
+
+
 def test_compute_from_journal_ignores_rows_missing_setup_or_session(journal: DecisionJournal):
     ensure_exec_events_table(journal._conn)
     insert_exec_event(

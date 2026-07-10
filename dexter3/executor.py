@@ -757,6 +757,10 @@ class Dexter3Executor:
             "sl": sl,
             "tp": tp,
             "setup": decision.setup,
+            # Persist the exact lane identity. The Fable and Grok VM services
+            # share the journal database, so empirical learning must never
+            # pool their outcomes merely because they trade the same symbol.
+            "label": LABEL,
             # session bucket at decision time — the learner's second key
             # (empirical_stats buckets by (setup, session)); getattr keeps
             # legacy/foreign decision objects without the field valid.
@@ -799,6 +803,7 @@ class Dexter3Executor:
             return {
                 "setup": str(payload.get("setup") or "") or None,
                 "session": str(payload.get("session") or "") or None,
+                "label": str(payload.get("label") or "") or None,
             }
         except Exception:  # noqa: BLE001 - learner enrichment must never break closes
             return {}
@@ -946,6 +951,7 @@ class Dexter3Executor:
                 "result": result,
                 "setup": entry_ctx.get("setup"),
                 "session": entry_ctx.get("session"),
+                "label": entry_ctx.get("label"),
                 "pnl": pnl_snapshot,
                 "exit_reason": reason,
             },
@@ -1023,6 +1029,7 @@ class Dexter3Executor:
                     "reason": "broker_side_close_reconciled",
                     "setup": str(entry_payload.get("setup") or "") or None,
                     "session": str(entry_payload.get("session") or "") or None,
+                    "label": str(entry_payload.get("label") or "") or None,
                     "pnl": pnl,
                     "exit_reason": "broker_side_close",
                     "reconciled": True,
