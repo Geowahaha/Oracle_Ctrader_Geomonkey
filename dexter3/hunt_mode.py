@@ -778,6 +778,15 @@ def decide_hunt(
     features_snapshot["hunt_raw_conviction"] = raw_conviction
     features_snapshot["hunt_trend_guard"] = trend_guard_detail
 
+    # session bucket for the learner — the SAME session_context label
+    # hunter_brain keys (setup, session) on; carried by the executor into
+    # entry_executed so every close (manual/OM/broker-side) lands in
+    # empirical_stats under a blendable key. HUNT is the LIVE entry producer
+    # (DEXTER3_HUNT=1 in the VM units), so without this every live outcome
+    # journaled session="" and the learner skipped it (found 2026-07-11 in
+    # the first vanish-reconcile backfill: session=None on every row).
+    session_label = str((lens_computed.get("session_context") or {}).get("value") or "unknown")
+
     return Decision(
         ts_close=ts_close,
         symbol=symbol,
@@ -793,6 +802,7 @@ def decide_hunt(
         setup=setup,
         reasons=reasons,
         features=features_snapshot,
+        session=session_label,
     )
 
 

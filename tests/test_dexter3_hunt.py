@@ -530,3 +530,17 @@ def test_guard_property_never_flips_when_aligned_or_no_trend() -> None:
         side, _, _ = hunt_mode._apply_trend_agreement_guard(raw_side, 0.5, committee)
         if no_aligned_trend or already_aligned:
             assert side == raw_side
+
+
+def test_decide_hunt_enter_carries_session_label() -> None:
+    """HUNT is the LIVE entry producer (DEXTER3_HUNT=1 on the VM units) — its
+    enter Decisions must carry the session bucket or every live outcome
+    journals session="" and empirical_stats skips it (2026-07-11: the first
+    vanish-reconcile backfill showed session=None on every live row)."""
+    rng = random.Random(7)
+    m5, m15, h1 = _regime_bars(rng, 7)
+    decision = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(7))
+    assert decision.action == "enter"
+    expected = str((decision.features.get("session_context") or {}).get("value") or "unknown")
+    assert decision.session == expected
+    assert decision.session != ""
