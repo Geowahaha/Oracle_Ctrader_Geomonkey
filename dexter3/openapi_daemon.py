@@ -298,6 +298,17 @@ def _account_id_from_payload(payload: dict) -> int:
             account_id = _safe_int(row.get("accountId"), 0)
             if account_id > 0:
                 return account_id
+    # Dexter3-scoped pin: when the caller supplied no EXPLICIT account identity,
+    # default to the account this daemon is pinned to (the lane's trading
+    # account). This deliberately beats the generic config CTRADER_ACCOUNT_*
+    # fallbacks below — those point at a different demo (9900897/46552794) on
+    # this box, which was silently winning for account_id-less calls and made
+    # the governor's get_deals reconcile hit an EMPTY account. Explicit payload
+    # account_id / account_login (the hot trading path) still win above.
+    # (2026-07-10)
+    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
+    if env_pin > 0:
+        return env_pin
     raw_login = str(getattr(config, "CTRADER_ACCOUNT_LOGIN", "") or "").strip()
     if raw_login and callable(finder):
         row = finder(raw_login, use_demo=use_demo)
@@ -314,14 +325,6 @@ def _account_id_from_payload(payload: dict) -> int:
                 if account_id > 0:
                     return account_id
         return _safe_int(raw, 0)
-    # Dexter3-scoped fallback: when the caller supplied no account identity,
-    # default to the account this daemon is PINNED to (the lane's trading
-    # account) instead of the generic "first demo" finder — otherwise an
-    # account_id-less call (e.g. a manual execute_once reconcile) silently
-    # resolves a DIFFERENT demo and reports empty positions/deals. (2026-07-10)
-    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
-    if env_pin > 0:
-        return env_pin
     if callable(finder):
         row = finder("", use_demo=use_demo)
         if isinstance(row, dict):

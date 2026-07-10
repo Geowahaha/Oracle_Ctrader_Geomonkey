@@ -135,6 +135,15 @@ def _account_id_from_payload(payload: dict) -> int:
             account_id = _safe_int(row.get("accountId"), 0)
             if account_id > 0:
                 return account_id
+    # Dexter3-scoped pin (parity with dexter3/openapi_daemon.py): when no
+    # EXPLICIT account identity was supplied, default to the pinned lane
+    # account. This deliberately beats the generic config CTRADER_ACCOUNT_*
+    # fallbacks below — on the VM those point at a different demo
+    # (9900897/46552794) and were silently winning for account_id-less calls
+    # (manual `--mode reconcile`), hitting an EMPTY account. (2026-07-10)
+    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
+    if env_pin > 0:
+        return env_pin
     raw_login = str(getattr(config, "CTRADER_ACCOUNT_LOGIN", "") or "").strip()
     if raw_login:
         row = getattr(config, "find_ctrader_account", lambda *_args, **_kwargs: None)(raw_login, use_demo=getattr(config, "CTRADER_USE_DEMO", False))
@@ -150,13 +159,6 @@ def _account_id_from_payload(payload: dict) -> int:
             if account_id > 0:
                 return account_id
         return _safe_int(raw, 0)
-    # Dexter3-scoped fallback (parity with dexter3/openapi_daemon.py): default
-    # to the daemon's PINNED account when the caller gave no account identity,
-    # so a manual `--mode reconcile` hits the lane account (46670728), not a
-    # different demo that reports empty. (2026-07-10)
-    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
-    if env_pin > 0:
-        return env_pin
     row = getattr(config, "find_ctrader_account", lambda *_args, **_kwargs: None)("", use_demo=getattr(config, "CTRADER_USE_DEMO", False))
     if isinstance(row, dict):
         account_id = _safe_int(row.get("accountId"), 0)

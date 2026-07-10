@@ -365,21 +365,24 @@ def test_account_id_from_payload_bad_value_falls_back_to_config_chain(monkeypatc
     assert _account_id_from_payload({}) == 0
 
 
-def test_account_id_from_payload_env_pin_is_fallback_default(monkeypatch):
-    """With no account identity in the payload, resolve the daemon's PINNED
-    account (DEXTER3_OPENAPI_ACCOUNT_ID) rather than the generic first-demo
-    finder — otherwise an account_id-less call (manual execute_once reconcile)
-    silently lands on a DIFFERENT demo and reports empty positions/deals."""
+def test_account_id_from_payload_env_pin_beats_generic_config_login(monkeypatch):
+    """With no EXPLICIT account identity in the payload, the dexter3 pin
+    (DEXTER3_OPENAPI_ACCOUNT_ID) must beat a SET generic config
+    CTRADER_ACCOUNT_LOGIN that points at a different demo. This is the live VM
+    bug: CTRADER_ACCOUNT_LOGIN=9900897 resolved 46552794 and won for
+    account_id-less calls, so the governor's get_deals reconcile hit an EMPTY
+    account (46552794) instead of the lane account (46670728)."""
     import dexter3.openapi_daemon as daemon_mod
 
     monkeypatch.setenv("DEXTER3_OPENAPI_ACCOUNT_ID", "46670728")
-    # a finder that would otherwise resolve a DIFFERENT demo (the bug)
+    # a finder + config login that WOULD otherwise resolve the wrong demo
     monkeypatch.setattr(
         daemon_mod.config, "find_ctrader_account",
-        lambda *_a, **_k: {"accountId": 46552794}, raising=False,
+        lambda ident="", **_k: {"accountId": 46552794}, raising=False,
     )
-    monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_LOGIN", "", raising=False)
+    monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_LOGIN", "9900897", raising=False)
     monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_ID", "", raising=False)
+    monkeypatch.setattr(daemon_mod.config, "CTRADER_USE_DEMO", True, raising=False)
     assert _account_id_from_payload({}) == 46670728
 
 
