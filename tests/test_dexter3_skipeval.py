@@ -2,8 +2,8 @@
 
 Critical invariants under test (per Dexter3 Phase 2 spec):
   - hit/miss/unevaluable simulation outcomes
-  - side determined from features.candidate (recomputed leader_score) when
-    strong enough, else falls back to day-range drift sign
+  - side determined from the recorded feature snapshot only; no future-bar
+    direction fallback is allowed
   - missing history is marked unevaluable, never guessed
   - evaluate_pending_skips only touches skip rows older than the delay,
     without an existing skip_outcomes row, and writes exactly one row each
@@ -14,6 +14,7 @@ NO live MCP calls — a fake client exposing get_trendbars(symbol, period, count
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -69,36 +70,27 @@ WEAK_UNCLEAR_FEATURES = {
 
 
 def test_determine_candidate_side_uses_strong_features_candidate():
-    side, source = se.determine_candidate_side(STRONG_BUY_FEATURES, [])
+    side, source = se.determine_candidate_side(STRONG_BUY_FEATURES)
     assert side == "buy"
     assert source == "features_candidate"
 
 
-def test_determine_candidate_side_falls_back_to_day_range_drift_when_features_unclear():
-    window_bars = [_bar(100, 101, 99, 100, "t0"), _bar(100, 102, 99, 102, "t1")]  # drift up
-    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES, window_bars)
-    assert side == "buy"
-    assert source == "day_range_drift"
-
-
-def test_determine_candidate_side_drift_down():
-    window_bars = [_bar(100, 101, 99, 100, "t0"), _bar(100, 100, 97, 98, "t1")]  # drift down
-    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES, window_bars)
-    assert side == "sell"
-    assert source == "day_range_drift"
+def test_determine_candidate_side_refuses_future_derived_direction_when_features_unclear():
+    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES)
+    assert side is None
+    assert source == "no_recorded_candidate"
 
 
 def test_determine_candidate_side_none_when_both_unclear():
-    flat_bars = [_bar(100, 101, 99, 100, "t0"), _bar(100, 101, 99, 100, "t1")]  # no drift
-    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES, flat_bars)
+    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES)
     assert side is None
-    assert source == "none"
+    assert source == "no_recorded_candidate"
 
 
 def test_determine_candidate_side_none_with_insufficient_bars_for_drift():
-    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES, [_bar(100, 101, 99, 100, "t0")])
+    side, source = se.determine_candidate_side(WEAK_UNCLEAR_FEATURES)
     assert side is None
-    assert source == "none"
+    assert source == "no_recorded_candidate"
 
 
 # -- simulate_would_have_trade ---------------------------------------------------------
@@ -272,8 +264,6 @@ def _insert_skip_decision(journal: DecisionJournal, *, symbol: str, ts_close: st
 
 
 def test_evaluate_pending_skips_only_touches_eligible_rows(journal: DecisionJournal):
-    from datetime import datetime, timezone
-
     now = datetime(2026, 7, 5, 10, 0, 0, tzinfo=timezone.utc)
     old_id = _insert_skip_decision(journal, symbol="XAUUSD", ts_close="2026-07-05T09:00:00Z", features=STRONG_BUY_FEATURES)
     too_recent_id = _insert_skip_decision(
@@ -367,9 +357,10 @@ def test_fear_cost_summary_aggregates_evaluated_rows_only(journal: DecisionJourn
     journal.insert_skip_outcome(d2, would_have_result=json.dumps({"hit": "loss"}), would_have_pnl=-1.0)
     journal.insert_skip_outcome(d3, would_have_result=json.dumps({"unevaluable": True}), would_have_pnl=None)
 
-    summary = se.fear_cost_summary(journal, hours=24)
+    summary = se.fear_cost_summary(journal, hours=24, now=datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc))
     assert summary["skips_evaluated"] == 2
     assert summary["unevaluable"] == 1
+    assert summary["invalid_lookahead"] == 0
     assert summary["would_have_wins"] == 1
     assert summary["would_have_pnl_r"] == pytest.approx(0.5)
 
@@ -380,9 +371,32 @@ def test_fear_cost_summary_empty_journal_returns_zeros(journal: DecisionJournal)
         "hours": 24,
         "skips_evaluated": 0,
         "unevaluable": 0,
+        "invalid_lookahead": 0,
         "would_have_wins": 0,
         "would_have_pnl_r": 0.0,
     }
+
+
+def test_fear_cost_summary_excludes_legacy_lookahead_rows(journal: DecisionJournal):
+    import json
+
+    legacy = _insert_skip_decision(journal, symbol="XAUUSD", ts_close="2026-07-05T09:00:00Z", features={})
+    valid = _insert_skip_decision(journal, symbol="XAUUSD", ts_close="2026-07-05T09:05:00Z", features={})
+    journal.insert_skip_outcome(
+        legacy,
+        would_have_result=json.dumps({"hit": "win", "side_source": "day_range_drift"}),
+        would_have_pnl=1.2,
+    )
+    journal.insert_skip_outcome(
+        valid,
+        would_have_result=json.dumps({"hit": "loss", "side_source": "features_candidate"}),
+        would_have_pnl=-1.0,
+    )
+
+    summary = se.fear_cost_summary(journal, hours=24, now=datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc))
+    assert summary["invalid_lookahead"] == 1
+    assert summary["skips_evaluated"] == 1
+    assert summary["would_have_pnl_r"] == pytest.approx(-1.0)
 
 
 def test_fear_cost_summary_excludes_rows_outside_hours_window(journal: DecisionJournal):
@@ -393,5 +407,5 @@ def test_fear_cost_summary_excludes_rows_outside_hours_window(journal: DecisionJ
     )
     journal.insert_skip_outcome(old_decision, would_have_result=json.dumps({"hit": "win"}), would_have_pnl=2.0)
 
-    summary = se.fear_cost_summary(journal, hours=24)
+    summary = se.fear_cost_summary(journal, hours=24, now=datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc))
     assert summary["skips_evaluated"] == 0

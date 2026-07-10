@@ -1779,6 +1779,7 @@ def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: D
         log_line(
             f"{utc_now_iso()} fear_cost hours={fear_cost['hours']} "
             f"skips_evaluated={fear_cost['skips_evaluated']} "
+            f"invalid_lookahead={fear_cost['invalid_lookahead']} "
             f"would_have_wins={fear_cost['would_have_wins']} "
             f"would_have_pnl_r={fear_cost['would_have_pnl_r']}"
         )

@@ -7,13 +7,10 @@ have won, so the journal can answer: how much would participation-first
 entry have earned versus how much fear (skipping) actually cost?
 
 Simulation inputs:
-  - side: the features snapshot's recorded leading side if one exists
-    (recomputed from the stored lens sub-dicts via
-    ``market_lens.leader_score`` — the raw ingredients are always present
-    in a skip's features snapshot even though the snapshot does not store
-    the composite score itself), else the sign of day-range drift over the
-    evaluation window (close-to-close direction of the M5 bars covering
-    the window).
+  - side: the features snapshot's recorded leading side, recomputed from the
+    stored lens sub-dicts via ``market_lens.leader_score``.  A skip without a
+    recorded side is unevaluable: deriving direction from bars after the
+    decision would be look-ahead bias.
   - entry: the close of the decision's own bar (``ts_close``).
   - SL: 1.0x the true-range quantile (median TR) of the recent bars at
     decision time.
@@ -80,19 +77,6 @@ def _recompute_leading_side(features: dict[str, Any]) -> str | None:
     return side if side in ("buy", "sell") else None
 
 
-def _day_range_drift_side(bars: list[dict[str, Any]]) -> str | None:
-    """Fallback: sign of close-to-close drift across the evaluation window's bars."""
-    if len(bars) < 2:
-        return None
-    first_close = float(bars[0].get("close") or 0.0)
-    last_close = float(bars[-1].get("close") or 0.0)
-    if last_close > first_close:
-        return "buy"
-    if last_close < first_close:
-        return "sell"
-    return None
-
-
 def _median_true_range(bars: list[dict[str, Any]]) -> float:
     trs = [tr for tr in market_lens.true_ranges(bars) if tr > 0]
     if not trs:
@@ -100,15 +84,12 @@ def _median_true_range(bars: list[dict[str, Any]]) -> float:
     return statistics.median(trs)
 
 
-def determine_candidate_side(features: dict[str, Any], window_bars: list[dict[str, Any]]) -> tuple[str | None, str]:
-    """Return (side, source) — source is "features_candidate" or "day_range_drift" or "none"."""
+def determine_candidate_side(features: dict[str, Any]) -> tuple[str | None, str]:
+    """Return the side recorded at decision time, never a future-derived side."""
     side = _recompute_leading_side(features)
     if side is not None:
         return side, "features_candidate"
-    side = _day_range_drift_side(window_bars)
-    if side is not None:
-        return side, "day_range_drift"
-    return None, "none"
+    return None, "no_recorded_candidate"
 
 
 def simulate_would_have_trade(
@@ -189,7 +170,7 @@ def evaluate_decision(
     if len(window_bars) < 1:
         return {"decision_id": decision_id, "evaluated": False, "reason": "insufficient_history_for_window"}
 
-    side, side_source = determine_candidate_side(features, window_bars)
+    side, side_source = determine_candidate_side(features)
     if side is None:
         return {"decision_id": decision_id, "evaluated": False, "reason": "no_determinable_side"}
 
@@ -338,17 +319,23 @@ def _insert_skip_outcome(
 # -- fear cost KPI ------------------------------------------------------------
 
 
-def fear_cost_summary(journal: Any, hours: int = FEAR_COST_DEFAULT_HOURS) -> dict[str, Any]:
-    """{skips_evaluated, would_have_wins, would_have_pnl_r} over the last ``hours``.
+def fear_cost_summary(
+    journal: Any,
+    hours: int = FEAR_COST_DEFAULT_HOURS,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validated fear-cost KPI over the last ``hours``.
 
     Reads only already-evaluated ``skip_outcomes`` rows (does not trigger
     evaluation itself — call ``evaluate_pending_skips`` first in the loop).
     Unevaluable rows (``would_have_pnl IS NULL``) are excluded from both the
     win count and the PnL sum, but their count is reported separately so the
-    KPI is honest about coverage gaps.
+    KPI is honest about coverage gaps.  Legacy rows whose side was derived
+    from future bars are excluded and reported as ``invalid_lookahead``.
     """
     conn = getattr(journal, "_conn", journal)
-    cutoff = _iso_z(datetime.now(timezone.utc) - timedelta(hours=hours))
+    cutoff = _iso_z((now or datetime.now(timezone.utc)) - timedelta(hours=hours))
     query = """
         SELECT so.would_have_result, so.would_have_pnl
         FROM skip_outcomes so
@@ -359,18 +346,25 @@ def fear_cost_summary(journal: Any, hours: int = FEAR_COST_DEFAULT_HOURS) -> dic
 
     skips_evaluated = 0
     unevaluable = 0
+    invalid_lookahead = 0
     would_have_wins = 0
     would_have_pnl_r = 0.0
     for would_have_result_json, would_have_pnl in rows:
         if would_have_pnl is None:
             unevaluable += 1
             continue
-        skips_evaluated += 1
-        would_have_pnl_r += float(would_have_pnl)
         try:
             payload = json.loads(would_have_result_json or "{}")
         except json.JSONDecodeError:
             payload = {}
+        # Results created before the P0 fix may have selected direction from
+        # the *future* evaluation window.  Keep them in the DB for audit, but
+        # do not let them influence the KPI or a promotion decision.
+        if payload.get("side_source") == "day_range_drift":
+            invalid_lookahead += 1
+            continue
+        skips_evaluated += 1
+        would_have_pnl_r += float(would_have_pnl)
         if payload.get("hit") == "win":
             would_have_wins += 1
 
@@ -378,6 +372,7 @@ def fear_cost_summary(journal: Any, hours: int = FEAR_COST_DEFAULT_HOURS) -> dic
         "hours": hours,
         "skips_evaluated": skips_evaluated,
         "unevaluable": unevaluable,
+        "invalid_lookahead": invalid_lookahead,
         "would_have_wins": would_have_wins,
         "would_have_pnl_r": round(would_have_pnl_r, 4),
     }
