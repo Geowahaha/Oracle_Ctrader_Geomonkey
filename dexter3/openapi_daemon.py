@@ -314,6 +314,14 @@ def _account_id_from_payload(payload: dict) -> int:
                 if account_id > 0:
                     return account_id
         return _safe_int(raw, 0)
+    # Dexter3-scoped fallback: when the caller supplied no account identity,
+    # default to the account this daemon is PINNED to (the lane's trading
+    # account) instead of the generic "first demo" finder — otherwise an
+    # account_id-less call (e.g. a manual execute_once reconcile) silently
+    # resolves a DIFFERENT demo and reports empty positions/deals. (2026-07-10)
+    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
+    if env_pin > 0:
+        return env_pin
     if callable(finder):
         row = finder("", use_demo=use_demo)
         if isinstance(row, dict):
@@ -1064,6 +1072,17 @@ class OpenApiDaemon:
         acc_payload = Protobuf.extract(acc_msg)
         if isinstance(acc_payload, pb.ProtoOAErrorRes):
             err = str(getattr(acc_payload, "description", "") or getattr(acc_payload, "errorCode", ""))
+            # "Trading account is already authorized in this channel" is a
+            # BENIGN idempotent condition, not a failure: a reconnect cleared
+            # our local authed_account_ids set (see _on_app_authed) while the
+            # broker still holds the account authed on this channel. Adopt it
+            # and proceed instead of raising _ModeError — the old behavior
+            # blocked reconcile/trade during the reconnect window and left a
+            # scary last_error even though the account was usable. (2026-07-10)
+            if "already authorized" in err.lower():
+                self.state.authed_account_ids.add(int(account_id))
+                self.state.last_error = ""
+                return
             self.state.last_error = f"account auth failed for {account_id}: {err}"
             raise _ModeError("account_auth_failed", err)
         self.state.authed_account_ids.add(int(account_id))

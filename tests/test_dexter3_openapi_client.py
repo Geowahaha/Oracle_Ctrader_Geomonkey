@@ -401,6 +401,53 @@ def test_get_deals_normalizes_confirmed_fields(monkeypatch):
     assert deal["label"] == ""
 
 
+def test_get_deals_uses_longer_timeout_than_get_positions_in_daemon_mode(monkeypatch):
+    """The labeled reconcile (get_deals) runs 2 extra heavy broker round-trips
+    (deal-list + order-list join) and measured ~8s on the VM — it exceeds the
+    5s daemon timeout get_positions needs every bar. get_deals must get a
+    longer dedicated timeout; get_positions stays at the fast daemon default,
+    or the governor's realized-PnL reconcile times out (cached/zero)."""
+    monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_URL", "http://127.0.0.1:9877")
+    monkeypatch.delenv("DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("DEXTER3_OPENAPI_DEALS_TIMEOUT_SEC", raising=False)
+    c = _client()
+    assert c.timeout_sec == 5.0  # daemon-mode fast default
+
+    seen: dict[str, float | None] = {}
+
+    def _cap(mode, payload, *, mutating=False, timeout_sec=None):
+        key = "labels" if payload.get("include_deal_labels") else mode
+        seen[key] = timeout_sec
+        if mode == "accounts":
+            return _accounts_ok()
+        return {"ok": True, "positions": [], "orders": [], "deals": []}
+
+    monkeypatch.setattr(c, "_invoke", _cap)
+    c.get_positions()          # unlabeled -> fast path
+    c.get_deals(count=50)      # labeled -> long path
+    assert seen["reconcile"] == 5.0          # get_positions stays fast
+    assert seen["labels"] >= 20.0            # get_deals gets the long timeout
+    assert seen["labels"] > seen["reconcile"]
+
+
+def test_get_deals_timeout_is_env_tunable(monkeypatch):
+    monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_URL", "http://127.0.0.1:9877")
+    monkeypatch.setenv("DEXTER3_OPENAPI_DEALS_TIMEOUT_SEC", "35")
+    c = _client()
+    seen: dict[str, float | None] = {}
+
+    def _cap(mode, payload, *, mutating=False, timeout_sec=None):
+        if payload.get("include_deal_labels"):
+            seen["labels"] = timeout_sec
+        if mode == "accounts":
+            return _accounts_ok()
+        return {"ok": True, "positions": [], "orders": [], "deals": []}
+
+    monkeypatch.setattr(c, "_invoke", _cap)
+    c.get_deals(count=50)
+    assert seen["labels"] == 35.0
+
+
 def test_get_deals_label_gap_means_lane_filter_matches_zero(monkeypatch):
     """Documents gap #4 concretely: shadow_runner._lane_realized_today
     filters deals by `"dexter3:fable" in label`; with label always "" that

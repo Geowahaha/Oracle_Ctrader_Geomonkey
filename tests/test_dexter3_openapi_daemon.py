@@ -357,11 +357,37 @@ def test_account_id_from_payload_bad_value_falls_back_to_config_chain(monkeypatc
     exactly 0 (the 'account_missing' trigger in _dispatch)."""
     import dexter3.openapi_daemon as daemon_mod
 
+    monkeypatch.delenv("DEXTER3_OPENAPI_ACCOUNT_ID", raising=False)
     monkeypatch.setattr(daemon_mod.config, "find_ctrader_account", None, raising=False)
     monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_LOGIN", "", raising=False)
     monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_ID", "", raising=False)
     assert _account_id_from_payload({"account_id": "not-a-number"}) == 0
     assert _account_id_from_payload({}) == 0
+
+
+def test_account_id_from_payload_env_pin_is_fallback_default(monkeypatch):
+    """With no account identity in the payload, resolve the daemon's PINNED
+    account (DEXTER3_OPENAPI_ACCOUNT_ID) rather than the generic first-demo
+    finder — otherwise an account_id-less call (manual execute_once reconcile)
+    silently lands on a DIFFERENT demo and reports empty positions/deals."""
+    import dexter3.openapi_daemon as daemon_mod
+
+    monkeypatch.setenv("DEXTER3_OPENAPI_ACCOUNT_ID", "46670728")
+    # a finder that would otherwise resolve a DIFFERENT demo (the bug)
+    monkeypatch.setattr(
+        daemon_mod.config, "find_ctrader_account",
+        lambda *_a, **_k: {"accountId": 46552794}, raising=False,
+    )
+    monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_LOGIN", "", raising=False)
+    monkeypatch.setattr(daemon_mod.config, "CTRADER_ACCOUNT_ID", "", raising=False)
+    assert _account_id_from_payload({}) == 46670728
+
+
+def test_account_id_from_payload_explicit_beats_env_pin(monkeypatch):
+    """The hot trading path always supplies account_id; it must win over the
+    env pin so the pin never silently redirects an explicit request."""
+    monkeypatch.setenv("DEXTER3_OPENAPI_ACCOUNT_ID", "46670728")
+    assert _account_id_from_payload({"account_id": 99999999}) == 99999999
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +466,36 @@ def test_dispatch_account_auth_failure_maps_to_account_auth_failed(monkeypatch):
     assert "Invalid access token" in result["message"]
     assert "Invalid access token" in d.state.last_error
     assert 46670728 not in d.state.authed_account_ids
+
+
+@pytestmark_daemon
+def test_ensure_account_auth_already_authorized_is_benign_success(monkeypatch):
+    """'Trading account is already authorized in this channel' is NOT a
+    failure: a reconnect cleared our local authed set while the broker still
+    holds the account authed on this channel. Adopt it + clear last_error
+    instead of raising _ModeError (which blocked reconcile/trade during the
+    reconnect window)."""
+    import dexter3.openapi_daemon as daemon_mod
+    from ctrader_open_api.messages import OpenApiMessages_pb2 as pb
+    from ctrader_open_api import Protobuf
+
+    d = _make_daemon()
+    d.state.last_error = "account auth failed for 46670728: already authorized"
+    err = pb.ProtoOAErrorRes()
+    err.errorCode = "ALREADY_AUTHORIZED"
+    err.description = "Trading account is already authorized in this channel."
+
+    class _FakeClient:
+        def send(self, message, responseTimeoutInSeconds=None, **_kw):  # noqa: N803
+            return twisted_defer.succeed(err)
+
+    monkeypatch.setattr(Protobuf, "extract", staticmethod(lambda m: m))
+    monkeypatch.setattr(daemon_mod, "_fresh_access_token", lambda: "tok", raising=False)
+    d.client = _FakeClient()
+    # must NOT raise, and must not depend on a running reactor
+    _sync_result(d._ensure_account_auth(46670728))
+    assert 46670728 in d.state.authed_account_ids
+    assert d.state.last_error == ""
 
 
 @pytestmark_daemon

@@ -150,6 +150,13 @@ def _account_id_from_payload(payload: dict) -> int:
             if account_id > 0:
                 return account_id
         return _safe_int(raw, 0)
+    # Dexter3-scoped fallback (parity with dexter3/openapi_daemon.py): default
+    # to the daemon's PINNED account when the caller gave no account identity,
+    # so a manual `--mode reconcile` hits the lane account (46670728), not a
+    # different demo that reports empty. (2026-07-10)
+    env_pin = _safe_int(os.environ.get("DEXTER3_OPENAPI_ACCOUNT_ID", ""), 0)
+    if env_pin > 0:
+        return env_pin
     row = getattr(config, "find_ctrader_account", lambda *_args, **_kwargs: None)("", use_demo=getattr(config, "CTRADER_USE_DEMO", False))
     if isinstance(row, dict):
         account_id = _safe_int(row.get("accountId"), 0)

@@ -756,6 +756,21 @@ class Dexter3OpenApiClient:
         payload = self._payload(lookback_hours=int(lookback_hours), max_rows=int(max_rows))
         if with_deal_labels:
             payload["include_deal_labels"] = True
+            # The labeled path runs TWO extra heavy broker round-trips
+            # (ProtoOADealListReq + ProtoOAOrderListReq join) on top of the
+            # reconcile — measured ~8s even on an empty account (2026-07-10),
+            # more with real deals, which legitimately exceeds the 5s daemon
+            # client timeout get_positions needs. get_deals is rare + cached
+            # (governor realized-PnL), so it gets a longer dedicated timeout;
+            # get_positions (unlabeled, every-bar) keeps self.timeout_sec.
+            try:
+                deals_timeout = float(os.environ.get("DEXTER3_OPENAPI_DEALS_TIMEOUT_SEC", "20") or 20.0)
+            except ValueError:
+                deals_timeout = 20.0
+            return self._invoke(
+                "reconcile", payload, mutating=False,
+                timeout_sec=max(float(self.timeout_sec), deals_timeout),
+            )
         return self._invoke("reconcile", payload, mutating=False, timeout_sec=self.timeout_sec)
 
     # -- normalization: worker's already-normalized reconcile shapes ---------
