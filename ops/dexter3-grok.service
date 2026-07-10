@@ -1,37 +1,33 @@
-# Dexter3 Grok v1.0 lane on the VM (OpenAPI transport) — P3 cutover unit.
-# Install: sudo cp ops/dexter3-grok.service /etc/systemd/system/ && sudo systemctl daemon-reload
-# DO NOT enable until the P3 cutover checklist is green (see dexter3-fable.service header).
+# Dexter3 Grok v1.0 scalper — LIVE lane on the VM (OpenAPI daemon transport, demo 9922808).
+# The cutover target: this replaces the PC-hosted lane so the PC can power off.
+# SAFETY: never run this live at the same time as the PC-hosted lane or the
+# paper unit on the same label — one host per label at a time (double-trade
+# risk). MIN_VOLUME_RISK_RATIO_CAP + governor loss-stop preserved from PC.
 [Unit]
-Description=Dexter3 Grok v1.0 lane (XAUUSD scalper, OpenAPI transport)
-After=network-online.target ctrader-token-keepalive.service
-Wants=network-online.target
+Description=Dexter3 Grok v1.0 scalper LIVE lane (OpenAPI daemon)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/dexter_pro
-# Env mirrors ops/dexter3_xau_grok_loop.ps1 (the PC launcher) — keep in sync.
+MemoryMax=200M
+Restart=always
+RestartSec=15
 Environment=PYTHONUNBUFFERED=1
 Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
 Environment=DEXTER3_LIVE=1
 Environment=DEXTER3_HUNT=1
-Environment=DEXTER3_MODE=grok
 Environment=DEXTER3_FAST_TICK_SEC=8
-Environment=DEXTER3_MAX_VOLUME_UNITS=10
-Environment=DEXTER3_MAX_ENTRIES_PER_DAY=60
-Environment=DEXTER3_DAILY_LOSS_BASKETS=3
-Environment=DEXTER3_ANTICHASE_ENABLED=1
-Environment=DEXTER3_PULLBACK_ENABLED=1
-Environment=DEXTER3_SMART_EXIT_ENABLED=0
 Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=1.5
+Environment=DEXTER3_MODE=grok
 Environment=DEXTER3_DAILY_TARGET_USD=30
 Environment=DEXTER3_DAILY_LOSS_USD=15
 Environment=DEXTER3_BASE_RISK_FRAC=0.004
 Environment=DEXTER3_MAX_RISK_FRAC=0.010
-Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=1.5
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok
-Restart=always
-RestartSec=20
-MemoryMax=200M
 
 [Install]
 WantedBy=multi-user.target
