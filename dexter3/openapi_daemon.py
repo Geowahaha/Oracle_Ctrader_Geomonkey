@@ -511,6 +511,7 @@ def build_server(
 
 try:
     from google.protobuf.json_format import MessageToDict
+    from twisted.application.internet import ClientService as _TwistedClientService
     from twisted.internet import defer, reactor, threads
     from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
     from ctrader_open_api.messages import OpenApiMessages_pb2 as pb
@@ -522,6 +523,44 @@ except Exception as _import_exc:  # pragma: no cover - exercised only when deps 
     _HAS_DEPS = False
     _IMPORT_ERROR = _import_exc
     MessageToDict = None  # type: ignore[assignment]
+    _TwistedClientService = None  # type: ignore[assignment]
+
+
+def _force_stop_client(client: Any) -> None:
+    """Actually halt an OpenAPI ``Client``'s underlying reconnect machine and
+    close any connection it still holds — bypassing
+    ``ctrader_open_api.Client.stopService()``'s broken guard.
+
+    Root cause (confirmed live 2026-07-10, see docs handoff): that method
+    reads ``if self.running and self.isConnected: ClientService.stopService(self)``
+    — i.e. it only forwards to the REAL stop (``ClientService.stopService``,
+    which calls ``self._machine.stop()``: twisted's own "stop attempting to
+    reconnect and close any existing connections") when the client is
+    CURRENTLY connected. But ``Client._disconnected()`` sets
+    ``self.isConnected = False`` *before* invoking the disconnected callback,
+    and a connect attempt that never succeeds never sets it True at all — so
+    every call site in this module tears down a ``Client`` from inside a
+    disconnect/connect-error callback, where the guard is ALWAYS false. The
+    real stop is silently skipped EVERY time, leaking the old
+    ``ClientService``'s internal retry loop forever on Twisted's own default
+    backoff policy — fully decoupled from this daemon's reconnect
+    bookkeeping, and still wired to this daemon's ``_on_disconnected``/
+    ``_messageReceivedCallback``, so a zombie's own later disconnect
+    re-triggers ``_schedule_reconnect`` a second (third, fourth...) time and
+    compounds. Live evidence: ``ss -tnp`` showed 13 concurrent ESTABLISHED
+    sockets to demo.ctraderapi.com:5035 from execution/ctrader_stream.py's
+    single PID (a service designed to hold exactly ONE persistent
+    connection, same vendored-library defect, just masked by rarer
+    reconnects) and this daemon's log showing reconnect events fractions of
+    a second apart that only multiple concurrent zombie Clients explain.
+    Calling ``ClientService.stopService`` directly bypasses the buggy
+    subclass override and performs the real teardown."""
+    if client is None or _TwistedClientService is None:
+        return
+    try:
+        _TwistedClientService.stopService(client)
+    except Exception:
+        pass
 
 
 def _proto_to_dict(message: Any) -> dict:
@@ -821,11 +860,7 @@ class OpenApiDaemon:
                 self._http_server.shutdown()
             except Exception:
                 pass
-        if self.client is not None:
-            try:
-                self.client.stopService()
-            except Exception:
-                pass
+        _force_stop_client(self.client)
 
     # -- connection lifecycle (cribbed from execution/ctrader_stream.py) --
 
@@ -908,12 +943,8 @@ class OpenApiDaemon:
             return
         self.state.connected = False
         self.state.app_authed = False
-        if self.client is not None:
-            try:
-                self.client.stopService()
-            except Exception:
-                pass
-            self.client = None
+        _force_stop_client(self.client)
+        self.client = None
         self.state.reconnect_count += 1
         delay = self.backoff.next_delay()
         logger.info("Reconnecting in %.0fs (attempt %d)...", delay, self.state.reconnect_count)
@@ -1252,10 +1283,7 @@ class OpenApiDaemon:
                 "token_refresh": {},
             })
         finally:
-            try:
-                temp_client.stopService()
-            except Exception:
-                pass
+            _force_stop_client(temp_client)
 
     @defer.inlineCallbacks
     def _mode_health(self, account_id: int):
