@@ -526,6 +526,56 @@ except Exception as _import_exc:  # pragma: no cover - exercised only when deps 
     _TwistedClientService = None  # type: ignore[assignment]
 
 
+if _HAS_DEPS:
+
+    class _IsolatedTcpProtocol(TcpProtocol):
+        """``TcpProtocol`` with per-INSTANCE send state.
+
+        The vendored ``ctrader_open_api.tcpProtocol.TcpProtocol`` declares
+        ``_send_queue`` (a ``deque``), ``_send_task`` and
+        ``_lastSendMessageTime`` as CLASS attributes — every protocol
+        instance in the process shares ONE send queue, and each connection's
+        1s ``_sendStrings`` loop pops from that SHARED deque. With two live
+        connections in this daemon (the persistent connection plus
+        ``_mode_accounts``'s temp live-host connection — the one mode that
+        must open its own connection, see its docstring), whichever loop
+        fires first transmits the OTHER connection's protobuf requests over
+        the wrong TCP connection; the response then arrives on the wrong
+        connection, whose ``Client`` doesn't own that ``clientMsgId``
+        deferred, so it is silently dropped and the real requester times
+        out.
+
+        Confirmed live 2026-07-10 ~03:52Z on the VM: every ``mode=accounts``
+        call failed with ``twisted.internet.defer.TimeoutError(10,
+        'Deferred')`` (traceback landing at ``_mode_accounts``'s
+        ``temp_client.send(ProtoOAApplicationAuthReq...)``) while the
+        persistent connection stayed perfectly healthy — deterministic,
+        not intermittent, because the temp protocol's LoopingCall starts at
+        its own connect time and is therefore almost always phase-BEHIND
+        the long-running persistent connection's loop, which steals the
+        temp client's auth request from the shared queue essentially every
+        time. The one-shot worker never hits this (one connection per
+        process); this daemon is the first place two ``TcpProtocol``
+        instances coexist in one process by design.
+
+        Assigning these three names in ``__init__`` shadows the class
+        attributes with per-instance state — full isolation, zero changes
+        to the vendored package (per this module's "crib, don't import" /
+        never-modify-shared-files constraint). Twisted instantiates
+        protocol classes with no arguments (``Factory.buildProtocol`` calls
+        ``self.protocol()``), so a no-arg ``__init__`` is safe."""
+
+        def __init__(self) -> None:
+            from collections import deque
+
+            self._send_queue = deque()
+            self._send_task = None
+            self._lastSendMessageTime = None
+
+else:  # pragma: no cover - only when twisted/ctrader deps are absent
+    _IsolatedTcpProtocol = None  # type: ignore[assignment]
+
+
 def _force_stop_client(client: Any) -> None:
     """Actually halt an OpenAPI ``Client``'s underlying reconnect machine and
     close any connection it still holds — bypassing
@@ -870,7 +920,7 @@ class OpenApiDaemon:
         host, port, environment = _resolve_host()
         logger.info("Connecting to cTrader %s (%s:%d)...", environment, host, port)
         self.state.environment = environment
-        self.client = Client(host, port, TcpProtocol)
+        self.client = Client(host, port, _IsolatedTcpProtocol)
         self.client.setDisconnectedCallback(self._on_disconnected)
         self.client.startService()
         d = self.client.whenConnected(failAfterFailures=1)
@@ -1251,7 +1301,7 @@ class OpenApiDaemon:
         if not client_id or not client_secret:
             defer.returnValue({"ok": False, "status": "credentials_missing", "message": "client id/secret missing"})
             return
-        temp_client = Client(EndPoints.PROTOBUF_LIVE_HOST, int(EndPoints.PROTOBUF_PORT), TcpProtocol)
+        temp_client = Client(EndPoints.PROTOBUF_LIVE_HOST, int(EndPoints.PROTOBUF_PORT), _IsolatedTcpProtocol)
         temp_client.startService()
         try:
             yield temp_client.whenConnected(failAfterFailures=1)
