@@ -302,6 +302,21 @@ def main() -> int:
         ),
     )
     ap.add_argument("--wf-size-floor", type=float, default=0.25, help="downsize-only policy floor multiplier")
+    ap.add_argument(
+        "--holdout-split",
+        type=float,
+        default=0.0,
+        help=(
+            "HOLD-OUT entry-filter validation (2026-07-11): time-split the sweep — first "
+            "SPLIT fraction of bars = DERIVE window (auto-pick losing (align x regime) "
+            "buckets: N>=--holdout-min-n and EXP/trade < --holdout-exp-cut), last "
+            "(1-SPLIT) = VALIDATE window (apply the derived block-list to trades it has "
+            "never seen; report baseline vs filtered net/PF/maxDD). A rule may go live "
+            "ONLY if it wins on the held-out segment. 0 = off."
+        ),
+    )
+    ap.add_argument("--holdout-min-n", type=int, default=20, help="min derive-window trades for a bucket to be blockable")
+    ap.add_argument("--holdout-exp-cut", type=float, default=-0.10, help="EXP/trade below this (derive window) -> bucket blocked")
     args = ap.parse_args()
 
     # DEXTER3_TRANSPORT-aware (2026-07-11): local_mcp on the PC (default,
@@ -335,6 +350,7 @@ def main() -> int:
     wf_stats: dict = {}
     wf_records: list[tuple[float, float]] = []   # (r_net, policy_mult)
     wf_downsized = 0
+    all_records: list[dict] = []                 # hold-out validation: every accepted trade
 
     # walk forward: decision uses [:i+1], outcome uses [i+1:]
     for i in range(MIN_M5, len(m5) - 2):
@@ -428,25 +444,28 @@ def main() -> int:
         buckets[(align, session)].append(r_net)
         regime_buckets[(align, regime)].append(r_net)
         side_split[str(d.side)].append(r_net)
+        # hold-out validation record: bar index + decision-time classification
+        # (align/regime both derive from h1c = completed-only bars, no lookahead)
+        all_records.append({"i": i, "r": r_net, "align": align, "regime": regime, "session": session})
 
     print(
         f"evaluated {n_eval} M5 closes, {n_candidates} candidates, {n_enter} accepted entries "
         f"({n_enter/max(1,n_eval)*100:.0f}% participation), entry_gate={args.entry_gate}\n"
     )
 
-    if args.walkforward_empirical:
-        def _equity_stats(rs: list[float]) -> tuple[float, float, float]:
-            """(net, PF, max drawdown) of an R-sequence in trade order."""
-            gw = sum(x for x in rs if x > 0)
-            gl = sum(x for x in rs if x <= 0)
-            pf = (gw / abs(gl)) if gl < 0 else float("inf")
-            eq = peak = maxdd = 0.0
-            for x in rs:
-                eq += x
-                peak = max(peak, eq)
-                maxdd = max(maxdd, peak - eq)
-            return sum(rs), pf, maxdd
+    def _equity_stats(rs: list[float]) -> tuple[float, float, float]:
+        """(net, PF, max drawdown) of an R-sequence in trade order."""
+        gw = sum(x for x in rs if x > 0)
+        gl = sum(x for x in rs if x <= 0)
+        pf = (gw / abs(gl)) if gl < 0 else float("inf")
+        eq = peak = maxdd = 0.0
+        for x in rs:
+            eq += x
+            peak = max(peak, eq)
+            maxdd = max(maxdd, peak - eq)
+        return sum(rs), pf, maxdd
 
+    if args.walkforward_empirical:
         base_rs = [r for r, _ in wf_records]
         pol_rs = [r * m for r, m in wf_records]
         b_net, b_pf, b_dd = _equity_stats(base_rs)
@@ -463,6 +482,46 @@ def main() -> int:
                   ("INSUFFICIENT (no mature bucket ever downsized — need more history)" if wf_downsized == 0 else
                    "FAIL (policy loses on this window — do NOT promote learner sizing)")
         print(f"verdict  : {verdict}\n")
+
+    if args.holdout_split > 0 and all_records:
+        split_bar = MIN_M5 + int((len(m5) - 2 - MIN_M5) * args.holdout_split)
+        derive = [rec for rec in all_records if rec["i"] < split_bar]
+        validate = [rec for rec in all_records if rec["i"] >= split_bar]
+        derive_buckets: dict[tuple, list] = defaultdict(list)
+        for rec in derive:
+            derive_buckets[(rec["align"], rec["regime"])].append(rec["r"])
+        block_list = sorted(
+            k for k, rs in derive_buckets.items()
+            if len(rs) >= args.holdout_min_n and (sum(rs) / len(rs)) < args.holdout_exp_cut
+        )
+        print("== HOLD-OUT ENTRY-FILTER VALIDATION (align x regime) ==")
+        print(f"derive: first {args.holdout_split:.0%} of bars ({derive[0]['i'] if derive else '-'}..{split_bar}) "
+              f"n={len(derive)} | validate: rest, n={len(validate)}")
+        print(f"derive buckets (N, EXP/trade):")
+        for k, rs in sorted(derive_buckets.items(), key=lambda kv: sum(kv[1]) / len(kv[1])):
+            mark = "  <== BLOCKED" if k in block_list else ""
+            print(f"  {k[0]:>8} x {k[1]:<9} N={len(rs):>3} exp={sum(rs)/len(rs):+.3f} tot={sum(rs):+.1f}R{mark}")
+        if not block_list:
+            print("verdict  : NO RULE DERIVED (no bucket met N>= "
+                  f"{args.holdout_min_n} and exp < {args.holdout_exp_cut})\n")
+        elif not validate:
+            print("verdict  : NO VALIDATE DATA\n")
+        else:
+            base = [rec["r"] for rec in validate]
+            kept = [rec["r"] for rec in validate if (rec["align"], rec["regime"]) not in block_list]
+            removed = [rec["r"] for rec in validate if (rec["align"], rec["regime"]) in block_list]
+            b_net2, b_pf2, b_dd2 = _equity_stats(base)
+            k_net2, k_pf2, k_dd2 = _equity_stats(kept)
+            print(f"block-list: {block_list}")
+            print(f"validate baseline : n={len(base):>3} net={b_net2:+.2f}R PF={b_pf2:.2f} maxDD={b_dd2:.2f}R")
+            print(f"validate filtered : n={len(kept):>3} net={k_net2:+.2f}R PF={k_pf2:.2f} maxDD={k_dd2:.2f}R "
+                  f"(blocked {len(removed)} trades totalling {sum(removed):+.2f}R)")
+            wins2 = k_net2 > b_net2 and k_dd2 <= b_dd2 and len(removed) > 0
+            print("verdict  : " + (
+                "PASS on held-out data (rule improves net without worse maxDD) — canary-eligible"
+                if wins2 else
+                "FAIL on held-out data (in-sample rule does not generalize) — do NOT deploy"
+            ) + "\n")
 
     def _row(name, rs):
         n = len(rs)
