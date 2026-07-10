@@ -65,7 +65,13 @@ DEFAULT_MAX_VOLUME_UNITS = 0.05
 # returns for it (measured live 2026-07-05, balance cross-checked against the
 # known demo equity). accountType is NOT a demo flag — it returns the margin
 # mode ("Hedged") — so traderId pinning stays the only account proof available.
-DEFAULT_DEMO_TRADER_IDS = (9922808, 3555162)
+# All THREE are the same demo account (login 9922808), just different cTrader
+# identifiers: 9922808 = login, 3555162 = traderId (Local MCP get_balance),
+# 46670728 = ctidTraderAccountId (OpenAPI get_balance().traderId). The gate must
+# accept the OpenAPI identity too or every VM-transport entry fails
+# account_not_confirmed_demo (found at cutover 2026-07-10). Overridable via
+# DEXTER3_DEMO_TRADER_IDS_CSV for a future account change.
+DEFAULT_DEMO_TRADER_IDS = (9922808, 3555162, 46670728)
 
 
 def utc_now_iso() -> str:
