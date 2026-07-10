@@ -114,6 +114,28 @@ from api.ctrader_token_manager import token_manager  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 logger = logging.getLogger("dexter3_openapi_daemon")
 
+
+def _fresh_access_token() -> str:
+    """READ-ONLY access token that survives keepalive rotation.
+
+    The single-owner keepalive rotates the token every ~30 min and each
+    rotation INVALIDATES the previous access token broker-side. A process-
+    lifetime cache therefore goes stale at the first rotation after daemon
+    start — live incident 2026-07-10 03:52Z: mode=accounts (new auth on a
+    temp client) failed "Invalid access token" while the already-authed demo
+    connection kept working. Fix: adopt the newer on-disk state (persisted by
+    the owner) before every NEW authentication. Never refreshes, never
+    writes — single-owner discipline preserved.
+    """
+    try:
+        disk = token_manager._load_state()
+        if token_manager._disk_state_is_newer(disk):
+            token_manager._adopt_disk_state(disk)
+            logger.info("adopted newer on-disk token state before auth (keepalive rotation)")
+    except Exception as exc:  # noqa: BLE001 - fall back to cached token
+        logger.warning("disk token adopt failed (using cached): %s", exc)
+    return token_manager.get_access_token()
+
 # ---------------------------------------------------------------------------
 # env-tunable constants. Every value is either a proven figure cribbed from
 # an existing LIVE file (cited inline) or documented with its own rationale
@@ -1028,7 +1050,7 @@ class OpenApiDaemon:
     def _ensure_account_auth(self, account_id: int):
         if account_id in self.state.authed_account_ids:
             return
-        access_token = token_manager.get_access_token()  # READ-ONLY — never refreshed here
+        access_token = _fresh_access_token()  # READ-ONLY + disk-adopt (rotation-safe)
         acc_msg = yield self.client.send(
             pb.ProtoOAAccountAuthReq(ctidTraderAccountId=int(account_id), accessToken=str(access_token or "")),
             responseTimeoutInSeconds=int(REQUEST_TIMEOUT_LIGHT_SEC),
@@ -1297,7 +1319,7 @@ class OpenApiDaemon:
         eliminate on the hot read path."""
         client_id = str(getattr(config, "CTRADER_OPENAPI_CLIENT_ID", "") or "").strip()
         client_secret = str(getattr(config, "CTRADER_OPENAPI_CLIENT_SECRET", "") or "").strip()
-        access_token = token_manager.get_access_token()  # READ-ONLY
+        access_token = _fresh_access_token()  # READ-ONLY + disk-adopt (rotation-safe)
         if not client_id or not client_secret:
             defer.returnValue({"ok": False, "status": "credentials_missing", "message": "client id/secret missing"})
             return
