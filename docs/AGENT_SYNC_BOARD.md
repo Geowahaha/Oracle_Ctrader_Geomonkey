@@ -673,3 +673,17 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Watchdog HEARTBEAT deployed (`1fc553c`):** `scripts/dexter3_lane_heartbeat.py` + parallel-watchdog wired to catch hung-but-alive lanes via `last_seen_at` (was PID-only → 3h49m blind today). Weekend guard: escalate only if stale AND MCP also down. 14 tests.
 - **Adapter perf note (P2 gap #4 confirmed live):** dexter3 openapi adapter spawns a subprocess per call = ~18s/read against Spotware — too slow for an 8s fast-tick loop. Persistent-connection daemon is the next build after the token fix.
 - **Live state at close:** PC lanes V1.8 (10208) + Grok (9208) trading, balance ~$10,612. VM main system + stream healthy. Owner advised to sleep; nothing urgent.
+
+### 2026-07-09 UTC 21:20Z — claude-fable (Fable 5, CEO) — token architecture FIXED (da341f4); install awaits 1 owner auth code
+
+- **Root cause (HIGH confidence):** cTrader refresh tokens are single-use/rotating (Spotware docs) — 6 refresh call sites across 4+ processes each held a process-local singleton; one success killed everyone else's pair, and their `on_token_failed` re-saved the stale pair over the fresh token (= tonight's clobber, consecutive_failures 63).
+- **Shipped (`da341f4`):** unconditional clobber guards (never empty-over-real; never stale-over-newer by `saved_utc`; failing consumers ADOPT newer disk state) + env-gated `DEXTER3_TOKEN_SINGLE_OWNER=1` mode (keepalive = sole refresher via `CTRADER_TOKEN_IS_OWNER=1`). 9 new tests, 58 green. PC-side note: `ctrader_open_api` lib lives in the GLOBAL Python312 site-packages, not the repo .venv.
+- **CLEAN INSTALL SEQUENCE (any agent can run once owner supplies a fresh auth code):**
+  1. VM: `git pull` to ≥`da341f4`; set `DEXTER3_TOKEN_SINGLE_OWNER=1` in `.env.local`
+  2. Confirm `ctrader-token-keepalive.timer` stopped (it is)
+  3. Owner opens `https://openapi.ctrader.com/apps/auth?client_id=22119_ZwoJCqLjyItWOZldR19yzyVMM2YW4nwJFWEp2fFTwSOAQdZBnz&redirect_uri=http://localhost:5000/callback&scope=trading` → Allow → copy `code` from URL bar (single-use, expires in seconds)
+  4. Exchange IMMEDIATELY on VM via `Auth(cid, sec, 'http://localhost:5000/callback').getToken(code)` + persist to `data/runtime/ctrader_token_state.json` (or run `scripts/refresh_ctrader_token.py` interactively)
+  5. `sudo systemctl restart dexter-monitor ctrader-stream` (reload singletons from fresh state)
+  6. Verify: `ops/ctrader_execute_once.py --mode accounts` → 7 accounts incl. 46670728; then `Dexter3OpenApiClient().diagnose_account_pin()` → pin_ok
+  7. Re-enable keepalive.timer; watch 1-2 cycles (consecutive_failures stays 0, saved_utc never regresses) = rung-1 proof of the fix
+- **Then VM lanes still need (before live trading):** persistent-connection daemon (18s/read subprocess too slow for 8s ticks), symbol_details worker mode, deals-label join for governor. Shadow (decision-only) can start once reads work at usable speed.
