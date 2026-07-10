@@ -696,3 +696,11 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - Resilience shipped this round (`240b32c`): keepalive Telegram alarm at consecutive_failures>=2 (silent 9-day death impossible now), VM lane systemd units (dexter3-fable/grok.service, DO-NOT-ENABLE header, MemoryMax=200M, Restart=always), full-dimension design table + PC failover runbook + P3 cutover checklist in the design doc.
 - Rung-1 watch armed: first scheduled keepalive cycle (~30min) must rotate the token with consecutive_failures staying 0 and no clobber.
 - Remaining to seamless: PM review of `dexter3/openapi_daemon.py` (built, 81KB) → deploy daemon → shadow session → P3 cutover (PC shutdown test).
+
+### 2026-07-10 UTC 03:55Z — claude-fable (Fable 5, CEO) — DAEMON LIVE ON VM: root cause was a vendored-library zombie leak; full-speed shadow started
+
+- Sonnet live-debug verdict (rung-1 evidence): `ctrader_open_api.Client.stopService()` (vendored lib) guards teardown behind `isConnected` which is ALWAYS false at teardown time → zombie ClientService retry loops multiply forever. Daemon showed reconnects ms apart from multiple zombies; **ctrader-stream.service has the SAME latent leak — 13→18 ESTABLISHED sockets to the broker from one PID** (untouched per live-safety constraint — queued below).
+- Fix `1fdaafe`: `_force_stop_client()` calls twisted's real `ClientService.stopService()` directly at all 3 teardown sites (daemon file only). **Verified live: connected:true, account_ids=[46670728], exactly 1 socket, reconnect_count=0 over 4+ min; spot_quote XAUUSD ok bid 4120.88 / ask 4120.93 / spread 0.05; 10/10 fresh quotes, latency median 78ms** (vs 18s/read subprocess — ~230x faster).
+- **Full-speed shadow relaunched 03:51:54Z** through the daemon (`DEXTER3_OPENAPI_DAEMON_URL`, poll 20s, fast_tick 8s = production cadence, live=off/paper). Watching for first decisions with valid spread.
+- **QUEUED (main-system follow-up, needs care — live service):** apply the same zombie-leak fix to `execution/ctrader_stream.py`'s usage or restart-cycle the stream service to clear its 18 leaked sockets; the leak grows on every reconnect and is a latent broker-side rate-limit / resource risk.
+- Remaining to cutover: shadow decisions look sane over a session → owner-witnessed P3 (stop PC lanes flat → enable dexter3-fable/grok services → PC OFF test).
