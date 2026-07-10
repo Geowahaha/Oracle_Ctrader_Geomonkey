@@ -1256,7 +1256,10 @@ def run_symbol_cycle(
             )
         elif is_newest and _hunt_enabled():
             lens = hunter_brain._run_lens(prefix, hunter_brain._bar_close_ts(bar_ts))
-            decision = hunt_mode.decide_hunt(symbol, prefix, m15_ctx, h1_ctx, lens, spread_abs)
+            decision = hunt_mode.decide_hunt(
+                symbol, prefix, m15_ctx, h1_ctx, lens, spread_abs,
+                journal_stats=journal_stats if is_newest else None,
+            )
         else:
             decision = hunter_brain.decide(
                 symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None

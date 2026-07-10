@@ -544,3 +544,27 @@ def test_decide_hunt_enter_carries_session_label() -> None:
     expected = str((decision.features.get("session_context") or {}).get("value") or "unknown")
     assert decision.session == expected
     assert decision.session != ""
+
+
+def test_decide_hunt_blends_mature_empirical_stats_without_changing_entry_contract() -> None:
+    rng = random.Random(31)
+    m5, m15, h1 = _regime_bars(rng, 31)
+    baseline = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(31))
+    stats = {
+        f"{baseline.setup}|{baseline.session}": {"win_rate": 0.90, "samples": 10, "below_min_samples": False}
+    }
+    blended = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(31), journal_stats=stats)
+    assert blended.action == "enter"
+    assert blended.side == baseline.side
+    assert blended.p_win_est > baseline.p_win_est
+    assert blended.features["empirical_p_win"]["applied"] is True
+
+
+def test_decide_hunt_ignores_immature_empirical_stats() -> None:
+    rng = random.Random(32)
+    m5, m15, h1 = _regime_bars(rng, 32)
+    baseline = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(32))
+    stats = {f"{baseline.setup}|{baseline.session}": {"win_rate": 0.90, "samples": 9, "below_min_samples": True}}
+    unchanged = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(32), journal_stats=stats)
+    assert unchanged.p_win_est == baseline.p_win_est
+    assert unchanged.features["empirical_p_win"]["applied"] is False

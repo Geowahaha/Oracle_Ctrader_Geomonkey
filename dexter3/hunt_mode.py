@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from dexter3 import market_lens
+from dexter3 import empirical_stats, market_lens
 from dexter3.hunter_brain import Decision, _bar_close_ts
 
 Bar = dict[str, Any]
@@ -725,6 +725,7 @@ def decide_hunt(
     lens: dict[str, Any] | None,
     spread_abs: float,
     config: HuntConfig | None = None,
+    journal_stats: dict[str, Any] | None = None,
 ) -> Decision:
     """HUNT MODE decision: participation-first, always ACTION on every M5 close.
 
@@ -758,8 +759,10 @@ def decide_hunt(
     tp, tp_detail = _compute_tp(side, entry, sl, lens_computed, spread_abs)
 
     size_class = "small" if conviction >= CONVICTION_SMALL_FLOOR else "scout"
-    p_win_est = round(_clip(P_WIN_BASE + P_WIN_CONVICTION_SLOPE * conviction, 0.0, 1.0), 4)
+    base_p_win_est = round(_clip(P_WIN_BASE + P_WIN_CONVICTION_SLOPE * conviction, 0.0, 1.0), 4)
     setup = f"hunt_{dominant}"
+    session_label = str((lens_computed.get("session_context") or {}).get("value") or "unknown")
+    p_win_est = empirical_stats.blended_p_win(base_p_win_est, setup, session_label, journal_stats)
 
     reasons = _build_reasons(side, conviction, dominant, committee, sl_detail, tp_detail)
     if trend_guard_detail.get("fired"):
@@ -777,6 +780,13 @@ def decide_hunt(
     features_snapshot["hunt_raw_side"] = raw_side
     features_snapshot["hunt_raw_conviction"] = raw_conviction
     features_snapshot["hunt_trend_guard"] = trend_guard_detail
+    features_snapshot["empirical_p_win"] = {
+        "base": base_p_win_est,
+        "blended": p_win_est,
+        "applied": p_win_est != base_p_win_est,
+        "setup": setup,
+        "session": session_label,
+    }
 
     # session bucket for the learner — the SAME session_context label
     # hunter_brain keys (setup, session) on; carried by the executor into
@@ -785,8 +795,6 @@ def decide_hunt(
     # (DEXTER3_HUNT=1 in the VM units), so without this every live outcome
     # journaled session="" and the learner skipped it (found 2026-07-11 in
     # the first vanish-reconcile backfill: session=None on every row).
-    session_label = str((lens_computed.get("session_context") or {}).get("value") or "unknown")
-
     return Decision(
         ts_close=ts_close,
         symbol=symbol,
