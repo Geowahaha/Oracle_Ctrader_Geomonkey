@@ -65,6 +65,12 @@ $env:DEXTER3_V18_WINNER_BOOST_ENABLED = "1"
 $env:DEXTER3_V18_CHASE_RESCUE_ENABLED = "1"
 $env:DEXTER3_V18_B_TIER_ENABLED = "1"
 $env:DEXTER3_BASE_RISK_FRAC = "0.0175"
+# Min-volume guard (2026-07-10): B-tier scout x0.35 pullback x0.6 asian shrinks
+# design risk to ~$1.8, but XAU's 1-oz floor executed $11.49 = 6.2x design
+# (loss 02:11Z proved it). Same cap as Grok: refuse entries whose 1-oz floor
+# risk exceeds 1.5x the designed risk — the B-tier edge math assumed 0.5x
+# sizing, not 6x.
+$env:DEXTER3_MIN_VOLUME_RISK_RATIO_CAP = "1.5"
 Remove-Item Env:DEXTER3_MODE -ErrorAction SilentlyContinue
 
 Write-Host "[dexter3-v16] MCP health check (auto-restart if down)..."
