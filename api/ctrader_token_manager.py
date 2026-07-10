@@ -42,6 +42,35 @@ _STATE_FILE = "data/runtime/ctrader_token_state.json"
 _MAX_REFRESH_RETRIES = 5
 _BACKOFF_BASE_SEC = 2.0
 _BACKOFF_MAX_SEC = 120.0
+_SAVED_UTC_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _flag(name: str) -> bool:
+    """Read a boolean feature flag directly from the live process
+    environment.
+
+    Deliberately NOT read from config.py's cached class attribute: config
+    evaluates os.getenv(...) once at import time, so a process that flips
+    its owner/read-only role at runtime (e.g. scripts/ctrader_token_keepalive.py
+    self-identifying as the owner before its first token check) would be
+    silently ignored if we consulted the frozen config snapshot instead of
+    the live environment. config.py still exposes these same keys
+    (DEXTER3_TOKEN_SINGLE_OWNER / CTRADER_TOKEN_IS_OWNER) for visibility/ops
+    tooling; this module intentionally reads os.environ directly so it
+    always reflects the current process, including in tests via
+    monkeypatch.setenv.
+    """
+    return str(os.getenv(name, "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _single_owner_mode_enabled() -> bool:
+    """DEXTER3_TOKEN_SINGLE_OWNER=1 — default OFF, current behavior unchanged."""
+    return _flag("DEXTER3_TOKEN_SINGLE_OWNER")
+
+
+def _is_refresh_owner() -> bool:
+    """CTRADER_TOKEN_IS_OWNER=1 — only meaningful when single-owner mode is on."""
+    return _flag("CTRADER_TOKEN_IS_OWNER")
 
 
 class CTraderTokenManager:
@@ -59,6 +88,11 @@ class CTraderTokenManager:
         self._consecutive_failures: int = 0
         self._initialized = False
         self._telegram_alerted = False
+        # Last-seen "saved_utc" from disk — our baseline for detecting
+        # whether another process (or a manual re-auth) has since installed
+        # a newer token state that must not be clobbered. See
+        # _disk_state_is_newer() / _adopt_disk_state().
+        self._state_saved_utc: str = ""
 
     def _state_path(self) -> Path:
         try:
@@ -98,19 +132,89 @@ class CTraderTokenManager:
             logger.debug("[TokenManager] state load error: %s", e)
             return {}
 
+    @staticmethod
+    def _parse_saved_utc(ts: str) -> Optional[datetime]:
+        ts = str(ts or "").strip()
+        if not ts:
+            return None
+        try:
+            return datetime.strptime(ts, _SAVED_UTC_FMT).replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    def _disk_state_is_newer(self, disk_state: dict) -> bool:
+        """True if the on-disk token state was saved more recently than the
+        state this process last observed (self._state_saved_utc).
+
+        This is the cross-process staleness guard: it is what tells a
+        process "someone else (the owner, a manual re-auth, another
+        consumer) already installed a token after you last synced — do not
+        write your own, older copy over it." Wall-clock saved_utc is used
+        (not refresh_count) because a full manual re-auth legitimately
+        resets refresh_count to 0/1, which would otherwise look "older"
+        than a process that had refreshed many times against the now-dead
+        token chain.
+        """
+        disk_access = str(disk_state.get("access_token", "") or "").strip()
+        if not disk_access:
+            return False  # nothing on disk worth protecting
+        disk_saved = self._parse_saved_utc(disk_state.get("saved_utc", ""))
+        mine_saved = self._parse_saved_utc(self._state_saved_utc)
+        if disk_saved and mine_saved:
+            return disk_saved > mine_saved
+        if disk_saved and not mine_saved:
+            return True
+        # No usable timestamps on either side — fall back to refresh_count
+        # as a weaker monotonic signal rather than assuming staleness.
+        try:
+            return int(disk_state.get("refresh_count", -1) or -1) > int(self._refresh_count)
+        except Exception:
+            return False
+
+    def _adopt_disk_state(self, disk_state: dict) -> None:
+        """Adopt a newer on-disk token state into memory (self-heal) instead
+        of overwriting it. Caller must hold self._lock."""
+        self._access_token = str(disk_state.get("access_token", "") or "").strip()
+        new_refresh = str(disk_state.get("refresh_token", "") or "").strip()
+        if new_refresh:
+            self._refresh_token = new_refresh
+        self._last_refresh_utc = str(disk_state.get("last_refresh_utc", "") or self._last_refresh_utc)
+        try:
+            self._refresh_count = int(disk_state.get("refresh_count", self._refresh_count) or self._refresh_count)
+        except Exception:
+            pass
+        self._state_saved_utc = str(disk_state.get("saved_utc", "") or self._state_saved_utc)
+
     def _save_state(self):
-        """Persist current tokens to disk (atomic)."""
+        """Persist current tokens to disk (atomic).
+
+        Safety net: never let a write erase an existing non-empty
+        access_token/refresh_token with an empty value — if this process's
+        in-memory copy is empty but disk already has a real token, keep
+        disk's value instead of clobbering it.
+        """
         path = self._state_path()
         try:
+            disk_state = self._load_state()
+            access_to_write = self._access_token
+            refresh_to_write = self._refresh_token
+            if not access_to_write and str(disk_state.get("access_token", "") or "").strip():
+                access_to_write = str(disk_state["access_token"]).strip()
+                logger.warning("[TokenManager] refused to overwrite existing access_token with an empty value")
+            if not refresh_to_write and str(disk_state.get("refresh_token", "") or "").strip():
+                refresh_to_write = str(disk_state["refresh_token"]).strip()
+                logger.warning("[TokenManager] refused to overwrite existing refresh_token with an empty value")
+            saved_utc = datetime.now(timezone.utc).strftime(_SAVED_UTC_FMT)
             state = {
-                "access_token": self._access_token,
-                "refresh_token": self._refresh_token,
+                "access_token": access_to_write,
+                "refresh_token": refresh_to_write,
                 "last_refresh_utc": self._last_refresh_utc,
                 "refresh_count": self._refresh_count,
                 "consecutive_failures": self._consecutive_failures,
-                "saved_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "saved_utc": saved_utc,
             }
             atomic_json_write(path, state)
+            self._state_saved_utc = saved_utc
             logger.debug("[TokenManager] state saved to %s", path)
         except Exception as e:
             logger.warning("[TokenManager] state save error: %s", e)
@@ -123,6 +227,7 @@ class CTraderTokenManager:
 
         env_access, env_refresh = self._load_config()
         state = self._load_state()
+        self._state_saved_utc = str(state.get("saved_utc", "") or "")
 
         # Priority: persisted state > env
         persisted_access = str(state.get("access_token", "") or "").strip()
@@ -150,6 +255,26 @@ class CTraderTokenManager:
         with self._lock:
             self._initialize()
             return self._access_token
+
+    def ensure_fresh_access_token(self, max_age_minutes: float = 45.0) -> str:
+        """Return a valid access token, refreshing proactively before expiry."""
+        with self._lock:
+            self._initialize()
+            if not self._refresh_token:
+                return self._access_token
+            last = self._last_refresh_utc
+        if not last:
+            refreshed = self.try_refresh()
+            return refreshed or self.get_access_token()
+        try:
+            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60.0
+        except Exception:
+            age_min = max_age_minutes + 1.0
+        if age_min >= float(max_age_minutes):
+            refreshed = self.try_refresh()
+            return refreshed or self.get_access_token()
+        return self.get_access_token()
 
     def get_refresh_token(self) -> str:
         """Get the current refresh token. Thread-safe."""
@@ -190,10 +315,43 @@ class CTraderTokenManager:
             )
 
     def on_token_failed(self, error: str = ""):
-        """Called when token refresh fails — tracks failures and alerts."""
+        """Called when token refresh fails — tracks failures and alerts.
+
+        Never clobbers a good token: if the on-disk state is newer than
+        what this process last saw (another process or a manual re-auth
+        already installed a valid token), adopt it into memory instead of
+        writing this process's stale copy back over it. In single-owner
+        mode, non-owner consumers never write shared state at all — they
+        observe locally and wait for the owner to fix it.
+        """
         with self._lock:
             self._consecutive_failures += 1
-            self._save_state()
+
+            read_only = _single_owner_mode_enabled() and not _is_refresh_owner()
+            if read_only:
+                disk_state = self._load_state()
+                if self._disk_state_is_newer(disk_state):
+                    self._adopt_disk_state(disk_state)
+                    self._consecutive_failures = int(disk_state.get("consecutive_failures", 0) or 0)
+                logger.error(
+                    "[TokenManager] (read-only consumer) token failure #%d: %s — "
+                    "not writing shared state, waiting for owner refresh",
+                    self._consecutive_failures, error,
+                )
+                return
+
+            disk_state = self._load_state()
+            if self._disk_state_is_newer(disk_state):
+                logger.warning(
+                    "[TokenManager] failing on a stale local token while disk has a "
+                    "newer one (refresh_count %s -> %s) — adopting instead of overwriting",
+                    self._refresh_count, disk_state.get("refresh_count"),
+                )
+                self._adopt_disk_state(disk_state)
+                self._consecutive_failures = int(disk_state.get("consecutive_failures", 0) or 0)
+            else:
+                self._save_state()
+
             logger.error(
                 "[TokenManager] Token failure #%d: %s",
                 self._consecutive_failures, error,
@@ -206,9 +364,37 @@ class CTraderTokenManager:
         """Attempt to refresh the access token with retry + backoff.
 
         Returns new access token on success, empty string on failure.
+
+        Cross-process safety: before ever hitting the network, re-check
+        disk for a newer token (another process — the owner, a manual
+        re-auth — may have already installed one) and adopt it instead of
+        racing Spotware's single-use refresh_token with a stale copy. In
+        single-owner mode (DEXTER3_TOKEN_SINGLE_OWNER=1), only the
+        designated owner (CTRADER_TOKEN_IS_OWNER=1) is allowed past this
+        point to actually call Spotware — every other consumer returns
+        here with whatever is currently valid (or "") and never writes
+        failure state.
         """
         with self._lock:
             self._initialize()
+
+            disk_state = self._load_state()
+            if self._disk_state_is_newer(disk_state):
+                logger.info(
+                    "[TokenManager] newer token found on disk before refresh "
+                    "attempt (refresh_count %s -> %s) — adopting, no network call made",
+                    self._refresh_count, disk_state.get("refresh_count"),
+                )
+                self._adopt_disk_state(disk_state)
+                return self._access_token
+
+            if _single_owner_mode_enabled() and not _is_refresh_owner():
+                logger.debug(
+                    "[TokenManager] read-only consumer — refresh delegated to "
+                    "owner, no network call made"
+                )
+                return ""
+
             refresh_token = self._refresh_token
             client_id = self._client_id
             client_secret = self._client_secret
@@ -301,15 +487,24 @@ class CTraderTokenManager:
         except Exception:
             pass
 
-        # If we have both token + refresh, proactively refresh to ensure freshness
-        if result["has_refresh_token"] and self._refresh_count == 0 and not self._last_refresh_utc:
-            logger.info("[TokenManager] First startup with seed token — proactive refresh for freshness")
-            new_token = self.try_refresh()
-            if new_token:
-                result["status"] = "ok:refreshed_at_startup"
-                result["message"] = "Seed token refreshed proactively at startup"
-                result["has_access_token"] = True
-                return result
+        # Proactive refresh: seed token or access token older than 45 minutes
+        if result["has_refresh_token"]:
+            needs_refresh = self._refresh_count == 0 and not self._last_refresh_utc
+            if not needs_refresh and self._last_refresh_utc:
+                try:
+                    last_dt = datetime.strptime(self._last_refresh_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60.0
+                    needs_refresh = age_min >= 45.0
+                except Exception:
+                    needs_refresh = True
+            if needs_refresh:
+                logger.info("[TokenManager] Proactive refresh at startup (age or seed token)")
+                new_token = self.try_refresh()
+                if new_token:
+                    result["status"] = "ok:refreshed_at_startup"
+                    result["message"] = "Token refreshed proactively at startup"
+                    result["has_access_token"] = True
+                    return result
 
         result["status"] = "ok"
         result["message"] = "Token available"

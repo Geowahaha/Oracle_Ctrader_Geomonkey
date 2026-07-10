@@ -1413,6 +1413,15 @@ class Config:
     # to revoked tokens after key rotation. Use CTRADER_OPENAPI_* keys only.
     CTRADER_OPENAPI_ACCESS_TOKEN: str = os.getenv("CTRADER_OPENAPI_ACCESS_TOKEN", "").strip()
     CTRADER_OPENAPI_REFRESH_TOKEN: str = os.getenv("CTRADER_OPENAPI_REFRESH_TOKEN", "").strip()
+    # Single-owner token refresh (2026-07-10): default OFF = current behavior
+    # (every consumer may attempt its own refresh, as today). When enabled,
+    # only the process with CTRADER_TOKEN_IS_OWNER=1 (the token-keepalive
+    # service by default) is allowed to call Spotware's refresh endpoint and
+    # persist the result; every other consumer becomes read-only and re-syncs
+    # from data/runtime/ctrader_token_state.json instead of racing the
+    # single-use refresh_token. See api/ctrader_token_manager.py.
+    DEXTER3_TOKEN_SINGLE_OWNER: bool = os.getenv("DEXTER3_TOKEN_SINGLE_OWNER", "0").strip().lower() in ("1", "true", "yes", "on")
+    CTRADER_TOKEN_IS_OWNER: bool = os.getenv("CTRADER_TOKEN_IS_OWNER", "0").strip().lower() in ("1", "true", "yes", "on")
     CTRADER_USER_ID_JSON: str = os.getenv("CTRADER_USER_ID_JSON", os.getenv("Ctrader_UserID", ""))
     CTRADER_ACCOUNTS_JSON: str = os.getenv("CTRADER_ACCOUNTS_JSON", os.getenv("Ctrader_accounts", ""))
     MT5_READINESS_CHECK_ON_START: bool = os.getenv("MT5_READINESS_CHECK_ON_START", "1").strip().lower() in ("1", "true", "yes", "on")
