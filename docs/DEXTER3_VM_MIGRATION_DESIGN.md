@@ -245,6 +245,37 @@ persists to `data/runtime/ctrader_token_state.json` for every consumer to
 pick up. This is a live-shared-credential change and is explicitly a
 PM/owner action, not something this investigation executed.
 
+## Full-dimension resilience design (owner goal 2026-07-10: "ครบทุกมิติ")
+
+**Auth layer (does the token expire? YES — and here is every layer against it):**
+| Layer | Mechanism | Status |
+|---|---|---|
+| Access token expiry | ~30 days (`expires_in=2628000`) — but refresh ROTATES the pair each cycle, so a working keepalive means it never reaches expiry | designed ✓ |
+| Auto-refresh | `ctrader-token-keepalive.timer` every 30 min, SOLE refresher (`DEXTER3_TOKEN_SINGLE_OWNER=1`, `CTRADER_TOKEN_IS_OWNER=1`) | code shipped `da341f4`; enable after token install |
+| Clobber protection | unconditional guards: never empty-over-real, never stale-over-newer (`saved_utc`), failing consumers ADOPT newer disk state | shipped `da341f4` ✓ |
+| State redundancy | `ctrader_token_state.json` + `.env.local` seed + `.bak-preauth` snapshot before any re-auth | in place ✓ |
+| Failure alarm | keepalive `consecutive_failures ≥ 2` → Telegram via watcher pattern (auth dies loud, not silent-for-9-days) | TODO after install |
+| Disaster path | manual re-auth runbook (auth URL + exchange one-liner) on the sync board | documented ✓ |
+
+**VM anti-hang:** systemd `Restart=always` + `RestartSec` on lane units; lane heartbeat helper (`scripts/dexter3_lane_heartbeat.py`, built+tested) run by a VM timer — stale >600s ⇒ restart lane service; `MemoryMax` on units so a leak can't OOM the 1GB box (2GB swap standing by); connection layer = persistent daemon (`dexter3/openapi_daemon.py`) with its own reconnect/backoff.
+
+**PC failover runbook (VM down → PC takes over in 2 commands):**
+```powershell
+# 1. verify VM lanes truly dead (no double-trade):  ssh ... systemctl is-active dexter3-fable dexter3-grok
+powershell -File ops\dexter3_xau_v16_loop.ps1
+powershell -File ops\dexter3_xau_grok_loop.ps1
+```
+Labels are identical on both hosts — NEVER run both hosts simultaneously; the
+runbook's step 1 is mandatory. Cutback = reverse order.
+
+**Cutover checklist (P3, execute when token+daemon+shadow are green):**
+1. VM shadow ≥1 session, decisions compared vs PC lanes — no unexplained divergence
+2. PC lanes stopped while broker flat (verify book empty first)
+3. `systemctl enable --now dexter3-fable dexter3-grok` on VM
+4. First VM live entry verified (label + SL/TP broker-side)
+5. **THE test: shut the PC down — lanes keep trading** (the goal's definition of done)
+6. Telegram watcher moved to VM systemd; PC watcher retired
+
 ## Risks / notes
 - VM RAM 956MB, ~229MB free + 2GB swap: two loops ≈ 100-120MB — fits; watch OOM.
 - OpenAPI symbol/volume conventions differ from local MCP (pipettes, cents on
