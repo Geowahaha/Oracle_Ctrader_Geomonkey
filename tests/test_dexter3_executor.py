@@ -143,6 +143,11 @@ class FakeMcp:
         self._positions = [p for p in self._positions if position_id_of(p) != position_id]
         return {"status": "closed"}
 
+    def get_deals(self, count: int = 200) -> list[dict]:
+        self.calls.append(("get_deals", {"count": count}))
+        self._maybe_raise("get_deals")
+        return list(getattr(self, "deals", []))
+
     def call_names(self) -> list[str]:
         return [c[0] for c in self.calls]
 
@@ -966,3 +971,91 @@ def test_close_lane_position_feeds_empirical_stats(journal_conn):
     assert key in stats  # the learner SEES the outcome now
     assert stats[key]["samples"] == 1
     assert stats[key]["below_min_samples"] is True  # honest: 1 < MIN_SAMPLES
+
+
+# -- broker-side close vanish reconcile (2026-07-11: last learner coverage gap) --------
+
+
+def _entered(ex, mcp, pid: int, setup: str = "sweep_reclaim", session: str = "london"):
+    """Drive a real entry so entry_executed exists for pid (the reconcile's input)."""
+    mcp.post_entry_position = _filled_position(position_id=pid, volume=0.01)
+    result = ex.execute_entry(FakeDecision(setup=setup, session=session), DEMO_ACCOUNT)
+    assert result["action"] == "entered" and result["position_id"] == pid
+    # subsequent entries must not see this one as open (fresh call log)
+    mcp.calls = [c for c in mcp.calls if c[0] != "place_market_order"]
+    mcp.post_entry_position = None
+    return result
+
+
+def test_vanish_reconcile_journals_broker_close_into_learner(journal_conn):
+    from dexter3 import empirical_stats as es
+
+    mcp = FakeMcp()
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    _entered(ex, mcp, 901, setup="dragon_shelf_short", session="overlap")
+    # broker closed it: pid 901 absent from lane; closing deal carries the pnl
+    mcp.deals = [
+        {"positionId": 901, "netProfit": 0.0},     # entry leg
+        {"positionId": 901, "netProfit": -7.25},   # SL close leg
+        {"positionId": 999, "netProfit": 3.0},     # foreign position noise
+    ]
+    out = ex.reconcile_vanished_lane_positions("BTCUSD", [])
+    assert len(out) == 1
+    assert out[0]["position_id"] == 901
+    assert out[0]["setup"] == "dragon_shelf_short"
+    assert out[0]["session"] == "overlap"
+    assert out[0]["pnl"] == pytest.approx(-7.25)
+    stats = es.compute_from_journal(journal_conn, "BTCUSD")
+    assert ("dragon_shelf_short", "overlap") in stats  # the learner SEES the SL hit
+
+
+def test_vanish_reconcile_skips_still_open_and_dedups(journal_conn):
+    mcp = FakeMcp()
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    _entered(ex, mcp, 902)
+    mcp.deals = [{"positionId": 902, "netProfit": 4.0}]
+    still_open = [_filled_position(position_id=902, volume=0.01)]
+    # still open -> untouched
+    assert ex.reconcile_vanished_lane_positions("BTCUSD", still_open) == []
+    # vanished -> journaled exactly once; second call dedups via the journal
+    assert len(ex.reconcile_vanished_lane_positions("BTCUSD", [])) == 1
+    assert ex.reconcile_vanished_lane_positions("BTCUSD", []) == []
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    closes = [e for e in events if e["event"] == "lane_position_closed"]
+    assert len(closes) == 1
+
+
+def test_vanish_reconcile_manual_close_not_double_counted(journal_conn):
+    mcp = FakeMcp()
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    entered = _entered(ex, mcp, 903)
+    # manual close journals lane_position_closed -> reconcile must NOT re-add
+    pos = _filled_position(position_id=903, volume=0.01)
+    pos["netProfit"] = 2.0
+    mcp._positions = [pos]
+    assert ex.close_lane_position(903, reason="om_exit")["action"] == "closed"
+    mcp.deals = [{"positionId": 903, "netProfit": 2.0}]
+    assert ex.reconcile_vanished_lane_positions("BTCUSD", []) == []
+
+
+def test_vanish_reconcile_deals_failure_defers_not_journal(journal_conn):
+    mcp = FakeMcp()
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    _entered(ex, mcp, 904)
+    mcp.raise_on = {"get_deals": McpClientError("transient")}
+    assert ex.reconcile_vanished_lane_positions("BTCUSD", []) == []
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    assert not any(e["event"] == "lane_position_closed" for e in events)
+    assert any(e["event"] == "vanish_reconcile_deferred" for e in events)
+    # deals recover -> journaled on the next bar
+    mcp.raise_on = {}
+    mcp.deals = [{"positionId": 904, "netProfit": 1.5}]
+    out = ex.reconcile_vanished_lane_positions("BTCUSD", [])
+    assert len(out) == 1 and out[0]["pnl"] == pytest.approx(1.5)
+
+
+def test_vanish_reconcile_unknown_lane_is_noop(journal_conn):
+    mcp = FakeMcp()
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    _entered(ex, mcp, 905)
+    assert ex.reconcile_vanished_lane_positions("BTCUSD", None) == []  # unknown broker state

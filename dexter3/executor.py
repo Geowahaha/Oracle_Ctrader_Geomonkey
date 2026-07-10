@@ -768,6 +768,20 @@ class Dexter3Executor:
         self._journal(symbol, "entry_executed", position_id=pid, verified=verified, payload=out)
         return out
 
+    @staticmethod
+    def _deal_position_id(deal: dict[str, Any]) -> int:
+        """Deal's position id across transport shapes (camelCase local-MCP /
+        openapi-normalized ``positionId``, snake_case daemon ``position_id``)."""
+        for key in ("positionId", "position_id"):
+            raw = deal.get(key)
+            if raw is None:
+                continue
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
     def _entry_context_of(self, symbol: str, position_id: int) -> dict[str, Any]:
         """Look up this position's OWN entry_executed journal row -> the
         learner keys (setup, session) recorded at entry time. Empty dict when
@@ -937,6 +951,87 @@ class Dexter3Executor:
             },
         )
         return {"action": "closed" if verified else "close_unverified", "position_id": position_id, "result": result}
+
+    def reconcile_vanished_lane_positions(
+        self, symbol: str, open_positions: list[dict[str, Any]] | None, *, max_candidates: int = 20
+    ) -> list[dict[str, Any]]:
+        """Journal learner outcomes for lane positions the BROKER closed (SL/TP).
+
+        Broker-side closes never pass through ``close_lane_position``, so
+        without this reconcile those outcomes stay invisible to
+        ``empirical_stats`` (the biggest coverage gap after 2026-07-10's
+        learner repair). Candidates are this executor's own ``entry_executed``
+        rows with NO close row yet — the journal write below IS the dedup
+        marker, so every vanish is recorded exactly once, restart-safe.
+
+        ``open_positions`` must be the CURRENT label-filtered lane list the
+        caller already fetched this bar (None = unknown broker state -> no-op).
+        Realized pnl is summed from closing deals when available; a transient
+        deals failure skips the round (retried next bar) rather than writing a
+        premature pnl-less row. Never raises — a reconcile bug must not block
+        the trading loop.
+        """
+        if open_positions is None:
+            return []
+        try:
+            open_ids = {position_id_of(p) for p in open_positions}
+            cur = self._conn.execute(
+                "SELECT e.position_id, e.payload_json FROM exec_events e "
+                "WHERE e.symbol = ? AND e.event = 'entry_executed' "
+                "AND e.position_id IS NOT NULL AND e.position_id > 0 "
+                "AND NOT EXISTS (SELECT 1 FROM exec_events c WHERE c.event IN "
+                "('lane_position_closed', 'naked_position_closed') "
+                "AND c.position_id = e.position_id) "
+                "ORDER BY e.id DESC LIMIT ?",
+                (str(symbol), int(max_candidates)),
+            )
+            candidates = [
+                (int(pid), payload_json) for pid, payload_json in cur.fetchall() if int(pid) not in open_ids
+            ]
+            if not candidates:
+                return []
+            try:
+                deals = self.client.get_deals(200) or []
+            except Exception as exc:  # noqa: BLE001 - transient deals failure -> retry next bar
+                self._journal(
+                    symbol,
+                    "vanish_reconcile_deferred",
+                    verified=False,
+                    payload={"error": str(exc), "pending_position_ids": [pid for pid, _ in candidates]},
+                )
+                return []
+            pnl_by_pid: dict[int, float] = {}
+            for d in deals:
+                if not isinstance(d, dict):
+                    continue
+                dpid = self._deal_position_id(d)
+                if dpid <= 0:
+                    continue
+                raw = d.get("netProfit", d.get("net_profit"))
+                try:
+                    pnl_by_pid[dpid] = pnl_by_pid.get(dpid, 0.0) + float(raw)
+                except (TypeError, ValueError):
+                    continue
+            out: list[dict[str, Any]] = []
+            for pid, payload_json in candidates:
+                try:
+                    entry_payload = json.loads(payload_json or "{}")
+                except json.JSONDecodeError:
+                    entry_payload = {}
+                pnl = pnl_by_pid.get(pid)
+                record = {
+                    "reason": "broker_side_close_reconciled",
+                    "setup": str(entry_payload.get("setup") or "") or None,
+                    "session": str(entry_payload.get("session") or "") or None,
+                    "pnl": pnl,
+                    "exit_reason": "broker_side_close",
+                    "reconciled": True,
+                }
+                self._journal(symbol, "lane_position_closed", position_id=pid, verified=True, payload=record)
+                out.append({"position_id": pid, **record})
+            return out
+        except Exception:  # noqa: BLE001 - reconcile must never break the loop
+            return []
 
     def amend_lane_sl_tp(
         self, position_id: int, sl: float | None, tp: float | None

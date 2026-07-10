@@ -1237,6 +1237,15 @@ def run_symbol_cycle(
             except (McpClientError, McpZombieError) as exc:
                 log_line(f"{utc_now_iso()} {symbol} lane_read_failed (no live action this bar): {exc}")
                 lane = None  # unknown broker state → hard veto on live actions
+            # Broker-side SL/TP closes bypass close_lane_position — reconcile
+            # them into the learner here (journal-deduped; None lane = no-op;
+            # never raises). See executor.reconcile_vanished_lane_positions.
+            reconciled = executor.reconcile_vanished_lane_positions(symbol, lane)
+            for rec in reconciled:
+                log_line(
+                    f"{utc_now_iso()} {symbol} vanish_reconciled position_id={rec.get('position_id')} "
+                    f"setup={rec.get('setup')} session={rec.get('session')} pnl={rec.get('pnl')}"
+                )
 
         # -- decision source routing -----------------------------------------
         basket_action: dict[str, Any] | None = None
