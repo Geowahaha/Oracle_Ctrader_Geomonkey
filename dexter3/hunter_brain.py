@@ -106,6 +106,11 @@ class Decision:
     p_win_est: float
     setup: str  # dragon_shelf_short|shelf_reclaim_long|leader_continuation|sweep_reclaim|none
     reasons: list[str] = field(default_factory=list)
+    # Session bucket at decision time (asian|london|overlap|newyork|off_hours|
+    # unknown) — the SAME label _p_win_est/blended_p_win key on, carried to
+    # the executor so closed outcomes land in the learner with a matching
+    # (setup, session) key. Default "" keeps every legacy constructor valid.
+    session: str = ""
     features: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -438,6 +443,7 @@ def decide(
                 setup=setup,
                 reasons=full_reasons,
                 features=features_snapshot,
+                session=session_label,
             )
         rr_failures.append(f"{setup}: rr={rr:.2f}<floor={MIN_REWARD_RISK}")
 

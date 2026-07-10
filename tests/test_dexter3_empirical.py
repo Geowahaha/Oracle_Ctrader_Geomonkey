@@ -308,3 +308,36 @@ def test_hunter_brain_decide_below_min_samples_leaves_p_win_unchanged():
     stats = {(baseline.setup, session_label): {"win_rate": 0.90, "below_min_samples": True}}
     unchanged = hunter_brain.decide("XAUUSD", None, bars, journal_stats=stats)
     assert unchanged.p_win_est == baseline.p_win_est
+
+
+def test_hunter_brain_blend_fires_with_flattened_journal_stats_shape():
+    """THE live wiring shape: shadow_runner passes stats through
+    stats_to_journal_stats_arg (flat "setup|session" keys) into decide().
+    Tuple-only lookup silently no-opped the blend on every live call
+    (2026-07-10) — the flat shape must blend identically to the tuple shape."""
+    from dexter3 import hunter_brain
+
+    bars = _downtrend_then_lower_sweep()
+    baseline = hunter_brain.decide("XAUUSD", None, bars, journal_stats=None)
+    assert baseline.action == "enter"
+
+    session_label = str(baseline.features.get("session_context", {}).get("value") or "unknown")
+    tuple_stats = {(baseline.setup, session_label): {"win_rate": 0.90, "below_min_samples": False}}
+    flat_stats = es.stats_to_journal_stats_arg(tuple_stats)
+    assert list(flat_stats.keys()) == [f"{baseline.setup}|{session_label}"]  # shape sanity
+
+    blended = hunter_brain.decide("XAUUSD", None, bars, journal_stats=flat_stats)
+    assert blended.p_win_est > baseline.p_win_est  # blend fired through the FLAT shape
+
+
+def test_hunter_brain_enter_decision_carries_session_label():
+    """The executor journals decision.session at entry so closed outcomes can
+    land in the learner under the SAME (setup, session) key decide() blends on."""
+    from dexter3 import hunter_brain
+
+    bars = _downtrend_then_lower_sweep()
+    d = hunter_brain.decide("XAUUSD", None, bars, journal_stats=None)
+    assert d.action == "enter"
+    session_label = str(d.features.get("session_context", {}).get("value") or "unknown")
+    assert d.session == session_label
+    assert d.session != ""

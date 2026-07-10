@@ -757,12 +757,37 @@ class Dexter3Executor:
             "sl": sl,
             "tp": tp,
             "setup": decision.setup,
+            # session bucket at decision time — the learner's second key
+            # (empirical_stats buckets by (setup, session)); getattr keeps
+            # legacy/foreign decision objects without the field valid.
+            "session": str(getattr(decision, "session", "") or ""),
             "smart_exit_regime": smart_exit_regime,
             "broker_sl": round(broker_sl, 6),
             "broker_sl_distance": round(broker_sl_distance, 6),
         }
         self._journal(symbol, "entry_executed", position_id=pid, verified=verified, payload=out)
         return out
+
+    def _entry_context_of(self, symbol: str, position_id: int) -> dict[str, Any]:
+        """Look up this position's OWN entry_executed journal row -> the
+        learner keys (setup, session) recorded at entry time. Empty dict when
+        not found — callers must treat the keys as best-effort."""
+        try:
+            cur = self._conn.execute(
+                "SELECT payload_json FROM exec_events WHERE symbol = ? AND event = 'entry_executed' "
+                "AND position_id = ? ORDER BY id DESC LIMIT 1",
+                (str(symbol), int(position_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            payload = json.loads(row[0] or "{}")
+            return {
+                "setup": str(payload.get("setup") or "") or None,
+                "session": str(payload.get("session") or "") or None,
+            }
+        except Exception:  # noqa: BLE001 - learner enrichment must never break closes
+            return {}
 
     def _resolve_new_position(self, symbol: str, known_ids: set[int]) -> int:
         """Re-read positions once looking for a new id carrying our label.
@@ -886,12 +911,30 @@ class Dexter3Executor:
         post_positions = self._safe_get_positions()
         still_open = any(position_id_of(p) == int(position_id) for p in post_positions)
         verified = not still_open
+        # -- learner payload (2026-07-10: make self-learning real) ----------
+        # empirical_stats needs (setup, session, pnl) on this event or it
+        # skips the row entirely (the audit's "learner reads zero"). setup +
+        # session come from this position's own entry_executed row; pnl is
+        # the pre-close floating PnL snapshot (market close -> sign-accurate,
+        # which is all the Laplace win-rate needs). All best-effort — a miss
+        # journals None and the learner skips just that row, never raises.
+        from dexter3.basket_live import _position_pnl
+
+        entry_ctx = self._entry_context_of(symbol, int(position_id))
+        pnl_snapshot = _position_pnl(pos)
         self._journal(
             symbol,
             "lane_position_closed",
             position_id=position_id,
             verified=verified,
-            payload={"reason": reason, "result": result},
+            payload={
+                "reason": reason,
+                "result": result,
+                "setup": entry_ctx.get("setup"),
+                "session": entry_ctx.get("session"),
+                "pnl": pnl_snapshot,
+                "exit_reason": reason,
+            },
         )
         return {"action": "closed" if verified else "close_unverified", "position_id": position_id, "result": result}
 

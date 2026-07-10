@@ -105,7 +105,13 @@ def blended_p_win(base_p_win: float, setup: str, session: str, stats: dict[tuple
     """
     if not stats:
         return round(base_p_win, 4)
-    entry = stats.get((str(setup), str(session)))
+    # Accept BOTH key shapes: the tuple-keyed dict from compute_from_journal
+    # AND the flattened "setup|session" dict from stats_to_journal_stats_arg —
+    # shadow_runner passes the FLATTENED shape into hunter_brain.decide()
+    # (shadow_runner._JOURNAL_STATS_CACHE), so tuple-only lookup silently
+    # returned None on every live call and the blend NEVER fired (found
+    # 2026-07-10 while making the learner real).
+    entry = stats.get((str(setup), str(session))) or stats.get(f"{setup}|{session}")
     if entry is None or bool(entry.get("below_min_samples", True)):
         return round(base_p_win, 4)
     empirical = float(entry.get("win_rate", base_p_win))

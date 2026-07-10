@@ -52,6 +52,7 @@ class FakeDecision:
     tp: float | None = 62150.0
     setup: str = "leader_continuation"
     reasons: list[str] = field(default_factory=lambda: ["test_reason"])
+    session: str = "london"
 
 
 # -- fake MCP transport -------------------------------------------------------
@@ -916,3 +917,52 @@ def test_execute_entry_smart_exit_classification_journaled_even_when_none(journa
     events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
     classified = next(e for e in events if e["event"] == "smart_exit_classified")
     assert classified["payload"]["regime"] == "tight"
+
+
+# -- close -> learner integration (2026-07-10: make self-learning real) ---------------
+
+
+def test_entry_executed_journals_session_from_decision(journal_conn):
+    mcp = FakeMcp(post_entry_position=_filled_position())
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    result = ex.execute_entry(FakeDecision(session="overlap"), DEMO_ACCOUNT)
+    assert result["action"] == "entered"
+    assert result["session"] == "overlap"
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    entry = next(e for e in events if e["event"] == "entry_executed")
+    assert entry["payload"]["session"] == "overlap"
+
+
+def test_close_lane_position_feeds_empirical_stats(journal_conn):
+    """Full learner loop on a temp DB: entry_executed (setup+session) ->
+    close_lane_position (pnl snapshot) -> empirical_stats sees the outcome.
+    Before 2026-07-10 the close payload had no setup/session/pnl, so
+    _exec_events_outcome_rows skipped every row (the audit's 'learner reads
+    zero')."""
+    from dexter3 import empirical_stats as es
+
+    filled = _filled_position(position_id=777, volume=0.01)
+    filled["netProfit"] = 6.15  # floating PnL the close snapshot reads
+    mcp = FakeMcp(post_entry_position=filled)
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+
+    entered = ex.execute_entry(
+        FakeDecision(setup="sweep_reclaim", session="london"), DEMO_ACCOUNT
+    )
+    assert entered["action"] == "entered" and entered["position_id"] == 777
+
+    closed = ex.close_lane_position(777, reason="om_ladder_exit")
+    assert closed["action"] == "closed"
+
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    close_ev = next(e for e in events if e["event"] == "lane_position_closed")
+    assert close_ev["payload"]["setup"] == "sweep_reclaim"
+    assert close_ev["payload"]["session"] == "london"
+    assert close_ev["payload"]["pnl"] == pytest.approx(6.15)
+    assert close_ev["payload"]["exit_reason"] == "om_ladder_exit"
+
+    stats = es.compute_from_journal(journal_conn, "BTCUSD")
+    key = ("sweep_reclaim", "london")
+    assert key in stats  # the learner SEES the outcome now
+    assert stats[key]["samples"] == 1
+    assert stats[key]["below_min_samples"] is True  # honest: 1 < MIN_SAMPLES
