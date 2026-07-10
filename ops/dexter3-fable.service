@@ -2,7 +2,14 @@
 # The cutover target: this replaces the PC-hosted lane so the PC can power off.
 # SAFETY: never run this live at the same time as the PC-hosted lane or the
 # paper unit on the same label — one host per label at a time (double-trade
-# risk). MIN_VOLUME_RISK_RATIO_CAP + governor loss-stop preserved from PC.
+# risk). Governor loss-stop preserved from PC.
+# 2026-07-10 cutover fix: DEXTER3_MAX_VOLUME_UNITS=10 was DROPPED from the PC
+# launcher during unit creation -> fell back to the 0.05 BTC-scale default ->
+# every XAU entry refused (min_volume_exceeds_max_volume_units_cap; XAU
+# minVolume=1 oz). Restored to PC value 10. Ratio cap loosened to 0 (off) per
+# owner directive so the de-sized micro setups also fire; per-trade risk stays
+# bounded by the governor cap (capital x 2.5% = $25). Revert cap to 1.5 for
+# PC-parity (skip low-conviction micro trades) if they underperform.
 [Unit]
 Description=Dexter3 Fable V1.8 size-the-edge LIVE lane (OpenAPI daemon)
 After=network-online.target dexter3-openapi-daemon.service
@@ -21,7 +28,8 @@ Environment=DEXTER3_LIVE=1
 Environment=DEXTER3_HUNT=1
 Environment=DEXTER3_FAST_TICK_SEC=8
 Environment=DEXTER3_CAPITAL_USD=1000
-Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=1.5
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 # v16 mode is default
 Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=1
 Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=1
