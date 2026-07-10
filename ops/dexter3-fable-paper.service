@@ -1,0 +1,34 @@
+# Dexter3 Fable lane — PAPER mode (decision shadow, NO live orders) on the VM.
+# Boot-persistent forward-evidence collector for the V1.8 stack via the
+# OpenAPI daemon. This is the pre-cutover stage: same brain, same cadence,
+# zero broker mutations (no --live flag => executor never fires).
+# Cutover to live = switch to ops/dexter3-fable.service (DO-NOT-ENABLE until
+# the deals-label governor gap is fixed and the owner witnesses the switch).
+[Unit]
+Description=Dexter3 Fable V1.8 PAPER lane (OpenAPI daemon transport)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+# MemoryMax 200M: lane process measured ~60-90MB; cap prevents a leak from
+# starving the 1GB box shared with the live main system.
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_HUNT=1
+Environment=DEXTER3_FABLE_VERSION=v1.8-size-the-edge
+Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=1
+Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=1
+Environment=DEXTER3_V18_B_TIER_ENABLED=1
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=1.5
+Environment=DEXTER3_BASE_RISK_FRAC=0.0175
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20
+
+[Install]
+WantedBy=multi-user.target
