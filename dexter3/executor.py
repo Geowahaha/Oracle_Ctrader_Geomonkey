@@ -604,9 +604,58 @@ class Dexter3Executor:
         volume, volume_meta = planned_volume_units(
             symbol_details, broker_sl_distance, risk_usd, self.config.max_volume_units
         )
+        # -- min-volume x disaster-stop interaction (2026-07-10 live lesson) --
+        # The disaster widening trades size-for-distance at equal $ risk
+        # (size shrinks ~1/disaster_mult). At the volume FLOOR the size cannot
+        # shrink, so widening only multiplies the real $ risk by disaster_mult
+        # (VM cutover day: a ~9pt tight stop became an 18pt broker stop at the
+        # 1oz XAU floor = -$18.11 realized on a $1.68-design trade). When the
+        # sized volume clamps to minVolume AND the stop was widened, revert to
+        # the TIGHT stop — that restores the equal-$-risk invariant the
+        # disaster regime promises. DEXTER3_MIN_VOL_DISASTER_TIGHTEN=0 restores
+        # legacy behavior.
+        if (
+            volume_meta.get("min_volume_clamped_up")
+            and broker_sl_distance > sl_distance
+            and str(os.environ.get("DEXTER3_MIN_VOL_DISASTER_TIGHTEN", "1") or "1").strip() != "0"
+        ):
+            self._journal(
+                symbol,
+                "min_vol_disaster_tightened",
+                payload={
+                    "widened_sl_distance": round(broker_sl_distance, 6),
+                    "tight_sl_distance": round(sl_distance, 6),
+                    "widened_min_vol_risk_usd": volume_meta.get("estimated_min_volume_risk_usd"),
+                    "note": "at the volume floor, widening cannot shrink size — reverting to tight stop",
+                },
+            )
+            broker_sl_distance = sl_distance
+            volume, volume_meta = planned_volume_units(
+                symbol_details, broker_sl_distance, risk_usd, self.config.max_volume_units
+            )
         if volume <= 0:
             return self._refuse(symbol, "sizing_refused", volume_meta=volume_meta)
         if volume_meta.get("min_volume_clamped_up"):
+            # -- absolute $ ceiling for volume-floored trades ----------------
+            # The ratio cap (planned_volume_units) keys off the DESIGN risk,
+            # which the sizing chain can crush to cents — a 1.5x ratio then
+            # blocks every entry (cutover day: 27 refusals / 0 fills). This cap
+            # keys off ACCOUNT economics instead: refuse only when the floored
+            # trade's real risk exceeds an absolute dollar ceiling. Default 0
+            # = off (legacy accept).
+            try:
+                abs_cap = float(os.environ.get("DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD", "0") or 0.0)
+            except ValueError:
+                abs_cap = 0.0
+            est_floor_risk = float(volume_meta.get("estimated_min_volume_risk_usd", 0.0) or 0.0)
+            if abs_cap > 0 and est_floor_risk > abs_cap:
+                return self._refuse(
+                    symbol,
+                    "min_volume_risk_exceeds_abs_cap",
+                    estimated_min_volume_risk_usd=est_floor_risk,
+                    abs_cap_usd=abs_cap,
+                    volume_meta=volume_meta,
+                )
             self._journal(
                 symbol,
                 "sizing_min_volume_clamped",

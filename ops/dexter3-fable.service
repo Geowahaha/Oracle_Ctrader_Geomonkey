@@ -30,6 +30,9 @@ Environment=DEXTER3_FAST_TICK_SEC=8
 Environment=DEXTER3_CAPITAL_USD=1000
 Environment=DEXTER3_MAX_VOLUME_UNITS=10
 Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+# 2026-07-10 negative-skew plug: floored 1oz trades pay tight-stop risk only
+# (disaster widening reverted at the floor — code default ON) + hard $ ceiling
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=12
 # v16 mode is default
 Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=1
 Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=1

@@ -404,6 +404,118 @@ def test_execute_entry_sizing_clamped_up_is_journaled_not_refused(journal_conn):
     assert any(e["event"] == "sizing_min_volume_clamped" for e in events)
 
 
+# -- min-volume floor x disaster stop + absolute $ cap (2026-07-10 live lesson) ------
+
+_XAU_STYLE_DETAILS = {
+    # XAUUSD-scale constraints (OpenAPI): 1 oz floor, whole-oz steps
+    "minVolume": 1.0,
+    "maxVolume": 100.0,
+    "volumeStep": 1.0,
+    "lotSize": 100.0,
+    "pipSize": 0.01,
+}
+
+
+def test_min_vol_floor_disaster_stop_reverts_to_tight(journal_conn, monkeypatch):
+    """At the volume floor, disaster widening cannot shrink size — it only
+    multiplies real $ risk (live: ~9pt tight became an 18pt broker stop at the
+    1oz floor = -$18.11 on a $1.68-design trade). The executor must revert to
+    the TIGHT stop, restoring the equal-$-risk invariant."""
+    monkeypatch.delenv("DEXTER3_MIN_VOL_DISASTER_TIGHTEN", raising=False)
+    mcp = FakeMcp(symbol_details=dict(_XAU_STYLE_DETAILS), post_entry_position=_filled_position(volume=1.0, stop_loss=61994.0, take_profit=62012.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61994.0, tp=62012.0),  # 6pt tight stop
+        DEMO_ACCOUNT,
+        risk_usd_override=1.68,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    assert result["action"] == "entered"
+    kwargs = next(c for c in mcp.calls if c[0] == "place_market_order")[1]
+    # tight 6pt at pipSize 0.01 -> 600 pips, NOT the widened 1200
+    assert kwargs["stop_loss_pips"] == pytest.approx(600, abs=1)
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    tightened = [e for e in events if e["event"] == "min_vol_disaster_tightened"]
+    assert len(tightened) == 1
+    assert tightened[0]["payload"]["tight_sl_distance"] == pytest.approx(6.0)
+
+
+def test_min_vol_floor_disaster_tighten_kill_switch(journal_conn, monkeypatch):
+    monkeypatch.setenv("DEXTER3_MIN_VOL_DISASTER_TIGHTEN", "0")
+    mcp = FakeMcp(symbol_details=dict(_XAU_STYLE_DETAILS), post_entry_position=_filled_position(volume=1.0, stop_loss=61988.0, take_profit=62012.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61994.0, tp=62012.0),
+        DEMO_ACCOUNT,
+        risk_usd_override=1.68,
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    assert result["action"] == "entered"
+    kwargs = next(c for c in mcp.calls if c[0] == "place_market_order")[1]
+    assert kwargs["stop_loss_pips"] == pytest.approx(1200, abs=1)  # legacy widened
+
+
+def test_disaster_widening_kept_when_properly_sized(journal_conn, monkeypatch):
+    """Fix must NOT touch trades whose size is above the floor — the widened
+    stop + reduced size is the designed equal-$-risk trade there."""
+    monkeypatch.delenv("DEXTER3_MIN_VOL_DISASTER_TIGHTEN", raising=False)
+    mcp = FakeMcp(post_entry_position=_filled_position(volume=0.05, stop_loss=61800.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0),  # 100pt tight
+        DEMO_ACCOUNT,
+        risk_usd_override=10.0,  # 10/200 = 0.05 >= minVolume 0.01 -> no clamp
+        smart_exit={"regime": "disaster", "disaster_mult": 2.0},
+    )
+    assert result["action"] == "entered"
+    kwargs = next(c for c in mcp.calls if c[0] == "place_market_order")[1]
+    assert kwargs["stop_loss_pips"] == pytest.approx(20000, abs=1)  # widened kept
+    events = recent_exec_events(journal_conn._conn, symbol="BTCUSD")
+    assert not any(e["event"] == "min_vol_disaster_tightened" for e in events)
+
+
+def test_min_vol_abs_cap_refuses_oversized_floor_risk(journal_conn, monkeypatch):
+    """DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD keys off ACCOUNT economics (absolute
+    dollars), not the crushed design risk the old ratio cap used."""
+    monkeypatch.setenv("DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD", "9")
+    mcp = FakeMcp(symbol_details=dict(_XAU_STYLE_DETAILS))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61988.0, tp=62030.0),  # 12pt -> 1oz = $12 > $9 cap
+        DEMO_ACCOUNT,
+        risk_usd_override=0.25,
+    )
+    assert result["action"] == "refused"
+    assert result["reason"] == "min_volume_risk_exceeds_abs_cap"
+    assert result["estimated_min_volume_risk_usd"] == pytest.approx(12.0)
+    assert not any(c[0] == "place_market_order" for c in mcp.calls)
+
+
+def test_min_vol_abs_cap_default_off_accepts(journal_conn, monkeypatch):
+    monkeypatch.delenv("DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD", raising=False)
+    monkeypatch.delenv("DEXTER3_MIN_VOLUME_RISK_RATIO_CAP", raising=False)
+    mcp = FakeMcp(symbol_details=dict(_XAU_STYLE_DETAILS), post_entry_position=_filled_position(volume=1.0, stop_loss=61988.0, take_profit=62030.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61988.0, tp=62030.0),
+        DEMO_ACCOUNT,
+        risk_usd_override=0.25,
+    )
+    assert result["action"] == "entered"
+
+
+def test_min_vol_abs_cap_allows_tight_floor_risk_under_cap(journal_conn, monkeypatch):
+    monkeypatch.setenv("DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD", "9")
+    mcp = FakeMcp(symbol_details=dict(_XAU_STYLE_DETAILS), post_entry_position=_filled_position(volume=1.0, stop_loss=61994.0, take_profit=62012.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(max_volume_units=10.0))
+    result = ex.execute_entry(
+        FakeDecision(entry=62000.0, sl=61994.0, tp=62012.0),  # 6pt -> 1oz = $6 <= $9
+        DEMO_ACCOUNT,
+        risk_usd_override=0.25,
+    )
+    assert result["action"] == "entered"
+
+
 # -- entry placement + verification --------------------------------------------------
 
 
@@ -694,8 +806,11 @@ def test_execute_entry_tight_regime_explicit_matches_omitted(journal_conn):
 
 
 def test_execute_entry_disaster_regime_widens_broker_stop_distance(journal_conn):
+    # risk 4.0 / 200pt widened = 0.02 units >= minVolume 0.01 -> properly sized
+    # (at the volume FLOOR the widening now reverts to tight — covered by
+    # test_min_vol_floor_disaster_stop_reverts_to_tight)
     mcp = FakeMcp(post_entry_position=_filled_position())
-    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=4.0, max_volume_units=10.0))
     result = ex.execute_entry(
         FakeDecision(entry=62000.0, sl=61900.0, tp=62150.0, side="buy"),
         DEMO_ACCOUNT,
@@ -764,7 +879,8 @@ def test_execute_entry_disaster_regime_sell_side_broker_sl_price_above_entry(jou
     mcp = FakeMcp(
         post_entry_position=_filled_position(side="Sell", stop_loss=62300.0, take_profit=61700.0),
     )
-    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=1.0, max_volume_units=10.0))
+    # risk 4.0 keeps the trade above the volume floor (see buy-side test note)
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig(risk_usd=4.0, max_volume_units=10.0))
     result = ex.execute_entry(
         FakeDecision(entry=62000.0, sl=62100.0, tp=61700.0, side="sell"),
         DEMO_ACCOUNT,

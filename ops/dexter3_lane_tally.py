@@ -7,8 +7,11 @@ or destroying? Run any time (read-only):
     python ops/dexter3_lane_tally.py            # all days in the deals window
     python ops/dexter3_lane_tally.py --today    # today (UTC) only
 
-Uses Dexter3McpClient.get_deals(count=N) + client-side day filtering — never
-pass from/to to get_deals directly (silently ignored, see mcp_client docs).
+Uses the DEXTER3_TRANSPORT factory (local_mcp on the PC, openapi on the VM) +
+client-side day filtering — never pass from/to to get_deals directly (silently
+ignored, see mcp_client docs). On the VM run with:
+    DEXTER3_TRANSPORT=openapi DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877 \
+        python ops/dexter3_lane_tally.py --today
 Exit code 1 when --today is given and ANY lane is below --alert-net (default
 -15), so schedulers/loops can alarm on it.
 """
@@ -22,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dexter3.mcp_client import Dexter3McpClient  # noqa: E402
+from dexter3.transport import make_client  # noqa: E402
 
 
 def main() -> int:
@@ -32,7 +35,7 @@ def main() -> int:
     ap.add_argument("--alert-net", type=float, default=-15.0)
     args = ap.parse_args()
 
-    c = Dexter3McpClient()
+    c = make_client()
     deals = c.get_deals(count=args.count) or []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
