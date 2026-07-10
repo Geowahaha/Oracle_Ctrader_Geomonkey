@@ -87,9 +87,11 @@ from dexter3.v16_entry_quality import (
 RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
 GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
+VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
+VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -131,8 +133,13 @@ def _hunt_enabled() -> bool:
 def _vp_producer_enabled() -> bool:
     """Volume-profile producer canary flag — DEFAULT OFF (owner sign-off
     required before enabling; see the 2026-07-11 promotion-gate results on
-    AGENT_SYNC_BOARD). Takes precedence over hunt when set to 'vp'."""
-    return os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "vp"
+    AGENT_SYNC_BOARD). Takes precedence over hunt when enabled. Two ways in:
+    DEXTER3_PRODUCER=vp (producer-only override) or DEXTER3_MODE=vp (the full
+    VP canary lane: own label dexter3:vp:canary + own state file + own lock,
+    same isolation pattern as the grok lane)."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "vp":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "vp"
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -144,12 +151,20 @@ def _active_order_label(mode: str | None = None) -> str:
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
     if current_mode == "grok" and GROK_LABEL:
         return GROK_LABEL
+    if current_mode == "vp":
+        from dexter3.volume_profile import VP_LABEL
+
+        return VP_LABEL
     return LIVE_ORDER_LABEL
 
 
 def _active_state_file(mode: str | None = None) -> Path:
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
-    return GROK_STATE_FILE if current_mode == "grok" else STATE_FILE
+    if current_mode == "grok":
+        return GROK_STATE_FILE
+    if current_mode == "vp":
+        return VP_STATE_FILE
+    return STATE_FILE
 
 
 def _executor_config_from_env() -> "ExecutorConfig":
@@ -919,8 +934,12 @@ def _pid_alive(pid: int) -> bool:
 
 def acquire_loop_lock(mode: str = "v16") -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    lock_file = GROK_LOCK_FILE if mode == "grok" else LOCK_FILE
-    lock_name = "grok-v1.0" if mode == "grok" else "dexter3"
+    if mode == "grok":
+        lock_file, lock_name = GROK_LOCK_FILE, "grok-v1.0"
+    elif mode == "vp":
+        lock_file, lock_name = VP_LOCK_FILE, "vp-canary"
+    else:
+        lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
         try:
             old_pid = int(lock_file.read_text(encoding="utf-8").strip())
@@ -937,7 +956,12 @@ def acquire_loop_lock(mode: str = "v16") -> None:
 
 
 def release_loop_lock(mode: str = "v16") -> None:
-    lock_file = GROK_LOCK_FILE if mode == "grok" else LOCK_FILE
+    if mode == "grok":
+        lock_file = GROK_LOCK_FILE
+    elif mode == "vp":
+        lock_file = VP_LOCK_FILE
+    else:
+        lock_file = LOCK_FILE
     try:
         if lock_file.exists() and lock_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
             lock_file.unlink(missing_ok=True)
@@ -2338,6 +2362,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     """
     mode = os.environ.get("DEXTER3_MODE", "v16").lower().strip()
     is_grok = mode == "grok"
+    is_vp = mode == "vp"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -2345,7 +2370,23 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = GROK_LABEL
         print(f"[Grok] Forced executor LABEL to {GROK_LABEL}", flush=True)
 
-    active_label = GROK_LABEL if (is_grok and GROK_LABEL) else LIVE_ORDER_LABEL
+    # VP canary lane (2026-07-11): same isolation pattern as grok — its own
+    # broker label so fable/grok loops never touch VP positions and vice versa.
+    if is_vp:
+        from dexter3.volume_profile import VP_LABEL as _VP_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _VP_LABEL
+        print(f"[VP] Forced executor LABEL to {_VP_LABEL}", flush=True)
+
+    if is_grok and GROK_LABEL:
+        active_label = GROK_LABEL
+    elif is_vp:
+        from dexter3.volume_profile import VP_LABEL as _VP_LABEL
+
+        active_label = _VP_LABEL
+    else:
+        active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
     fable_version = os.environ.get("DEXTER3_FABLE_VERSION", "v1.7-selective-edge")
 

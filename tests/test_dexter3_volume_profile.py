@@ -177,3 +177,37 @@ def test_vp_producer_flag_other_value_off(monkeypatch):
 
     monkeypatch.setenv("DEXTER3_PRODUCER", "hunt")
     assert shadow_runner._vp_producer_enabled() is False
+
+
+# -- VP lane isolation (label / state / lock per DEXTER3_MODE=vp) ----------------
+
+
+def test_vp_mode_selects_vp_label_state_and_producer(monkeypatch):
+    from dexter3 import shadow_runner
+
+    monkeypatch.setenv("DEXTER3_MODE", "vp")
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert shadow_runner._active_order_label() == vp.VP_LABEL
+    assert shadow_runner._active_state_file().name == "dexter3_vp_shadow_state.json"
+    assert shadow_runner._vp_producer_enabled() is True  # mode implies producer
+
+
+def test_vp_mode_does_not_leak_into_default_lane(monkeypatch):
+    from dexter3 import shadow_runner
+
+    monkeypatch.delenv("DEXTER3_MODE", raising=False)
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert shadow_runner._active_order_label() != vp.VP_LABEL
+    assert shadow_runner._active_state_file().name == "dexter3_shadow_state.json"
+    assert shadow_runner._vp_producer_enabled() is False
+
+
+def test_vp_label_is_distinct_from_fable_and_grok():
+    from dexter3.executor import LABEL as FABLE_LABEL
+
+    assert vp.VP_LABEL != FABLE_LABEL
+    try:
+        from dexter3.grok_v10 import GROK_LABEL
+        assert vp.VP_LABEL != GROK_LABEL
+    except ImportError:
+        pass

@@ -37,6 +37,12 @@ from dexter3.hunter_brain import Decision, _bar_close_ts
 
 Bar = dict[str, Any]
 
+# Broker label for the VP canary lane — mirrors grok_v10.GROK_LABEL's role:
+# a distinct label per lane is the peer-isolation contract (loops never touch
+# foreign-labelled positions). shadow_runner forces executor.LABEL to this
+# when DEXTER3_MODE=vp.
+VP_LABEL = "dexter3:vp:canary"
+
 # -- tunables (module constants, auditable in one place) ---------------------
 PROFILE_WINDOW = 288          # bars in the rolling profile (24h of M5)
 PROFILE_BINS = 40             # price bins across the window's range
