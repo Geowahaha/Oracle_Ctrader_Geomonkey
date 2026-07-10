@@ -88,10 +88,16 @@ GAPS (read before relying on any of these in a live loop):
    guess). An unrecognized symbol raises a clear error rather than assuming
    a pip size.
 
-7. Every call here is a fresh subprocess (full OpenAPI TCP+auth handshake,
-   typically 1-5s) vs the local MCP's persistent HTTP session (~60-200ms).
-   This is a latency difference, not a correctness gap — expected and
-   accepted per ``docs/DEXTER3_VM_MIGRATION_DESIGN.md``.
+7. By default every call here is a fresh subprocess (full OpenAPI TCP+auth
+   handshake, ~18s measured live on the VM) vs the local MCP's persistent
+   HTTP session (~60-200ms). This was accepted as a latency difference for
+   P1/P2, but flagged in ``docs/DEXTER3_VM_MIGRATION_DESIGN.md`` gap #4 as a
+   connection-churn antipattern unusable at the lanes' 8-20s cadence.
+   FIXED (additive): set ``DEXTER3_OPENAPI_DAEMON_URL`` (e.g.
+   ``http://127.0.0.1:9877``) to route every call through
+   ``dexter3/openapi_daemon.py`` instead — ONE persistent, already-
+   authenticated connection serving many requests, no per-call handshake.
+   Unset = unchanged subprocess behavior (this module's historical default).
 
 8. Volume units: dexter3 volume is in "units" (1 unit = 0.01 lot XAU = 1 oz,
    confirmed against ``tests/test_dexter3_wiring.py``'s
@@ -115,6 +121,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from dexter3.mcp_client import (
     McpClientError,
@@ -140,6 +148,20 @@ DEFAULT_WORKER_PATH = ROOT / "ops" / "ctrader_execute_once.py"
 # only — never a way to silently widen which accounts this client can touch.
 DEFAULT_ACCOUNT_ID_PIN = 46670728
 ACCOUNT_ID_PIN_ENV_VAR = "DEXTER3_OPENAPI_ACCOUNT_ID"
+
+# Persistent-connection daemon (dexter3/openapi_daemon.py, gap #4 in
+# docs/DEXTER3_VM_MIGRATION_DESIGN.md). Unset (default) = unchanged
+# subprocess-per-call behavior below; set to the daemon's base URL (e.g.
+# "http://127.0.0.1:9877") to POST /call instead of spawning
+# ops/ctrader_execute_once.py — no TCP+OAuth handshake per call, since the
+# daemon already holds one persistent authenticated connection.
+DAEMON_URL_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_URL"
+# Daemon-mode default timeout: much lower than the subprocess default (25s)
+# because there is no connection handshake to wait out — only the actual
+# protobuf round-trip over an already-open socket. Env-tunable per the task
+# spec ("Timeout per call env-tunable, default much lower (5s)").
+DAEMON_TIMEOUT_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC"
+DEFAULT_DAEMON_TIMEOUT_SEC = 5.0
 
 # dexter3 "units" (1 unit = 0.01 lot XAU = 1 oz) <-> cTrader OpenAPI raw
 # volume (hundredths of a unit) — see module docstring gap #8 for evidence.
@@ -171,8 +193,12 @@ DEFAULT_RETRY_BACKOFF_SEC = 1.5
 # broker never definitively answered" (retryable for reads, McpMutationUncertain
 # for mutations). Every other status (even ok=False ones like "rejected") means
 # the worker DID get a definitive answer back and must never be retried.
+# "disconnected" is the daemon-mode-only status (dexter3/openapi_daemon.py's
+# handle_call) meaning the daemon itself has no live cTrader connection right
+# now — the broker never saw this request either, so it belongs in the same
+# retryable bucket as the subprocess-mode transport failures.
 _TRANSPORT_FAILURE_STATUSES = frozenset(
-    {"worker_missing", "worker_error", "timeout", "worker_failure", "worker_invalid_result"}
+    {"worker_missing", "worker_error", "timeout", "worker_failure", "worker_invalid_result", "disconnected"}
 )
 
 
@@ -244,13 +270,26 @@ class Dexter3OpenApiClient:
         worker_path: Path | str | None = None,
         account_id: int | None = None,
         python_executable: str | None = None,
-        timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+        timeout_sec: float | None = None,
         health_timeout_sec: float = DEFAULT_HEALTH_TIMEOUT_SEC,
         retry_backoff_sec: float = DEFAULT_RETRY_BACKOFF_SEC,
     ) -> None:
         self.worker_path = Path(worker_path) if worker_path is not None else DEFAULT_WORKER_PATH
         self.python_executable = python_executable or sys.executable
-        self.timeout_sec = float(timeout_sec)
+        # Daemon mode (additive): DEXTER3_OPENAPI_DAEMON_URL set -> _run_worker_once
+        # POSTs to the daemon instead of spawning the subprocess (unset =
+        # unchanged subprocess behavior below). timeout_sec=None (the new
+        # default) resolves to the daemon's lower default when daemon mode is
+        # active, else the historical subprocess default — an explicit
+        # timeout_sec argument always wins over either default.
+        self.daemon_url = str(os.environ.get(DAEMON_URL_ENV_VAR, "") or "").strip()
+        if timeout_sec is not None:
+            self.timeout_sec = float(timeout_sec)
+        elif self.daemon_url:
+            env_val = str(os.environ.get(DAEMON_TIMEOUT_ENV_VAR, "") or "").strip()
+            self.timeout_sec = float(env_val) if env_val else DEFAULT_DAEMON_TIMEOUT_SEC
+        else:
+            self.timeout_sec = DEFAULT_TIMEOUT_SEC
         self.health_timeout_sec = float(health_timeout_sec)
         self.retry_backoff_sec = float(retry_backoff_sec)
 
@@ -265,13 +304,21 @@ class Dexter3OpenApiClient:
     # -- transport plumbing --------------------------------------------------
 
     def _run_worker_once(self, mode: str, payload: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-        """One subprocess invocation of the proven worker. Mirrors
+        """One call to the proven worker's mode contract — either the
+        persistent daemon (POST /call, when ``self.daemon_url`` is set) or a
+        fresh subprocess invocation of ``ops/ctrader_execute_once.py``
+        (unset, unchanged default). Mirrors
         ``execution/ctrader_executor.py::CTraderExecutor._run_worker``
-        exactly (same worker, same CLI contract) — duplicated here (not
-        imported) because that method is bound to the live executor's own
-        instance state; this is the same small, self-contained subprocess
-        plumbing, not a new protocol implementation.
+        exactly for the subprocess path (same worker, same CLI contract) —
+        duplicated here (not imported) because that method is bound to the
+        live executor's own instance state; this is the same small,
+        self-contained subprocess plumbing, not a new protocol
+        implementation. Both branches return the identical raw-dict shape
+        so ``_invoke``'s retry/mutation-classification logic below never
+        needs to know which transport answered it.
         """
+        if self.daemon_url:
+            return self._run_worker_once_via_daemon(mode, payload, timeout_sec)
         if not self.worker_path.exists():
             return {"ok": False, "status": "worker_missing", "message": f"worker not found: {self.worker_path}"}
         cmd = [self.python_executable, str(self.worker_path), "--mode", str(mode or "health")]
@@ -315,6 +362,42 @@ class Dexter3OpenApiClient:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    def _run_worker_once_via_daemon(self, mode: str, payload: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+        """Daemon-mode transport: POST /call to ``dexter3/openapi_daemon.py``.
+
+        Returns the SAME raw-dict shape ``_run_worker_once``'s subprocess
+        branch returns — ``_invoke``'s classification (transport failure vs.
+        tool-level failure) is transport-agnostic by design, so a network
+        error/timeout here is mapped to the identical
+        ``_TRANSPORT_FAILURE_STATUSES`` vocabulary the subprocess path uses.
+        """
+        url = f"{self.daemon_url.rstrip('/')}/call"
+        eff_timeout = max(1.0, float(timeout_sec or self.timeout_sec))
+        try:
+            resp = requests.post(
+                url,
+                json={"mode": str(mode or "health"), "payload": payload},
+                timeout=eff_timeout,
+            )
+        except requests.exceptions.Timeout as exc:
+            return {"ok": False, "status": "timeout", "message": f"daemon request timeout after {eff_timeout}s: {exc}"}
+        except requests.exceptions.RequestException as exc:
+            return {"ok": False, "status": "worker_error", "message": f"daemon request failed: {exc}"}
+        if resp.status_code >= 400:
+            detail = (resp.text or "")[:300]
+            return {"ok": False, "status": "worker_error", "message": f"daemon HTTP {resp.status_code}: {detail}"}
+        try:
+            parsed = resp.json()
+        except ValueError as exc:
+            return {"ok": False, "status": "worker_error", "message": f"daemon returned non-JSON body: {exc}"}
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "status": "worker_error",
+                "message": f"daemon returned non-dict JSON: {type(parsed).__name__}",
+            }
+        return parsed
 
     @staticmethod
     def _extract_json_line(stdout_text: str) -> dict[str, Any]:
@@ -513,11 +596,41 @@ class Dexter3OpenApiClient:
         return bars[-count:] if count and len(bars) > count else bars
 
     def get_spot_price(self, symbol: str) -> dict[str, Any]:
-        """Live bid/ask via a short ``capture_market`` subscribe window
-        (the only read-only worker mode that streams spot ticks). Returns
-        the MOST RECENT spot event's bid/ask; raises if none arrived within
-        the capture window."""
+        """Live bid/ask.
+
+        Daemon mode (``DEXTER3_OPENAPI_DAEMON_URL`` set): served by the
+        daemon-only ``spot_quote`` mode from its standing spot-subscription
+        cache with a staleness bound (see ``dexter3/openapi_daemon.py``'s
+        ``DEFAULT_SPOT_MAX_AGE_SEC`` rationale). A ``spot_stale`` answer is
+        a definitive tool-level failure, so ``_invoke`` raises
+        ``McpClientError`` — the entry pipeline's HARD VETO stays
+        fail-closed instead of pricing off an old quote (the exact failure
+        the VM shadow hit 2026-07-10 03:21Z: spread_abs=0.0 from an empty
+        short capture window).
+
+        Subprocess mode (unset, historical default): a short
+        ``capture_market`` subscribe window, unchanged. Both paths return
+        the same shape and raise when no usable quote exists."""
         sym = str(symbol or "").strip().upper()
+        if self.daemon_url:
+            raw = self._invoke(
+                "spot_quote",
+                self._payload(symbol=sym),
+                mutating=False,
+                timeout_sec=self.timeout_sec,
+            )
+            spots = raw.get("spots") or []
+            if not spots:
+                raise McpClientError(f"no live quote for {sym} via daemon spot_quote (empty spots)")
+            latest = spots[-1]
+            return {
+                "bid": float(latest.get("bid", 0.0) or 0.0),
+                "ask": float(latest.get("ask", 0.0) or 0.0),
+                "symbol": sym,
+                "quote_source": "openapi_daemon_spot_cache",
+                "event_utc": str(latest.get("event_utc") or ""),
+                "quote_age_sec": raw.get("quote_age_sec"),
+            }
         payload = self._payload(
             symbols=[sym],
             include_depth=False,

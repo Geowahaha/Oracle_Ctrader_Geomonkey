@@ -1,0 +1,36 @@
+# dexter3 persistent cTrader OpenAPI daemon (docs/DEXTER3_VM_MIGRATION_DESIGN.md gap #4).
+# ONE long-lived authenticated OpenAPI connection serving the dexter3 lanes'
+# reads/writes over local HTTP (127.0.0.1:9877) — replaces the
+# subprocess-per-call transport (~18s handshake per read).
+#
+# Install (VM):
+#   sudo cp /opt/dexter_pro/ops/dexter3-openapi-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dexter3-openapi-daemon.service
+# Verify:
+#   curl -s http://127.0.0.1:9877/health
+#
+# Token: READ-ONLY consumer of data/runtime/ctrader_token_state.json via
+# api/ctrader_token_manager — refresh ownership stays with the keepalive
+# owner (single-owner architecture, commit da341f4). This unit never
+# refreshes or writes token state.
+
+[Unit]
+Description=Dexter3 persistent cTrader OpenAPI daemon (local HTTP 127.0.0.1:9877)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/dexter_pro
+EnvironmentFile=-/opt/dexter_pro/.env.local
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dexter_pro/.venv/bin/python -m dexter3.openapi_daemon
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/dexter3-openapi-daemon.log
+StandardError=append:/var/log/dexter3-openapi-daemon.log
+
+[Install]
+WantedBy=multi-user.target

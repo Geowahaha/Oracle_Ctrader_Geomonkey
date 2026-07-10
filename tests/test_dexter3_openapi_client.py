@@ -13,10 +13,14 @@ import os
 from typing import Any
 
 import pytest
+import requests
 
+import dexter3.openapi_client as openapi_client_module
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpMutationUncertain
 from dexter3.openapi_client import (
     DEFAULT_ACCOUNT_ID_PIN,
+    DEFAULT_DAEMON_TIMEOUT_SEC,
+    DEFAULT_TIMEOUT_SEC,
     Dexter3OpenApiAccountPinError,
     Dexter3OpenApiClient,
     Dexter3OpenApiNotImplementedError,
@@ -802,3 +806,314 @@ def test_factory_case_insensitive(monkeypatch):
     monkeypatch.setenv("DEXTER3_TRANSPORT", "OpenAPI")
     client = make_client()
     assert isinstance(client, Dexter3OpenApiClient)
+
+
+# ---------------------------------------------------------------------------
+# daemon mode (DEXTER3_OPENAPI_DAEMON_URL) — added 2026-07-10, gap #4 of
+# docs/DEXTER3_VM_MIGRATION_DESIGN.md. When the env var is SET, _invoke's
+# transport (_run_worker_once) POSTs {"mode","payload"} to the daemon's
+# /call endpoint instead of spawning ops/ctrader_execute_once.py; when it
+# is UNSET, behavior is byte-identical to before (every test above this
+# section runs without the env var and still passes — that IS the
+# regression guard for the subprocess path).
+# ---------------------------------------------------------------------------
+
+DAEMON_URL = "http://127.0.0.1:9877"
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload: Any, status_code: int = 200, text: str = "") -> None:
+        self._payload = payload
+        self.status_code = int(status_code)
+        self.text = text or ("" if payload is None else str(payload))
+
+    def json(self) -> Any:
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def _daemon_client(monkeypatch, **kwargs) -> Dexter3OpenApiClient:
+    monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_URL", DAEMON_URL)
+    return Dexter3OpenApiClient(**kwargs)
+
+
+def test_daemon_mode_off_by_default(monkeypatch):
+    monkeypatch.delenv("DEXTER3_OPENAPI_DAEMON_URL", raising=False)
+    c = _client()
+    assert c.daemon_url == ""
+    assert c.timeout_sec == DEFAULT_TIMEOUT_SEC  # subprocess default unchanged
+
+
+def test_daemon_mode_uses_lower_default_timeout(monkeypatch):
+    c = _daemon_client(monkeypatch)
+    assert c.daemon_url == DAEMON_URL
+    assert c.timeout_sec == DEFAULT_DAEMON_TIMEOUT_SEC == 5.0
+
+
+def test_daemon_mode_timeout_env_tunable(monkeypatch):
+    monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC", "9.5")
+    c = _daemon_client(monkeypatch)
+    assert c.timeout_sec == pytest.approx(9.5)
+
+
+def test_daemon_mode_explicit_timeout_argument_wins(monkeypatch):
+    monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC", "9.5")
+    c = _daemon_client(monkeypatch, timeout_sec=3.0)
+    assert c.timeout_sec == pytest.approx(3.0)
+
+
+def test_daemon_mode_posts_to_daemon_not_subprocess(monkeypatch):
+    """DEXTER3_OPENAPI_DAEMON_URL set -> _run_worker_once must hit the URL
+    with the {"mode","payload"} envelope and must NEVER touch the subprocess
+    path (worker_path/subprocess.run)."""
+    seen: dict[str, Any] = {}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002 - requests kwarg name
+        seen["url"] = url
+        seen["body"] = json
+        seen["timeout"] = timeout
+        return _FakeHttpResponse({"ok": True, "status": "connected", "balance": 100000, "money_digits": 2, "account_id": DEFAULT_ACCOUNT_ID_PIN, "environment": "demo"})
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("subprocess path must not run in daemon mode")
+
+    monkeypatch.setattr(openapi_client_module.subprocess, "run", _explode)
+
+    c = _daemon_client(monkeypatch)
+    raw = c._run_worker_once("health", {"account_id": DEFAULT_ACCOUNT_ID_PIN}, 5.0)
+    assert raw["ok"] is True
+    assert seen["url"] == f"{DAEMON_URL}/call"
+    assert seen["body"] == {"mode": "health", "payload": {"account_id": DEFAULT_ACCOUNT_ID_PIN}}
+    assert seen["timeout"] == pytest.approx(5.0)
+
+
+def test_daemon_mode_full_read_parses_same_shapes(monkeypatch):
+    """End-to-end through _invoke + normalization: a daemon-served reconcile
+    response produces the identical get_positions() output the subprocess
+    transport produces (same golden position fixture)."""
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        mode = json["mode"]
+        if mode == "accounts":
+            return _FakeHttpResponse(_accounts_ok())
+        if mode == "reconcile":
+            return _FakeHttpResponse({"ok": True, "status": "reconciled", "positions": [dict(_GOLDEN_POSITION)], "orders": [], "deals": []})
+        raise AssertionError(f"unexpected mode {mode}")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    [pos] = c.get_positions()
+    assert pos["positionId"] == 62664990
+    assert pos["tradeSide"] == "BUY"
+    assert pos["volume"] == pytest.approx(1.0)
+    assert pos["label"] == "dexter3:fable:m5h-v1"
+
+
+def test_daemon_mode_connection_error_maps_to_transport_failure(monkeypatch):
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    raw = c._run_worker_once("health", {}, 5.0)
+    assert raw["ok"] is False
+    assert raw["status"] == "worker_error"  # retryable transport bucket
+
+
+def test_daemon_mode_timeout_maps_to_timeout_status(monkeypatch):
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    raw = c._run_worker_once("health", {}, 5.0)
+    assert raw["status"] == "timeout"
+
+
+def test_daemon_mode_http_error_status_maps_to_worker_error(monkeypatch):
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        return _FakeHttpResponse({"ok": False}, status_code=500, text="internal")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    raw = c._run_worker_once("health", {}, 5.0)
+    assert raw["status"] == "worker_error"
+    assert "500" in raw["message"]
+
+
+def test_daemon_mode_disconnected_read_retries_then_raises_transport_error(monkeypatch):
+    """The daemon's {"ok":false,"status":"disconnected"} means the broker
+    never saw the request — reads retry once (like other transport failures)
+    then raise Dexter3OpenApiTransportError, NOT a plain tool error."""
+    calls = {"n": 0}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        calls["n"] += 1
+        return _FakeHttpResponse({"ok": False, "status": "disconnected", "message": "no live connection"})
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    monkeypatch.setattr(c, "retry_backoff_sec", 0.0)
+    with pytest.raises(Dexter3OpenApiTransportError):
+        c._invoke("reconcile", {}, mutating=False)
+    assert calls["n"] == 2  # one retry, no more
+
+
+def test_daemon_mode_disconnected_mutation_raises_mutation_uncertain(monkeypatch):
+    calls = {"n": 0}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        calls["n"] += 1
+        return _FakeHttpResponse({"ok": False, "status": "disconnected", "message": "no live connection"})
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    with pytest.raises(McpMutationUncertain):
+        c._invoke("execute", {"symbol": "XAUUSD"}, mutating=True)
+    assert calls["n"] == 1  # never blind-retry a mutation
+
+
+def test_daemon_mode_tool_level_failure_never_retried(monkeypatch):
+    """A definitive broker answer relayed by the daemon (e.g. rejected)
+    must raise plain McpClientError after exactly one attempt."""
+    calls = {"n": 0}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        calls["n"] += 1
+        return _FakeHttpResponse({"ok": False, "status": "rejected", "message": "order rejected"})
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    with pytest.raises(McpClientError) as excinfo:
+        c._invoke("execute", {"symbol": "XAUUSD"}, mutating=True)
+    assert not isinstance(excinfo.value, McpMutationUncertain)
+    assert calls["n"] == 1
+
+
+def test_daemon_mode_non_json_body_maps_to_worker_error(monkeypatch):
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        return _FakeHttpResponse(ValueError("not json"), status_code=200, text="<html>oops</html>")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    raw = c._run_worker_once("health", {}, 5.0)
+    assert raw["status"] == "worker_error"
+    assert "non-JSON" in raw["message"]
+
+
+def test_daemon_mode_get_spot_price_uses_spot_quote_mode(monkeypatch):
+    """Daemon mode routes get_spot_price through the daemon-only spot_quote
+    (live-cache) mode — NOT capture_market — and parses the same shape."""
+    seen_modes: list[str] = []
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        seen_modes.append(json["mode"])
+        if json["mode"] == "accounts":
+            return _FakeHttpResponse(_accounts_ok())
+        if json["mode"] == "spot_quote":
+            assert json["payload"]["symbol"] == "XAUUSD"
+            return _FakeHttpResponse({
+                "ok": True,
+                "status": "spot_quote",
+                "source": "live_cache",
+                "quote_age_sec": 0.12,
+                "spots": [{"bid": 4125.83, "ask": 4126.03, "event_utc": "2026-07-10T03:21:32Z"}],
+            })
+        raise AssertionError(f"unexpected mode {json['mode']}")
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    quote = c.get_spot_price("XAUUSD")
+    assert quote["bid"] == pytest.approx(4125.83)
+    assert quote["ask"] == pytest.approx(4126.03)
+    assert quote["quote_source"] == "openapi_daemon_spot_cache"
+    assert quote["quote_age_sec"] == pytest.approx(0.12)
+    assert "capture_market" not in seen_modes
+    assert seen_modes == ["accounts", "spot_quote"]
+
+
+def test_daemon_mode_spot_stale_raises_fail_closed(monkeypatch):
+    """spot_stale is a definitive tool-level answer: get_spot_price must
+    raise McpClientError (HARD VETO upstream), never return a stale price
+    and never retry."""
+    calls = {"n": 0}
+
+    def _fake_post(url, json=None, timeout=None):  # noqa: A002
+        if json["mode"] == "accounts":
+            return _FakeHttpResponse(_accounts_ok())
+        calls["n"] += 1
+        return _FakeHttpResponse({
+            "ok": False,
+            "status": "spot_stale",
+            "message": "no fresh XAUUSD quote within max_age=5.0s (newest cached quote is 42.0s old)",
+            "age_sec": 42.0,
+        })
+
+    monkeypatch.setattr(openapi_client_module.requests, "post", _fake_post)
+    c = _daemon_client(monkeypatch)
+    with pytest.raises(McpClientError) as excinfo:
+        c.get_spot_price("XAUUSD")
+    assert "spot_stale" in str(excinfo.value)
+    assert calls["n"] == 1  # definitive answer -> no retry
+
+
+def test_subprocess_mode_get_spot_price_still_uses_capture_market(monkeypatch):
+    """Regression guard: with the daemon env var UNSET, get_spot_price's
+    capture_market path is byte-identical to before."""
+    monkeypatch.delenv("DEXTER3_OPENAPI_DAEMON_URL", raising=False)
+    c = _client()
+    router = _InvokeRouter(
+        {
+            "capture_market": {
+                "ok": True,
+                "spots": [{"bid": 2400.0, "ask": 2400.2, "event_utc": "t"}],
+            }
+        }
+    )
+    monkeypatch.setattr(c, "_invoke", router)
+    quote = c.get_spot_price("XAUUSD")
+    assert quote["quote_source"] == "openapi_capture_market"
+    assert [m for m, _p, _mut in router.calls] == ["accounts", "capture_market"]
+
+
+def test_daemon_mode_against_real_local_http_server(monkeypatch):
+    """Full-stack loopback: a REAL daemon HTTP listener (dexter3.openapi_daemon.
+    build_server on an ephemeral port, fake dispatcher — no Twisted, no
+    broker) served to a REAL Dexter3OpenApiClient in daemon mode. Proves the
+    two halves actually speak the same wire protocol, not just that each
+    half matches its own mocks."""
+    import threading
+
+    from dexter3.openapi_daemon import build_server
+
+    received: list[tuple[str, dict]] = []
+
+    def _dispatch(mode: str, payload: dict) -> dict:
+        received.append((mode, payload))
+        if mode == "accounts":
+            return _accounts_ok()
+        if mode == "health":
+            return {"ok": True, "status": "connected", "balance": 100000, "money_digits": 2, "account_id": DEFAULT_ACCOUNT_ID_PIN, "environment": "demo"}
+        return {"ok": False, "status": "unknown_mode", "message": mode}
+
+    server = build_server(dispatch_call=_dispatch, health_snapshot=lambda: {"connected": True}, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        monkeypatch.setenv("DEXTER3_OPENAPI_DAEMON_URL", f"http://127.0.0.1:{port}")
+        c = Dexter3OpenApiClient()
+        bal = c.get_balance()
+        assert bal["balance"] == pytest.approx(1000.00)
+        assert bal["traderId"] == DEFAULT_ACCOUNT_ID_PIN
+        modes = [m for m, _p in received]
+        assert modes == ["accounts", "health"]  # pin first, then the real read
+        # account pin id was carried in the payload exactly like subprocess mode
+        assert received[1][1]["account_id"] == DEFAULT_ACCOUNT_ID_PIN
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
