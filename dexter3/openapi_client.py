@@ -113,6 +113,7 @@ GAPS (read before relying on any of these in a live loop):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -682,13 +683,54 @@ class Dexter3OpenApiClient:
         }
 
     def get_symbol_details(self, symbol: str) -> dict[str, Any]:
-        raise Dexter3OpenApiNotImplementedError(
-            f"get_symbol_details({symbol!r}) is not supported by the OpenAPI transport yet: "
-            "no existing ops/ctrader_execute_once.py worker mode returns minVolume/stepVolume/"
-            "maxVolume/lotSize to the caller (see gap #1 in dexter3/openapi_client.py's module "
-            "docstring). Extend the worker with a read-only symbol-meta mode, or provide a "
-            "confirmed-live static table, before relying on this for live execution."
+        """Symbol trading spec via the daemon's ``symbol_details`` mode (closes
+        migration gap #2). Only available in daemon mode — the one-shot
+        subprocess worker has no symbol-meta mode, so without a daemon this
+        still raises NotImplemented (execute_entry then fail-closes as before).
+
+        Converts RAW cTrader ProtoOASymbol fields to the dexter3 dict shape the
+        executor reads (minVolume/volumeStep/maxVolume in dexter3 units,
+        pipSize, lotSize) using the SAME volume helper as positions/deals so
+        the raw↔units boundary stays consistent. pipSize is DERIVED live from
+        pipPosition (``10**-pipPosition``) — not hardcoded — with the known
+        table used only as a sanity cross-check / fallback when the broker
+        sends an unusable pipPosition."""
+        if not self.daemon_url:
+            raise Dexter3OpenApiNotImplementedError(
+                f"get_symbol_details({symbol!r}) requires the OpenAPI daemon "
+                "(DEXTER3_OPENAPI_DAEMON_URL). The one-shot subprocess worker has no "
+                "symbol-meta mode; execute_entry fail-closes without it."
+            )
+        raw = self._invoke(
+            "symbol_details",
+            {**self._payload(), "symbol": str(symbol)},
+            mutating=False,
+            timeout_sec=self.health_timeout_sec,
         )
+        pip_position = int(raw.get("pipPosition", 0) or 0)
+        pip_size = 10.0 ** (-pip_position) if pip_position > 0 else 0.0
+        known = _PIP_SIZE_BY_SYMBOL.get(str(symbol).upper())
+        if pip_size <= 0.0:
+            # Broker sent an unusable pipPosition — fall back to the known table
+            # rather than trade with a zero pip size (which would corrupt SL/TP).
+            pip_size = float(known) if known else 0.0
+        elif known is not None and abs(pip_size - known) > 1e-9:
+            logging.getLogger("dexter3.openapi_client").warning(
+                "get_symbol_details(%s): derived pipSize %s disagrees with known table %s "
+                "(using LIVE derived value)", symbol, pip_size, known
+            )
+        return {
+            "symbolName": str(raw.get("symbolName") or symbol),
+            "minVolume": _raw_volume_to_units(raw.get("minVolume_raw", 0)),
+            "volumeStep": _raw_volume_to_units(raw.get("stepVolume_raw", 0)),
+            "maxVolume": _raw_volume_to_units(raw.get("maxVolume_raw", 0)),
+            # lotSize = raw-volume units per one dexter3 sizing unit, i.e. the
+            # conversion scale itself (informational — executor's sizing math
+            # uses minVolume/volumeStep, not lotSize).
+            "lotSize": float(UNITS_TO_RAW_SCALE),
+            "pipSize": pip_size,
+            "digits": int(raw.get("digits", 0) or 0),
+        }
 
     def get_pending_orders(self) -> list[dict[str, Any]]:
         raw = self._reconcile()

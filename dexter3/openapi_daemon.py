@@ -1277,6 +1277,8 @@ class OpenApiDaemon:
                     result = yield self._mode_spot_quote(account_id, payload)
                 elif mode == "get_trendbars":
                     result = yield self._mode_get_trendbars(account_id, payload)
+                elif mode == "symbol_details":
+                    result = yield self._mode_symbol_details(account_id, payload)
                 elif mode == "capture_market":
                     result = yield self._mode_capture_market(account_id, payload)
                 elif mode == "execute":
@@ -1417,6 +1419,47 @@ class OpenApiDaemon:
             "orders": orders,
             "deals": deals,
             "token_refresh": {},
+        })
+
+    @defer.inlineCallbacks
+    def _mode_symbol_details(self, account_id: int, payload: dict[str, Any]):
+        """Full trading spec for a symbol (closes migration gap #2 — execute_entry
+        needs minVolume/volumeStep/lotSize/pipSize to size orders).
+
+        Returns RAW cTrader ProtoOASymbol fields; the client
+        (Dexter3OpenApiClient.get_symbol_details) does the unit conversion with
+        its own existing helpers so the raw-vs-dexter3-units boundary lives in
+        ONE place. Volumes here are cTrader raw (centi-units); the client
+        divides by UNITS_TO_RAW_SCALE. pipPosition/digits are the price
+        precision the client turns into pipSize = 10**(-pipPosition)."""
+        sd_symbol = str(payload.get("symbol", "XAUUSD") or "XAUUSD")
+        light_symbols, _symbol_map = yield self._get_symbols(account_id)
+        sd_obj, _match = _resolve_symbol(light_symbols, {"symbol": sd_symbol, "market_symbol": sd_symbol})
+        if sd_obj is None:
+            defer.returnValue({"ok": False, "status": "symbol_not_found", "message": f"symbol not found: {sd_symbol}"})
+            return
+        sd_symbol_id = _safe_int(getattr(sd_obj, "symbolId", 0), 0)
+        sd_symbol_name = str(getattr(sd_obj, "symbolName", "") or "").strip()
+        meta_msg = yield self.client.send(
+            pb.ProtoOASymbolByIdReq(ctidTraderAccountId=int(account_id), symbolId=[int(sd_symbol_id)]),
+            responseTimeoutInSeconds=int(REQUEST_TIMEOUT_LIGHT_SEC),
+        )
+        meta_payload = Protobuf.extract(meta_msg)
+        meta_list = list(getattr(meta_payload, "symbol", []) or [])
+        if not meta_list:
+            defer.returnValue({"ok": False, "status": "symbol_details_empty", "message": f"no ProtoOASymbol for {sd_symbol_name}"})
+            return
+        meta = meta_list[0]
+        defer.returnValue({
+            "ok": True,
+            "status": "symbol_details_loaded",
+            "symbolId": sd_symbol_id,
+            "symbolName": sd_symbol_name,
+            "digits": _safe_int(getattr(meta, "digits", 0), 0),
+            "pipPosition": _safe_int(getattr(meta, "pipPosition", 0), 0),
+            "minVolume_raw": _safe_int(getattr(meta, "minVolume", 0), 0),
+            "stepVolume_raw": _safe_int(getattr(meta, "stepVolume", 0), 0),
+            "maxVolume_raw": _safe_int(getattr(meta, "maxVolume", 0), 0),
         })
 
     @defer.inlineCallbacks
