@@ -85,6 +85,16 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=8, help="combos re-scored on the validate segment")
     ap.add_argument("--min-derive-trades", type=int, default=80, help="combos with fewer derive trades are ignored")
     ap.add_argument("--base-risk-usd", type=float, default=12.0, help="$ per 1R for the $/day translation")
+    ap.add_argument(
+        "--brain",
+        action="store_true",
+        help=(
+            "decisions from hunter_brain.decide (SELECTIVE path: named setups + RR floor) "
+            "instead of hunt_mode.decide_hunt (participation-first). The 6000-bar hunt-mode "
+            "sweep proved NO exit/gate combo rescues the hunt stream — this tests the other "
+            "entry model in the codebase under the same discipline. Canary = DEXTER3_HUNT=0."
+        ),
+    )
     args = ap.parse_args()
 
     c = make_client()
@@ -105,7 +115,11 @@ def main() -> int:
         m15c = [b for b in m15 if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
         h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
         try:
-            d = hunt_mode.decide_hunt(args.symbol, prefix, m15c, h1c, None, args.spread_abs)
+            if args.brain:
+                from dexter3 import hunter_brain
+                d = hunter_brain.decide(args.symbol, None, prefix, m15c, h1c, journal_stats=None)
+            else:
+                d = hunt_mode.decide_hunt(args.symbol, prefix, m15c, h1c, None, args.spread_abs)
         except Exception:
             continue
         if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
