@@ -1,0 +1,11 @@
+# Every 6h forward-evidence tally — see dexter3-forward-tally.service.
+[Unit]
+Description=Dexter3 forward-evidence tally every 6h
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+# Dexter3 forward-evidence tally (measurement-only, no trading behavior).
+# Appends the clean-window per-lane PnL (since the 2026-07-10T16:55Z
+# uncontaminated cutoff — post double-owner/skew/learner fixes) to
+# data/runtime/dexter3_forward_tally.log so the decisive forward evidence
+# accumulates even with no agent session attached. Paired with
+# dexter3-forward-tally.timer (every 6h).
+[Unit]
+Description=Dexter3 forward-evidence lane tally (clean window, append log)
+After=dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dexter_pro
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_OPENAPI_DEALS_TIMEOUT_SEC=30
+ExecStart=/bin/sh -c 'echo "===== $(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) =====" >> data/runtime/dexter3_forward_tally.log && /opt/dexter_pro/.venv/bin/python ops/dexter3_lane_tally.py --since 2026-07-10T16:55:00Z >> data/runtime/dexter3_forward_tally.log 2>&1 || true'
