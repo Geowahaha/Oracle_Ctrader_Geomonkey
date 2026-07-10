@@ -516,8 +516,11 @@ def test_get_trendbars_maps_period_and_shape(monkeypatch):
     monkeypatch.setattr(c, "_invoke", router)
     bars = c.get_trendbars("XAUUSD", "m5", 2)
     assert len(bars) == 2
-    assert set(bars[0].keys()) == {"open", "high", "low", "close", "ts"}
+    assert set(bars[0].keys()) == {"open", "high", "low", "close", "ts", "volume"}
     assert bars[0]["ts"] < bars[1]["ts"]  # oldest -> newest
+    # tick volume passthrough (2026-07-11): the daemon always returned it but
+    # this normalization silently dropped it — volume-profile logic needs it
+    assert bars[0]["volume"] == pytest.approx(10.0)
 
 
 def test_get_trendbars_unsupported_period_raises(monkeypatch):

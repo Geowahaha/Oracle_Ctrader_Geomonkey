@@ -88,14 +88,23 @@ def main() -> int:
     ap.add_argument(
         "--brain",
         action="store_true",
+        help="deprecated alias for --producer brain",
+    )
+    ap.add_argument(
+        "--producer",
+        choices=("hunt", "brain", "vp"),
+        default="hunt",
         help=(
-            "decisions from hunter_brain.decide (SELECTIVE path: named setups + RR floor) "
-            "instead of hunt_mode.decide_hunt (participation-first). The 6000-bar hunt-mode "
-            "sweep proved NO exit/gate combo rescues the hunt stream — this tests the other "
-            "entry model in the codebase under the same discipline. Canary = DEXTER3_HUNT=0."
+            "decision producer: hunt = decide_hunt (participation-first, LIVE default); "
+            "brain = hunter_brain.decide (selective setups + RR floor); "
+            "vp = dexter3.volume_profile.decide_vp (NEW logic 2026-07-11: LVN rejection / "
+            "POC reversion / HVN break-retest from a rolling tick-volume profile — needs "
+            "bars with volume, i.e. openapi transport at >= the volume-passthrough fix)."
         ),
     )
     args = ap.parse_args()
+    if args.brain:
+        args.producer = "brain"
 
     c = make_client()
     m5 = c.get_trendbars(args.symbol, "m5", args.count)
@@ -115,9 +124,13 @@ def main() -> int:
         m15c = [b for b in m15 if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
         h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
         try:
-            if args.brain:
+            if args.producer == "brain":
                 from dexter3 import hunter_brain
                 d = hunter_brain.decide(args.symbol, None, prefix, m15c, h1c, journal_stats=None)
+            elif args.producer == "vp":
+                from dexter3 import market_lens, volume_profile
+                session = str(market_lens.session_context(ts).get("value") or "unknown")
+                d = volume_profile.decide_vp(args.symbol, prefix, args.spread_abs, session=session)
             else:
                 d = hunt_mode.decide_hunt(args.symbol, prefix, m15c, h1c, None, args.spread_abs)
         except Exception:

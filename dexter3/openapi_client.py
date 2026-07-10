@@ -589,6 +589,11 @@ class Dexter3OpenApiClient:
                 "low": float(b.get("low", 0.0) or 0.0),
                 "close": float(b.get("close", 0.0) or 0.0),
                 "ts": str(b.get("ts_utc") or ""),
+                # tick volume — the daemon has ALWAYS returned it
+                # (ProtoOATrendbar.volume) but this normalization silently
+                # dropped it, blocking any volume-profile work (found
+                # 2026-07-11 probing the VP entry-producer premise).
+                "volume": float(b.get("volume", 0.0) or 0.0),
             }
             for b in bars_raw
             if isinstance(b, dict)
