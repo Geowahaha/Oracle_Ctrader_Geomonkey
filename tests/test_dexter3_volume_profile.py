@@ -153,3 +153,27 @@ def test_enter_geometry_rejected_on_wrong_sidedness():
                   entry=100.0, sl=99.0, tp=101.0, session="asian",
                   reasons=[], features={})
     assert d is None  # sell needs tp < entry < sl
+
+
+# -- canary wiring flag (default OFF) -------------------------------------------
+
+
+def test_vp_producer_flag_default_off(monkeypatch):
+    from dexter3 import shadow_runner
+
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert shadow_runner._vp_producer_enabled() is False
+
+
+def test_vp_producer_flag_on(monkeypatch):
+    from dexter3 import shadow_runner
+
+    monkeypatch.setenv("DEXTER3_PRODUCER", "vp")
+    assert shadow_runner._vp_producer_enabled() is True
+
+
+def test_vp_producer_flag_other_value_off(monkeypatch):
+    from dexter3 import shadow_runner
+
+    monkeypatch.setenv("DEXTER3_PRODUCER", "hunt")
+    assert shadow_runner._vp_producer_enabled() is False

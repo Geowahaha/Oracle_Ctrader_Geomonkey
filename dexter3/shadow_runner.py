@@ -128,6 +128,13 @@ def _hunt_enabled() -> bool:
     return os.environ.get(DEXTER3_HUNT_ENV_VAR) == "1"
 
 
+def _vp_producer_enabled() -> bool:
+    """Volume-profile producer canary flag — DEFAULT OFF (owner sign-off
+    required before enabling; see the 2026-07-11 promotion-gate results on
+    AGENT_SYNC_BOARD). Takes precedence over hunt when set to 'vp'."""
+    return os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "vp"
+
+
 def _active_order_label(mode: str | None = None) -> str:
     """Broker label owned by the current Dexter3 process.
 
@@ -1254,6 +1261,17 @@ def run_symbol_cycle(
             decision, basket_action = _manage_lane_basket(
                 executor, symbol, bar_ts, prefix, lane, state, spread_abs
             )
+        elif is_newest and _vp_producer_enabled():
+            # Volume-profile producer canary (2026-07-11): the FIRST candidate
+            # to pass the promotion gate on BOTH hold-out splits (60/40:
+            # validate +76.4R PF 1.57; 50/50: +67.2R PF 1.36 — board 22:15Z).
+            # Env-gated DEFAULT OFF (DEXTER3_PRODUCER=vp to enable, owner
+            # sign-off required); bars without volume make decide_vp skip
+            # gracefully, so a mis-set flag can never crash the loop.
+            from dexter3 import market_lens, volume_profile
+
+            vp_session = str(market_lens.session_context(bar_ts).get("value") or "unknown")
+            decision = volume_profile.decide_vp(symbol, prefix, spread_abs, session=vp_session)
         elif is_newest and _hunt_enabled():
             lens = hunter_brain._run_lens(prefix, hunter_brain._bar_close_ts(bar_ts))
             decision = hunt_mode.decide_hunt(
