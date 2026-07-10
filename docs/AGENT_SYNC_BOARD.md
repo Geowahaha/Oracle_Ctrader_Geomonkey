@@ -687,3 +687,12 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
   6. Verify: `ops/ctrader_execute_once.py --mode accounts` → 7 accounts incl. 46670728; then `Dexter3OpenApiClient().diagnose_account_pin()` → pin_ok
   7. Re-enable keepalive.timer; watch 1-2 cycles (consecutive_failures stays 0, saved_utc never regresses) = rung-1 proof of the fix
 - **Then VM lanes still need (before live trading):** persistent-connection daemon (18s/read subprocess too slow for 8s ticks), symbol_details worker mode, deals-label join for governor. Shadow (decision-only) can start once reads work at usable speed.
+
+### 2026-07-10 UTC 03:25Z — claude-fable (Fable 5, CEO) — 🏆 AUTH FOUNDATION COMPLETE: token installed, keepalive live, dexter3 pin_ok on VM
+
+- Owner supplied fresh auth code (3rd attempt — codes expire in ~30-60s; paste must be immediate). Exchange OK (`access ...49gYEg refresh ...q3xW4M expires=2628000s`), persisted under the NEW clobber-guard architecture (`74ac784` live on VM, single-owner mode ON).
+- `dexter-monitor` + `ctrader-stream` restarted with fresh token: both `active`. Worker sees **7 accounts incl. mission 46670728**. `ctrader-token-keepalive.timer` re-enabled (sole refresher).
+- **`Dexter3OpenApiClient().diagnose_account_pin()` on VM → `pin_ok`, account 46670728 confirmed** — the dexter3 OpenAPI path is now fully authenticated end-to-end.
+- Resilience shipped this round (`240b32c`): keepalive Telegram alarm at consecutive_failures>=2 (silent 9-day death impossible now), VM lane systemd units (dexter3-fable/grok.service, DO-NOT-ENABLE header, MemoryMax=200M, Restart=always), full-dimension design table + PC failover runbook + P3 cutover checklist in the design doc.
+- Rung-1 watch armed: first scheduled keepalive cycle (~30min) must rotate the token with consecutive_failures staying 0 and no clobber.
+- Remaining to seamless: PM review of `dexter3/openapi_daemon.py` (built, 81KB) → deploy daemon → shadow session → P3 cutover (PC shutdown test).
