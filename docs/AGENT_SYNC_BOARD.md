@@ -746,6 +746,13 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **LIVE PROOF within 2 min:** first bar after deploy backfilled today's broker-closed trades — `vanish_reconciled 650869904 setup=hunt_swing_structure pnl=-18.11`, `650867420 +8.19`, `650859943 +7.43`, `650851162 -14.13`... (8 lane_position_closed rows total, real deal pnl). BUT every row showed `session=None` → exposed that **decide_hunt() (the LIVE producer, DEXTER3_HUNT=1) never set Decision.session** — only hunter_brain did. Fixed (`1c690cd`): hunt enter-Decisions now carry the lens session_context label. Sweep 979 green, deployed, lanes restarted. From this restart every outcome lands fully-keyed.
 - **Next lever (needs samples first):** hunt-mode p_win does NOT blend journal_stats (decide_hunt has no such param) — the learner steers hunter_brain path only, but live = hunt path. Once buckets reach MIN_SAMPLES=10, wire blended_p_win into hunt conviction/size or the entry-quality gate so the learner actually influences live entries. Weekend (XAU closes ~21:00Z Fri) = build window.
 
+### 2026-07-11 UTC ~23:59Z — claude-fable (Opus 4.8, CEO) — VP ACTIVATION PACKAGE ready (dceda61): sign-off = one command
+
+- **Lane isolation shipped:** `DEXTER3_MODE=vp` = full grok pattern — own label `dexter3:vp:canary` (VP_LABEL), own state file, own lock, implies the VP producer. Without this a VP lane would have SHARED the fable label = label-collision rerun of the double-owner incident. 6 isolation tests; sweep 1001 green. Code deployed to VM (lanes restarted, behavior unchanged — modes stay v16/grok).
+- **`ops/dexter3-vp.service` committed, NOT installed:** scout governor 15/8, base risk 0.4%, abs cap $9, exit-posture note in comments (replay favored plain/hold-48; measure a forward week before touching OM knobs). **ACTIVATION AFTER SIGN-OFF:** `sudo cp ops/dexter3-vp.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-vp`
+- 10000-bar (~7wk) VP robustness run in flight — one more datapoint for the sign-off decision.
+- Health: all lanes+daemon active, PC clean, forward-tally timer logging. XAU closed until Sunday ~22:00Z.
+
 ### 2026-07-11 UTC ~22:45Z — claude-fable (Opus 4.8, CEO) — REFUTATION SURVIVED + canary wiring shipped DEFAULT OFF — awaiting owner sign-off to activate
 
 - **50/50-split refutation CONFIRMS VP:** same winning combo (v17-mission/plain/hold48/slm1.0) on both splits — 50/50: derive +29.48R (266 tr, PF 1.16) / validate +67.16R (265 tr, PF 1.36) ≈ $54/day; 60/40: validate +76.37R PF 1.57 ≈ $85/day. Positive on all 4 segments; derive PF actually STRONGER on the second split. Not split luck.
