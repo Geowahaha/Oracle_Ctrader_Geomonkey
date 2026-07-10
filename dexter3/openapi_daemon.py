@@ -1422,7 +1422,11 @@ class OpenApiDaemon:
         # realized-PnL tracking works on the OpenAPI transport. Best-effort:
         # a failed/empty order-list leaves labels blank (governor degrades to
         # the pre-join behavior — no worse than before this join existed).
-        try:
+        # Only run the extra order-list round-trip when the caller asked for
+        # labels (get_deals); get_positions skips it to stay under the 5s
+        # daemon client timeout on its every-bar lane-verification path.
+        if bool(payload.get("include_deal_labels")):
+          try:
             order_msg = yield self.client.send(
                 pb.ProtoOAOrderListReq(
                     ctidTraderAccountId=int(account_id),
@@ -1449,7 +1453,7 @@ class OpenApiDaemon:
                     d["label"] = lbl
                 if cmt:
                     d["comment"] = cmt
-        except Exception as exc:  # noqa: BLE001 - label join is best-effort
+          except Exception as exc:  # noqa: BLE001 - label join is best-effort
             logger.warning("deal->order label join failed (deals unlabeled this cycle): %s", exc)
         defer.returnValue({
             "ok": True,

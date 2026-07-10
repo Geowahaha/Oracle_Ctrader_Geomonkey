@@ -738,14 +738,24 @@ class Dexter3OpenApiClient:
         return [self._normalize_order_for_dexter3(o) for o in orders if isinstance(o, dict)]
 
     def get_deals(self, count: int = 200) -> list[dict[str, Any]]:
-        raw = self._reconcile(max_rows=max(1, int(count)))
+        raw = self._reconcile(max_rows=max(1, int(count)), with_deal_labels=True)
         deals = raw.get("deals") or []
         return [self._normalize_deal_for_dexter3(d) for d in deals if isinstance(d, dict)][: max(1, int(count))]
 
     # -- internal: reconcile (positions + orders + deals in one worker call) -
 
-    def _reconcile(self, *, lookback_hours: int = 72, max_rows: int = 200) -> dict[str, Any]:
+    def _reconcile(
+        self, *, lookback_hours: int = 72, max_rows: int = 200, with_deal_labels: bool = False
+    ) -> dict[str, Any]:
+        # with_deal_labels gates the deal->order label join (an extra broker
+        # round-trip): only get_deals (governor realized-PnL, called rarely +
+        # cached) needs it. get_positions runs the lane-verification EVERY bar
+        # and must stay fast — paying the join there caused reconcile to exceed
+        # the daemon-mode 5s client timeout -> live_skipped_lane_unverified
+        # (observed at cutover 2026-07-10 10:36Z).
         payload = self._payload(lookback_hours=int(lookback_hours), max_rows=int(max_rows))
+        if with_deal_labels:
+            payload["include_deal_labels"] = True
         return self._invoke("reconcile", payload, mutating=False, timeout_sec=self.timeout_sec)
 
     # -- normalization: worker's already-normalized reconcile shapes ---------
