@@ -19,9 +19,9 @@
 | Field | Value |
 |-------|--------|
 | **Mission playbook** | `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` §4.1 **A→E**, then §5 |
-| **Phase now** | **Repo integrity restored + V1.7 relaunch precondition MET.** Unlogged fibo purge (33 files) restored — scheduler imports fixed; dexter3 suite 225 passed + fibo 69 passed. Broker FLAT @ 14:26Z, MCP healthy, Grok lane healthy (21 entries, 0 loss baskets). V1.7 launch awaiting owner approval (permission-gated). V1.7 stack committed to git (was untracked). |
-| **Last updated (UTC)** | 2026-07-09T14:40Z |
-| **Last updated by** | claude-fable (Fable 5) |
+| **Phase now** | **PC lanes trading (V1.8 Fable + Grok, both ~breakeven today); VM migration P1/P2 done, blocked on token architecture.** Tonight: security rotation (Telegram/Anthropic/Gemini done, Stripe skipped-owner), watchdog HEARTBEAT deployed (`1fc553c`), cTrader OAuth PROVEN (token sees mission acct 46670728) but install doesn't stick — multi-process refresh clobber. **ctrader-token-keepalive.timer STOPPED** (was failing+clobbering). Token-architecture fix Sonnet running. VM install needs: architecture fix + 1 fresh owner auth code. |
+| **Last updated (UTC)** | 2026-07-09T20:55Z |
+| **Last updated by** | claude-fable (Fable 5, CEO) |
 
 ---
 
@@ -664,3 +664,12 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Fable relaunched PID 10208** (17:21:23Z, book was flat): `version=v1.8-size-the-edge`, governor 100/50/1.75% verified — now also on the hygienic client. **Zero-churn architecture is now live across every MCP consumer** (both loops + watchdog + all scripts).
 - One more zombie occurred at ~17:12Z (pre-hygiene loops still leaking + possibly my 40-session soak burst) — schtask healed it. With all consumers hygienic, the zombie detector monitor now measures the true post-fix rate; watch for it to hit ~0.
 - Next: first `min_volume_risk_exceeds_ratio_cap` refusal in grok log = ratio cap live-verified (monitor armed); measure Fable V1.8 forward PF + Grok supplement over the next session via `ops/dexter3_lane_tally.py`.
+
+### 2026-07-09 UTC 20:55Z — claude-fable (Fable 5, CEO) — session close: token OAuth proven, watchdog deployed, keepalive stopped
+
+- **Security rotation (leaked public .env backup):** TELEGRAM/ANTHROPIC/GEMINI tokens rotated+validated on PC+VM; STRIPE (sk_live) skipped per owner (~$15 balance, low priority). cTrader creds were NOT in the leak (verified).
+- **cTrader OAuth token — PROVEN path, install blocked:** minted a fresh token via `Auth.getToken(code)` (openapi.ctrader.com/apps/auth, redirect `http://localhost:5000/callback` — the REGISTERED uri, not bare localhost; VM `CTRADER_OPENAPI_REDIRECT_URI` updated to match). Token authenticates + lists 7 accounts INCLUDING mission **46670728 / 9922808**. BUT it does not STICK: (1) `Auth.refreshToken()` returns ACCESS_DENIED even right after a good getToken (likely single-use refresh-token contention); (2) multiple processes share one token_state.json and clobber a fresh token back to the dead one within seconds (consecutive_failures hit 63). **`ctrader-token-keepalive.timer` STOPPED** to halt the clobbering (it was failing uselessly anyway; live system survives on its pre-existing TCP session). Backup at `data/runtime/ctrader_token_state.json.bak-preauth`.
+- **Token-architecture fix Sonnet running** (single-owner refresh + read-only consumers + stale-write guard + root-cause of refresh ACCESS_DENIED). After it lands + PM review, the clean install sequence = stop clobberers → owner supplies 1 fresh auth code → write token → restart dexter-monitor → verify via `diagnose_account_pin()`.
+- **Watchdog HEARTBEAT deployed (`1fc553c`):** `scripts/dexter3_lane_heartbeat.py` + parallel-watchdog wired to catch hung-but-alive lanes via `last_seen_at` (was PID-only → 3h49m blind today). Weekend guard: escalate only if stale AND MCP also down. 14 tests.
+- **Adapter perf note (P2 gap #4 confirmed live):** dexter3 openapi adapter spawns a subprocess per call = ~18s/read against Spotware — too slow for an 8s fast-tick loop. Persistent-connection daemon is the next build after the token fix.
+- **Live state at close:** PC lanes V1.8 (10208) + Grok (9208) trading, balance ~$10,612. VM main system + stream healthy. Owner advised to sleep; nothing urgent.
