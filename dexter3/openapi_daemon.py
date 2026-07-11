@@ -1424,19 +1424,27 @@ class OpenApiDaemon:
         from_ts = _safe_int(payload.get("from_timestamp"), now_ms - (lookback_h * 3600 * 1000))
         to_ts = _safe_int(payload.get("to_timestamp"), now_ms)
         max_rows = max(10, min(_safe_int(payload.get("max_rows"), 200), 1000))
-        deal_msg = yield self.client.send(
-            pb.ProtoOADealListReq(
-                ctidTraderAccountId=int(account_id),
-                fromTimestamp=int(from_ts),
-                toTimestamp=int(to_ts),
-                maxRows=int(max_rows),
-            ),
-            responseTimeoutInSeconds=int(REQUEST_TIMEOUT_HEAVY_SEC),
-        )
-        deal_payload = Protobuf.extract(deal_msg)
         positions = [_normalize_position(x, symbol_map) for x in list(getattr(reconcile_payload, "position", []) or [])]
         orders = [_proto_to_dict(x) for x in list(getattr(reconcile_payload, "order", []) or [])]
-        deals = [_normalize_deal(x, symbol_map) for x in list(getattr(deal_payload, "deal", []) or [])]
+        # Position-management is the daemon's hottest path.  It has no use
+        # for historical deals, yet previously always incurred this extra
+        # broker round trip (up to REQUEST_TIMEOUT_HEAVY_SEC), starving OM
+        # reads.  Deal consumers opt in explicitly; absent the new flag we
+        # preserve the old response shape for compatibility.
+        include_deals = bool(payload.get("include_deals", True))
+        deals: list[dict[str, Any]] = []
+        if include_deals:
+            deal_msg = yield self.client.send(
+                pb.ProtoOADealListReq(
+                    ctidTraderAccountId=int(account_id),
+                    fromTimestamp=int(from_ts),
+                    toTimestamp=int(to_ts),
+                    maxRows=int(max_rows),
+                ),
+                responseTimeoutInSeconds=int(REQUEST_TIMEOUT_HEAVY_SEC),
+            )
+            deal_payload = Protobuf.extract(deal_msg)
+            deals = [_normalize_deal(x, symbol_map) for x in list(getattr(deal_payload, "deal", []) or [])]
         # -- deal->order label join (closes migration gap #1) -----------------
         # ProtoOADeal carries no label; the label lives on the order that
         # produced it. Fetch the historical order list for the SAME window and

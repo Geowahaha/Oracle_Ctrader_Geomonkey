@@ -283,6 +283,23 @@ def test_get_positions_normalizes_confirmed_fields(monkeypatch):
     assert pos["openTime"].endswith("Z") and "." in pos["openTime"]  # ms precision, basket timing depends on it
 
 
+def test_get_positions_om_path_skips_historical_deals(monkeypatch):
+    """The every-tick OM book read must not pay for a historical deal list."""
+    c = _client()
+    c._pin_verified = True
+    seen: dict[str, object] = {}
+
+    def _capture(mode, payload, *, mutating=False, timeout_sec=None):
+        seen["mode"] = mode
+        seen["payload"] = dict(payload)
+        return {"ok": True, "positions": [], "orders": [], "deals": []}
+
+    monkeypatch.setattr(c, "_invoke", _capture)
+    assert c.get_positions() == []
+    assert seen["mode"] == "reconcile"
+    assert seen["payload"]["include_deals"] is False
+
+
 def test_get_positions_short_side_maps_sell(monkeypatch):
     c = _client()
     short_pos = dict(_GOLDEN_POSITION)

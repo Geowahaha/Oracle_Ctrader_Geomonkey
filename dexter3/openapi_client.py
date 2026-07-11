@@ -46,16 +46,13 @@ GAPS (read before relying on any of these in a live loop):
    it correctly using the ``money_digits`` the same response already
    carries).
 
-3. ``get_positions()``: never includes ``netProfit``. ``ProtoOAPosition``
-   has no PnL field (confirmed against the installed protobuf descriptor —
-   fields are positionId/tradeData/positionStatus/swap/price/stopLoss/
-   takeProfit/.../usedMargin, no PnL). ``dexter3.basket_live.aggregate_lane``
-   already degrades SAFELY when a position's PnL is unreadable
-   (``_position_pnl`` returns ``None`` -> ``unreliable=True`` -> the basket
-   decision holds rather than acting blind) — verified by reading that
-   function — so this gap fails closed, not silently wrong.
+3. ``get_positions()``: ``ProtoOAPosition`` has no PnL field, so daemon mode
+   computes ``netProfit`` from a fresh standing spot quote, position volume,
+   swap and commission. When the quote is stale/unavailable (for example,
+   market close), it deliberately leaves PnL unreadable and the basket holds
+   fail-closed. The one-shot subprocess transport has the same safe degrade.
 
-4. ``get_deals()``: ``label``/``comment`` are always ``""``.
+4. ``get_deals()``: label recovery is daemon-only.
    ``ProtoOADeal`` (confirmed against the installed protobuf descriptor) has
    no label field at all — labels live on ``ProtoOATradeData`` (orders/
    positions only). Reconcile's live "orders" list could join a still-open
@@ -65,11 +62,9 @@ GAPS (read before relying on any of these in a live loop):
    currently-used worker mode. **This means
    ``dexter3.shadow_runner._lane_realized_today``'s label filter
    (``"dexter3:fable" in label``) will match ZERO deals via this
-   transport** — the Daily Mission Governor's realized-PnL tracking is
-   silently blind under ``DEXTER3_TRANSPORT=openapi`` until this is fixed
-   (needs a ``ProtoOAOrderListReq`` join, not currently wired anywhere).
-   Flagged loudly here and in the handoff report; do not cut over the
-   governor lane to this transport until it's addressed.
+   transport** unless it uses the daemon's enabled ``ProtoOAOrderListReq``
+   join. The one-shot subprocess transport still has no reliable historical
+   label join, therefore its governor remains fail-closed.
 
 5. ``get_pending_orders()`` is best-effort: normalized from
    ``ProtoOAReconcileReq``'s live "order" list using the same
@@ -681,7 +676,11 @@ class Dexter3OpenApiClient:
         }
 
     def get_positions(self) -> list[dict[str, Any]]:
-        raw = self._reconcile()
+        # The OM only needs the live open book.  Do not make its every-tick
+        # read wait on the historical deal list: that broker request has a
+        # separate, materially slower tail and was the actual source of the
+        # daemon's former 5s read timeouts.
+        raw = self._reconcile(include_deals=False)
         positions = raw.get("positions") or []
         normed = [self._normalize_position_for_dexter3(p) for p in positions if isinstance(p, dict)]
         self._enrich_positions_with_live_pnl(normed)
@@ -809,7 +808,7 @@ class Dexter3OpenApiClient:
         }
 
     def get_pending_orders(self) -> list[dict[str, Any]]:
-        raw = self._reconcile()
+        raw = self._reconcile(include_deals=False)
         orders = raw.get("orders") or []
         return [self._normalize_order_for_dexter3(o) for o in orders if isinstance(o, dict)]
 
@@ -821,7 +820,12 @@ class Dexter3OpenApiClient:
     # -- internal: reconcile (positions + orders + deals in one worker call) -
 
     def _reconcile(
-        self, *, lookback_hours: int = 72, max_rows: int = 200, with_deal_labels: bool = False
+        self,
+        *,
+        lookback_hours: int = 72,
+        max_rows: int = 200,
+        with_deal_labels: bool = False,
+        include_deals: bool = True,
     ) -> dict[str, Any]:
         # with_deal_labels gates the deal->order label join (an extra broker
         # round-trip): only get_deals (governor realized-PnL, called rarely +
@@ -830,6 +834,11 @@ class Dexter3OpenApiClient:
         # the daemon-mode 5s client timeout -> live_skipped_lane_unverified
         # (observed at cutover 2026-07-10 10:36Z).
         payload = self._payload(lookback_hours=int(lookback_hours), max_rows=int(max_rows))
+        # This flag is additive: the legacy subprocess worker ignores it,
+        # while the daemon can skip ProtoOADealListReq for OM/entry reads.
+        # Keep historical deals on by default for compatibility with callers
+        # which consume the raw reconciliation result.
+        payload["include_deals"] = bool(include_deals)
         if with_deal_labels:
             payload["include_deal_labels"] = True
             # The labeled path runs TWO extra heavy broker round-trips
@@ -884,7 +893,9 @@ class Dexter3OpenApiClient:
             "swap": float(p.get("swap", 0.0) or 0.0),
             "commission": float(p.get("commission", 0.0) or 0.0),
             "usedMargin": float(p.get("used_margin", 0.0) or 0.0),
-            # netProfit intentionally absent — see module docstring gap #3.
+            # PnL is attached by _enrich_positions_with_live_pnl after a
+            # fresh daemon spot read; absent a fresh quote it stays missing
+            # and basket_live deliberately holds fail-closed.
         }
 
     @staticmethod
@@ -1039,7 +1050,7 @@ class Dexter3OpenApiClient:
         this resolves the position's ACTUAL raw volume via a fresh reconcile
         before sending the close request."""
         pid = int(position_id)
-        raw_positions = (self._reconcile().get("positions")) or []
+        raw_positions = (self._reconcile(include_deals=False).get("positions")) or []
         match = next((p for p in raw_positions if int(p.get("position_id", 0) or 0) == pid), None)
         if match is None:
             raise McpClientError(f"close_position: position_id={pid} not found in current reconcile (already closed?)")
