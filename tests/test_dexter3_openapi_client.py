@@ -341,6 +341,23 @@ def test_get_positions_computes_live_pnl_from_spot(monkeypatch):
     assert agg["unreliable"] is False  # now the OM can SEE the loss and act
 
 
+def test_get_positions_computed_pnl_respects_long_volume_and_costs(monkeypatch):
+    """Regression: OpenAPI raw volume 300 is 3 oz; long exits at bid and
+    position swap/commission remain part of net PnL."""
+    c = _client()
+    long_pos = dict(_GOLDEN_POSITION)
+    long_pos.update({"direction": "long", "entry_price": 4100.0, "volume": 300,
+                     "symbol": "XAUUSD", "swap": -0.25, "commission": -0.75})
+    monkeypatch.setattr(c, "_invoke", _InvokeRouter({
+        "reconcile": {"ok": True, "positions": [long_pos], "orders": [], "deals": []},
+    }))
+    monkeypatch.setattr(c, "get_spot_price", lambda sym: {"bid": 4102.0, "ask": 4102.1, "symbol": sym})
+    [pos] = c.get_positions()
+    # (4102 - 4100) x 3 oz - 0.25 swap - 0.75 commission = +5.00 USD.
+    assert pos["grossProfit"] == pytest.approx(6.0)
+    assert pos["netProfit"] == pytest.approx(5.0)
+
+
 # ---------------------------------------------------------------------------
 # balance normalization
 # ---------------------------------------------------------------------------
