@@ -2155,6 +2155,10 @@ def run_om_tick(
             "side": action.get("side"),
             "note": action.get("note"),
             "conviction": action.get("conviction"),
+            "aggregate_pnl_usd": agg_probe.get("aggregate_pnl_usd"),
+            "aggregate_unreliable": bool(agg_probe.get("unreliable")),
+            "pnl_sources": agg_probe.get("pnl_sources"),
+            "unreliable_pnl_position_ids": agg_probe.get("unreliable_pnl_position_ids"),
             "executed": executed,
         },
     )

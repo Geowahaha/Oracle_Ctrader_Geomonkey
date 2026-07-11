@@ -899,3 +899,9 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - **Patch (local, not deployed):** `get_positions`, pending-order reads, and close preflight now send `include_deals=false`; daemon skips `ProtoOADealListReq` only for that explicit hot path. `get_deals()` retains `include_deals=true` and the labeled historical order join. This is a latency/risk reduction only — no entry, sizing, exit, or PnL decision changed.
 - **Proof:** `tests/test_dexter3_openapi_client.py` **68 passed** and `py_compile` for client+daemon passed. Regression test asserts the OM position path sends `include_deals=false`.
 - **Fable deploy handoff:** surgical deploy only `dexter3/openapi_client.py` and `dexter3/openapi_daemon.py` from this commit on the dirty VM; do not pull/reset/restart a lane while the Friday position is protected over market close. After the next safe restart, record reconcile p50/p95 and count of `om_lane_read_failed`; success is no deal-list request on OM ticks and no PnL-blind hold when a fresh spot exists.
+
+### 2026-07-11 UTC — codex — PnL-blindness telemetry added (local, not deployed)
+
+- The fail-closed behaviour is correct, but its cause had been invisible: a stale/failed spot enrichment appeared exactly like a generic `unreliable_pnl` hold. `aggregate_lane` now reports per-leg `pnl_sources` plus the IDs whose PnL is unreadable; every `om_action` journal payload persists the aggregate PnL, reliability flag, and those fields.
+- This does **not** alter an OM decision or relax safety. Monday evidence can now distinguish `computed_from_live_spot` from `unavailable` without reconstructing the broker state after the fact.
+- Proof: basket/OM/OpenAPI-client focused suites **186 passed** and changed modules compile. Deploy together with `1a443f1` only by surgical file checkout on the VM.

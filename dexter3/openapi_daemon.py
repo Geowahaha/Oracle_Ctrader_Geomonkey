@@ -197,7 +197,7 @@ SPOT_MAX_AGE_ENV_VAR = "DEXTER3_SPOT_QUOTE_MAX_AGE_SEC"
 # subscription (cold cache, or the first call after a reconnect re-subscribe)
 # before reporting spot_stale. 2.5s: comfortably longer than one tick
 # interval on an active feed, while leaving headroom inside the daemon-mode
-# client's 5s default HTTP timeout (openapi_client.DEFAULT_DAEMON_TIMEOUT_SEC)
+# client's 12s default HTTP timeout (openapi_client.DEFAULT_DAEMON_TIMEOUT_SEC)
 # for account-auth + HTTP overhead. Payload-overridable ("wait_sec") rather
 # than env-tunable — it is a per-call trade-off, not a deployment property.
 DEFAULT_SPOT_FIRST_TICK_WAIT_SEC = 2.5

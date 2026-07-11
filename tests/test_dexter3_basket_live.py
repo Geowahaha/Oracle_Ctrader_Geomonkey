@@ -177,6 +177,8 @@ def test_aggregate_lane_missing_pnl_field_marks_unreliable() -> None:
     ]
     agg = basket_live.aggregate_lane(positions, base_risk_usd=5.0)
     assert agg["unreliable"] is True
+    assert agg["pnl_sources"] == {"broker_or_legacy": 1, "unavailable": 1}
+    assert agg["unreliable_pnl_position_ids"] == [2]
 
 
 def test_aggregate_lane_unparseable_pnl_marks_unreliable() -> None:

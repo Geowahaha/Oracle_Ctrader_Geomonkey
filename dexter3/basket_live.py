@@ -191,12 +191,16 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
             "oldest_open_ts": None,
             "weighted_entry": None,
             "unreliable": False,
+            "pnl_sources": {},
+            "unreliable_pnl_position_ids": [],
         }
 
     sides = {"buy": 0, "sell": 0}
     volume_net = 0.0
     total_pnl = 0.0
     unreliable = False
+    pnl_sources: dict[str, int] = {}
+    unreliable_pnl_position_ids: list[int] = []
     open_ts_list: list[str] = []
     weighted_entry_num = 0.0
     weighted_entry_den = 0.0
@@ -212,8 +216,14 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
         pnl = _position_pnl(position)
         if pnl is None:
             unreliable = True
+            try:
+                unreliable_pnl_position_ids.append(int(position.get("positionId") or position.get("id") or 0))
+            except (TypeError, ValueError):
+                unreliable_pnl_position_ids.append(0)
         else:
             total_pnl += pnl
+        source = str(position.get("pnl_source") or ("broker_or_legacy" if pnl is not None else "unavailable"))
+        pnl_sources[source] = pnl_sources.get(source, 0) + 1
 
         entry = _position_entry(position)
         if entry > 0 and volume > 0:
@@ -242,6 +252,11 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
         "oldest_open_ts": oldest_open_ts,
         "weighted_entry": round(weighted_entry, 5) if weighted_entry is not None else None,
         "unreliable": unreliable,
+        # Observability only.  OM still makes exactly the same fail-closed
+        # decision, but an event can now distinguish a normal broker PnL
+        # from a stale/missing OpenAPI enrichment on a live session.
+        "pnl_sources": pnl_sources,
+        "unreliable_pnl_position_ids": unreliable_pnl_position_ids,
     }
 
 
