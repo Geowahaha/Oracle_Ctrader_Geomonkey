@@ -912,3 +912,9 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - Added `--min-volume-risk-abs-cap-usd`, `--min-volume-units`, `--volume-step-units`, and `--max-volume-units` to `scripts/dexter3_edge_discovery.py`. The size-policy race now uses executor-equivalent floor-down sizing and reports rejected candidates plus actual dollar PnL.
 - **Fable research handoff (no lane restart):** surgical-copy this script and run with VM settings: `--entry-gate v18 --size-policy-race --base-risk-usd 17.5 --min-volume-risk-abs-cap-usd 12 --min-volume-units 1 --volume-step-units 1 --max-volume-units 10`. Do not use $100/day sizing claim unless the floor-aware result and a time-held-out segment both pass.
 - Proof: new economics regression + V16 gate suite **56 passed**; `--help` confirms the flags. This changes research fidelity only, never a live order/risk rule.
+
+### 2026-07-11 UTC — codex — weekend-flatten P0 implemented (local, default OFF)
+
+- VM source search confirmed the Monday queue item was real: no existing weekend/Friday-close flatten logic was wired anywhere. New pure `dexter3.weekly_risk.weekly_close_policy` blocks entries from Friday **20:30 UTC** (configurable 30-minute buffer before the normal 21:00 UTC close) through Sunday 21:00 UTC.
+- When `DEXTER3_WEEKEND_FLATTEN_ENABLED=1`, the fast loop invokes a label-isolated `weekly_flatten` close only during the still-open Friday buffer. It deliberately does not hammer close requests after market closure. Entry path is simultaneously blocked; shadow/default-off behaviour is unchanged.
+- Proof: weekly guard + wiring + OM suites **118 passed**. Fable activation handoff: deploy `dexter3/weekly_risk.py` + `dexter3/shadow_runner.py`, add `Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1` to both VM lane units, daemon-reload/restart only while flat, then use the following Friday to verify `weekly_flatten attempted` and no weekend carry.

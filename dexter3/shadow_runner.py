@@ -63,6 +63,7 @@ from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
+from dexter3.weekly_risk import weekly_close_policy
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import Dexter3Executor, ExecutorConfig
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
@@ -1226,6 +1227,11 @@ def run_symbol_cycle(
     catch-up bars never place a live order (that would be a backfill/
     lookahead order against a price that has already moved on).
     """
+    if _env_bool("DEXTER3_WEEKEND_FLATTEN_ENABLED", False):
+        weekly = weekly_close_policy(datetime.now(timezone.utc))
+        if bool(weekly["block_entries"]):
+            return f"weekly_entry_blocked:{weekly['reason']}"
+
     m5_bars = fetch_fresh_m5(mcp, symbol)
     if len(m5_bars) < MIN_M5_BARS:
         return f"insufficient_m5_bars({len(m5_bars)})"
@@ -1959,6 +1965,31 @@ def _om_bars_for(mcp: Dexter3McpClient, symbol: str) -> tuple[list[dict[str, Any
         return [], [], []
 
 
+def run_weekly_flatten_tick(executor: Dexter3Executor | None, symbol: str) -> str:
+    """Close only this lane's positions in the still-open Friday buffer.
+
+    Default-off at the environment boundary; no shadow-mode mutation and no
+    close attempt once the weekly market is already shut.
+    """
+    if executor is None or not _env_bool("DEXTER3_WEEKEND_FLATTEN_ENABLED", False):
+        return "weekly_flatten_disabled"
+    weekly = weekly_close_policy(datetime.now(timezone.utc))
+    if not bool(weekly["flatten"]):
+        return str(weekly["reason"])
+    try:
+        positions = executor.client.get_positions()
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} weekly_flatten_read_failed: {exc}")
+        return "weekly_flatten_read_failed"
+    lane = basket_live.lane_positions(positions, _active_order_label())
+    ids = [position_id_of(p) for p in lane if position_id_of(p) > 0 and str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
+    if not ids:
+        return "weekly_flatten_no_lane"
+    result = executor.execute_close_all(ids, reason="weekly_flatten")
+    log_line(f"{utc_now_iso()} {symbol} weekly_flatten attempted ids={ids} result={result}")
+    return "weekly_flatten_attempted"
+
+
 def run_om_tick(
     mcp: Dexter3McpClient,
     journal: DecisionJournal,
@@ -2427,6 +2458,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
                 state = load_shadow_state()
                 for symbol in symbols:
                     try:
+                        run_weekly_flatten_tick(executor, symbol)
                         run_om_tick(mcp, journal, state, symbol, executor=executor)
                     except McpZombieError as exc:
                         log_line(f"{utc_now_iso()} {symbol} OM MCP_ZOMBIE: {exc}")
