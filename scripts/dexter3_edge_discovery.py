@@ -76,6 +76,37 @@ def _wilson_lower(wins: int, n: int, z: float = 1.96) -> float:
     return max(0.0, (centre - margin) / denom)
 
 
+def _executed_risk_usd(
+    stop_distance: float,
+    designed_risk_usd: float,
+    *,
+    min_volume: float = 1.0,
+    volume_step: float = 1.0,
+    max_volume: float = 10.0,
+    min_volume_abs_risk_cap_usd: float = 0.0,
+) -> float | None:
+    """Replay the executor's XAU volume floor/step economics.
+
+    The prior size-policy race multiplied R by a *designed* dollar risk.  It
+    therefore counted entries that live ``Dexter3Executor`` refuses when the
+    one-ounce floor's stop risk exceeds ``MIN_VOLUME_RISK_ABS_CAP_USD``.  This
+    helper is intentionally tiny and pure so the promotion report can model
+    the VM's execution constraint rather than a frictionless position size.
+    ``None`` means the live executor would refuse the entry.
+    """
+    distance = max(0.0, float(stop_distance))
+    if distance <= 0.0 or min_volume <= 0.0 or max_volume <= 0.0:
+        return None
+    floor_risk = min_volume * distance
+    if min_volume_abs_risk_cap_usd > 0.0 and floor_risk > min_volume_abs_risk_cap_usd:
+        return None
+    step = max(float(volume_step), 1e-9)
+    raw_volume = max(0.0, float(designed_risk_usd)) / distance
+    stepped_volume = math.floor(raw_volume / step) * step
+    volume = max(min_volume, min(stepped_volume, float(max_volume)))
+    return volume * distance
+
+
 def _h1_trend_sign(h1_ctx: list, n: int = 6) -> int:
     """Direction of the last n completed H1 bars (net close change)."""
     if len(h1_ctx) < 2:
@@ -290,6 +321,18 @@ def main() -> int:
     )
     ap.add_argument("--base-risk-usd", type=float, default=12.0, help="full-size $ risk for the policy race")
     ap.add_argument(
+        "--min-volume-risk-abs-cap-usd",
+        type=float,
+        default=0.0,
+        help=(
+            "model executor DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD: reject a trade "
+            "when one minimum XAU unit's stop risk exceeds this dollar cap; 0=off"
+        ),
+    )
+    ap.add_argument("--min-volume-units", type=float, default=1.0, help="live symbol minVolume for size-policy replay")
+    ap.add_argument("--volume-step-units", type=float, default=1.0, help="live symbol volumeStep for size-policy replay")
+    ap.add_argument("--max-volume-units", type=float, default=10.0, help="live executor volume ceiling for size-policy replay")
+    ap.add_argument(
         "--walkforward-empirical",
         action="store_true",
         help=(
@@ -408,7 +451,11 @@ def main() -> int:
                 and not bool(gate_features.get("is_chase", False))
                 and float(gate_features.get("leader_score") or 0.0) >= 0.15
             ):
-                b_pool.append({"r": r_net, "pull": bool(gate_features.get("is_pullback", False))})
+                b_pool.append({
+                    "r": r_net,
+                    "pull": bool(gate_features.get("is_pullback", False)),
+                    "stop_distance": abs(entry_p - sl_p),
+                })
             continue
         if args.size_policy_race and gate_features is not None:
             accepted_records.append(
@@ -418,6 +465,7 @@ def main() -> int:
                     "pull": bool(gate_features.get("is_pullback", False)),
                     "a_plus": bool(gate.get("a_plus", False)),
                     "score": float(gate_features.get("leader_score") or 0.0),
+                    "stop_distance": abs(entry_p - sl_p),
                 }
             )
         n_enter += 1
@@ -580,28 +628,52 @@ def main() -> int:
             return (0.15 if rec["chase"] else 1.0) * (1.0 if rec["pull"] else 0.35)
 
         def _policy_total(name: str, boost: bool, rescue: bool, b_tier: bool) -> tuple:
-            wtot = 0.0
+            wtot = usd_total = 0.0
             n = 0
+            rejected = 0
             for rec in accepted_records:
                 w = _chain(rec)
                 if boost and rec["a_plus"] and not rec["chase"] and rec["pull"]:
                     w = min(w * 1.6, cap_mult)
                 if rescue and rec["a_plus"] and rec["chase"]:
                     w = max(w, 0.5)
-                wtot += rec["r"] * w
+                actual_risk = _executed_risk_usd(
+                    rec["stop_distance"], args.base_risk_usd * w,
+                    min_volume=args.min_volume_units,
+                    volume_step=args.volume_step_units,
+                    max_volume=args.max_volume_units,
+                    min_volume_abs_risk_cap_usd=args.min_volume_risk_abs_cap_usd,
+                )
+                if actual_risk is None:
+                    rejected += 1
+                    continue
+                wtot += rec["r"] * (actual_risk / args.base_risk_usd)
+                usd_total += rec["r"] * actual_risk
                 n += 1
             if b_tier:
                 for rec in b_pool:
                     w = 0.5 * (1.0 if rec["pull"] else 0.35)
-                    wtot += rec["r"] * w
+                    actual_risk = _executed_risk_usd(
+                        rec["stop_distance"], args.base_risk_usd * w,
+                        min_volume=args.min_volume_units,
+                        volume_step=args.volume_step_units,
+                        max_volume=args.max_volume_units,
+                        min_volume_abs_risk_cap_usd=args.min_volume_risk_abs_cap_usd,
+                    )
+                    if actual_risk is None:
+                        rejected += 1
+                        continue
+                    wtot += rec["r"] * (actual_risk / args.base_risk_usd)
+                    usd_total += rec["r"] * actual_risk
                     n += 1
-            usd = wtot * args.base_risk_usd
-            return (name, n, wtot, usd, usd / hours * 24.0)
+            return (name, n, rejected, wtot, usd_total, usd_total / hours * 24.0)
 
         print("\n=== SIZE POLICY RACE ($-weighted; same v17 entry edge, different sizing) ===")
-        print(f"window={hours:.0f}h  base_risk=${args.base_risk_usd:.0f}  cap=2.5%/$1000")
-        print(f"{'policy':44} {'N':>4} {'wR':>8} {'$window':>9} {'$/day':>8}")
-        print("-" * 78)
+        print(f"window={hours:.0f}h  base_risk=${args.base_risk_usd:.0f}  cap=2.5%/$1000 "
+              f"min={args.min_volume_units:g} step={args.volume_step_units:g} max={args.max_volume_units:g} "
+              f"floor_abs_cap=${args.min_volume_risk_abs_cap_usd:g}")
+        print(f"{'policy':44} {'N':>4} {'rej':>4} {'wR':>8} {'$window':>9} {'$/day':>8}")
+        print("-" * 84)
         for row in (
             _policy_total("P0 current (chase .15 / non-pull .35)", False, False, False),
             _policy_total("P1 winner-boost x1.6 (A+ non-chase pull)", True, False, False),
@@ -610,8 +682,8 @@ def main() -> int:
             _policy_total("P4 B-tier scout 0.5x (0.15-0.18 non-chase)", False, False, True),
             _policy_total("P5 = P1 + P2 + B-tier", True, True, True),
         ):
-            name, n, wtot, usd, per_day = row
-            print(f"{name:44} {n:>4} {wtot:>+8.2f} {usd:>+9.2f} {per_day:>+8.2f}")
+            name, n, rejected, wtot, usd, per_day = row
+            print(f"{name:44} {n:>4} {rejected:>4} {wtot:>+8.2f} {usd:>+9.2f} {per_day:>+8.2f}")
 
         def _grp(name, recs):
             if not recs:

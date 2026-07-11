@@ -905,3 +905,10 @@ otes\20260704T040156Z-mcp-zombie-permanent-fix.md` so future Codex runs inherit 
 - The fail-closed behaviour is correct, but its cause had been invisible: a stale/failed spot enrichment appeared exactly like a generic `unreliable_pnl` hold. `aggregate_lane` now reports per-leg `pnl_sources` plus the IDs whose PnL is unreadable; every `om_action` journal payload persists the aggregate PnL, reliability flag, and those fields.
 - This does **not** alter an OM decision or relax safety. Monday evidence can now distinguish `computed_from_live_spot` from `unavailable` without reconstructing the broker state after the fact.
 - Proof: basket/OM/OpenAPI-client focused suites **186 passed** and changed modules compile. Deploy together with `1a443f1` only by surgical file checkout on the VM.
+
+### 2026-07-11 UTC — codex — size-policy replay now models VM floor-risk execution (local, not deployed)
+
+- **Read-only VM fact:** Fable unit is `base_risk=$17.5`, `max_volume=10`, `MIN_VOLUME_RISK_RATIO_CAP=0`, and `MIN_VOLUME_RISK_ABS_CAP_USD=12`. The prior P5 figure (~$100/day) multiplied R by designed risk and did not model the active $12 one-ounce stop cap, so it over-counted trades the current executor rejects. It is not valid promotion evidence as-is.
+- Added `--min-volume-risk-abs-cap-usd`, `--min-volume-units`, `--volume-step-units`, and `--max-volume-units` to `scripts/dexter3_edge_discovery.py`. The size-policy race now uses executor-equivalent floor-down sizing and reports rejected candidates plus actual dollar PnL.
+- **Fable research handoff (no lane restart):** surgical-copy this script and run with VM settings: `--entry-gate v18 --size-policy-race --base-risk-usd 17.5 --min-volume-risk-abs-cap-usd 12 --min-volume-units 1 --volume-step-units 1 --max-volume-units 10`. Do not use $100/day sizing claim unless the floor-aware result and a time-held-out segment both pass.
+- Proof: new economics regression + V16 gate suite **56 passed**; `--help` confirms the flags. This changes research fidelity only, never a live order/risk rule.
