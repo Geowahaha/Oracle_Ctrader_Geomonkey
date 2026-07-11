@@ -197,7 +197,10 @@ def main() -> int:
     print(f"\ngrid: {len(results)} combos scored on derive (first {args.split:.0%}); top {args.top_k} advance")
 
     # current-live reference: v17 + smart + hold 24 + disaster 2.0 + slm 1.0
-    ref = {"gate": "v17", "style": "smart", "max_hold": 24, "disaster": 2.0, "sl_mult": 1.0}
+    # (falls back to the first requested gate when v17 isn't in --gates —
+    # found 2026-07-12: --gates v17-mission alone crashed the ref lookup)
+    ref_gate = "v17" if "v17" in accepted_by_gate else gate_modes[0]
+    ref = {"gate": ref_gate, "style": "smart", "max_hold": 24, "disaster": 2.0, "sl_mult": 1.0}
 
     # -- phase 4: VALIDATE — touched exactly once, by the finalists + ref ----
     def _validate(combo: dict) -> tuple[int, float, float, float]:
