@@ -459,7 +459,7 @@ def test_get_deals_uses_longer_timeout_than_get_positions_in_daemon_mode(monkeyp
     monkeypatch.delenv("DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC", raising=False)
     monkeypatch.delenv("DEXTER3_OPENAPI_DEALS_TIMEOUT_SEC", raising=False)
     c = _client()
-    assert c.timeout_sec == 5.0  # daemon-mode fast default
+    assert c.timeout_sec == DEFAULT_DAEMON_TIMEOUT_SEC  # daemon-mode fast default (12.0 since 2026-07-11)
 
     seen: dict[str, float | None] = {}
 
@@ -473,7 +473,7 @@ def test_get_deals_uses_longer_timeout_than_get_positions_in_daemon_mode(monkeyp
     monkeypatch.setattr(c, "_invoke", _cap)
     c.get_positions()          # unlabeled -> fast path
     c.get_deals(count=50)      # labeled -> long path
-    assert seen["reconcile"] == 5.0          # get_positions stays fast
+    assert seen["reconcile"] == DEFAULT_DAEMON_TIMEOUT_SEC  # get_positions stays on the fast default
     assert seen["labels"] >= 20.0            # get_deals gets the long timeout
     assert seen["labels"] > seen["reconcile"]
 
