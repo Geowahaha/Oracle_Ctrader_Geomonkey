@@ -157,12 +157,16 @@ ACCOUNT_ID_PIN_ENV_VAR = "DEXTER3_OPENAPI_ACCOUNT_ID"
 # ops/ctrader_execute_once.py — no TCP+OAuth handshake per call, since the
 # daemon already holds one persistent authenticated connection.
 DAEMON_URL_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_URL"
-# Daemon-mode default timeout: much lower than the subprocess default (25s)
-# because there is no connection handshake to wait out — only the actual
-# protobuf round-trip over an already-open socket. Env-tunable per the task
-# spec ("Timeout per call env-tunable, default much lower (5s)").
+# Daemon-mode default timeout: lower than the subprocess default (25s)
+# because there is no connection handshake to wait out — only the protobuf
+# round-trip over an already-open socket. Raised 5.0 -> 12.0 on 2026-07-11:
+# live evidence showed reconcile's broker round-trip tail exceeds 5s under
+# load (17 of 112 OM ticks on 2026-07-10 failed "daemon request timeout
+# after 5.0s" -> om_lane_read_failed -> the OM held blind that tick). 12s
+# covers the observed reconcile tail (typ ~2s, join-path ~8s) while still
+# failing well inside the 20s poll cadence. Env-tunable as before.
 DAEMON_TIMEOUT_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC"
-DEFAULT_DAEMON_TIMEOUT_SEC = 5.0
+DEFAULT_DAEMON_TIMEOUT_SEC = 12.0
 
 # dexter3 "units" (1 unit = 0.01 lot XAU = 1 oz) <-> cTrader OpenAPI raw
 # volume (hundredths of a unit) — see module docstring gap #8 for evidence.

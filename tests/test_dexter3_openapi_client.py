@@ -946,7 +946,11 @@ def test_daemon_mode_off_by_default(monkeypatch):
 def test_daemon_mode_uses_lower_default_timeout(monkeypatch):
     c = _daemon_client(monkeypatch)
     assert c.daemon_url == DAEMON_URL
-    assert c.timeout_sec == DEFAULT_DAEMON_TIMEOUT_SEC == 5.0
+    # 12.0 (raised from 5.0 on 2026-07-11): reconcile's broker tail exceeded 5s
+    # on 15% of live OM ticks (om_lane_read_failed -> OM held blind). Still
+    # well under the subprocess default (25s) and the 20s poll cadence.
+    assert c.timeout_sec == DEFAULT_DAEMON_TIMEOUT_SEC == 12.0
+    assert DEFAULT_DAEMON_TIMEOUT_SEC < DEFAULT_TIMEOUT_SEC  # daemon stays the faster path
 
 
 def test_daemon_mode_timeout_env_tunable(monkeypatch):
