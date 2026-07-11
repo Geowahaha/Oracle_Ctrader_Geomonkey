@@ -184,6 +184,19 @@ _PIP_SIZE_BY_SYMBOL = {
     "XAUUSD": 0.01,
 }
 
+# Gap #3 fix (2026-07-11): OpenAPI ProtoOAPosition carries NO netProfit, so the
+# basket/OM read pnl=0.0 -> unreliable -> HOLD forever -> losers ran to broker
+# SL unmanaged (the Fri -$18 short the owner caught). get_positions() computes
+# live netProfit from the daemon spot cache using this USD-per-price-unit-per-
+# volume-unit table. XAUUSD is quoted USD/oz and a dexter3 volume unit = 1 oz
+# (raw÷100), so a 1.00 USD price move on 1 unit = 1.00 USD P&L → 1.0. This is
+# contract-derived, not a guess; symbols absent here get NO computed pnl (basket
+# stays unreliable→hold for them, the pre-fix safe behavior) rather than a wrong
+# number. Add a symbol only with its confirmed contract point value.
+_USD_POINT_VALUE_PER_UNIT = {
+    "XAUUSD": 1.0,
+}
+
 DEFAULT_TIMEOUT_SEC = 25.0
 DEFAULT_HEALTH_TIMEOUT_SEC = 18.0
 DEFAULT_QUOTE_DURATION_SEC = 3
@@ -666,7 +679,61 @@ class Dexter3OpenApiClient:
     def get_positions(self) -> list[dict[str, Any]]:
         raw = self._reconcile()
         positions = raw.get("positions") or []
-        return [self._normalize_position_for_dexter3(p) for p in positions if isinstance(p, dict)]
+        normed = [self._normalize_position_for_dexter3(p) for p in positions if isinstance(p, dict)]
+        self._enrich_positions_with_live_pnl(normed)
+        return normed
+
+    def _enrich_positions_with_live_pnl(self, positions: list[dict[str, Any]]) -> None:
+        """Attach a live-computed ``netProfit`` per position (gap #3 fix).
+
+        OpenAPI positions have no PnL field, which left the basket/OM blind
+        (pnl=0.0 → unreliable → HOLD forever → losers ran to broker SL). We
+        compute netProfit from the daemon's live spot: SHORT exits at ask,
+        LONG at bid; pnl = price_diff × volume_units × usd_point_value + swap +
+        commission. Fetches spot ONCE per symbol. NEVER raises: if spot is
+        unavailable (market closed / stale quote / unknown symbol point value),
+        the position keeps NO netProfit — basket then reports ``unreliable`` and
+        HOLDs, which is correct when there is genuinely no live price to manage
+        against (e.g. weekend). Only a fresh quote unblocks active management."""
+        if not positions:
+            return
+        spot_cache: dict[str, dict[str, float] | None] = {}
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "").strip().upper()
+            point_value = _USD_POINT_VALUE_PER_UNIT.get(symbol)
+            if not point_value:
+                continue  # unknown contract — do not fabricate a PnL
+            if symbol not in spot_cache:
+                try:
+                    spot_cache[symbol] = self.get_spot_price(symbol)
+                except Exception:  # noqa: BLE001 - enrichment is best-effort; ANY
+                    # spot failure (market closed, stale quote, transport) must
+                    # leave the position blind → basket unreliable → HOLD, never
+                    # break get_positions itself.
+                    spot_cache[symbol] = None
+            spot = spot_cache.get(symbol)
+            if not spot:
+                continue
+            side = str(pos.get("tradeSide") or "").upper()
+            entry = float(pos.get("entryPrice", 0.0) or 0.0)
+            vol = float(pos.get("volume", 0.0) or 0.0)
+            if entry <= 0.0 or vol <= 0.0:
+                continue
+            bid = float(spot.get("bid", 0.0) or 0.0)
+            ask = float(spot.get("ask", 0.0) or 0.0)
+            if bid <= 0.0 or ask <= 0.0:
+                continue
+            if side == "BUY":
+                price_diff = bid - entry            # long closes at bid
+            elif side == "SELL":
+                price_diff = entry - ask            # short closes at ask
+            else:
+                continue
+            gross = price_diff * vol * float(point_value)
+            net = gross + float(pos.get("swap", 0.0) or 0.0) + float(pos.get("commission", 0.0) or 0.0)
+            pos["netProfit"] = round(net, 4)
+            pos["grossProfit"] = round(gross, 4)
+            pos["pnl_source"] = "computed_from_live_spot"
 
     def get_balance(self) -> dict[str, Any]:
         raw = self._invoke(

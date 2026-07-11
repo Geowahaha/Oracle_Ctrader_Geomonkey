@@ -293,12 +293,14 @@ def test_get_positions_short_side_maps_sell(monkeypatch):
     assert pos["tradeSide"] == "SELL"
 
 
-def test_get_positions_never_fakes_net_profit(monkeypatch):
-    """ProtoOAPosition has no PnL field (gap #3) — must never invent one.
-    dexter3.basket_live.aggregate_lane degrades to unreliable=True/hold when
-    netProfit is absent; faking a value here would silently defeat that
-    fail-safe."""
+def test_get_positions_no_pnl_when_spot_unavailable(monkeypatch):
+    """Gap #3 fix (2026-07-11): when no live spot is available (market closed /
+    stale quote / unconfigured mode), get_positions must NOT invent a PnL — the
+    position stays without netProfit so aggregate_lane degrades to
+    unreliable=True/hold. Enrichment is best-effort and must never raise."""
     c = _client()
+    # router answers reconcile but has NO spot_quote — the spot fetch fails and
+    # enrichment leaves the position blind (the correct market-closed behavior).
     router = _InvokeRouter({"reconcile": {"ok": True, "positions": [dict(_GOLDEN_POSITION)], "orders": [], "deals": []}})
     monkeypatch.setattr(c, "_invoke", router)
     [pos] = c.get_positions()
@@ -307,7 +309,36 @@ def test_get_positions_never_fakes_net_profit(monkeypatch):
     from dexter3.basket_live import aggregate_lane
 
     agg = aggregate_lane([pos], base_risk_usd=5.0)
-    assert agg["unreliable"] is True  # confirms the safe degrade actually fires
+    assert agg["unreliable"] is True  # confirms the safe degrade still fires
+
+
+def test_get_positions_computes_live_pnl_from_spot(monkeypatch):
+    """Gap #3 fix: with a fresh spot quote, get_positions computes a REAL
+    netProfit (not faked) so the basket/OM can actually manage the position
+    instead of holding blind to broker SL. SHORT closes at ask."""
+    c = _client()
+    short_pos = dict(_GOLDEN_POSITION)
+    short_pos["direction"] = "short"
+    short_pos["entry_price"] = 4093.36
+    short_pos["volume"] = 100  # raw → 1.0 oz
+    short_pos["swap"] = 0.0
+    short_pos["commission"] = 0.0
+    short_pos["symbol"] = "XAUUSD"
+    router = _InvokeRouter({
+        "reconcile": {"ok": True, "positions": [short_pos], "orders": [], "deals": []},
+    })
+    monkeypatch.setattr(c, "_invoke", router)
+    # transport-independent: enrichment calls self.get_spot_price; feed a fresh quote.
+    monkeypatch.setattr(c, "get_spot_price", lambda sym: {"bid": 4110.90, "ask": 4111.00, "symbol": sym})
+    [pos] = c.get_positions()
+    # short at 4093.36, closes at ask 4111.00 → (4093.36 - 4111.00) × 1.0 = -17.64
+    assert pos["netProfit"] == pytest.approx(-17.64, abs=1e-2)
+    assert pos["pnl_source"] == "computed_from_live_spot"
+
+    from dexter3.basket_live import aggregate_lane
+
+    agg = aggregate_lane([pos], base_risk_usd=5.0)
+    assert agg["unreliable"] is False  # now the OM can SEE the loss and act
 
 
 # ---------------------------------------------------------------------------
