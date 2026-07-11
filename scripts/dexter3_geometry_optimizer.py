@@ -41,6 +41,7 @@ from scripts.dexter3_edge_discovery import (  # noqa: E402
     _stamp_entry_gate_features,
 )
 from dexter3 import hunt_mode  # noqa: E402
+from dexter3.vp_regime import profile_regime  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
 
@@ -157,6 +158,7 @@ def main() -> int:
                 "sl": float(d.sl),
                 "tp": float(d.tp),
                 "future": m5[i + 1:],
+                "vp_regime": profile_regime(m5[:i]),
             })
         accepted_by_gate[mode] = acc
         print(f"gate={mode}: accepted {len(acc)}")
@@ -228,6 +230,19 @@ def main() -> int:
               f"{(combo['disaster'] or 0):>4.1f} {combo['sl_mult']:>4.2f} | "
               f"{combo['d_n']:>4} {combo['d_net']:>+8.2f} {combo['d_pf']:>5.2f} | "
               f"{v_n:>4} {v_net:>+8.2f} {v_pf:>5.2f} {v_dd:>6.2f} {usd_day:>+7.0f} {verdict}")
+
+    if args.producer == "vp":
+        # Measurement only: identify whether VP's apparent edge is regime-local
+        # before anyone proposes a filter.
+        print("\n=== VP REGIME DIAGNOSTIC (report-only; no filter applied) ===")
+        for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+            rows = [t for t in accepted_by_gate.get("v17-mission", []) if pred(t)]
+            for state in ("directional", "rotational", "unknown"):
+                rs = [_combo_r(t, "plain", 48, 2.0, 1.0, args.spread_abs, args.commission_r) for t in rows if t["vp_regime"]["state"] == state]
+                rs = [r for r in rs if r is not None]
+                if rs:
+                    net, pf, _ = _equity(rs)
+                    print(f"{segment:8} {state:11} N={len(rs):>3} net={net:+.2f}R PF={pf:.2f}")
     print("\nRULES: report/act on VALIDATE numbers only; canary requires both-segments-positive "
           "AND beats the current-live ref on validate. Replay approximates live OM exits — a "
           "canary must still prove itself forward before any scale-up.")
