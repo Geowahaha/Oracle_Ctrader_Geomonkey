@@ -58,8 +58,39 @@ def _equity(rs: list[float]) -> tuple[float, float, float]:
     return sum(rs), pf, dd
 
 
+def _simulate_bank(side: str, entry: float, sl: float, future: list, max_hold: int,
+                    target_r: float) -> tuple[str, float, int]:
+    """Replays the ORIGINAL Dexter3 v1.0 basket exit (2026-07-05, commit
+    3ca3341, basket_manager.py close_all_in_profit): bank the WHOLE position
+    at the first M5 CLOSE where floating R >= target_r (no TP — banking is
+    the only profit exit). Conservative SL-first on the same bar, same as
+    ``_simulate``. Single-trade approximation of a basket-aggregate rule."""
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "skip", 0.0, 0
+    for held, bar in enumerate(future[:max_hold]):
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        cl = float(bar.get("close", 0.0))
+        if side == "buy":
+            if lo <= sl:                      # conservative: SL wins ties
+                return "loss", -1.0, held
+            r = (cl - entry) / risk
+        else:
+            if hi >= sl:
+                return "loss", -1.0, held
+            r = (entry - cl) / risk
+        if r >= target_r:
+            return "bank", r, held
+    # timed out — mark to the last bar's close (same convention as _simulate)
+    held = min(max_hold, len(future)) - 1
+    last = float(future[max_hold - 1].get("close", entry)) if len(future) >= max_hold else float(future[-1].get("close", entry)) if future else entry
+    r = (last - entry) / risk if side == "buy" else (entry - last) / risk
+    return ("win" if r > 0 else "loss"), r, max(0, held)
+
+
 def _combo_r(trade: dict, style: str, max_hold: int, disaster: float, sl_mult: float,
-             spread_abs: float, commission_r: float) -> float | None:
+             spread_abs: float, commission_r: float, bank_target_r: float | None = None) -> float | None:
     """Cost-adjusted R for one accepted trade under one exit combo (None=skip)."""
     entry, sl, tp = trade["entry"], trade["sl"], trade["tp"]
     side = trade["side"]
@@ -67,6 +98,10 @@ def _combo_r(trade: dict, style: str, max_hold: int, disaster: float, sl_mult: f
         sl = entry - (entry - sl) * sl_mult if side == "buy" else entry + (sl - entry) * sl_mult
     if style == "smart":
         outcome, r, _ = _simulate_smart(side, entry, sl, tp, trade["future"], max_hold, disaster)
+    elif style == "bank":
+        if bank_target_r is None:
+            raise ValueError("style='bank' requires bank_target_r")
+        outcome, r, _ = _simulate_bank(side, entry, sl, trade["future"], max_hold, bank_target_r)
     else:
         outcome, r, _ = _simulate(side, entry, sl, tp, trade["future"], max_hold)
     if outcome == "skip":
@@ -84,6 +119,14 @@ def main() -> int:
     ap.add_argument("--commission-r", type=float, default=0.03)
     ap.add_argument("--gates", default="v17,v17-mission,v18,none")
     ap.add_argument("--top-k", type=int, default=8, help="combos re-scored on the validate segment")
+    ap.add_argument(
+        "--bank-targets", default="0.2,0.4,0.8",
+        help=(
+            "comma R thresholds for style=bank (replays v1.0 basket "
+            "close_all_in_profit; 0.2 = v1.0 resolve_target_r default, "
+            "commit 3ca3341 basket_manager.py:48)"
+        ),
+    )
     ap.add_argument("--min-derive-trades", type=int, default=80, help="combos with fewer derive trades are ignored")
     ap.add_argument("--base-risk-usd", type=float, default=12.0, help="$ per 1R for the $/day translation")
     ap.add_argument(
@@ -166,29 +209,33 @@ def main() -> int:
     split_bar = MIN_M5 + int((len(m5) - 2 - MIN_M5) * args.split)
 
     # -- phase 3: grid scored on DERIVE only ---------------------------------
-    styles = ["plain", "smart"]
+    styles = ["plain", "smart", "bank"]
     max_holds = [12, 24, 48, 96]
     disasters = [1.5, 2.0, 2.5, 3.0]
     sl_mults = [1.0, 1.25, 1.5]
+    bank_targets = [float(x) for x in args.bank_targets.split(",") if x.strip()]
     results: list[dict] = []
     for mode in gate_modes:
         trades = accepted_by_gate[mode]
         derive_trades = [t for t in trades if t["i"] < split_bar]
         for style, mh, dis, slm in product(styles, max_holds, disasters, sl_mults):
-            if style == "plain" and dis != disasters[0]:
-                continue  # disaster only applies to smart
-            rs = [
-                r for t in derive_trades
-                if (r := _combo_r(t, style, mh, dis, slm, args.spread_abs, args.commission_r)) is not None
-            ]
-            if len(rs) < args.min_derive_trades:
-                continue
-            net, pf, dd = _equity(rs)
-            results.append({
-                "gate": mode, "style": style, "max_hold": mh,
-                "disaster": dis if style == "smart" else None, "sl_mult": slm,
-                "d_n": len(rs), "d_net": net, "d_pf": pf, "d_dd": dd,
-            })
+            if style in ("plain", "bank") and dis != disasters[0]:
+                continue  # disaster only applies to smart; bank sweeps bank_targets below instead
+            for bt in (bank_targets if style == "bank" else [None]):
+                rs = [
+                    r for t in derive_trades
+                    if (r := _combo_r(t, style, mh, dis, slm, args.spread_abs, args.commission_r,
+                                       bank_target_r=bt)) is not None
+                ]
+                if len(rs) < args.min_derive_trades:
+                    continue
+                net, pf, dd = _equity(rs)
+                results.append({
+                    "gate": mode, "style": style, "max_hold": mh,
+                    "disaster": dis if style == "smart" else None, "sl_mult": slm,
+                    "bank_r": bt if style == "bank" else None,
+                    "d_n": len(rs), "d_net": net, "d_pf": pf, "d_dd": dd,
+                })
     if not results:
         print("no combo met the min-derive-trades floor")
         return 1
@@ -208,7 +255,8 @@ def main() -> int:
         rs = [
             r for t in trades
             if (r := _combo_r(t, combo["style"], combo["max_hold"], combo["disaster"] or 2.0,
-                              combo["sl_mult"], args.spread_abs, args.commission_r)) is not None
+                              combo["sl_mult"], args.spread_abs, args.commission_r,
+                              bank_target_r=combo.get("bank_r"))) is not None
         ]
         net, pf, dd = _equity(rs)
         return len(rs), net, pf, dd
@@ -219,7 +267,7 @@ def main() -> int:
           f"n={ref_n} net={ref_net:+.2f}R PF={ref_pf:.2f} maxDD={ref_dd:.2f}R "
           f"(~${ref_net / v_days * args.base_risk_usd:+.0f}/day at ${args.base_risk_usd:.0f}/R)\n")
 
-    header = (f"{'gate':<12} {'style':<6} {'hold':>4} {'dis':>4} {'slm':>4} | "
+    header = (f"{'gate':<12} {'style':<6} {'hold':>4} {'dis':>4} {'bankR':>5} {'slm':>4} | "
               f"{'dN':>4} {'d_net':>8} {'d_PF':>5} | {'vN':>4} {'v_net':>8} {'v_PF':>5} {'v_DD':>6} {'$/day':>7} verdict")
     print(header)
     print("-" * len(header))
@@ -229,10 +277,20 @@ def main() -> int:
         both_pos = combo["d_net"] > 0 and v_net > 0
         beats_ref = v_net > ref_net
         verdict = "CANARY-ELIGIBLE" if (both_pos and beats_ref) else ("both+ but <=ref" if both_pos else "fails validate")
+        bank_r_str = f"{combo['bank_r']:.2f}" if combo.get("bank_r") is not None else "-"
         print(f"{combo['gate']:<12} {combo['style']:<6} {combo['max_hold']:>4} "
-              f"{(combo['disaster'] or 0):>4.1f} {combo['sl_mult']:>4.2f} | "
+              f"{(combo['disaster'] or 0):>4.1f} {bank_r_str:>5} {combo['sl_mult']:>4.2f} | "
               f"{combo['d_n']:>4} {combo['d_net']:>+8.2f} {combo['d_pf']:>5.2f} | "
               f"{v_n:>4} {v_net:>+8.2f} {v_pf:>5.2f} {v_dd:>6.2f} {usd_day:>+7.0f} {verdict}")
+
+    # bank-style visibility: if no bank combo reached the finalists, print the
+    # best one's DERIVE stats (validate stays untouched — finalists only).
+    best_bank = next((c for c in results if c["style"] == "bank"), None)
+    if best_bank is not None and best_bank not in results[: args.top_k]:
+        print(f"\nbest bank combo by derive (outside top-{args.top_k}; validate untouched): "
+              f"gate={best_bank['gate']} hold={best_bank['max_hold']} bankR={best_bank['bank_r']} "
+              f"slm={best_bank['sl_mult']} dN={best_bank['d_n']} "
+              f"d_net={best_bank['d_net']:+.2f}R d_PF={best_bank['d_pf']:.2f}")
 
     if args.producer == "vp":
         # Measurement only: identify whether VP's apparent edge is regime-local
