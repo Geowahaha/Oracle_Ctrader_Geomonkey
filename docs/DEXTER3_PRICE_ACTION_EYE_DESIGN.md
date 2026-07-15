@@ -92,6 +92,16 @@ feature:
 - **Tick-level (L2/L3):** pressure ratio, velocity bursts, delta proxy,
   micro-trend state on synthetic tick bars.
 
+**Two-sided read (owner insight, 2026-07-15):** every anatomy verdict is
+direction-RELATIVE, so a high-confidence oppose is simultaneously a
+candidate ENTRY signal for the mirror side — an upper-wick rejection
+cluster at minor resistance that vetoes a BUY is Brooks failed-breakout
+logic arguing FOR a sell fade. The Eye therefore has two possible careers:
+goalkeeper (veto the toxic side) and spotter (generate fade entries), and
+the second is tested with the SAME replay evidence via the mirror
+diagnostic (`--pa-eye` prints both tables). What the first exam rejected
+was confirmation-chasing ("support" as a boost), NOT anatomy-timed entries.
+
 **Promotion policy (the honest part):** knowing a textbook pattern is NOT
 evidence it pays on XAU M1/M5 in this regime — this repo has killed many
 plausible rules in replay (bucket lists, empirical sizing, 240 exit combos,

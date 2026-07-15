@@ -369,6 +369,45 @@ def main() -> int:
                         f"{segment:<9} {mode:<12} {verdict:<8} {len(rs):>5} "
                         f"{mean_r:>+7.3f} {net:>+8.2f} {pf:>6.2f}"
                     )
+        # MIRROR (fade) hypothesis — owner 2026-07-15: an anatomy verdict is
+        # direction-RELATIVE, so oppose(buy) at a rejection level is a
+        # candidate ENTRY for the fade side (Brooks failed-breakout logic),
+        # not merely a veto. Test it: for every verdicted trade, simulate the
+        # EXACT mirror (side flipped, SL/TP reflected around entry — inherits
+        # the committee's geometry, a known first-pass simplification) under
+        # the same live-ref exit. Report-only; oppose-mirror is the bucket
+        # the hypothesis lives or dies on.
+        print("\n=== PA EYE MIRROR (fade) DIAGNOSTIC (report-only) ===")
+        print(
+            f"{'segment':<9} {'gate':<12} {'verdict':<8} {'N':>5} {'meanR':>7} {'netR':>8} {'PF':>6}  (mirror side)"
+        )
+        for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+            for mode in gate_modes:
+                rows = [t for t in accepted_by_gate.get(mode, []) if pred(t)]
+                for verdict in ("support", "neutral", "oppose"):
+                    subset = [t for t in rows if t.get("pa_eye_verdict") == verdict]
+                    rs = []
+                    for t in subset:
+                        mirrored = dict(
+                            t,
+                            side=("sell" if t["side"] == "buy" else "buy"),
+                            sl=2.0 * t["entry"] - t["sl"],
+                            tp=2.0 * t["entry"] - t["tp"],
+                        )
+                        r = _combo_r(
+                            mirrored, ref["style"], ref["max_hold"], ref["disaster"], ref["sl_mult"],
+                            args.spread_abs, args.commission_r,
+                        )
+                        if r is not None:
+                            rs.append(r)
+                    if not rs:
+                        continue
+                    net, pf, _dd = _equity(rs)
+                    mean_r = net / len(rs)
+                    print(
+                        f"{segment:<9} {mode:<12} {verdict:<8} {len(rs):>5} "
+                        f"{mean_r:>+7.3f} {net:>+8.2f} {pf:>6.2f}"
+                    )
     print("\nRULES: report/act on VALIDATE numbers only; canary requires both-segments-positive "
           "AND beats the current-live ref on validate. Replay approximates live OM exits — a "
           "canary must still prove itself forward before any scale-up.")
