@@ -916,6 +916,10 @@ class Dexter3OpenApiClient:
             "time": _ms_to_iso_with_millis(exec_ms),
             "executionTimestamp": int(exec_ms or 0),
             "dealStatus": str(d.get("deal_status") or ""),
+            # Close-leg marker: netProfit below is stamped 0.0 even on ENTRY
+            # legs (pnl_usd absent), so consumers that sum realized pnl need
+            # this to tell the legs apart (2026-07-15 vanish incident).
+            "hasCloseDetail": bool(d.get("has_close_detail")),
             "netProfit": float(d.get("pnl_usd", 0.0) or 0.0),
             "grossProfit": float(d.get("gross_profit_usd", 0.0) or 0.0),
             "swap": float(d.get("swap_usd", 0.0) or 0.0),

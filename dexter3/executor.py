@@ -355,6 +355,15 @@ class Dexter3Executor:
         # accept a bare sqlite3.Connection too for lighter-weight tests.
         self._conn: sqlite3.Connection = getattr(journal, "_conn", journal)
         ensure_exec_events_table(self._conn)
+        # Capture THIS executor's own lane label at construction time (Fable
+        # vs Grok vs VP run as separate processes, each patching the module
+        # global LABEL before constructing its Dexter3Executor — see
+        # shadow_runner.run_loop/main). reconcile_vanished_lane_positions
+        # needs a per-instance value (not a live re-read of the mutable
+        # module global) so two lanes stay distinguishable even when both
+        # share one process (tests) — captured here, it is byte-identical to
+        # the live per-process patch-then-construct order.
+        self._own_label = LABEL
 
     # -- journaling helper ----------------------------------------------
 
@@ -966,16 +975,25 @@ class Dexter3Executor:
         Broker-side closes never pass through ``close_lane_position``, so
         without this reconcile those outcomes stay invisible to
         ``empirical_stats`` (the biggest coverage gap after 2026-07-10's
-        learner repair). Candidates are this executor's own ``entry_executed``
-        rows with NO close row yet — the journal write below IS the dedup
-        marker, so every vanish is recorded exactly once, restart-safe.
+        learner repair). Candidates are this executor's OWN ``entry_executed``
+        rows (label == ``self._own_label``; foreign-lane and unlabeled rows
+        are never candidates, same exclusion rule empirical_stats.py's
+        ``_exec_events_outcome_rows`` uses) with NO close row yet — the
+        journal write below IS the dedup marker, so every vanish is recorded
+        exactly once, restart-safe.
 
         ``open_positions`` must be the CURRENT label-filtered lane list the
         caller already fetched this bar (None = unknown broker state -> no-op).
         Realized pnl is summed from closing deals when available; a transient
-        deals failure skips the round (retried next bar) rather than writing a
-        premature pnl-less row. Never raises — a reconcile bug must not block
-        the trading loop.
+        deals failure skips the whole round (retried next bar), and a
+        candidate with NO deal rows at all in the fetched window is deferred
+        individually (retried next bar too) rather than journaling a
+        pnl=0.0 guess — writing a guessed pnl was exactly how a foreign
+        lane's still-open position (only its zero-pnl entry leg visible in
+        the window) got mis-journaled as a real close (2026-07-15 cross-lane
+        vanish incident; the label filter above independently closes that
+        hole too, this is belt-and-suspenders for the own-lane case). Never
+        raises — a reconcile bug must not block the trading loop.
         """
         if open_positions is None:
             return []
@@ -991,9 +1009,19 @@ class Dexter3Executor:
                 "ORDER BY e.id DESC LIMIT ?",
                 (str(symbol), int(max_candidates)),
             )
-            candidates = [
-                (int(pid), payload_json) for pid, payload_json in cur.fetchall() if int(pid) not in open_ids
-            ]
+            candidates: list[tuple[int, dict[str, Any]]] = []
+            for pid, payload_json in cur.fetchall():
+                pid = int(pid)
+                if pid in open_ids:
+                    continue
+                try:
+                    entry_payload = json.loads(payload_json or "{}")
+                except json.JSONDecodeError:
+                    entry_payload = {}
+                row_label = str(entry_payload.get("label") or "")
+                if row_label != str(self._own_label):
+                    continue  # foreign lane or unlabeled entry row — never ours to reconcile
+                candidates.append((pid, entry_payload))
             if not candidates:
                 return []
             try:
@@ -1010,6 +1038,15 @@ class Dexter3Executor:
             for d in deals:
                 if not isinstance(d, dict):
                     continue
+                # Only CLOSE legs carry realized pnl. The openapi client
+                # stamps netProfit=0.0 on ENTRY legs too (pnl_usd absent ->
+                # 0.0), so an own-lane open position's entry leg could still
+                # satisfy the defer check and journal a pnl=0.0 guess. When
+                # the deal shape exposes a close-detail marker, trust it;
+                # shapes without one (local MCP) keep the legacy sum.
+                if any(k in d for k in ("hasCloseDetail", "has_close_detail", "closePositionDetail")):
+                    if not (d.get("hasCloseDetail") or d.get("has_close_detail") or d.get("closePositionDetail")):
+                        continue
                 dpid = self._deal_position_id(d)
                 if dpid <= 0:
                     continue
@@ -1019,12 +1056,14 @@ class Dexter3Executor:
                 except (TypeError, ValueError):
                     continue
             out: list[dict[str, Any]] = []
-            for pid, payload_json in candidates:
-                try:
-                    entry_payload = json.loads(payload_json or "{}")
-                except json.JSONDecodeError:
-                    entry_payload = {}
-                pnl = pnl_by_pid.get(pid)
+            for pid, entry_payload in candidates:
+                if pid not in pnl_by_pid:
+                    # No deal row at all for this position in the fetched
+                    # window — defer to next round rather than guess pnl=0.0;
+                    # no journal write means no dedup marker, so it stays a
+                    # candidate and is retried as soon as the deal appears.
+                    continue
+                pnl = pnl_by_pid[pid]
                 record = {
                     "reason": "broker_side_close_reconciled",
                     "setup": str(entry_payload.get("setup") or "") or None,

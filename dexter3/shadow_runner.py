@@ -675,15 +675,38 @@ def _apply_v16_entry_quality_gate(
     state: dict[str, Any],
     decision: hunter_brain.Decision,
 ) -> dict[str, Any]:
-    """V1.6-only entry gate. Grok always passes. Journals features on decision."""
+    """V1.6-only entry gate. Grok always passes above its own leader_score
+    floor (DEXTER3_GROK_MIN_LEADER_SCORE — grok bypasses the v16 gate
+    entirely otherwise, so a near-zero leader_score signal was reaching
+    live entry unfiltered, e.g. leader_score=0.056 on 2026-07-15). Journals
+    features on decision."""
     if _is_grok_mode():
+        leader_score = float(getattr(decision, "leader_score", 0.0) or 0.0)
+        min_leader_score = _env_float("DEXTER3_GROK_MIN_LEADER_SCORE", 0.10)
+        if min_leader_score > 0.0 and leader_score < min_leader_score:
+            return {
+                "allow": False,
+                "reason": "grok_min_leader_score",
+                "a_plus": False,
+                "a_plus_reason": "",
+                "cooldown_bypassed": False,
+                "features": {
+                    "grok_bypass": True,
+                    "leader_score": leader_score,
+                    "min_leader_score": min_leader_score,
+                },
+            }
         return {
             "allow": True,
             "reason": "grok_bypass",
             "a_plus": False,
             "a_plus_reason": "",
             "cooldown_bypassed": False,
-            "features": {"grok_bypass": True},
+            "features": {
+                "grok_bypass": True,
+                "leader_score": leader_score,
+                "min_leader_score": min_leader_score,
+            },
         }
     cfg = _v16_entry_quality_config_from_env()
     result = evaluate_v16_entry_gate(
@@ -836,20 +859,38 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
     """Sum of today's (UTC) realized netProfit for our lane + the ordered
     list of those close PnLs (oldest -> newest), both derived from
     ``get_deals``. Cached for ``LANE_REALIZED_CACHE_SEC`` — callers on the
-    fast (~4s) tick path must never trigger a fresh MCP read every tick.
+    fast (~4s) tick path must never trigger a fresh MCP read every tick. The
+    cache is ALSO invalidated the instant the UTC calendar date rolls over,
+    even inside the 60s window: a fetch made at 23:59:5xZ used to keep
+    serving yesterday's already-computed "today" sum for up to 60s into the
+    new UTC day, and the governor read that stale total as the NEW day's
+    realized PnL — LOSS_STOPPED fired on a fresh 19-second-old position at
+    00:00:54Z on 2026-07-15 counting the PREVIOUS day's losses (cross-
+    midnight cache staleness, not a real loss on the new day).
 
     On an MCP failure, returns the last cached value; if there has never
     been a successful read, returns (0.0, []) and logs the failure exactly
     once (not every tick) so a persistent outage does not spam the log.
     """
     now_epoch = datetime.now(timezone.utc).timestamp()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache = _LANE_REALIZED_CACHE.setdefault(
-        label_filter, {"epoch": 0.0, "sum": 0.0, "pnls": [], "logged_failure": False}
+        label_filter, {"epoch": 0.0, "date": "", "sum": 0.0, "pnls": [], "logged_failure": False}
     )
-    if now_epoch - float(cache.get("epoch", 0.0)) < LANE_REALIZED_CACHE_SEC and cache.get("epoch", 0.0) > 0:
+    if (
+        cache.get("date") == today
+        and now_epoch - float(cache.get("epoch", 0.0)) < LANE_REALIZED_CACHE_SEC
+        and cache.get("epoch", 0.0) > 0
+    ):
         return float(cache["sum"]), list(cache["pnls"])
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Strict UTC-midnight clamp for the numeric-timestamp path below (used
+    # when a deal carries execution_timestamp_ms/executionTimestamp) — a
+    # precise ">= today 00:00:00Z" boundary the string-prefix check further
+    # down cannot express and which is immune to timestamp-format drift.
+    today_start_ms = int(
+        datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+    )
     try:
         deals = mcp.get_deals(count=500)
     except (McpClientError, McpZombieError) as exc:
@@ -866,14 +907,30 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
         if label_filter not in label:
             continue
         ts = str(
-            deal.get("time")  # the Local MCP's actual field (live-verified 2026-07-07)
+            deal.get("execution_utc")  # normalized client shape (openapi daemon path)
+            or deal.get("time")  # the Local MCP's actual field (live-verified 2026-07-07)
             or deal.get("executionTimestamp")
             or deal.get("closeTimestamp")
             or deal.get("closingTimestamp")
             or deal.get("utcLastUpdateTimestamp")
             or ""
         )
-        if not ts.startswith(today):
+        # Prefer a numeric UTC epoch-ms clamp over the ts string-prefix
+        # check when available (execution_timestamp_ms / executionTimestamp)
+        # — see today_start_ms above.
+        exec_ms = None
+        for ms_key in ("execution_timestamp_ms", "executionTimestamp"):
+            raw_ms = deal.get(ms_key)
+            if raw_ms:
+                try:
+                    exec_ms = int(raw_ms)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        if exec_ms is not None:
+            if exec_ms < today_start_ms:
+                continue
+        elif not ts.startswith(today):
             continue
         pnl = None
         for key in ("netProfit", "profit", "grossProfit", "pnl", "closedNetProfit"):
@@ -897,6 +954,7 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
     total = sum(pnls)
 
     cache["epoch"] = now_epoch
+    cache["date"] = today
     cache["sum"] = total
     cache["pnls"] = pnls
     cache["logged_failure"] = False
@@ -1337,6 +1395,11 @@ def run_symbol_cycle(
             smart_exit_meta = _apply_smart_exit_gate(decision, h1_ctx, state)
             if executor is not None:
                 gov = state.get("governor") or {}
+                # Computed eagerly (even on the locked/unverified branches
+                # below, where its result goes unused) so the pre-entry cap
+                # check below has it without a second MCP-adjacent call —
+                # _lane_realized_today is cache-backed, so this is cheap.
+                risk_info = _governor_entry_risk(mcp, decision, state)
                 if gov.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
                     # Owner's daily mission rule (2026-07-07) outranks
                     # participation-first for EXECUTION only — the decision above
@@ -1344,9 +1407,13 @@ def run_symbol_cycle(
                     status += f":governor_{str(gov.get('state')).lower()}"
                 elif lane is None:
                     status += ":live_skipped_lane_unverified"
+                elif risk_info is not None and not risk_info.get("allow", True):
+                    # Pre-entry loss-cap refusal (closes the race window
+                    # between one tick's governor evaluation and the next
+                    # tick's entry attempt — 2026-07-15).
+                    status += f":live_blocked_{risk_info.get('reason', 'governor_cap')}"
                 else:
                     daily = _daily_state(state)
-                    risk_info = _governor_entry_risk(mcp, decision)
                     base_risk_usd = (risk_info or {}).get("risk_usd")
                     if base_risk_usd is None:
                         base_risk_usd = executor.config.risk_usd
@@ -1414,17 +1481,49 @@ def run_symbol_cycle(
     return ";".join(statuses)
 
 
-def _governor_entry_risk(mcp: Dexter3McpClient, decision: hunter_brain.Decision) -> dict[str, Any] | None:
+def _governor_entry_risk(
+    mcp: Dexter3McpClient, decision: hunter_brain.Decision, state: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     """Daily Mission Governor dynamic sizing for one entry: ladder by today's
     win streak (stateless, derived from today's closed lane deals) × session
-    multiplier, on the owner's virtual capital base. Never raises — a failure
-    falls back to the executor's static config risk (returns None)."""
+    multiplier, on the owner's virtual capital base.
+
+    Also refuses the entry outright — ``allow: False``, reason
+    ``governor_loss_stop_pre_entry`` — when today's realized (+ floating, if
+    ``state["governor"]["floating_by_symbol"]`` already has a fresh snapshot)
+    PnL is already at/through the SAME ``daily_loss_usd`` cap
+    ``run_governor_tick`` uses for its close-all trigger (reused via
+    ``_get_governor().config``, never duplicated). This closes the race
+    window between one fast tick's governor evaluation and the NEXT tick's
+    entry attempt — a fresh 19-second-old position was let through and then
+    immediately closed by the governor's loss-stop (2026-07-15).
+
+    Never raises — a failure (sizing OR the cap check above) falls back to
+    the executor's static config risk (returns None), same fail-open posture
+    as every other entry-sizing gate in this file."""
     try:
-        _, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
+        realized, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
+        cfg = _get_governor().config
+        floating = 0.0
+        if state is not None:
+            floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
+            floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
+        effective = realized + floating
+        if effective <= -abs(cfg.daily_loss_usd):
+            log_line(
+                f"{utc_now_iso()} {decision.symbol} governor_loss_stop_pre_entry "
+                f"effective={effective:.2f} cap=-{abs(cfg.daily_loss_usd):.2f} (entry refused)"
+            )
+            return {
+                "allow": False,
+                "reason": "governor_loss_stop_pre_entry",
+                "effective_pnl": round(effective, 4),
+            }
         governor = _get_governor()
         session = str(((decision.features or {}).get("session_context") or {}).get("value") or "unknown")
         streak = governor.win_streak_from_closes(pnls)
         info = governor.risk_for_entry(session, streak)
+        info["allow"] = True
         log_line(
             f"{utc_now_iso()} {decision.symbol} governor sizing risk_usd={info.get('risk_usd')} "
             f"streak={streak} ladder={info.get('ladder_mult')} session={session}x{info.get('session_mult')}"
