@@ -220,6 +220,55 @@ def test_no_fresh_scalp_opens_on_ts_own_bar():
 
 
 # ---------------------------------------------------------------------------
+# (g) "wide" parent model regression (coordinator directive 2026-07-15):
+#     plain and smart both degenerate (their machinery ends the parent at the
+#     first close beyond -1.0R, so trigger bar == T, 0 scalps). The wide model
+#     (hard SL at entry +/- parent_sl_mult x ORIGINAL risk, no close-based
+#     exit) must let a close breach -1.2R (original units) at bar k << T,
+#     with T forced later by the widened SL at -2R -- and scalps must run,
+#     with every reported R in ORIGINAL-risk units.
+# ---------------------------------------------------------------------------
+
+
+def test_wide_parent_trigger_fires_before_t_and_scalps_run_in_original_units():
+    entry, sl, tp = 2000.0, 2002.0, 1990.0  # short; ORIGINAL risk = 2.0
+    # widened SL (mult 2.0) = 2000 + 2*(2002-2000) = 2004
+    future = [
+        _bar(2000.00, 2001.00, 1999.80, 2000.80),  # close r = -0.40 (original units)
+        _bar(2000.80, 2001.80, 2000.60, 2001.60),  # -0.80
+        _bar(2001.60, 2002.70, 2001.40, 2002.50),  # -1.25 <= -1.2 -> TRIGGER (k=2);
+                                                   # a plain parent would already be
+                                                   # dead here (high 2002.7 > sl 2002)
+        _bar(2002.50, 2003.20, 2002.30, 2003.00),  # scalp1 banks: (2003-2002.5)/2 = 0.25
+        _bar(2003.00, 2003.60, 2002.80, 2003.40),  # scalp2 opens at this close
+        _bar(2003.40, 2003.95, 2003.20, 2003.85),  # scalp2 banks: (2003.85-2003.4)/2 = 0.225
+        _bar(2003.85, 2004.20, 2003.70, 2004.10),  # high 2004.2 >= widened SL 2004 -> T=6
+    ]
+    trade = {"side": "sell", "entry": entry, "sl": sl, "tp": tp, "future": future}
+    spread_abs, commission_r = 0.12, 0.03
+
+    ep = _build_episode(trade, parent_max_hold=36, trigger_r=1.2, scalp_sl_frac=1.0,
+                         scalp_max_hold=12, bank_target_r=0.2, spread_abs=spread_abs,
+                         commission_r=commission_r, parent_style="wide", parent_sl_mult=2.0)
+
+    assert ep["excluded"] is None
+    assert ep["trigger_idx"] == 2      # trigger fires at bar k=2 ...
+    assert ep["T"] == 6                # ... well before the widened-SL death at T=6
+    # parent death in ORIGINAL-risk units = -parent_sl_mult, plus original-risk cost
+    cost = spread_abs / 2.0 + commission_r  # 0.09, denominated in ORIGINAL risk (2.0)
+    assert ep["baseline_r"] == pytest.approx(-2.0 - cost)
+    assert ep["baseline_r"] == pytest.approx(-2.09)
+    # at least one scalp ran (the whole point of the wide model) -- exactly two
+    # here, and their values prove the scalp risk = scalp_sl_frac x ORIGINAL
+    # risk (2.0), not the widened distance (4.0)
+    assert len(ep["scalp_rs"]) == 2
+    assert ep["scalp_rs"][0] == pytest.approx((2003.00 - 2002.50) / 2.0 - cost)  # 0.16
+    assert ep["scalp_rs"][1] == pytest.approx((2003.85 - 2003.40) / 2.0 - cost)  # 0.135
+    assert ep["repaired_total"] == pytest.approx(-2.09 + 0.16 + 0.135)
+    assert ep["repaired_total"] > ep["baseline_r"]
+
+
+# ---------------------------------------------------------------------------
 # misc small-surface checks
 # ---------------------------------------------------------------------------
 

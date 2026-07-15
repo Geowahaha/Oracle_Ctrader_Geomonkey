@@ -36,23 +36,29 @@ state writes. Promotion path (if the hypothesis holds): owner review of the
 VALIDATE numbers -> forward/shadow proof -> only then any live change to the
 basket repair-leg policy.
 
-DEVIATION / FINDING (2026-07-15, worth owner attention): under the plain
-hard-SL parent-resolution model (``_simulate``), a bar's CLOSE can never read
-worse than -1.0R while the parent is still "alive" -- OHLC guarantees
-close >= low, and a low breaching sl (at exactly -1.0R by definition) is what
-ends the parent's simulated life right there (``_simulate`` returns the
-instant ``lo <= sl``/``hi >= sl``). So a close-based ``--repair-trigger-r``
-of >= 1.0 (the spec's own stated default, 1.2, preserved here unchanged) can
-only ever coincide with T itself -- a 0-scalp episode -- never with room for
-scalps to run. This is a structural property of the model, not an
-implementation bug: real-market sweeps at the literal default will mostly
-report "never triggered" exclusions. The engine below is fully general
-(any --repair-trigger-r works correctly); the unit tests exercise it with
-sub-1.0 triggers to reach non-degenerate trapped episodes. Getting real bite
-out of the 1.2 default would require either lowering it below 1.0, or
-swapping the parent-resolution model for one where sl-breach does not itself
-end the trade (e.g. mark-to-close-only with a much wider hard stop) --
-an owner decision, not made here.
+PARENT MODEL (settled 2026-07-15 after two degenerate attempts -- keep this
+history so nobody re-walks it): a close-based trigger past -1.0R requires a
+parent model whose closes can SURVIVE beyond -1.0R.
+  * "plain" (hard SL at the original distance) caps floating closes at
+    -1.0R: the sl wick that would allow a worse close kills the parent on
+    that same bar. Trigger >= 1.0 lands on T itself -> 0-scalp episodes.
+  * "smart" (``_simulate_smart``) was the first fix attempt and is ALSO
+    degenerate -- proven by the 10k-bar run (1015 studied episodes, 0
+    scalps, +0.00 improvement everywhere): its close-confirmed SL branch
+    (``cl <= sl`` / ``cl >= sl``) exits the parent on the very first close
+    beyond -1.0R, so the trigger bar always coincides with T.
+  * "wide" (the CLI default) is the model the LIVE evidence demands: real
+    trade 652652362 (2026-07-15) floated at -1.33R for 3 HOURS before a
+    time-based cap_stop -- at the 1oz volume floor the broker stop sits at
+    the disaster distance, not the design sl. So: plain hard-SL simulation
+    with the SL widened to entry +/- (--parent-sl-mult x the ORIGINAL
+    |entry-sl|), original TP kept, NO close-based early exit, and
+    --parent-max-hold 36 (the live 3h cap_stop in M5 bars). All R is
+    reported in ORIGINAL-risk units (a wide parent's SL death = -mult R);
+    the trigger and the scalp risk distance are original-risk based in
+    every style.
+"plain" and "smart" remain selectable for comparison and for the synthetic
+unit tests, whose hand-computed geometry uses sub-1.0 triggers.
 
 Usage (VM, through the daemon):
     DEXTER3_TRANSPORT=openapi DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877 \
@@ -78,7 +84,7 @@ from scripts.dexter3_edge_discovery import (  # noqa: E402
     _simulate_smart,
     _stamp_entry_gate_features,
 )
-from scripts.dexter3_geometry_optimizer import _combo_r, _equity, _simulate_bank  # noqa: E402
+from scripts.dexter3_geometry_optimizer import _equity, _simulate_bank  # noqa: E402
 from dexter3 import hunt_mode  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
@@ -146,36 +152,68 @@ def _run_repair_scalps(parent_side: str, parent_entry: float, parent_sl: float, 
 def _build_episode(trade: dict, parent_max_hold: int, trigger_r: float, scalp_sl_frac: float,
                     scalp_max_hold: int, bank_target_r: float, spread_abs: float,
                     commission_r: float, parent_style: str = "plain",
-                    parent_disaster: float = 2.0) -> dict:
+                    parent_disaster: float = 2.0, parent_sl_mult: float = 2.0) -> dict:
     """Score one accepted parent trade end to end: resolve it under the
     chosen parent exit model to get its resolution bar T and cost-adjusted R,
     find its repair trigger (if any) within [0, T], and -- only for trapped
     episodes -- run the repair-scalp engine truncated at T.
 
-    ``parent_style``: "plain" = hard SL/TP (structurally caps floating at
-    -1.0R, so a close-based trigger >= 1.0 can never fire mid-life — see the
-    module docstring); "smart" = the CURRENT-LIVE exit machinery
-    (_simulate_smart with ``parent_disaster`` x risk as the effective floor
-    ~-2R) — the model that matches how the live basket actually floated to
-    -1.33R before repairing on 2026-07-15. The CLI defaults to "smart";
-    "plain" stays the function default so the synthetic unit tests keep
-    their hand-computed geometry.
+    ``parent_style`` (the CLI defaults to "wide"; "plain" stays the function
+    default so the synthetic unit tests keep their hand-computed geometry):
+      * "plain" = hard SL/TP at the original sl. Structurally caps floating
+        closes at -1.0R (the sl wick that would allow a worse close kills the
+        parent on that same bar), so a close-based trigger >= 1.0 can never
+        fire mid-life -- degenerate for this study, kept for the unit tests.
+      * "smart" = close-confirmed SL + disaster wick (``_simulate_smart``,
+        ``parent_disaster`` x risk). ALSO degenerate here (proven by the 10k
+        run of 2026-07-15: 1015 episodes, 0 scalps): its ``cl <= sl`` /
+        ``cl >= sl`` branch exits the parent on the very first close beyond
+        -1.0R, so the trigger bar always coincides with T.
+      * "wide" = plain hard-SL simulation with the SL WIDENED to
+        entry +/- (``parent_sl_mult`` x the ORIGINAL |entry-sl|), original TP
+        kept, NO close-based early exit. This models the live evidence (trade
+        652652362, 2026-07-15: held -1.33R for 3 hours before a time-based
+        cap_stop) -- the broker stop at the 1oz floor sits at the disaster
+        distance, not at the design sl, so closes between -1.0R and
+        -``parent_sl_mult`` R are survivable and the 1.2R trigger is
+        reachable mid-life.
+
+    ALL returned R values are in ORIGINAL-risk units (risk = the original
+    |entry-sl|): "wide" simulates against the widened distance and converts
+    back via r_widened * parent_sl_mult, so a wide parent's SL death reports
+    as -``parent_sl_mult`` R; "plain"/"smart" already measure R against the
+    original distance. The repair trigger and the scalp risk distance are
+    original-risk based in every style (both consume the trade's original
+    ``sl`` directly).
 
     Returns a dict with ``excluded`` = None (studied), ``"zero_risk"``
     (parent has no risk distance), or ``"no_trigger"`` (never breached the
     trigger before resolving -- not a trapped episode)."""
     side, entry, sl, tp = trade["side"], trade["entry"], trade["sl"], trade["tp"]
     future = trade["future"]
+    risk_orig = abs(entry - sl)
     if parent_style == "smart":
         outcome, r_raw, held = _simulate_smart(side, entry, sl, tp, future, parent_max_hold, parent_disaster)
+    elif parent_style == "wide":
+        if parent_sl_mult <= 0:
+            raise ValueError(f"parent_sl_mult must be > 0, got {parent_sl_mult}")
+        sl_wide = (entry - parent_sl_mult * (entry - sl)) if side == "buy" \
+            else (entry + parent_sl_mult * (sl - entry))
+        outcome, r_widened, held = _simulate(side, entry, sl_wide, tp, future, parent_max_hold)
+        # _simulate measured R against the WIDENED distance; convert back to
+        # ORIGINAL-risk units (SL death = -1.0 widened = -parent_sl_mult orig)
+        r_raw = r_widened * parent_sl_mult
     else:
         outcome, r_raw, held = _simulate(side, entry, sl, tp, future, parent_max_hold)
     if outcome == "skip":
         return {"excluded": "zero_risk", "T": None, "trigger_idx": None,
                 "baseline_r": None, "scalp_rs": [], "repaired_total": None}
     t_idx = held  # 0-based index into `future` of the parent's resolution bar
-    baseline_r = _combo_r(trade, parent_style, parent_max_hold, parent_disaster, 1.0,
-                          spread_abs, commission_r)
+    # cost in ORIGINAL-risk units -- same formula _combo_r applies for its
+    # sl_mult=1.0 styles (spread over the original risk distance + flat
+    # commission R); inlined here because "wide" needs the original-risk
+    # denominator while its simulation ran against the widened one
+    baseline_r = r_raw - ((spread_abs / risk_orig if risk_orig > 0 else 0.0) + commission_r)
     future_upto_t = future[: t_idx + 1]
     trigger_idx = _find_repair_trigger(side, entry, sl, future_upto_t, trigger_r)
     if trigger_idx is None:
@@ -203,33 +241,36 @@ def main() -> int:
     ap.add_argument("--spread-abs", type=float, default=0.12)
     ap.add_argument("--commission-r", type=float, default=0.03)
     ap.add_argument("--gates", default="v17,v17-mission,none")
-    ap.add_argument("--parent-max-hold", type=int, default=24,
-                    help="current-live ref exit hold window for the parent (plain SL/TP)")
+    ap.add_argument("--parent-max-hold", type=int, default=36,
+                    help="parent resolution cap in M5 bars (live basket cap_stop = 3h = 36 bars, "
+                         "per trade 652652362 on 2026-07-15)")
     ap.add_argument("--repair-trigger-r", type=float, default=1.2,
                     help=(
-                        "parent floating R (at M5 close) that marks the position TRAPPED. NOTE: "
-                        "under the plain hard-SL parent model used here, a bar's CLOSE can never "
-                        "be worse than -1.0R without its own wick already having touched sl (which "
-                        "ends the parent's simulated life right there) -- so any --repair-trigger-r "
-                        ">= 1.0 can only ever coincide with the parent's OWN resolution bar T "
-                        "(a 0-scalp episode). Real-market runs at the 1.2 default will mostly report "
-                        "'never triggered' exclusions; this is a structural property of the plain-SL "
-                        "resolution model, not a bug -- see the module docstring's DEVIATION note."
+                        "parent floating R at an M5 close (ORIGINAL-risk units) that marks the "
+                        "position TRAPPED. Reachable mid-life only under --parent-style wide: "
+                        "plain caps closes at -1.0R (sl wick kills first) and smart exits on the "
+                        "first close beyond -1.0R, so under those styles a >= 1.0 trigger always "
+                        "lands on T itself (0-scalp episode) -- see _build_episode's docstring."
                     ))
     ap.add_argument("--scalp-sl-frac", type=float, default=1.0,
-                    help="scalp risk distance = this x the parent's |entry-sl|")
+                    help="scalp risk distance = this x the parent's ORIGINAL |entry-sl|")
     ap.add_argument("--scalp-max-hold", type=int, default=12, help="max M5 bars to hold one scalp")
     ap.add_argument(
-        "--parent-style", choices=("plain", "smart"), default="smart",
+        "--parent-style", choices=("plain", "smart", "wide"), default="wide",
         help=(
-            "parent exit model: smart (DEFAULT — the current-live machinery; effective "
-            "floor ~ parent-disaster x risk, matching how the live basket floated to "
-            "-1.33R before the 2026-07-15 repair) or plain (hard SL caps floating at "
-            "-1.0R, so trigger >= 1.0 can never fire — degenerate; see module docstring)"
+            "parent exit model: wide (DEFAULT -- hard SL widened to entry +/- "
+            "parent-sl-mult x the ORIGINAL risk, no close-based early exit; matches live "
+            "evidence: trade 652652362 held -1.33R for 3h before a time-based cap_stop), "
+            "smart (close-confirmed SL -- exits on the first close beyond -1.0R, so the "
+            "1.2R trigger degenerates to T; kept for comparison), or plain (hard SL at "
+            "the original distance -- same degeneracy; kept for the unit tests)"
         ),
     )
     ap.add_argument("--parent-disaster", type=float, default=2.0,
                     help="disaster stop multiple for --parent-style smart (live ref 2.0)")
+    ap.add_argument("--parent-sl-mult", type=float, default=2.0,
+                    help="--parent-style wide: broker stop distance = this x the ORIGINAL "
+                         "|entry-sl|; the parent's SL death reports as -this R in original units")
     ap.add_argument("--bank-target-r", type=float, default=0.2,
                     help="bank the whole scalp at the first close >= this R (v1.0 default)")
     ap.add_argument("--per-episode", action="store_true",
@@ -306,7 +347,8 @@ def main() -> int:
                                      args.scalp_sl_frac, args.scalp_max_hold, args.bank_target_r,
                                      args.spread_abs, args.commission_r,
                                      parent_style=args.parent_style,
-                                     parent_disaster=args.parent_disaster)
+                                     parent_disaster=args.parent_disaster,
+                                     parent_sl_mult=args.parent_sl_mult)
                 if ep["excluded"] == "zero_risk":
                     excl_zero += 1
                     continue
