@@ -812,8 +812,18 @@ class Dexter3OpenApiClient:
         orders = raw.get("orders") or []
         return [self._normalize_order_for_dexter3(o) for o in orders if isinstance(o, dict)]
 
-    def get_deals(self, count: int = 200) -> list[dict[str, Any]]:
-        raw = self._reconcile(max_rows=max(1, int(count)), with_deal_labels=True)
+    def get_deals(self, count: int = 200, from_timestamp_ms: int | None = None) -> list[dict[str, Any]]:
+        """``from_timestamp_ms`` (H1, 2026-07-15 cross-lane entanglement
+        audit, optional): a precise UTC-ms lower bound threaded straight into
+        the reconcile payload's ``from_timestamp`` — see ``_reconcile`` below
+        and ``openapi_daemon.py::_mode_reconcile``'s ``payload.get(
+        "from_timestamp")``. Closes the hole where a deal-heavy lane's fills
+        push the OTHER lane's earlier-today closes out of a shared
+        ``count``-only window before any client-side day/label filter ever
+        sees them."""
+        raw = self._reconcile(
+            max_rows=max(1, int(count)), with_deal_labels=True, from_timestamp_ms=from_timestamp_ms
+        )
         deals = raw.get("deals") or []
         return [self._normalize_deal_for_dexter3(d) for d in deals if isinstance(d, dict)][: max(1, int(count))]
 
@@ -826,6 +836,7 @@ class Dexter3OpenApiClient:
         max_rows: int = 200,
         with_deal_labels: bool = False,
         include_deals: bool = True,
+        from_timestamp_ms: int | None = None,
     ) -> dict[str, Any]:
         # with_deal_labels gates the deal->order label join (an extra broker
         # round-trip): only get_deals (governor realized-PnL, called rarely +
@@ -839,6 +850,15 @@ class Dexter3OpenApiClient:
         # Keep historical deals on by default for compatibility with callers
         # which consume the raw reconciliation result.
         payload["include_deals"] = bool(include_deals)
+        if from_timestamp_ms is not None:
+            # H1 fix (2026-07-15 cross-lane entanglement audit): overrides the
+            # lookback_hours-derived from_ts fallback
+            # openapi_daemon.py::_mode_reconcile computes when this key is
+            # absent, with a PRECISE caller-supplied UTC-ms floor. The
+            # one-shot subprocess worker ignores unknown payload keys, so this
+            # is a no-op there (unchanged historical behavior); only the
+            # daemon transport honors it.
+            payload["from_timestamp"] = int(from_timestamp_ms)
         if with_deal_labels:
             payload["include_deal_labels"] = True
             # The labeled path runs TWO extra heavy broker round-trips

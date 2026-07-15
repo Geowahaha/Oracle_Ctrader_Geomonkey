@@ -90,6 +90,12 @@ STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
 GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
 VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
+# H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
+# path stays LOG_FILE unchanged (confirmed the only code reader,
+# ops/dexter3_telegram_watcher.py, hardcodes exactly this fable path — see
+# _active_log_file below), so keeping it as-is means zero breakage there.
+GROK_LOG_FILE = RUNTIME / "dexter3_grok_shadow.log"
+VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
@@ -166,6 +172,20 @@ def _active_state_file(mode: str | None = None) -> Path:
     if current_mode == "vp":
         return VP_STATE_FILE
     return STATE_FILE
+
+
+def _active_log_file(mode: str | None = None) -> Path:
+    """H5 (2026-07-15 cross-lane entanglement audit): mode-selected log path,
+    same pattern as ``_active_state_file`` above. Fable (default/"v16") keeps
+    ``LOG_FILE`` (``dexter3_shadow.log``) unchanged — ops/dexter3_telegram_watcher.py
+    is the only code that reads this path today and it only ever reads the
+    fable path, so this default is a strict no-op for that reader."""
+    current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "grok":
+        return GROK_LOG_FILE
+    if current_mode == "vp":
+        return VP_LOG_FILE
+    return LOG_FILE
 
 
 def _executor_config_from_env() -> "ExecutorConfig":
@@ -892,7 +912,14 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
         datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
     )
     try:
-        deals = mcp.get_deals(count=500)
+        # H1 fix (2026-07-15 cross-lane entanglement audit): thread the
+        # already-computed UTC-day-start floor into get_deals so a deal-heavy
+        # lane can never push the OTHER lane's earlier-today closes out of
+        # this shared count=500 window before the per-deal filters below ever
+        # see them. The local-MCP transport accepts and drops this param (see
+        # Dexter3McpClient.get_deals); the per-deal date/label filters below
+        # remain the correctness backstop on that path.
+        deals = mcp.get_deals(count=500, from_timestamp_ms=today_start_ms)
     except (McpClientError, McpZombieError) as exc:
         if not cache.get("logged_failure"):
             log_line(f"{utc_now_iso()} governor lane_realized_today get_deals_failed (using cached/zero): {exc}")
@@ -1156,7 +1183,7 @@ def fetch_fresh_m5(mcp: Dexter3McpClient, symbol: str, count: int = MIN_M5_BARS)
 def log_line(text: str) -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
     print(text)
-    with LOG_FILE.open("a", encoding="utf-8") as fh:
+    with _active_log_file().open("a", encoding="utf-8") as fh:
         fh.write(text + "\n")
 
 
@@ -1175,7 +1202,7 @@ def log_error(context: str, exc: BaseException) -> None:
     log_line(f"{utc_now_iso()} ERROR {context}: {exc!r}")
     tb = traceback.format_exc()
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as fh:
+    with _active_log_file().open("a", encoding="utf-8") as fh:
         fh.write(tb + "\n")
 
 
@@ -1221,6 +1248,7 @@ class PaperBasket:
                 self.manager.state.basket_id or 0,
                 "on_entry",
                 {"decision_action": decision.action, "result": result.to_dict()},
+                label=_active_order_label(),
             )
 
     def on_m5_close_tick(self, current_price: float | None) -> None:
@@ -1249,6 +1277,7 @@ class PaperBasket:
                 self.manager.state.basket_id or 0,
                 "on_m5_close",
                 {"result": result.to_dict(), "aggregate_r": aggregate_r},
+                label=_active_order_label(),
             )
 
 
@@ -1370,7 +1399,10 @@ def run_symbol_cycle(
             decision = hunter_brain.decide(
                 symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
             )
-        journal.insert_decision(decision)
+        # H2 (2026-07-15 cross-lane entanglement audit): stamp this row with
+        # the writing lane's own order label so per-lane journal queries
+        # (empirical stats, skip fear-cost) never pool Fable/Grok/VP rows.
+        journal.insert_decision(decision, label=_active_order_label())
         log_decision_line(decision, late_sec=late_sec)
 
         basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
@@ -1929,12 +1961,17 @@ def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: D
         except Exception as exc:  # noqa: BLE001 - stats refresh must never break the loop
             log_error(f"empirical_stats.compute_from_journal({symbol})", exc)
     try:
-        result = skip_evaluator.evaluate_pending_skips(journal, mcp)
+        # H2 (2026-07-15 cross-lane entanglement audit): each lane's learner
+        # loop only ever evaluates/summarizes ITS OWN decisions — see
+        # skip_evaluator.evaluate_pending_skips/fear_cost_summary's label
+        # exclusion convention.
+        active_label = _active_order_label()
+        result = skip_evaluator.evaluate_pending_skips(journal, mcp, label=active_label)
         log_line(
             f"{utc_now_iso()} skip_evaluator checked={result['checked']} "
             f"evaluated={result['evaluated']} unevaluable={result['unevaluable']}"
         )
-        fear_cost = skip_evaluator.fear_cost_summary(journal)
+        fear_cost = skip_evaluator.fear_cost_summary(journal, label=active_label)
         log_line(
             f"{utc_now_iso()} fear_cost hours={fear_cost['hours']} "
             f"skips_evaluated={fear_cost['skips_evaluated']} "
@@ -2291,6 +2328,7 @@ def run_om_tick(
             "unreliable_pnl_position_ids": agg_probe.get("unreliable_pnl_position_ids"),
             "executed": executed,
         },
+        label=_active_order_label(),
     )
     save_shadow_state(state)
     if act != "hold":
@@ -2430,6 +2468,7 @@ def run_governor_tick(
                     "win_streak": DailyGovernor.win_streak_from_closes(pnls),
                     "closed": closed_summary,
                 },
+                label=_active_order_label(),
             )
 
         save_shadow_state(state)
@@ -2631,6 +2670,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.grok:
         os.environ["DEXTER3_MODE"] = "grok"
+
+    # H6 fix (2026-07-15 cross-lane entanglement audit): --once previously
+    # only ever patched executor.LABEL for --grok, never for the VP canary
+    # lane (DEXTER3_MODE=vp is env-var-driven only — there is no --vp CLI
+    # flag, same as run_loop's own is_vp check above). Without this, a --once
+    # invocation launched with DEXTER3_MODE=vp already set in the environment
+    # would place any live entry under the DEFAULT (Fable) LABEL instead of
+    # VP_LABEL — mirrors run_loop's own VP patch exactly.
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "vp":
+        from dexter3.volume_profile import VP_LABEL as _VP_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _VP_LABEL
+        print(f"[VP] Forced executor LABEL to {_VP_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

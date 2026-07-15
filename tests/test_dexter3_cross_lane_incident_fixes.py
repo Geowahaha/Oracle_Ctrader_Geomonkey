@@ -90,8 +90,11 @@ class FakeMcp:
         self._positions = [p for p in self._positions if position_id_of(p) != position_id]
         return {"status": "closed"}
 
-    def get_deals(self, count: int = 200) -> list[dict]:
-        self.calls.append(("get_deals", {"count": count}))
+    def get_deals(self, count: int = 200, from_timestamp_ms: int | None = None) -> list[dict]:
+        # from_timestamp_ms: accepted for call-site parity with the H1 fix
+        # (2026-07-15 cross-lane entanglement audit) — this fake stands in
+        # for the local-MCP transport, which also accepts-and-drops it.
+        self.calls.append(("get_deals", {"count": count, "from_timestamp_ms": from_timestamp_ms}))
         return list(self.deals)
 
 
@@ -255,7 +258,7 @@ def test_lane_realized_today_cache_invalidates_across_utc_midnight(monkeypatch):
     calls = {"n": 0}
 
     class _MultiCallMcp:
-        def get_deals(self, count: int = 500) -> list[dict]:
+        def get_deals(self, count: int = 500, from_timestamp_ms: int | None = None) -> list[dict]:
             calls["n"] += 1
             if calls["n"] == 1:
                 return [

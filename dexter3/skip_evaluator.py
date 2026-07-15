@@ -232,6 +232,7 @@ def evaluate_pending_skips(
     now: datetime | None = None,
     delay_min: int = SKIP_EVAL_DELAY_MIN,
     limit: int = 200,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate all eligible pending skip decisions and write skip_outcomes rows.
 
@@ -239,16 +240,28 @@ def evaluate_pending_skips(
     least ``delay_min`` minutes before ``now``, and no ``skip_outcomes`` row
     already references it. Never raises — MCP/history failures degrade a
     single decision to "unevaluable" and move on to the next one.
+
+    ``label`` (H2, 2026-07-15 cross-lane entanglement audit, optional): when
+    provided, restricts eligible decisions to rows carrying EXACTLY this
+    label — same exclusion convention as ``dexter3.empirical_stats``'s own
+    ``label`` param (``None`` = no filter/legacy pooled behavior; a value
+    excludes both unlabeled rows AND a peer lane's rows). Two lanes sharing
+    this journal previously raced to evaluate the SAME unlabeled skip rows
+    (each writing its own skip_outcomes row for identical decisions); passing
+    each lane's own label here means every lane only ever claims its OWN
+    rows, which incidentally also kills that duplicate-evaluation race — no
+    unique index needed, the label filter alone makes the row sets disjoint.
     """
     now = now or datetime.now(timezone.utc)
     conn = getattr(journal, "_conn", journal)
-    pending = _fetch_pending_skip_rows(conn, now=now, delay_min=delay_min, limit=limit)
+    pending = _fetch_pending_skip_rows(conn, now=now, delay_min=delay_min, limit=limit, label=label)
 
     evaluated_count = 0
     unevaluable_count = 0
     for row in pending:
         result = evaluate_decision(row, mcp)
         decision_id = result["decision_id"]
+        row_label = row.get("label")
         if result.get("evaluated"):
             would_have_result = result["would_have_result"]
             _insert_skip_outcome(
@@ -256,6 +269,7 @@ def evaluate_pending_skips(
                 decision_id=decision_id,
                 would_have_result=json.dumps(would_have_result, ensure_ascii=False, default=str),
                 would_have_pnl=float(result["pnl_r"]),
+                label=row_label,
             )
             evaluated_count += 1
         else:
@@ -264,6 +278,7 @@ def evaluate_pending_skips(
                 decision_id=decision_id,
                 would_have_result=json.dumps({"unevaluable": True, "reason": result.get("reason")}, ensure_ascii=False),
                 would_have_pnl=None,
+                label=row_label,
             )
             unevaluable_count += 1
 
@@ -275,41 +290,63 @@ def evaluate_pending_skips(
 
 
 def _fetch_pending_skip_rows(
-    conn: Any, *, now: datetime, delay_min: int, limit: int
+    conn: Any, *, now: datetime, delay_min: int, limit: int, label: str | None = None
 ) -> list[dict[str, Any]]:
     cutoff = _iso_z(now - timedelta(minutes=delay_min))
     query = """
-        SELECT d.id, d.ts_close, d.symbol, d.action, d.features_json
+        SELECT d.id, d.ts_close, d.symbol, d.action, d.features_json, d.label
         FROM decisions d
         LEFT JOIN skip_outcomes so ON so.decision_id = d.id
         WHERE d.action = 'skip' AND d.ts_close <= ? AND so.id IS NULL
-        ORDER BY d.id ASC
-        LIMIT ?
     """
-    rows = conn.execute(query, (cutoff, int(limit))).fetchall()
+    params: list[Any] = [cutoff]
+    if label is not None:
+        # H2 exclusion convention (matches empirical_stats.py): a lane must
+        # only ever evaluate ITS OWN decisions — legacy unlabeled rows and a
+        # peer lane's rows are excluded, never pooled in.
+        query += " AND d.label = ?"
+        params.append(label)
+    query += " ORDER BY d.id ASC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(query, tuple(params)).fetchall()
     out: list[dict[str, Any]] = []
-    for row_id, ts_close, symbol, action, features_json in rows:
+    for row_id, ts_close, symbol, action, features_json, row_label in rows:
         try:
             features = json.loads(features_json or "{}")
         except json.JSONDecodeError:
             features = {}
-        out.append({"id": row_id, "ts_close": ts_close, "symbol": symbol, "action": action, "features": features})
+        out.append(
+            {
+                "id": row_id,
+                "ts_close": ts_close,
+                "symbol": symbol,
+                "action": action,
+                "features": features,
+                "label": row_label,
+            }
+        )
     return out
 
 
 def _insert_skip_outcome(
-    conn: Any, *, decision_id: int, would_have_result: str | None, would_have_pnl: float | None
+    conn: Any,
+    *,
+    decision_id: int,
+    would_have_result: str | None,
+    would_have_pnl: float | None,
+    label: str | None = None,
 ) -> int:
     from datetime import datetime as _dt
 
     cur = conn.execute(
-        """INSERT INTO skip_outcomes (decision_id, would_have_result, would_have_pnl, evaluated_at)
-           VALUES (?, ?, ?, ?)""",
+        """INSERT INTO skip_outcomes (decision_id, would_have_result, would_have_pnl, evaluated_at, label)
+           VALUES (?, ?, ?, ?, ?)""",
         (
             int(decision_id),
             would_have_result,
             would_have_pnl,
             _dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            label,
         ),
     )
     conn.commit()
@@ -324,6 +361,7 @@ def fear_cost_summary(
     hours: int = FEAR_COST_DEFAULT_HOURS,
     *,
     now: datetime | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """Validated fear-cost KPI over the last ``hours``.
 
@@ -333,6 +371,13 @@ def fear_cost_summary(
     win count and the PnL sum, but their count is reported separately so the
     KPI is honest about coverage gaps.  Legacy rows whose side was derived
     from future bars are excluded and reported as ``invalid_lookahead``.
+
+    ``label`` (H2, 2026-07-15 cross-lane entanglement audit, optional):
+    restricts the KPI to the decisions carrying EXACTLY this label — same
+    exclusion convention as ``evaluate_pending_skips``/``empirical_stats``
+    (``None`` = no filter, legacy pooled-across-lanes behavior). Filters on
+    the DECISION's own label (the source of truth), not skip_outcomes'
+    redundant copy.
     """
     conn = getattr(journal, "_conn", journal)
     cutoff = _iso_z((now or datetime.now(timezone.utc)) - timedelta(hours=hours))
@@ -342,7 +387,11 @@ def fear_cost_summary(
         JOIN decisions d ON d.id = so.decision_id
         WHERE d.ts_close >= ?
     """
-    rows = conn.execute(query, (cutoff,)).fetchall()
+    params: list[Any] = [cutoff]
+    if label is not None:
+        query += " AND d.label = ?"
+        params.append(label)
+    rows = conn.execute(query, tuple(params)).fetchall()
 
     skips_evaluated = 0
     unevaluable = 0

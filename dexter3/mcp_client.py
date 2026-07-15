@@ -503,7 +503,7 @@ class Dexter3McpClient:
             return data
         raise McpClientError(f"get_pending_orders returned unexpected payload: {data!r}")
 
-    def get_deals(self, count: int = 200) -> list[dict[str, Any]]:
+    def get_deals(self, count: int = 200, from_timestamp_ms: int | None = None) -> list[dict[str, Any]]:
         """Fetch the most recent realized deals (read-only).
 
         The Local MCP's ``get_deals`` tool is paged by ``count`` (per-request
@@ -513,6 +513,15 @@ class Dexter3McpClient:
         exactly — do not invent a from/to-windowed call here; callers that
         need "today's deals" filter the returned list client-side by each
         deal's own timestamp field (see ``dexter3.daily_governor`` callers).
+
+        ``from_timestamp_ms`` (H1, 2026-07-15 cross-lane entanglement audit):
+        accepted ONLY for call-site parity with
+        ``Dexter3OpenApiClient.get_deals`` (which honors it — see that
+        module). The Local MCP transport has no from/to filtering support at
+        all (see above), so this parameter is intentionally accepted and
+        dropped here rather than raising — callers on this transport must
+        keep relying on their own client-side day/label filters (already the
+        case everywhere in this repo) as the correctness backstop.
         """
         data = self.call("get_deals", {"count": max(1, int(count))})
         if isinstance(data, dict):

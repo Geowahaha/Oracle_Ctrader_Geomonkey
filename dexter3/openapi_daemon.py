@@ -1056,10 +1056,33 @@ class OpenApiDaemon:
                 "status": "disconnected",
                 "message": "daemon has no live cTrader OpenAPI connection right now",
             }
+        start = time.time()
         try:
             return threads.blockingCallFromThread(reactor, self._dispatch, str(mode or ""), dict(payload or {}))
         except Exception as exc:  # noqa: BLE001 - surface as a clean JSON error, never crash
             return {"ok": False, "status": "worker_error", "message": str(exc)}
+        finally:
+            self._log_slow_call(mode, time.time() - start)
+
+    @staticmethod
+    def _log_slow_call(mode: str, elapsed_sec: float) -> None:
+        """H3 (2026-07-15 cross-lane entanglement audit) — OBSERVABILITY
+        ONLY: logs one line when a dispatched call's total wall time
+        (including the HTTP-thread-to-reactor blocking wait) exceeds env
+        ``DEXTER3_DAEMON_SLOW_CALL_LOG_SEC`` (default 5.0s; <=0 disables).
+        Does not change dispatch behavior, timeouts, or retries in any way —
+        this is a log line, nothing else."""
+        try:
+            raw_threshold = os.environ.get("DEXTER3_DAEMON_SLOW_CALL_LOG_SEC", "")
+            threshold = float(raw_threshold) if raw_threshold.strip() else 5.0
+        except ValueError:
+            threshold = 5.0
+        if threshold <= 0:
+            return
+        if elapsed_sec > threshold:
+            logger.warning(
+                "slow daemon call mode=%s elapsed=%.2fs (threshold=%.2fs)", mode, elapsed_sec, threshold
+            )
 
     # -- per-mode dispatch ----------------------------------------------------
 

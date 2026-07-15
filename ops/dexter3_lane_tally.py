@@ -83,12 +83,32 @@ def main() -> int:
     args = ap.parse_args()
 
     c = make_client()
-    deals = c.get_deals(count=args.count) or []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         since = _parse_utc(args.since) if args.since else None
     except ValueError as exc:
         ap.error(f"invalid --since: {exc}")
+
+    # H1 fix (2026-07-15 cross-lane entanglement audit): get_deals is
+    # count-paged (not from/to-windowed) on every transport, so a deal-heavy
+    # lane can push the OTHER lane's earlier-today closes out of a shared
+    # --count window before the client-side day/label filters in
+    # tally_deals() ever see them. When the caller asked for a bounded window
+    # (--since, or --today's UTC day start), thread that same lower bound
+    # into get_deals so the OpenAPI/daemon transport narrows its OWN
+    # broker-side query too; the local-MCP transport accepts-and-drops the
+    # param (see Dexter3McpClient.get_deals) and keeps relying on
+    # tally_deals()'s client-side filters as its correctness backstop.
+    # Unbounded invocations (neither --since nor --today) keep the pre-fix
+    # count-only behavior unchanged.
+    from_timestamp_ms: int | None = None
+    if since is not None:
+        from_timestamp_ms = int(since.timestamp() * 1000)
+    elif args.today:
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        from_timestamp_ms = int(day_start.timestamp() * 1000)
+
+    deals = c.get_deals(count=args.count, from_timestamp_ms=from_timestamp_ms) or []
     by_lane_day = tally_deals(deals, today=today if args.today else None, since=since)
 
     alert = False

@@ -73,6 +73,16 @@ DEFAULT_MAX_VOLUME_UNITS = 0.05
 # DEXTER3_DEMO_TRADER_IDS_CSV for a future account change.
 DEFAULT_DEMO_TRADER_IDS = (9922808, 3555162, 46670728)
 
+# H4 (2026-07-15 cross-lane entanglement audit): combined real-account
+# open-risk ceiling. Two live lanes (Fable/Grok/VP) share ONE cTrader
+# account, so any single lane's own per-entry risk cap cannot bound the
+# ACCOUNT's total open risk across all of them simultaneously. Env
+# DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD (default 40.0 USD; <=0 disables) caps
+# sum(|entry-SL| x volume) across every OPEN position labeled "dexter3*"
+# (own lane + every peer lane) plus this entry's own planned risk — see
+# ``Dexter3Executor._account_open_risk_cap_refusal``.
+DEFAULT_ACCOUNT_MAX_OPEN_RISK_USD = 40.0
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -451,6 +461,7 @@ class Dexter3Executor:
         today_entry_count: int,
         today_losing_count: int,
         basket_authorized: bool = False,
+        planned_risk_usd: float = 0.0,
     ) -> dict[str, Any] | None:
         """Return a refusal dict (already journaled) or None to proceed.
 
@@ -458,6 +469,11 @@ class Dexter3Executor:
         it bypasses exactly one gate (duplicate_label_position_open) so the
         basket engine can add a repair/hedge leg; every other gate still
         applies.
+
+        ``planned_risk_usd`` (H4, 2026-07-15 cross-lane entanglement audit):
+        this entry's own intended USD risk (``risk_usd_override`` or
+        ``self.config.risk_usd``), folded into the account-wide open-risk
+        ceiling check below — see ``_account_open_risk_cap_refusal``.
         """
         symbol = str(decision.symbol)
         side = str(decision.side or "")
@@ -515,7 +531,88 @@ class Dexter3Executor:
                 today_losing_count=today_losing_count,
                 cap=self.config.stop_after_daily_losses,
             )
+
+        cap_refusal = self._account_open_risk_cap_refusal(symbol, open_positions, planned_risk_usd)
+        if cap_refusal is not None:
+            return cap_refusal
         return None
+
+    def _account_open_risk_cap_refusal(
+        self, symbol: str, open_positions: list[dict[str, Any]], planned_risk_usd: float
+    ) -> dict[str, Any] | None:
+        """H4 (2026-07-15 cross-lane entanglement audit): combined
+        real-account open-risk ceiling across ALL dexter3 lanes.
+
+        Env ``DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD`` (default 40.0 USD; <=0
+        disables) caps ``sum(|entry-SL| x volume)`` — the SAME $-risk
+        formula this file's own sizing already uses (``planned_volume_units``
+        inverts risk_usd = sl_distance x volume with an implicit USD-per-
+        unit-per-price-point of 1.0, and
+        ``dexter3.shadow_runner._lane_actual_risk_usd`` uses the identical
+        formula for the same reason — every symbol this repo currently
+        trades prices at that point value) — across every OPEN position
+        whose label starts with ``"dexter3"`` (own lane + every peer lane,
+        via the SAME unfiltered ``open_positions`` list ``execute_entry``
+        already fetched for the duplicate-label check above — no extra MCP
+        read), plus THIS entry's own ``planned_risk_usd``.
+
+        A position with NO stop loss cannot be priced by that formula (its
+        risk is unbounded) — rather than guess, it is treated as consuming
+        the ENTIRE cap on its own, mirroring this file's existing naked-
+        position posture (``_repair_naked_position``: an SL-less position is
+        always repaired or closed, never left open) by making a naked peer
+        position alone block further entries until it is resolved, instead
+        of being silently ignored.
+
+        Fail-open on any read/compute error — a bug in this new gate must
+        never block a live entry the rest of the pipeline already approved
+        (same posture as every other optional sizing/risk gate in this
+        repo, e.g. ``shadow_runner._apply_anti_chase_gate``).
+        """
+        try:
+            raw_cap = os.environ.get("DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD", "")
+            cap = float(raw_cap) if raw_cap.strip() else DEFAULT_ACCOUNT_MAX_OPEN_RISK_USD
+        except ValueError:
+            cap = DEFAULT_ACCOUNT_MAX_OPEN_RISK_USD
+        if cap <= 0:
+            return None
+        try:
+            existing_total = 0.0
+            for pos in open_positions or []:
+                label = position_label_of(pos)
+                if not label.startswith("dexter3"):
+                    continue
+                vol = position_volume_of(pos)
+                if vol <= 0:
+                    continue
+                entry_price = float(pos.get("entryPrice") or pos.get("price") or 0.0)
+                sl_price = position_stop_loss_of(pos)
+                if sl_price <= 0 or entry_price <= 0:
+                    # Unpriceable risk (no SL, or a position snapshot missing
+                    # its own entry price) — never fabricate a distance from
+                    # a zero placeholder; treat it the same conservative way
+                    # a naked position is treated above (see docstring).
+                    existing_total = max(existing_total, cap)
+                    continue
+                existing_total += abs(entry_price - sl_price) * vol
+            projected_total = existing_total + max(0.0, float(planned_risk_usd))
+            if projected_total > cap:
+                return self._refuse(
+                    symbol,
+                    "account_open_risk_cap",
+                    existing_open_risk_usd=round(existing_total, 4),
+                    planned_risk_usd=round(float(planned_risk_usd), 4),
+                    projected_total_usd=round(projected_total, 4),
+                    cap_usd=cap,
+                )
+            return None
+        except Exception as exc:  # noqa: BLE001 - fail-open: a gate bug must never block an approved entry
+            self._journal(
+                symbol,
+                "account_open_risk_gate_failed",
+                payload={"error": str(exc), "note": "fail-open — entry proceeds ungated by this check"},
+            )
+            return None
 
     # -- entry --------------------------------------------------------------
 
@@ -583,6 +680,7 @@ class Dexter3Executor:
             today_entry_count=today_entry_count,
             today_losing_count=today_losing_count,
             basket_authorized=basket_authorized,
+            planned_risk_usd=(self.config.risk_usd if risk_usd_override is None else float(risk_usd_override)),
         )
         if refusal is not None:
             return refusal
