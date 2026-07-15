@@ -33,6 +33,7 @@ Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 # 2026-07-10 negative-skew plug: floored 1oz trades pay tight-stop risk only
 # (disaster widening reverted at the floor — code default ON) + hard $ ceiling
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=12
+Environment=DEXTER3_FABLE_VERSION=v1.8-size-the-edge
 # v16 mode is default
 Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=1
 Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=1
@@ -40,6 +41,35 @@ Environment=DEXTER3_V18_B_TIER_ENABLED=1
 Environment=DEXTER3_DAILY_TARGET_USD=100
 Environment=DEXTER3_DAILY_LOSS_USD=50
 Environment=DEXTER3_BASE_RISK_FRAC=0.0175
+# --- PC-launcher parity (proven config). These lived ONLY in VM drop-ins
+# after cutover; consolidated here 2026-07-16 as the single source of truth
+# after DEXTER3_SMART_EXIT_ENABLED=0 was found MISSING on the VM (defaulted
+# ON) and closed positions ~28s after entry via smart_confirmed_break —
+# missing opportunity AND preempting the basket repair-leg / harvest (a
+# close_all fired before any position could stay trapped). PC ran smart-exit
+# OFF. Redeploying this unit now carries the whole proven env; do not rely on
+# untracked drop-ins.
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=60
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+Environment=DEXTER3_OM_LADDER_CSV=0.25:0.02,0.50:0.15,0.80:0.40,1.20:0.80,2.00:1.45,3.00:2.25
+Environment=DEXTER3_ANTICHASE_ENABLED=1
+Environment=DEXTER3_PULLBACK_ENABLED=1
+Environment=DEXTER3_V16_PROFIT_CONTROLS_ENABLED=1
+Environment=DEXTER3_V16_COOLDOWN_ENABLED=0
+Environment=DEXTER3_V16_GREEN_THRESHOLD_USD=20
+Environment=DEXTER3_V16_HOUSE_THRESHOLD_USD=30
+Environment=DEXTER3_V16_HOUSE_FLOOR_USD=20
+Environment=DEXTER3_V16_WEAK_MULT=0.25
+Environment=DEXTER3_V16_WINNER_MULT=2.0
+Environment=DEXTER3_V16_HOUSE_MULT=3.0
+Environment=DEXTER3_V16_MAX_EDGE_MULT=3.0
+# VM-intentional (post-cutover): shadow observers + weekend safety
+Environment=DEXTER3_PA_EYE=shadow
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_REPAIR_HARVEST=shadow
+Environment=DEXTER3_REPAIR_HARVEST_BANK_TARGET_R=0.4
+Environment=DEXTER3_REPAIR_HARVEST_SCALP_SL_FRAC=0.5
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
 [Install]

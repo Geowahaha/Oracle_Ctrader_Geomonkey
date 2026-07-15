@@ -38,6 +38,18 @@ Environment=DEXTER3_DAILY_TARGET_USD=30
 Environment=DEXTER3_DAILY_LOSS_USD=15
 Environment=DEXTER3_BASE_RISK_FRAC=0.004
 Environment=DEXTER3_MAX_RISK_FRAC=0.010
+# --- PC-launcher parity (proven config); consolidated 2026-07-16, see the
+# fable unit's note. Grok bypasses v16, so only the OM/exit + entry-cadence
+# envs apply. SMART_EXIT off (PC parity) — same fast-close/repair-preempt bug.
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=60
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+Environment=DEXTER3_OM_LADDER_CSV=0.25:0.02,0.50:0.15,0.80:0.40,1.20:0.80,2.00:1.45,3.00:2.25
+Environment=DEXTER3_ANTICHASE_ENABLED=1
+Environment=DEXTER3_PULLBACK_ENABLED=1
+# VM-intentional (post-cutover): shadow observers + weekend safety
+Environment=DEXTER3_PA_EYE=shadow
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok
 
 [Install]
