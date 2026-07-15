@@ -40,7 +40,7 @@ from scripts.dexter3_edge_discovery import (  # noqa: E402
     _simulate_smart,
     _stamp_entry_gate_features,
 )
-from dexter3 import hunt_mode  # noqa: E402
+from dexter3 import hunt_mode, price_action_eye  # noqa: E402
 from dexter3.vp_regime import profile_regime  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
@@ -130,6 +130,20 @@ def main() -> int:
     ap.add_argument("--min-derive-trades", type=int, default=80, help="combos with fewer derive trades are ignored")
     ap.add_argument("--base-risk-usd", type=float, default=12.0, help="$ per 1R for the $/day translation")
     ap.add_argument(
+        "--pa-eye",
+        action="store_true",
+        help=(
+            "Price Action Eye Phase A replay diagnostic (2026-07-15, REPORT-ONLY, no "
+            "filtering of trades): compute the Eye's verdict (support/neutral/oppose) "
+            "against each accepted trade's own prefix bars and print a per-gate x "
+            "verdict table (N, meanR, netR, PF) for derive AND validate segments, "
+            "using the current-live-ref exit combo for R -- this is promotion "
+            "evidence, not a filter (see docs/DEXTER3_PRICE_ACTION_EYE_DESIGN.md's "
+            "promotion policy: a detector only earns power after its own "
+            "journaled-vs-outcome replay shows separation)."
+        ),
+    )
+    ap.add_argument(
         "--brain",
         action="store_true",
         help="deprecated alias for --producer brain",
@@ -194,7 +208,7 @@ def main() -> int:
             gate = _apply_entry_gate(d, mode if mode != "none" else "none", str(d.ts_close or ""))
             if not bool(gate.get("allow", True)):
                 continue
-            acc.append({
+            trade = {
                 "i": i,
                 "side": str(d.side),
                 "entry": float(d.entry),
@@ -202,7 +216,19 @@ def main() -> int:
                 "tp": float(d.tp),
                 "future": m5[i + 1:],
                 "vp_regime": profile_regime(m5[:i]),
-            })
+            }
+            if args.pa_eye:
+                # Report-only replay evidence (2026-07-15 Phase A): the Eye
+                # itself stays powerless here too -- this verdict is NEVER
+                # used to accept/reject the trade, only to bucket it for the
+                # diagnostic table printed after phase 4 below.
+                try:
+                    trade["pa_eye_verdict"] = price_action_eye.evaluate(m5[: i + 1], str(d.side)).get(
+                        "verdict", "neutral"
+                    )
+                except Exception:
+                    trade["pa_eye_verdict"] = "neutral"
+            acc.append(trade)
         accepted_by_gate[mode] = acc
         print(f"gate={mode}: accepted {len(acc)}")
 
@@ -304,6 +330,45 @@ def main() -> int:
                 if rs:
                     net, pf, _ = _equity(rs)
                     print(f"{segment:8} {state:11} N={len(rs):>3} net={net:+.2f}R PF={pf:.2f}")
+
+    if args.pa_eye:
+        # PRICE ACTION EYE DIAGNOSTIC (Phase A, 2026-07-15): report-only,
+        # mirrors the VP regime diagnostic just above -- NO trades are
+        # filtered by verdict here; this table is the promotion evidence a
+        # future --pa-eye-gate mode would need before the design doc's
+        # promotion gate lets any verdict earn power (support/oppose vote or
+        # veto). R is computed with the CURRENT-LIVE reference exit combo
+        # (same `ref` used by the validate-segment table above) so verdict
+        # buckets are compared on an apples-to-apples exit, not each combo's
+        # own best-fit exit.
+        print("\n=== PRICE ACTION EYE DIAGNOSTIC (report-only; no filtering applied) ===")
+        print(
+            f"{'segment':<9} {'gate':<12} {'verdict':<8} {'N':>5} {'meanR':>7} {'netR':>8} {'PF':>6}"
+        )
+        for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+            for mode in gate_modes:
+                rows = [t for t in accepted_by_gate.get(mode, []) if pred(t)]
+                for verdict in ("support", "neutral", "oppose"):
+                    subset = [t for t in rows if t.get("pa_eye_verdict") == verdict]
+                    rs = [
+                        r
+                        for t in subset
+                        if (
+                            r := _combo_r(
+                                t, ref["style"], ref["max_hold"], ref["disaster"], ref["sl_mult"],
+                                args.spread_abs, args.commission_r,
+                            )
+                        )
+                        is not None
+                    ]
+                    if not rs:
+                        continue
+                    net, pf, _dd = _equity(rs)
+                    mean_r = net / len(rs)
+                    print(
+                        f"{segment:<9} {mode:<12} {verdict:<8} {len(rs):>5} "
+                        f"{mean_r:>+7.3f} {net:>+8.2f} {pf:>6.2f}"
+                    )
     print("\nRULES: report/act on VALIDATE numbers only; canary requires both-segments-positive "
           "AND beats the current-live ref on validate. Replay approximates live OM exits — a "
           "canary must still prove itself forward before any scale-up.")

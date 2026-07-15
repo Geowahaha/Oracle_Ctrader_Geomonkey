@@ -58,7 +58,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dexter3 import basket_live, edge_buckets, empirical_stats, hunt_mode, hunter_brain, market_lens, skip_evaluator
+from dexter3 import (
+    basket_live,
+    edge_buckets,
+    empirical_stats,
+    hunt_mode,
+    hunter_brain,
+    market_lens,
+    price_action_eye,
+    skip_evaluator,
+)
 from dexter3.basket_manager import BasketConfig, BasketManager, Leg
 from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
@@ -446,6 +455,109 @@ def _smart_exit_config_from_env() -> SmartExitConfig:
         except ValueError:
             log_line(f"{utc_now_iso()} ignored invalid DEXTER3_SMART_EXIT_DISASTER_MULT={raw_mult!r}")
     return SmartExitConfig(**kw)
+
+
+# ---------------------------------------------------------------------------
+# PRICE ACTION EYE — Layer 1 bar anatomy (Phase A, 2026-07-15, additive,
+# shadow-only). See dexter3/price_action_eye.py for the full detector
+# catalog + verdict contract, and docs/DEXTER3_PRICE_ACTION_EYE_DESIGN.md for
+# the design. Governing philosophy: detectors are born POWERLESS -- Phase A
+# only journals features + a verdict, it NEVER blocks or resizes a trade.
+# ---------------------------------------------------------------------------
+
+DEXTER3_PA_EYE_ENV_VAR = "DEXTER3_PA_EYE"
+# One-time-per-distinct-value warning cache (process lifetime; mirrors the
+# "logged_failure" one-shot pattern already used by _lane_realized_today
+# above) so an unrecognized mode does not spam the log every M5 close.
+_PA_EYE_MODE_WARNED: set[str] = set()
+
+
+def _pa_eye_config_from_env() -> "price_action_eye.PriceActionEyeConfig":
+    """Price Action Eye Layer-1 threshold knobs — env prefix
+    DEXTER3_PA_EYE_* (see price_action_eye.PriceActionEyeConfig's docstring
+    for the full list + documented default rationale). Same "ignored
+    invalid falls back to default" posture as every other
+    ``_*_config_from_env`` builder in this file."""
+    kw: dict[str, Any] = {}
+    for env, field_name, cast in (
+        ("DEXTER3_PA_EYE_WICK_FRAC_MIN", "wick_frac_min", float),
+        ("DEXTER3_PA_EYE_TREND_BODY_FRAC_MIN", "trend_body_frac_min", float),
+        ("DEXTER3_PA_EYE_DOJI_BODY_FRAC_MAX", "doji_body_frac_max", float),
+        ("DEXTER3_PA_EYE_EXHAUSTION_ATR_MULT", "exhaustion_atr_mult", float),
+        ("DEXTER3_PA_EYE_ATR_WINDOW", "atr_window", int),
+        ("DEXTER3_PA_EYE_SWING_WINDOW", "swing_window", int),
+        ("DEXTER3_PA_EYE_SWING_PIVOT_SPAN", "swing_pivot_span", int),
+        ("DEXTER3_PA_EYE_NEAR_LEVEL_ATR_DIST", "near_level_atr_dist", float),
+        ("DEXTER3_PA_EYE_ROUND_NUMBER_GRID", "round_number_grid", float),
+        ("DEXTER3_PA_EYE_ROUND_NUMBER_ATR_FRAC", "round_number_atr_frac", float),
+        ("DEXTER3_PA_EYE_ALWAYS_IN_WINDOW", "always_in_window", int),
+        ("DEXTER3_PA_EYE_MICROCHANNEL_MIN_BARS", "microchannel_min_bars", int),
+        ("DEXTER3_PA_EYE_REJECTION_CLUSTER_MIN", "rejection_cluster_min", int),
+        ("DEXTER3_PA_EYE_REJECTION_CLUSTER_LOOKBACK", "rejection_cluster_lookback", int),
+        ("DEXTER3_PA_EYE_TRADING_RANGE_OVERLAP_MIN", "trading_range_overlap_min", float),
+    ):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                kw[field_name] = cast(raw)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw!r}")
+    return price_action_eye.PriceActionEyeConfig(**kw)
+
+
+def _apply_pa_eye_shadow(decision: "hunter_brain.Decision", prefix: list[dict[str, Any]]) -> None:
+    """Price Action Eye Phase A wiring (2026-07-15, additive, both lanes).
+
+    Called for EVERY decided ``enter`` (fable/v16, grok, hunt-mode, and the
+    VP producer all route through the single decision-source block in
+    ``run_symbol_cycle`` this is invoked from -- one call site covers both
+    lanes since the lane identity only changes ``DEXTER3_MODE``, not this
+    code path) -- BEFORE the caller's ``journal.insert_decision`` so the
+    existing journaling captures ``pa_eye`` with ZERO DecisionJournal
+    changes (``features_json`` is a one-time snapshot taken at insert time;
+    see ``decision_journal.py``'s ``insert_decision`` -- stamping the
+    feature any later, e.g. beside the v16 entry-quality gate further down
+    in this function, would silently miss the journal row).
+
+    ``DEXTER3_PA_EYE`` modes:
+      off (default) -- does nothing, zero cost, no evaluate() call.
+      shadow        -- journals features + verdict; NEVER affects the
+                       decision, sizing, or execution.
+      anything else (typo, or a future 'veto'/'lens' value not yet wired)
+                    -- treated as shadow (fail-safe default: an
+                       unrecognized mode must never silently gate a live
+                       decision before the design doc's replay-gate
+                       promotes it) with a ONE-TIME log note per distinct
+                       value.
+
+    Fail-open: ANY exception out of ``price_action_eye.evaluate`` is caught
+    here, stamps ``{"error": str(exc)}`` in its place, and NEVER raises --
+    a bug in the Eye must never block or crash a decision (same posture as
+    every other ``_apply_*`` gate in this file, e.g.
+    ``_apply_v18_size_levers``'s governor-cap fallback).
+    """
+    mode = os.environ.get(DEXTER3_PA_EYE_ENV_VAR, "off").strip().lower()
+    if mode == "off":
+        return
+    if mode != "shadow" and mode not in _PA_EYE_MODE_WARNED:
+        _PA_EYE_MODE_WARNED.add(mode)
+        log_line(
+            f"{utc_now_iso()} pa-eye: unrecognized {DEXTER3_PA_EYE_ENV_VAR}={mode!r} "
+            "-- mode not yet promoted, running shadow"
+        )
+    try:
+        cfg = _pa_eye_config_from_env()
+        result = price_action_eye.evaluate(prefix, decision.side, cfg=cfg)
+        if isinstance(decision.features, dict):
+            decision.features["pa_eye"] = result
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} pa-eye: verdict={result.get('verdict')} "
+            f"side={decision.side} reasons={result.get('verdict_reasons')}"
+        )
+    except Exception as exc:  # noqa: BLE001 - the Eye must never block/crash a decision
+        if isinstance(decision.features, dict):
+            decision.features["pa_eye"] = {"error": str(exc)}
+        log_line(f"{utc_now_iso()} {decision.symbol} pa-eye_failed (fail-open, no trade impact): {exc}")
 
 
 def _fast_tick_sec_from_env() -> int:
@@ -1399,6 +1511,16 @@ def run_symbol_cycle(
             decision = hunter_brain.decide(
                 symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
             )
+        if decision.action == "enter":
+            # Price Action Eye Phase A shadow (2026-07-15, additive): MUST
+            # run before insert_decision just below so the journaled
+            # features_json snapshot captures pa_eye automatically (see
+            # _apply_pa_eye_shadow's docstring) -- placed here rather than
+            # beside the v16 entry-quality gate further down because that
+            # gate only evaluates on is_newest LIVE entries, while the Eye
+            # shadow-journals EVERY decided enter (both lanes, catch-up
+            # bars included) per the Phase A design doc.
+            _apply_pa_eye_shadow(decision, prefix)
         # H2 (2026-07-15 cross-lane entanglement audit): stamp this row with
         # the writing lane's own order label so per-lane journal queries
         # (empirical stats, skip fear-cost) never pool Fable/Grok/VP rows.
