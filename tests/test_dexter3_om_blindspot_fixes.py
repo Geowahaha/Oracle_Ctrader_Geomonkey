@@ -408,8 +408,19 @@ def test_run_om_tick_peak_r_survives_simulated_restart_and_reseeds(journal, monk
     monkeypatch.setattr(sr, "_OM_INSTANCE", None)
     _isolate_shadow_runtime(monkeypatch, tmp_path)
 
+    # TIME-BOMB FIX (2026-07-15): open_time must be dynamic, never the file's
+    # hardcoded 2026-07-15T05:00Z literal — from 08:00:00Z (05:00Z +
+    # BasketConfig.time_stop_min=180) onward that literal makes enforce_caps
+    # fire cap_stop -> close_all -> _clear_basket_runtime pops the very key
+    # this test asserts (KeyError 'XAUUSD'), so the test only ever passed for
+    # the 3h window after it was written (owner rule: no hardcoded
+    # timestamps — memory feedback_no_careless_hardcode.md). A fresh
+    # timestamp keeps the OM on the hold path forever; every assertion below
+    # is unchanged.
+    open_ts = sr.utc_now_iso()
+
     mcp = FakeMcp()
-    mcp._positions = [_lane_pos(652652362, 0.5)]  # $0.50 pnl / $10 risk = 0.05R
+    mcp._positions = [_lane_pos(652652362, 0.5, open_time=open_ts)]  # $0.50 pnl / $10 risk = 0.05R
     state: dict = {}
     status = sr.run_om_tick(mcp, journal, state, "XAUUSD", executor=None)
     assert status.startswith("om_")
@@ -426,7 +437,8 @@ def test_run_om_tick_peak_r_survives_simulated_restart_and_reseeds(journal, monk
     restarted_state["basket_runtime"].pop("XAUUSD", None)
     monkeypatch.setattr(sr, "_OM_INSTANCE", None)  # fresh OM instance ("new process")
     mcp2 = FakeMcp()
-    mcp2._positions = [_lane_pos(652652362, 0.1)]  # a LOWER pnl this tick: 0.1/10 = 0.01R
+    # SAME open_ts as the first tick — the same broker position, still open.
+    mcp2._positions = [_lane_pos(652652362, 0.1, open_time=open_ts)]  # a LOWER pnl this tick: 0.1/10 = 0.01R
     status2 = sr.run_om_tick(mcp2, journal, restarted_state, "XAUUSD", executor=None)
     assert status2.startswith("om_")
     # A blind reset would have started peak_r at 0.01 (this tick's live_r).

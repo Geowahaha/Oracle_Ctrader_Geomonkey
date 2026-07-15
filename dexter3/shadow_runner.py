@@ -50,6 +50,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1604,7 +1605,16 @@ def run_symbol_cycle(
         lane: list[dict[str, Any]] | None = []
         if is_newest and executor is not None:
             try:
-                lane = basket_live.lane_positions(executor.client.get_positions(), _active_label_family())
+                # 2026-07-15 repair-scalp-harvest design: exclude ":rsh" scalp
+                # legs from the M5-close basket-management lane too (same
+                # rationale as run_om_tick's own lane fetch above) — a
+                # harvester scalp is family-owned but must never be swept
+                # into the PARENT basket's aggregate_r or close_all_* sweep.
+                lane = basket_live.lane_positions(
+                    executor.client.get_positions(),
+                    _active_label_family(),
+                    exclude_label_suffix=_repair_harvest_label_suffix(),
+                )
                 lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
             except (McpClientError, McpZombieError) as exc:
                 log_line(f"{utc_now_iso()} {symbol} lane_read_failed (no live action this bar): {exc}")
@@ -2000,14 +2010,30 @@ def _execute_live_entry(
     risk_usd_override: float | None = None,
     smart_exit: dict[str, Any] | None = None,
     repair_context: dict[str, Any] | None = None,
+    basket_authorized: bool = False,
+    label_override: str | None = None,
 ) -> dict[str, Any]:
     """Resolve account state and place a live micro-entry. Never raises.
 
     ``repair_context`` (additive, default None): forwarded to
     ``executor.execute_repair_leg`` unchanged — see
-    ``Dexter3Executor._build_repair_lineage`` for the expected shape.
-    Ignored on the non-repair path (2026-07-15 repair-lineage-enrichment
-    fix)."""
+    ``Dexter3Executor._build_repair_lineage`` for the expected shape. On the
+    non-repair path it is now ALSO forwarded (2026-07-15 repair-scalp-harvest
+    design — previously ignored there; the Repair-Scalp Harvester needs
+    lineage on a plain ``execute_entry`` call, not a ``execute_repair_leg``
+    one, since it opens a NEW-labeled mirror scalp rather than a same-basket
+    repair leg).
+
+    ``basket_authorized`` (additive, default False -> unchanged behavior):
+    forwarded to ``executor.execute_entry`` on the non-repair path only —
+    lets a caller (the harvester) bypass the duplicate-label pre-flight gate
+    the same way a repair leg does, without going through
+    ``execute_repair_leg``'s own basket_repair_leg journaling.
+
+    ``label_override`` (additive, default None): forwarded to
+    ``executor.execute_entry`` on the non-repair path only — see that
+    method's own docstring.
+    """
     account_state: dict[str, Any] = {}
     # get_balance() intermittently returns without traderId (observed live
     # 2026-07-05 11:00:21Z → demo gate refused a valid entry). One short
@@ -2041,6 +2067,9 @@ def _execute_live_entry(
                 today_losing_count=today_losing_count,
                 risk_usd_override=risk_usd_override,
                 smart_exit=smart_exit,
+                basket_authorized=basket_authorized,
+                repair_context=repair_context,
+                label_override=label_override,
             )
     except Exception as exc:  # noqa: BLE001 - live path must never crash the loop
         log_error(f"execute_entry({decision.symbol})", exc)
@@ -2435,6 +2464,759 @@ def run_weekly_flatten_tick(executor: Dexter3Executor | None, symbol: str) -> st
     return "weekly_flatten_attempted"
 
 
+# ---------------------------------------------------------------------------
+# REPAIR-SCALP HARVESTER (owner hypothesis, 2026-07-15 — replay-validated on
+# BOTH segments, see docs/AGENT_SYNC_BOARD.md 2026-07-15 ~08:15Z and
+# scripts/dexter3_repair_scalp_replay.py for the exact semantics this engine
+# keeps identical).
+#
+# CONCEPT: when a lane's basket is TRAPPED (a single open leg whose
+# aggregate_r has fallen to/below ``-trigger_r``), harvest the MIRROR side
+# with v1.0-style bank-green scalps: enter at each M5 close with no scalp
+# currently open, bank the WHOLE scalp at the first M5 close where its own
+# floating R >= ``bank_target_r`` (no TP — banking is the exit), re-enter at
+# the M5 close AFTER the one that resolved it, repeat until the PARENT basket
+# resolves (closes/vanishes) — bounded by a per-episode scalp cap and a
+# cumulative loss-stop.
+#
+# MODES (env ``DEXTER3_REPAIR_HARVEST``): off (default, zero engine
+# activity) | shadow (journals every would-be scalp and resolves its
+# counterfactual outcome against subsequent REAL M5 bars — zero orders) |
+# live (real market orders). An unrecognized value degrades to shadow with a
+# one-time log note — nothing can go live by typo (mirrors
+# ``_apply_pa_eye_shadow``'s mode handling).
+#
+# CRITICAL ISOLATION: every scalp's broker label is
+# ``f"{_active_order_label()}:{suffix}"`` (env
+# ``DEXTER3_REPAIR_HARVEST_LABEL_SUFFIX``, default "rsh"). This label is
+# EXCLUDED from ``basket_live.lane_positions`` (see ``run_om_tick`` /
+# ``run_symbol_cycle``'s own lane fetches above) so a harvester scalp's
+# floating PnL never distorts the PARENT basket's aggregate_r or gets swept
+# by a basket close_all — while STILL matching the lane's FAMILY prefix
+# everywhere ownership is family-based: vanish reconcile
+# (``Dexter3Executor.reconcile_vanished_lane_positions`` matches via
+# ``label_matches_family``, unaffected by a trailing suffix), the H4
+# account-risk cap (``Dexter3Executor._account_open_risk_cap_refusal`` scans
+# every position whose label starts with "dexter3", suffix included), and
+# the Daily Mission Governor's realized PnL (``_lane_realized_today`` also
+# matches via ``label_matches_family``). The duplicate-label pre-flight gate
+# is bypassed the same way a repair leg bypasses it — ``basket_authorized``.
+# ---------------------------------------------------------------------------
+
+DEXTER3_REPAIR_HARVEST_ENV_VAR = "DEXTER3_REPAIR_HARVEST"
+_RSH_MODE_WARNED: set[str] = set()
+
+
+@dataclass(frozen=True)
+class RepairHarvestConfig:
+    """Replay-validated defaults (2026-07-15 owner hypothesis — see
+    ``scripts/dexter3_repair_scalp_replay.py``'s CLI defaults, which this
+    mirrors exactly): trigger 1.2R, bank 0.2R, scalp SL = 1.0x parent risk
+    distance, scalp max-hold 12 M5 bars."""
+
+    trigger_r: float = 1.2
+    bank_target_r: float = 0.2
+    scalp_sl_frac: float = 1.0
+    scalp_max_hold_bars: int = 12
+    max_scalps_per_episode: int = 8
+    episode_loss_stop_r: float = 1.5
+
+
+def _repair_harvest_mode_from_env() -> str:
+    """off (zero engine activity) | shadow (journal-only counterfactual) |
+    live (real orders). Any other value degrades to shadow with a ONE-TIME
+    log note per distinct value — nothing can go live by typo."""
+    raw = os.environ.get(DEXTER3_REPAIR_HARVEST_ENV_VAR, "off").strip().lower()
+    if raw == "off":
+        return "off"
+    if raw in ("shadow", "live"):
+        return raw
+    if raw not in _RSH_MODE_WARNED:
+        _RSH_MODE_WARNED.add(raw)
+        log_line(
+            f"{utc_now_iso()} repair-harvest: unrecognized {DEXTER3_REPAIR_HARVEST_ENV_VAR}={raw!r} "
+            "-- mode not recognized, running shadow"
+        )
+    return "shadow"
+
+
+def _repair_harvest_label_suffix() -> str:
+    raw = str(os.environ.get("DEXTER3_REPAIR_HARVEST_LABEL_SUFFIX", "rsh") or "").strip()
+    return raw or "rsh"
+
+
+def _repair_harvest_config_from_env() -> RepairHarvestConfig:
+    """Same "ignored invalid falls back to default" posture as every other
+    ``_*_config_from_env`` builder in this file — a typo'd env var must
+    never crash the live loop, only leave that one knob at its default."""
+    kw: dict[str, Any] = {}
+    for env, field_name in (
+        ("DEXTER3_REPAIR_HARVEST_TRIGGER_R", "trigger_r"),
+        ("DEXTER3_REPAIR_HARVEST_BANK_TARGET_R", "bank_target_r"),
+        ("DEXTER3_REPAIR_HARVEST_SCALP_SL_FRAC", "scalp_sl_frac"),
+        ("DEXTER3_REPAIR_HARVEST_EPISODE_LOSS_STOP_R", "episode_loss_stop_r"),
+    ):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                kw[field_name] = float(raw)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw!r}")
+    for env, field_name in (
+        ("DEXTER3_REPAIR_HARVEST_SCALP_MAX_HOLD_BARS", "scalp_max_hold_bars"),
+        ("DEXTER3_REPAIR_HARVEST_MAX_SCALPS_PER_EPISODE", "max_scalps_per_episode"),
+    ):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                kw[field_name] = int(raw)
+            except ValueError:
+                log_line(f"{utc_now_iso()} ignored invalid {env}={raw!r}")
+    return RepairHarvestConfig(**kw)
+
+
+# -- small local position-field helpers (duplicated small pure parsers — same
+# "no cross-import of a peer module's private helpers" convention
+# basket_live.py/executor.py each document for themselves) -------------------
+
+
+def _rsh_position_id(p: dict[str, Any]) -> int:
+    try:
+        return int(p.get("positionId") or p.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rsh_position_side(p: dict[str, Any]) -> str:
+    raw = str(p.get("tradeSide") or p.get("side") or "").strip().lower()
+    if raw.startswith("buy"):
+        return "buy"
+    if raw.startswith("sell"):
+        return "sell"
+    return raw
+
+
+def _rsh_position_entry(p: dict[str, Any]) -> float:
+    return _f(p.get("entryPrice", p.get("price", 0.0)))
+
+
+def _rsh_position_sl(p: dict[str, Any]) -> float:
+    return _f(p.get("stopLoss", p.get("stopLossPrice", 0.0)))
+
+
+def _rsh_opposite(side: str) -> str:
+    return "sell" if side == "buy" else "buy"
+
+
+def _shadow_scalp_bar_outcome(
+    open_scalp: dict[str, Any], bar: dict[str, Any], bank_target_r: float
+) -> tuple[str | None, float]:
+    """Mirrors ``scripts/dexter3_geometry_optimizer.py::_simulate_bank``'s
+    PER-BAR step exactly: conservative SL-first (a bar whose low/high
+    breaches the scalp's own SL is a loss at -1.0R, ties go to the stop),
+    else close-based bank check (floating R at THIS bar's close >=
+    ``bank_target_r``). Returns ``(outcome, r)`` where outcome is
+    "loss"/"bank"/None (still open — ``r`` is this bar's close-based R,
+    kept for the caller's own max-hold timeout bookkeeping) or "skip" (a
+    degenerate zero-risk scalp — mirrors ``_simulate_bank``'s own "skip"
+    return for ``risk <= 0``)."""
+    side = str(open_scalp.get("side"))
+    entry = _f(open_scalp.get("entry"))
+    sl = _f(open_scalp.get("sl"))
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "skip", 0.0
+    hi = _f(bar.get("high"))
+    lo = _f(bar.get("low"))
+    cl = _f(bar.get("close"))
+    if side == "buy":
+        if lo <= sl:
+            return "loss", -1.0
+        r = (cl - entry) / risk
+    else:
+        if hi >= sl:
+            return "loss", -1.0
+        r = (entry - cl) / risk
+    if r >= bank_target_r:
+        return "bank", r
+    return None, r
+
+
+def _journal_repair_harvest_scalp_cap_once(
+    journal: DecisionJournal, state: dict[str, Any], symbol: str, episode: dict[str, Any]
+) -> None:
+    """Journal ``rsh_scalp_cap_reached`` at most once per distinct scalp
+    count (the cap check runs at most once per M5 close, so this cannot
+    spam even without the guard — the guard just keeps a re-read of an
+    unchanged episode from re-journaling identical rows)."""
+    flagged = state.setdefault("repair_harvest_cap_warned", {})
+    n = len(episode.get("scalps", []))
+    if flagged.get(symbol) == n:
+        return
+    flagged[symbol] = n
+    journal.insert_basket_event(
+        0,
+        "rsh_scalp_cap_reached",
+        {"symbol": symbol, "n_scalps": n, "parent_position_id": episode.get("parent_position_id")},
+        label=_active_order_label(),
+    )
+
+
+def _maybe_open_repair_harvest_episode(
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbol: str,
+    lane: list[dict[str, Any]],
+    cfg: RepairHarvestConfig,
+    base_risk_usd: float,
+    governor_locked: bool,
+) -> None:
+    """Open a new episode iff: mode != off (checked by the caller), the lane
+    basket has EXACTLY ONE leg (multi-leg -> log ``rsh_skip_multileg``, no
+    episode — matches the replay's single-parent model), its aggregate_r <=
+    ``-trigger_r``, AND the aggregate pnl is RELIABLE (fail-closed — a blind
+    OM must never harvest). Never opens new exposure once the governor has
+    locked/stopped the day (mirrors the existing add_repair_leg suppression
+    in ``run_om_tick``/``_manage_lane_basket``)."""
+    if governor_locked:
+        return
+    n = len(lane)
+    if n == 0:
+        return
+    if n > 1:
+        ids = sorted(_rsh_position_id(p) for p in lane)
+        warned = state.setdefault("repair_harvest_multileg_warned", {})
+        if warned.get(symbol) != ids:
+            warned[symbol] = ids
+            journal.insert_basket_event(
+                0,
+                "rsh_skip_multileg",
+                {"symbol": symbol, "legs": n, "position_ids": ids},
+                label=_active_order_label(),
+            )
+        return
+
+    parent = lane[0]
+    parent_pid = _rsh_position_id(parent)
+    parent_side = _rsh_position_side(parent)
+    if parent_pid <= 0 or parent_side not in ("buy", "sell"):
+        return
+
+    agg = basket_live.aggregate_lane(lane, base_risk_usd=base_risk_usd)
+    if bool(agg.get("unreliable")):
+        return  # fail-closed -- never harvest on an unreliable pnl snapshot
+    aggregate_r = _f(agg.get("aggregate_r"), 0.0)
+    if aggregate_r > -abs(cfg.trigger_r):
+        return  # not trapped yet
+
+    mode = _repair_harvest_mode_from_env()
+    episode = {
+        "parent_position_id": parent_pid,
+        "parent_side": parent_side,
+        "parent_entry": _rsh_position_entry(parent),
+        "parent_sl": _rsh_position_sl(parent),
+        "started_ts": utc_now_iso(),
+        "trigger_r_at_open": round(aggregate_r, 4),
+        "mode": mode,
+        "cum_scalp_r": 0.0,
+        "scalps": [],
+        "open_scalp": None,
+        "last_m5_close_ts": None,
+        "loss_stopped": False,
+    }
+    state.setdefault("repair_harvest", {})[symbol] = episode
+    journal.insert_basket_event(
+        0,
+        "rsh_episode_opened",
+        {
+            "symbol": symbol,
+            "parent_position_id": parent_pid,
+            "parent_side": parent_side,
+            "aggregate_r": round(aggregate_r, 4),
+            "trigger_r": cfg.trigger_r,
+            "mode": mode,
+        },
+        label=_active_order_label(),
+    )
+    log_line(
+        f"{utc_now_iso()} {symbol} rsh_episode_opened parent={parent_pid} side={parent_side} "
+        f"aggregate_r={aggregate_r:.4f} mode={mode}"
+    )
+
+
+def _finalize_repair_harvest_scalp(
+    journal: DecisionJournal,
+    symbol: str,
+    episode: dict[str, Any],
+    open_scalp: dict[str, Any],
+    *,
+    outcome: str,
+    r: float,
+    mode: str,
+    cfg: RepairHarvestConfig,
+) -> None:
+    record = {
+        "position_id": open_scalp.get("position_id"),
+        "side": open_scalp.get("side"),
+        "entry": open_scalp.get("entry"),
+        "entry_ts": open_scalp.get("opened_bar_ts"),
+        "outcome": outcome,
+        "r": round(float(r), 6),
+    }
+    episode.setdefault("scalps", []).append(record)
+    episode["cum_scalp_r"] = round(_f(episode.get("cum_scalp_r"), 0.0) + float(r), 6)
+    episode["open_scalp"] = None
+    event = "rsh_bank" if outcome == "bank" else "rsh_timeout" if outcome == "timeout" else "rsh_scalp_resolved"
+    journal.insert_basket_event(
+        0,
+        event,
+        {
+            "symbol": symbol,
+            "mode": mode,
+            "parent_position_id": episode.get("parent_position_id"),
+            "cum_scalp_r": episode["cum_scalp_r"],
+            **record,
+        },
+        label=_active_order_label(),
+    )
+    if not episode.get("loss_stopped") and episode["cum_scalp_r"] <= -abs(cfg.episode_loss_stop_r):
+        episode["loss_stopped"] = True
+        journal.insert_basket_event(
+            0,
+            "rsh_loss_stopped",
+            {
+                "symbol": symbol,
+                "parent_position_id": episode.get("parent_position_id"),
+                "cum_scalp_r": episode["cum_scalp_r"],
+                "threshold_r": -abs(cfg.episode_loss_stop_r),
+            },
+            label=_active_order_label(),
+        )
+        log_line(
+            f"{utc_now_iso()} {symbol} rsh_loss_stopped cum_scalp_r={episode['cum_scalp_r']:.4f} "
+            f"threshold={-abs(cfg.episode_loss_stop_r):.4f}"
+        )
+
+
+def _resolve_open_scalp_at_close(
+    journal: DecisionJournal,
+    symbol: str,
+    executor: Dexter3Executor | None,
+    episode: dict[str, Any],
+    open_scalp: dict[str, Any],
+    scalp_lane: list[dict[str, Any]],
+    bar: dict[str, Any],
+    cfg: RepairHarvestConfig,
+    mode: str,
+) -> bool:
+    """Evaluate the currently-open scalp at THIS M5 close. Returns True iff
+    it resolved (bank/timeout/loss/vanished) this tick — the caller must
+    never open a fresh scalp on the SAME tick a resolution happened (the
+    replay's own index math always opens the NEXT scalp one bar AFTER the
+    resolution bar, never on it)."""
+    if mode == "live":
+        pid = int(open_scalp.get("position_id") or 0)
+        pos = next((p for p in scalp_lane if _rsh_position_id(p) == pid), None) if pid > 0 else None
+        if pos is None:
+            # Broker already closed it (SL fill, external close, weekly
+            # flatten, ...) -- NEVER guess its R; vanish reconcile
+            # (Dexter3Executor.reconcile_vanished_lane_positions, called from
+            # run_symbol_cycle) owns journaling the REAL realized pnl for
+            # this position_id since it is still family-owned.
+            episode["open_scalp"] = None
+            episode.setdefault("scalps", []).append(
+                {
+                    "position_id": pid,
+                    "side": open_scalp.get("side"),
+                    "entry": open_scalp.get("entry"),
+                    "entry_ts": open_scalp.get("opened_bar_ts"),
+                    "outcome": "vanished_unresolved",
+                    "r": None,
+                }
+            )
+            journal.insert_basket_event(
+                0,
+                "rsh_scalp_vanished",
+                {"symbol": symbol, "position_id": pid, "parent_position_id": episode.get("parent_position_id")},
+                label=_active_order_label(),
+            )
+            return True
+        scalp_risk_usd = _f(open_scalp.get("scalp_risk_usd"), 0.0) or 1.0
+        agg = basket_live.aggregate_lane([pos], base_risk_usd=scalp_risk_usd)
+        if bool(agg.get("unreliable")):
+            return False  # stale/missing pnl this tick -- never guess, retry at the next close
+        live_r = _f(agg.get("aggregate_r"), 0.0)
+        bars_held = int(_f(open_scalp.get("bars_evaluated"), 0)) + 1
+        if live_r >= cfg.bank_target_r:
+            if executor is not None:
+                executor.close_lane_position(pid, reason="rsh_bank")
+            _finalize_repair_harvest_scalp(journal, symbol, episode, open_scalp, outcome="bank", r=live_r, mode=mode, cfg=cfg)
+            return True
+        if bars_held >= cfg.scalp_max_hold_bars:
+            if executor is not None:
+                executor.close_lane_position(pid, reason="rsh_timeout")
+            _finalize_repair_harvest_scalp(journal, symbol, episode, open_scalp, outcome="timeout", r=live_r, mode=mode, cfg=cfg)
+            return True
+        open_scalp["bars_evaluated"] = bars_held
+        return False
+
+    # -- shadow: pure counterfactual against this REAL completed M5 bar -----
+    outcome, r = _shadow_scalp_bar_outcome(open_scalp, bar, cfg.bank_target_r)
+    if outcome == "skip":
+        _finalize_repair_harvest_scalp(journal, symbol, episode, open_scalp, outcome="skip", r=0.0, mode=mode, cfg=cfg)
+        return True
+    bars_held = int(_f(open_scalp.get("bars_evaluated"), 0)) + 1
+    if outcome is None:
+        if bars_held >= cfg.scalp_max_hold_bars:
+            _finalize_repair_harvest_scalp(journal, symbol, episode, open_scalp, outcome="timeout", r=r, mode=mode, cfg=cfg)
+            return True
+        open_scalp["bars_evaluated"] = bars_held
+        return False
+    _finalize_repair_harvest_scalp(journal, symbol, episode, open_scalp, outcome=outcome, r=r, mode=mode, cfg=cfg)
+    return True
+
+
+def _open_new_repair_harvest_scalp(
+    journal: DecisionJournal,
+    symbol: str,
+    executor: Dexter3Executor | None,
+    episode: dict[str, Any],
+    m5_bars: list[dict[str, Any]],
+    cfg: RepairHarvestConfig,
+    suffix: str,
+    daily: dict[str, Any],
+    mode: str,
+) -> None:
+    parent_side = str(episode.get("parent_side") or "")
+    if parent_side not in ("buy", "sell"):
+        return
+    mirror_side = _rsh_opposite(parent_side)
+    entry_price = _f(m5_bars[-1].get("close"), 0.0)
+    parent_risk = abs(_f(episode.get("parent_entry")) - _f(episode.get("parent_sl")))
+    scalp_risk_price = max(0.0, float(cfg.scalp_sl_frac)) * parent_risk
+    if entry_price <= 0 or scalp_risk_price <= 0:
+        return  # degenerate geometry -- retry at the next M5 close rather than fabricate a trade
+    sl_price = entry_price - scalp_risk_price if mirror_side == "buy" else entry_price + scalp_risk_price
+    # No real TP -- banking (rsh_bank) / timeout (rsh_timeout) is the exit.
+    # execute_entry's own pre-flight hard-requires a non-None, correctly-
+    # sided tp, so a far ceiling (never expected to bind) satisfies that
+    # contract without becoming a real profit-taking mechanism.
+    tp_far_mult = 50.0
+    tp_price = (
+        entry_price + tp_far_mult * scalp_risk_price
+        if mirror_side == "buy"
+        else entry_price - tp_far_mult * scalp_risk_price
+    )
+    bar_ts = str(m5_bars[-1].get("ts") or "")
+    ts_close = hunter_brain._bar_close_ts(bar_ts)
+    session_label = str(market_lens.session_context(ts_close).get("value") or "unknown")
+    scalp_index = len(episode.get("scalps", [])) + 1
+    decision = hunter_brain.Decision(
+        ts_close=ts_close,
+        symbol=symbol,
+        action="enter",
+        side=mirror_side,
+        entry_type="market",
+        entry=entry_price,
+        sl=sl_price,
+        tp=tp_price,
+        size_class="scout",
+        leader_score=0.0,
+        p_win_est=0.5,
+        setup="repair_harvest",
+        reasons=[
+            f"Repair-Scalp Harvester: bank-green scalp #{scalp_index} mirror={mirror_side} "
+            f"while parent {episode.get('parent_position_id')} trapped",
+            f"cum_scalp_r_before={episode.get('cum_scalp_r')}",
+        ],
+        features={
+            "repair_harvest": {
+                "parent_position_id": episode.get("parent_position_id"),
+                "episode_started_ts": episode.get("started_ts"),
+                "scalp_index": scalp_index,
+            }
+        },
+        session=session_label,
+    )
+
+    if mode != "live" or executor is None:
+        episode["open_scalp"] = {
+            "position_id": 0,
+            "side": mirror_side,
+            "entry": entry_price,
+            "sl": sl_price,
+            "opened_bar_ts": bar_ts,
+            "bars_evaluated": 0,
+            "scalp_risk_usd": 1.0,
+        }
+        journal.insert_basket_event(
+            0,
+            "rsh_scalp_opened",
+            {
+                "symbol": symbol,
+                "mode": "shadow",
+                "side": mirror_side,
+                "entry": entry_price,
+                "sl": sl_price,
+                "scalp_index": scalp_index,
+                "parent_position_id": episode.get("parent_position_id"),
+            },
+            label=_active_order_label(),
+        )
+        return
+
+    scalp_risk_usd = _om_base_risk_usd(executor)
+    lineage = {
+        "parent_position_id": episode.get("parent_position_id"),
+        "episode_started_ts": episode.get("started_ts"),
+        "scalp_index": scalp_index,
+        "cum_scalp_r_before": episode.get("cum_scalp_r"),
+        "engine": "repair_scalp_harvest",
+    }
+    label_override = f"{_active_order_label()}:{suffix}"
+    result = _execute_live_entry(
+        executor,
+        decision,
+        today_entry_count=int(daily.get("entries", 0)),
+        today_losing_count=int(daily.get("loss_baskets", 0)),
+        risk_usd_override=scalp_risk_usd,
+        repair_context=lineage,
+        basket_authorized=True,
+        label_override=label_override,
+    )
+    journal.insert_basket_event(
+        0,
+        "rsh_scalp_open_attempt",
+        {
+            "symbol": symbol,
+            "mode": "live",
+            "side": mirror_side,
+            "entry": entry_price,
+            "sl": sl_price,
+            "scalp_index": scalp_index,
+            "parent_position_id": episode.get("parent_position_id"),
+            "result_action": result.get("action"),
+        },
+        label=_active_order_label(),
+    )
+    if result.get("action") == "entered":
+        daily["entries"] = int(daily.get("entries", 0)) + 1
+        episode["open_scalp"] = {
+            "position_id": int(result.get("position_id") or 0),
+            "side": mirror_side,
+            "entry": _f(result.get("entry"), entry_price),
+            "sl": sl_price,
+            "opened_bar_ts": bar_ts,
+            "bars_evaluated": 0,
+            "scalp_risk_usd": scalp_risk_usd,
+        }
+        journal.insert_basket_event(
+            0,
+            "rsh_scalp_opened",
+            {
+                "symbol": symbol,
+                "mode": "live",
+                "position_id": result.get("position_id"),
+                "side": mirror_side,
+                "entry": entry_price,
+                "sl": sl_price,
+                "scalp_index": scalp_index,
+                "parent_position_id": episode.get("parent_position_id"),
+            },
+            label=_active_order_label(),
+        )
+
+
+def _manage_repair_harvest_episode(
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbol: str,
+    executor: Dexter3Executor | None,
+    episode: dict[str, Any],
+    scalp_lane: list[dict[str, Any]],
+    m5_bars: list[dict[str, Any]],
+    cfg: RepairHarvestConfig,
+    suffix: str,
+    daily: dict[str, Any],
+    governor_locked: bool,
+) -> None:
+    """Per-M5-close scalp management: resolve any open scalp (bank/timeout),
+    then open a fresh one iff none is open, the episode is not loss-stopped,
+    caps allow it, and the day is not governor-locked. Runs every fast tick
+    but only ACTS on a genuinely new M5 close (``last_m5_close_ts`` dedup —
+    same one-decision-per-close discipline as ``is_new_m5_close`` elsewhere
+    in this file), tracked independently of the main decision path's own
+    dedup key so the two can never interfere with each other."""
+    episode_mode = str(episode.get("mode") or "shadow")
+    if not m5_bars:
+        return
+    last_bar = m5_bars[-1]
+    last_ts = str(last_bar.get("ts") or "")
+    if not last_ts:
+        return
+    if last_ts == str(episode.get("last_m5_close_ts") or ""):
+        return  # no new M5 close since we last acted -- nothing to do
+
+    just_resolved = False
+    open_scalp = episode.get("open_scalp")
+    if open_scalp is not None:
+        just_resolved = _resolve_open_scalp_at_close(
+            journal, symbol, executor, episode, open_scalp, scalp_lane, last_bar, cfg, episode_mode
+        )
+
+    if (
+        not just_resolved
+        and episode.get("open_scalp") is None
+        and not episode.get("loss_stopped")
+        and not governor_locked
+    ):
+        if len(episode.get("scalps", [])) >= cfg.max_scalps_per_episode:
+            _journal_repair_harvest_scalp_cap_once(journal, state, symbol, episode)
+        else:
+            _open_new_repair_harvest_scalp(journal, symbol, executor, episode, m5_bars, cfg, suffix, daily, episode_mode)
+
+    episode["last_m5_close_ts"] = last_ts
+
+
+def _close_repair_harvest_episode(
+    journal: DecisionJournal,
+    symbol: str,
+    executor: Dexter3Executor | None,
+    episode: dict[str, Any],
+    m5_bars: list[dict[str, Any]],
+    reason: str,
+) -> None:
+    """Episode ENDS when the parent position leaves the lane
+    (closed/vanished): close any open LIVE scalp at market immediately;
+    journal a final episode summary (parent id, parent outcome if knowable,
+    n_scalps, cum_scalp_r, mode)."""
+    mode = str(episode.get("mode") or "shadow")
+    open_scalp = episode.get("open_scalp")
+    if open_scalp is not None:
+        pid = int(open_scalp.get("position_id") or 0)
+        if mode == "live" and executor is not None and pid > 0:
+            executor.close_lane_position(pid, reason="rsh_episode_close")
+            episode.setdefault("scalps", []).append(
+                {
+                    "position_id": pid,
+                    "side": open_scalp.get("side"),
+                    "entry": open_scalp.get("entry"),
+                    "entry_ts": open_scalp.get("opened_bar_ts"),
+                    "outcome": "episode_end_closed",
+                    "r": None,
+                }
+            )
+        else:
+            # Shadow (or no executor bound): nothing real to close. Mark the
+            # virtual scalp to the LAST known bar's close (best-effort,
+            # honest — never fabricate a resolved outcome for a still-open
+            # counterfactual position).
+            r = None
+            if m5_bars:
+                side = str(open_scalp.get("side"))
+                entry = _f(open_scalp.get("entry"))
+                sl = _f(open_scalp.get("sl"))
+                risk = abs(entry - sl)
+                if risk > 0:
+                    cl = _f(m5_bars[-1].get("close"))
+                    r = round(((cl - entry) / risk if side == "buy" else (entry - cl) / risk), 6)
+            episode.setdefault("scalps", []).append(
+                {
+                    "position_id": 0,
+                    "side": open_scalp.get("side"),
+                    "entry": open_scalp.get("entry"),
+                    "entry_ts": open_scalp.get("opened_bar_ts"),
+                    "outcome": "episode_end_mark",
+                    "r": r,
+                }
+            )
+            if r is not None:
+                episode["cum_scalp_r"] = round(_f(episode.get("cum_scalp_r"), 0.0) + r, 6)
+        episode["open_scalp"] = None
+    journal.insert_basket_event(
+        0,
+        "rsh_episode_closed",
+        {
+            "symbol": symbol,
+            "parent_position_id": episode.get("parent_position_id"),
+            "parent_last_known_agg_r": episode.get("parent_last_known_agg_r"),
+            "parent_last_known_pnl_usd": episode.get("parent_last_known_pnl_usd"),
+            "n_scalps": len(episode.get("scalps", [])),
+            "cum_scalp_r": episode.get("cum_scalp_r"),
+            "mode": mode,
+            "reason": reason,
+        },
+        label=_active_order_label(),
+    )
+    log_line(
+        f"{utc_now_iso()} {symbol} rsh_episode_closed parent={episode.get('parent_position_id')} "
+        f"n_scalps={len(episode.get('scalps', []))} cum_scalp_r={episode.get('cum_scalp_r')} mode={mode}"
+    )
+    # State cleanup (popping this symbol's episode out of state["repair_harvest"])
+    # is the caller's responsibility (_run_repair_harvest_tick) — this function
+    # only journals the summary and closes/marks the open scalp.
+
+
+def _run_repair_harvest_tick(
+    mcp: Dexter3McpClient,
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbol: str,
+    executor: Dexter3Executor | None,
+    lane: list[dict[str, Any]],
+    all_positions: list[dict[str, Any]],
+) -> None:
+    """Entry point called once per fast tick from ``run_om_tick`` (BEFORE its
+    own ``if not lane:`` early return — the harvester must still detect a
+    parent-left-the-lane episode-end even when the OM's own lane just went
+    empty). ``off`` mode is a pure no-op: no MCP reads beyond what the caller
+    already fetched, no journal writes, no state mutation."""
+    mode = _repair_harvest_mode_from_env()
+    if mode == "off":
+        return
+
+    cfg = _repair_harvest_config_from_env()
+    suffix = _repair_harvest_label_suffix()
+    family = _active_label_family()
+    scalp_lane = basket_live.repair_harvest_legs(all_positions, family, suffix)
+    scalp_lane = [p for p in scalp_lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
+
+    store = state.setdefault("repair_harvest", {})
+    episode = store.get(symbol)
+    governor_locked = (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED")
+    m5_bars, _m15, _h1 = _om_bars_for(mcp, symbol)
+
+    if episode is None:
+        base_risk_usd = _lane_actual_risk_usd(lane, _om_base_risk_usd(executor))
+        _maybe_open_repair_harvest_episode(journal, state, symbol, lane, cfg, base_risk_usd, governor_locked)
+        episode = store.get(symbol)
+        if episode is None:
+            return
+    else:
+        parent_pid = int(episode.get("parent_position_id") or 0)
+        parent_lane = [p for p in lane if _rsh_position_id(p) == parent_pid]
+        if not parent_lane:
+            _close_repair_harvest_episode(journal, symbol, executor, episode, m5_bars, reason="parent_resolved")
+            store.pop(symbol, None)
+            return
+        # Best-effort proxy for "parent outcome if knowable" at episode-close
+        # time — the last RELIABLE aggregate observed for the parent leg
+        # while it was still open (never a broker-verified realized pnl,
+        # which would need an extra get_deals() call this fast-tick path
+        # deliberately avoids; documented as a best-effort field).
+        parent_agg = basket_live.aggregate_lane(
+            parent_lane, base_risk_usd=_lane_actual_risk_usd(parent_lane, _om_base_risk_usd(executor))
+        )
+        if not bool(parent_agg.get("unreliable")):
+            episode["parent_last_known_agg_r"] = parent_agg.get("aggregate_r")
+            episode["parent_last_known_pnl_usd"] = parent_agg.get("aggregate_pnl_usd")
+
+    daily = _daily_state(state)
+    _manage_repair_harvest_episode(
+        journal, state, symbol, executor, episode, scalp_lane, m5_bars, cfg, suffix, daily, governor_locked
+    )
+
+
 def run_om_tick(
     mcp: Dexter3McpClient,
     journal: DecisionJournal,
@@ -2461,7 +3243,17 @@ def run_om_tick(
         # versioned-labels design) so a version bump never drops this lane's
         # own already-open positions from OM management mid-day.
         active_label_family = _active_label_family()
-        lane = basket_live.lane_positions(positions, active_label_family)
+        # 2026-07-15 repair-scalp-harvest design: exclude the harvester's own
+        # ":rsh" scalp legs from the OM/basket lane — a harvester scalp's
+        # floating PnL must never distort the PARENT basket's aggregate_r
+        # (else the OM would "repair" a basket that is actually fine, or the
+        # vanish/duplicate gates would fight the harvester). The excluded
+        # legs remain family-owned everywhere else (vanish reconcile, H4 cap,
+        # governor realized) via plain prefix matching — see
+        # basket_live.lane_positions' own docstring.
+        lane = basket_live.lane_positions(
+            positions, active_label_family, exclude_label_suffix=_repair_harvest_label_suffix()
+        )
         lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
     except (McpClientError, McpZombieError) as exc:
         _note_mcp_error(state, ok=False)
@@ -2469,6 +3261,11 @@ def run_om_tick(
         return "om_lane_read_failed"
 
     _note_mcp_error(state, ok=True)
+
+    try:
+        _run_repair_harvest_tick(mcp, journal, state, symbol, executor, lane, positions)
+    except Exception as exc:  # noqa: BLE001 - the harvester must never crash the OM fast tick
+        log_line(f"{utc_now_iso()} {symbol} repair_harvest_tick_failed (fail-open, no harvest action): {exc}")
 
     if not lane:
         is_grok = bool((state.get("grok_v10_flags") or {}).get("is_grok_scalp"))

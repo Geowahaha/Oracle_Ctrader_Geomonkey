@@ -744,6 +744,7 @@ class Dexter3Executor:
         risk_usd_override: float | None = None,
         smart_exit: dict[str, Any] | None = None,
         repair_context: dict[str, Any] | None = None,
+        label_override: str | None = None,
     ) -> dict[str, Any]:
         """Place a demo micro-entry for an ``enter`` decision.
 
@@ -785,6 +786,20 @@ class Dexter3Executor:
         enrichment fix) so a repair leg's entry is forever traceable to the
         basket state that triggered it — never present for a normal (non-
         repair) entry.
+
+        ``label_override`` (additive, default None -> byte-identical to the
+        module-global ``LABEL``): the exact broker label to stamp on THIS
+        order/journal row instead of ``LABEL``. Used by the Repair-Scalp
+        Harvester (``dexter3.shadow_runner``, 2026-07-15) to suffix its scalp
+        legs (``f"{LABEL}:{suffix}"``) so ``dexter3.basket_live.lane_positions``
+        can exclude them from basket/OM aggregation while family-prefix
+        ownership (duplicate-gate bypass via ``basket_authorized``, vanish
+        reconcile, the H4 account-risk cap, governor realized) still
+        recognizes them — a plain prefix check, so appending a suffix never
+        breaks family matching. Ownership checks inside THIS call
+        (``is_our_position`` for the duplicate-label probe and
+        ``_resolve_new_position``) always use the module-global ``LABEL``
+        unchanged — only the value SENT to the broker/journal changes.
         """
         symbol = str(decision.symbol)
         if str(decision.action) != "enter":
@@ -919,6 +934,8 @@ class Dexter3Executor:
             },
         )
 
+        effective_label = str(label_override) if label_override else LABEL
+
         known_ids = {position_id_of(p) for p in open_positions if position_id_of(p) > 0}
         reconciled_pid = 0
         try:
@@ -928,7 +945,7 @@ class Dexter3Executor:
                 volume=volume,
                 stop_loss_pips=sl_pips,
                 take_profit_pips=tp_pips,
-                label=LABEL,
+                label=effective_label,
                 comment=comment,
             )
         except McpMutationUncertain as exc:
@@ -996,7 +1013,7 @@ class Dexter3Executor:
             # Persist the exact lane identity. The Fable and Grok VM services
             # share the journal database, so empirical learning must never
             # pool their outcomes merely because they trade the same symbol.
-            "label": LABEL,
+            "label": effective_label,
             # session bucket at decision time — the learner's second key
             # (empirical_stats buckets by (setup, session)); getattr keeps
             # legacy/foreign decision objects without the field valid.

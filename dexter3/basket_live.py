@@ -142,8 +142,22 @@ def _position_pnl(position: Position) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+def _has_label_suffix(label: str, suffix: str) -> bool:
+    """True when ``label`` ends with a ``:{suffix}`` segment (e.g. a Repair-
+    Scalp Harvester leg whose label is ``f"{parent_label}:{suffix}"`` —
+    2026-07-15 repair-scalp-harvest design). Empty ``suffix`` never matches
+    (an accidentally-blank env override must never exclude every position)."""
+    suffix = str(suffix or "").strip()
+    if not suffix:
+        return False
+    return label.endswith(f":{suffix}")
+
+
 def lane_positions(
-    all_positions: list[Position] | None, label_prefix: str = DEFAULT_LABEL_PREFIX
+    all_positions: list[Position] | None,
+    label_prefix: str = DEFAULT_LABEL_PREFIX,
+    *,
+    exclude_label_suffix: str | None = None,
 ) -> list[Position]:
     """Filter ``all_positions`` down to our Dexter3 lane.
 
@@ -156,6 +170,18 @@ def lane_positions(
     version tag must never be swept into this basket's aggregate). Never
     raises on malformed entries; a position dict missing expected keys is
     simply excluded rather than crashing the caller's M5 loop.
+
+    ``exclude_label_suffix`` (2026-07-15 repair-scalp-harvest design,
+    additive, default ``None`` -> byte-identical prior behavior): when
+    supplied, a position whose label ends with ``f":{exclude_label_suffix}"``
+    is ALSO excluded — this is the CRITICAL isolation a Repair-Scalp
+    Harvester scalp leg needs from basket/OM aggregation (see
+    ``repair_harvest_legs`` below for the complementary "give me ONLY those
+    legs" view). Callers pass this whenever the returned lane feeds
+    ``aggregate_lane``/``decide_basket_action``/OM management — a harvester
+    scalp's own floating PnL must never distort the PARENT basket's
+    aggregate_r, or the OM's vanish/duplicate gates would fight the
+    harvester (see docs/AGENT_SYNC_BOARD.md's repair-scalp-harvest design).
     """
     if not all_positions:
         return []
@@ -167,7 +193,37 @@ def lane_positions(
             label = _position_label(position)
         except Exception:  # noqa: BLE001 - never let one malformed row crash the lane scan
             continue
-        if label.startswith(label_prefix):
+        if not label.startswith(label_prefix):
+            continue
+        if exclude_label_suffix and _has_label_suffix(label, exclude_label_suffix):
+            continue
+        out.append(position)
+    return out
+
+
+def repair_harvest_legs(
+    all_positions: list[Position] | None,
+    label_prefix: str = DEFAULT_LABEL_PREFIX,
+    label_suffix: str = "rsh",
+) -> list[Position]:
+    """Complementary view to ``lane_positions(..., exclude_label_suffix=...)``:
+    return ONLY this family's Repair-Scalp Harvester legs (label matches
+    ``label_prefix`` AND ends with ``f":{label_suffix}"``). The harvester
+    engine (``dexter3.shadow_runner``) uses this to find/manage its OWN open
+    scalp without ever touching the parent basket's aggregation — never
+    raises on malformed entries, same posture as ``lane_positions``.
+    """
+    if not all_positions:
+        return []
+    out: list[Position] = []
+    for position in all_positions:
+        if not isinstance(position, dict):
+            continue
+        try:
+            label = _position_label(position)
+        except Exception:  # noqa: BLE001 - never let one malformed row crash the scan
+            continue
+        if label.startswith(label_prefix) and _has_label_suffix(label, label_suffix):
             out.append(position)
     return out
 
