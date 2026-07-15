@@ -197,6 +197,7 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
             "weighted_entry": None,
             "unreliable": False,
             "pnl_sources": {},
+            "pnl_spot_ages": {},
             "unreliable_pnl_position_ids": [],
         }
 
@@ -205,6 +206,7 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
     total_pnl = 0.0
     unreliable = False
     pnl_sources: dict[str, int] = {}
+    pnl_spot_ages: dict[str, float] = {}
     unreliable_pnl_position_ids: list[int] = []
     open_ts_list: list[str] = []
     weighted_entry_num = 0.0
@@ -229,6 +231,21 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
             total_pnl += pnl
         source = str(position.get("pnl_source") or ("broker_or_legacy" if pnl is not None else "unavailable"))
         pnl_sources[source] = pnl_sources.get(source, 0) + 1
+        # Observability only (2026-07-15 OM-blindspot fix #1): the spot age
+        # dexter3.openapi_client's live-pnl enrichment stamped per leg — a
+        # stale rejection (source "stale_spot_rejected") or even a normal
+        # "computed_from_live_spot" leg both carry it when known, so the
+        # journal shows exactly how old the priced-off quote was, forever.
+        raw_age = position.get("pnl_spot_age_sec")
+        if raw_age is not None:
+            try:
+                pid = int(position.get("positionId") or position.get("id") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            try:
+                pnl_spot_ages[str(pid)] = round(float(raw_age), 3)
+            except (TypeError, ValueError):
+                pass
 
         entry = _position_entry(position)
         if entry > 0 and volume > 0:
@@ -261,6 +278,7 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
         # decision, but an event can now distinguish a normal broker PnL
         # from a stale/missing OpenAPI enrichment on a live session.
         "pnl_sources": pnl_sources,
+        "pnl_spot_ages": pnl_spot_ages,
         "unreliable_pnl_position_ids": unreliable_pnl_position_ids,
     }
 

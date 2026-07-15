@@ -743,6 +743,7 @@ class Dexter3Executor:
         basket_authorized: bool = False,
         risk_usd_override: float | None = None,
         smart_exit: dict[str, Any] | None = None,
+        repair_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Place a demo micro-entry for an ``enter`` decision.
 
@@ -773,6 +774,17 @@ class Dexter3Executor:
         other value (None, missing, or ``regime == 'tight'``) places the
         stop at the decision's own tight ``sl`` exactly as before smart exit
         existed.
+
+        ``repair_context`` (additive, default None -> byte-identical to
+        pre-repair-lineage behavior; set ONLY by ``execute_repair_leg`` via
+        its own ``_build_repair_lineage``): a pre-resolved dict of basket
+        repair-lineage facts (parent_position_ids, parent_setup, basket_id,
+        repair_side_mode, basket_agg_r_at_repair, basket_pnl_at_repair,
+        level_lost, close_beyond) nested under the ``entry_executed`` journal
+        row's own ``repair_context`` key (2026-07-15 repair-lineage-
+        enrichment fix) so a repair leg's entry is forever traceable to the
+        basket state that triggered it — never present for a normal (non-
+        repair) entry.
         """
         symbol = str(decision.symbol)
         if str(decision.action) != "enter":
@@ -993,6 +1005,12 @@ class Dexter3Executor:
             "broker_sl": round(broker_sl, 6),
             "broker_sl_distance": round(broker_sl_distance, 6),
         }
+        if repair_context:
+            # 2026-07-15 repair-lineage-enrichment fix: nested (not flattened
+            # into the top level) so a repair leg's entry_executed row keeps
+            # the same top-level shape every OTHER entry_executed row has —
+            # only its presence, never its absence, is new.
+            out["repair_context"] = dict(repair_context)
         self._journal(symbol, "entry_executed", position_id=pid, verified=verified, payload=out)
         return out
 
@@ -1359,6 +1377,66 @@ class Dexter3Executor:
             "results": results,
         }
 
+    def _build_repair_lineage(self, decision: Any, repair_context: dict[str, Any] | None) -> dict[str, Any]:
+        """Resolve+normalize repair-lineage facts threaded onto BOTH the
+        ``entry_executed`` and ``basket_repair_leg`` journal rows for a
+        repair/hedge leg (2026-07-15 repair-lineage-enrichment fix — closes
+        defect #3 of docs/AGENT_SYNC_BOARD.md's 2026-07-15 ~07:30Z "OM
+        ROUND-TRIP INCIDENT": today's ``basket_repair_leg`` payload carried
+        no parent link/session at all).
+
+        ``repair_context`` (caller-supplied, from ``shadow_runner.py`` — the
+        only place that has the basket-level aggregate/evidence facts this
+        method cannot derive itself) is expected to optionally carry:
+        ``parent_position_ids`` (list[int], oldest leg first),
+        ``basket_id`` (the basket's own identity key — this repo already
+        uses ``oldest_open_ts`` for that, see ``shadow_runner._basket_runtime_for``),
+        ``basket_side`` (str), ``basket_agg_r_at_repair`` (float),
+        ``basket_pnl_at_repair`` (float), ``level_lost``/``close_beyond``
+        (bool evidence flags). ``parent_setup`` is resolved HERE from the
+        oldest parent leg's own ``entry_executed`` row via
+        ``_entry_context_of`` — the one piece of lineage only this executor
+        (owner of the journal connection) can look up. Never raises: any
+        resolution failure degrades that one field to ``None`` rather than
+        blocking the repair leg itself."""
+        ctx = dict(repair_context or {})
+        parent_ids: list[int] = []
+        for raw_id in (ctx.get("parent_position_ids") or []):
+            try:
+                pid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if pid > 0:
+                parent_ids.append(pid)
+        parent_setup = None
+        if parent_ids:
+            try:
+                first_ctx = self._entry_context_of(str(getattr(decision, "symbol", "") or ""), parent_ids[0])
+                parent_setup = first_ctx.get("setup")
+            except Exception:  # noqa: BLE001 - lineage enrichment must never block a repair leg
+                parent_setup = None
+        basket_side = str(ctx.get("basket_side") or "").strip().lower() or None
+        decision_side = str(getattr(decision, "side", "") or "").strip().lower() or None
+        repair_side_mode = None
+        if basket_side and decision_side:
+            # Same literal values as dexter3.basket_live.REPAIR_MODE_SAME_SIDE
+            # / REPAIR_MODE_HEDGE_LOCK — NOT imported (this module never
+            # imports basket_live, mirroring basket_live's own documented
+            # "no cross-import of a peer module's internals" convention),
+            # just the identical strings so payload data stays consistent
+            # across both modules without coupling them.
+            repair_side_mode = "same_side" if decision_side == basket_side else "hedge_lock"
+        return {
+            "parent_position_ids": parent_ids,
+            "parent_setup": parent_setup,
+            "basket_id": ctx.get("basket_id"),
+            "repair_side_mode": repair_side_mode,
+            "basket_agg_r_at_repair": ctx.get("basket_agg_r_at_repair"),
+            "basket_pnl_at_repair": ctx.get("basket_pnl_at_repair"),
+            "level_lost": ctx.get("level_lost"),
+            "close_beyond": ctx.get("close_beyond"),
+        }
+
     def execute_repair_leg(
         self,
         decision: Any,
@@ -1367,13 +1445,22 @@ class Dexter3Executor:
         today_entry_count: int = 0,
         today_losing_count: int = 0,
         risk_usd_override: float | None = None,
+        repair_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Add a basket repair/hedge leg: the ONLY path that may open a second
         position on a symbol we already hold. All other pre-flight gates
         (demo, quote, sidedness, sizing, daily caps) still apply unchanged.
 
         ``risk_usd_override`` is forwarded to ``execute_entry`` unchanged —
-        see its docstring (additive, default None -> existing behavior)."""
+        see its docstring (additive, default None -> existing behavior).
+
+        ``repair_context`` (additive, default None -> byte-identical
+        pre-lineage-enrichment behavior): see ``_build_repair_lineage`` for
+        the caller-supplied shape. The RESOLVED lineage (never the raw
+        ``repair_context``) is threaded onto both this leg's own
+        ``entry_executed`` row (via ``execute_entry``'s own
+        ``repair_context`` param) and the ``basket_repair_leg`` row below."""
+        lineage = self._build_repair_lineage(decision, repair_context)
         result = self.execute_entry(
             decision,
             account_state,
@@ -1381,12 +1468,13 @@ class Dexter3Executor:
             today_losing_count=today_losing_count,
             basket_authorized=True,
             risk_usd_override=risk_usd_override,
+            repair_context=lineage,
         )
         self._journal(
             str(getattr(decision, "symbol", "unknown")),
             "basket_repair_leg",
             position_id=result.get("position_id"),
             verified=bool(result.get("verified")),
-            payload={"entry_result_action": result.get("action")},
+            payload={"entry_result_action": result.get("action"), **lineage},
         )
         return result

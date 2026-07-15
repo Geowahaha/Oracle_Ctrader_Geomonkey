@@ -521,6 +521,23 @@ class OpeningManager:
                 )
                 if repair_action is not None:
                     repair_action["basket_runtime"] = basket_runtime
+                    # 2026-07-15 repair-lineage-enrichment fix (#3 of the OM
+                    # blindspot triad): the caller (shadow_runner.run_om_tick)
+                    # journals both entry_executed and basket_repair_leg with
+                    # full lineage context, but had no access to the
+                    # evidence/aggregate facts that TRIGGERED this repair —
+                    # those were computed here and previously dropped once
+                    # ``_basket_doctor`` returned its bare
+                    # {action,side,conviction,note} dict. Additive fields
+                    # only; nothing above reads them.
+                    sides = agg.get("sides", {}) or {}
+                    repair_action["basket_side"] = (
+                        "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
+                    )
+                    repair_action["basket_agg_r_at_repair"] = round(live_r, 4)
+                    repair_action["basket_pnl_at_repair"] = agg.get("aggregate_pnl_usd")
+                    repair_action["level_lost"] = bool(evidence.get("level_lost"))
+                    repair_action["close_beyond"] = bool(evidence.get("m5_close_beyond"))
                     return repair_action
 
         return {

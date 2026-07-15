@@ -163,6 +163,44 @@ DAEMON_URL_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_URL"
 DAEMON_TIMEOUT_ENV_VAR = "DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC"
 DEFAULT_DAEMON_TIMEOUT_SEC = 12.0
 
+# Independent CLIENT-side spot-staleness ceiling (2026-07-15 OM-blindspot fix
+# #1 — docs/AGENT_SYNC_BOARD.md 2026-07-15 ~07:30Z "OM ROUND-TRIP INCIDENT",
+# defect #3 "THE KILLER"). Position 652652362: 05:30->06:46Z the OM read
+# this position's PnL as -5 to -15 USD while the broker's true floating was
+# roughly -1 to +5 USD (the implied spot was ~4044, hours old); telemetry
+# still stamped ``pnl_source=computed_from_live_spot`` because
+# ``_enrich_positions_with_live_pnl`` below trusted ANY successful
+# ``get_spot_price()`` call unconditionally — it never inspected the
+# ``quote_age_sec``/``spot_age_sec`` that daemon mode already returns
+# (see ``get_spot_price``'s daemon branch). Freshness was therefore enforced
+# ONLY by ``dexter3.openapi_daemon``'s OWN internal gate
+# (``DEXTER3_SPOT_QUOTE_MAX_AGE_SEC``, default 5.0s) — a single point of
+# failure with no independently-configured fallback at the consuming layer,
+# and the subprocess/capture_market transport had NO age concept at all.
+# This env is a SEPARATE knob from the daemon's own gate on purpose: a
+# second, independently-tunable ceiling at the layer that actually stamps
+# ``netProfit`` to journal/OM state, so a drifted or misconfigured daemon-side
+# value can never again pass a stale price through as "live" without this
+# layer also catching it. <=0 disables (never widens implicitly); a MISSING
+# age (older transports/tests that supply no age field) is NOT rejected —
+# there is nothing to compare, so this gate fails OPEN on absent metadata and
+# fails CLOSED only on a KNOWN stale age, preserving every pre-existing
+# fixture that never modeled quote age.
+CLIENT_SPOT_MAX_AGE_ENV_VAR = "DEXTER3_SPOT_MAX_AGE_SEC"
+DEFAULT_CLIENT_SPOT_MAX_AGE_SEC = 90.0
+
+
+def resolve_client_spot_max_age_sec() -> float | None:
+    """Env override for the client-side pnl-enrichment staleness ceiling,
+    else the documented default. Returns ``None`` when the gate is disabled
+    (parsed value <= 0) — callers must treat ``None`` as "no ceiling"."""
+    raw = str(os.environ.get(CLIENT_SPOT_MAX_AGE_ENV_VAR, "") or "").strip()
+    try:
+        val = float(raw) if raw else DEFAULT_CLIENT_SPOT_MAX_AGE_SEC
+    except ValueError:
+        val = DEFAULT_CLIENT_SPOT_MAX_AGE_SEC
+    return val if val > 0 else None
+
 # dexter3 "units" (1 unit = 0.01 lot XAU = 1 oz) <-> cTrader OpenAPI raw
 # volume (hundredths of a unit) — see module docstring gap #8 for evidence.
 UNITS_TO_RAW_SCALE = 100.0
@@ -648,6 +686,12 @@ class Dexter3OpenApiClient:
                 "quote_source": "openapi_daemon_spot_cache",
                 "event_utc": str(latest.get("event_utc") or ""),
                 "quote_age_sec": raw.get("quote_age_sec"),
+                # spot_age_sec: same value as quote_age_sec (2026-07-15
+                # OM-blindspot fix #1) — the name
+                # _enrich_positions_with_live_pnl's independent staleness
+                # gate reads, aliased here for both transports so that gate
+                # never needs to know which one answered.
+                "spot_age_sec": raw.get("spot_age_sec", raw.get("quote_age_sec")),
             }
         payload = self._payload(
             symbols=[sym],
@@ -667,12 +711,29 @@ class Dexter3OpenApiClient:
         latest = spots[-1]
         bid = float(latest.get("bid", 0.0) or 0.0)
         ask = float(latest.get("ask", 0.0) or 0.0)
+        # Age from the event's own wall-clock stamp (2026-07-15 OM-blindspot
+        # fix #1) — this transport had NO staleness concept at all before;
+        # ``event_ts`` is the daemon's capture_market event timestamp
+        # (``ops/ctrader_execute_once.py`` / ``openapi_daemon._mode_capture_market``
+        # both stamp it at real receipt time), so this is a genuine tick age,
+        # not a synthetic one. Absent/unparseable -> None (unknown age; the
+        # enrichment gate below fails OPEN on unknown age, never rejects on
+        # missing metadata).
+        event_ts = latest.get("event_ts")
+        spot_age_sec: float | None = None
+        if event_ts is not None:
+            try:
+                spot_age_sec = max(0.0, time.time() - float(event_ts))
+            except (TypeError, ValueError):
+                spot_age_sec = None
         return {
             "bid": bid,
             "ask": ask,
             "symbol": sym,
             "quote_source": "openapi_capture_market",
             "event_utc": str(latest.get("event_utc") or ""),
+            "quote_age_sec": round(spot_age_sec, 3) if spot_age_sec is not None else None,
+            "spot_age_sec": round(spot_age_sec, 3) if spot_age_sec is not None else None,
         }
 
     def get_positions(self) -> list[dict[str, Any]]:
@@ -697,7 +758,14 @@ class Dexter3OpenApiClient:
         unavailable (market closed / stale quote / unknown symbol point value),
         the position keeps NO netProfit — basket then reports ``unreliable`` and
         HOLDs, which is correct when there is genuinely no live price to manage
-        against (e.g. weekend). Only a fresh quote unblocks active management."""
+        against (e.g. weekend). Only a fresh quote unblocks active management.
+
+        2026-07-15 OM-blindspot fix #1: ALSO refuses to compute netProfit when
+        the fetched spot's own age (``spot_age_sec``/``quote_age_sec``) exceeds
+        ``CLIENT_SPOT_MAX_AGE_ENV_VAR`` — an independent ceiling from the
+        daemon's own internal staleness gate, so a single misconfigured/
+        drifted env value on one side can never again let a stale price pass
+        as live. See that env var's module-level docstring for the incident."""
         if not positions:
             return
         spot_cache: dict[str, dict[str, float] | None] = {}
@@ -717,6 +785,27 @@ class Dexter3OpenApiClient:
             spot = spot_cache.get(symbol)
             if not spot:
                 continue
+            # -- independent client-side staleness gate (2026-07-15
+            # OM-blindspot fix #1) — see CLIENT_SPOT_MAX_AGE_ENV_VAR's
+            # docstring above for the incident this closes. Checked BEFORE
+            # computing netProfit so a stale-but-otherwise-valid quote can
+            # never be stamped as "computed_from_live_spot": the position
+            # keeps no netProfit (basket_live.aggregate_lane already
+            # degrades that to unreliable=True -> OM holds, unchanged
+            # fail-closed behavior), and the rejection itself — including
+            # the age that triggered it — is stamped onto the position so
+            # the journal shows WHY, forever (never silent).
+            spot_age = spot.get("spot_age_sec", spot.get("quote_age_sec"))
+            max_age = resolve_client_spot_max_age_sec()
+            if max_age is not None and spot_age is not None:
+                try:
+                    age_val = float(spot_age)
+                except (TypeError, ValueError):
+                    age_val = None
+                if age_val is not None and age_val > max_age:
+                    pos["pnl_source"] = "stale_spot_rejected"
+                    pos["pnl_spot_age_sec"] = round(age_val, 3)
+                    continue
             side = str(pos.get("tradeSide") or "").upper()
             entry = float(pos.get("entryPrice", 0.0) or 0.0)
             vol = float(pos.get("volume", 0.0) or 0.0)
@@ -737,6 +826,11 @@ class Dexter3OpenApiClient:
             pos["netProfit"] = round(net, 4)
             pos["grossProfit"] = round(gross, 4)
             pos["pnl_source"] = "computed_from_live_spot"
+            if spot_age is not None:
+                try:
+                    pos["pnl_spot_age_sec"] = round(float(spot_age), 3)
+                except (TypeError, ValueError):
+                    pass
 
     def get_balance(self) -> dict[str, Any]:
         raw = self._invoke(

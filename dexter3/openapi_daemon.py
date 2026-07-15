@@ -1290,6 +1290,16 @@ class OpenApiDaemon:
             "account_id": int(account_id),
             "environment": self.state.environment,
             "quote_age_sec": round(float(age or 0.0), 3),
+            # Alias of quote_age_sec (2026-07-15 OM-blindspot fix #1): the
+            # incident's forensics (docs/AGENT_SYNC_BOARD.md 2026-07-15
+            # ~07:30Z "OM ROUND-TRIP INCIDENT") named the field the CLIENT's
+            # own independent staleness gate should read `spot_age_sec` —
+            # this daemon already computes the correct "age since the last
+            # REAL tick" value (``_fresh_quote`` measures from
+            # bid_mono/ask_mono, stamped only by ``_update_spot_cache`` on a
+            # genuine ``ProtoOASpotEvent``, never on read/reconnect), so this
+            # is a pure rename-for-the-consumer, not a new computation.
+            "spot_age_sec": round(float(age or 0.0), 3),
             "max_age_sec": float(max_age),
             "source": "live_cache",
             # "spots" list mirrors capture_market's per-event shape so the

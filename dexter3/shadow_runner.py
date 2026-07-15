@@ -642,6 +642,106 @@ def _clear_basket_runtime(state: dict[str, Any], symbol: str, grok: bool = False
     runtimes.pop(symbol, None)
 
 
+# ---------------------------------------------------------------------------
+# FIX 2b (2026-07-15 OM-blindspot fix #2) — per-position peak-R durability
+# ledger, keyed by the broker's OWN position_id rather than
+# (symbol, oldest_open_ts).
+#
+# ``basket_runtime`` above already persists peak_r to disk every tick
+# (save_shadow_state runs unconditionally in run_om_tick, and
+# load_shadow_state reloads the FULL state fresh at the top of every loop
+# iteration) — a plain process restart does NOT lose it. The real gap docs/
+# AGENT_SYNC_BOARD.md's 2026-07-15 ~07:30Z "OM ROUND-TRIP INCIDENT" (defect
+# #2, "OM amnesia") points at: that key resets to a fresh peak the instant
+# ``oldest_open_ts`` changes or ``_clear_basket_runtime`` fires — which
+# happens on a transient empty-lane read (a momentary reconcile hiccup, NOT
+# a real close) or a label-family boundary crossing (exactly what happened
+# during today's versioned-labels cutover, 90239b5). This ledger tracks the
+# SAME peak_r/floor_r by ``position_id`` instead — an identity that survives
+# every one of those resets — so a resetting basket_runtime can re-seed its
+# starting peak from real history instead of always restarting blind at
+# live_r. Never LOWERS an existing recorded peak; purges only entries whose
+# position_id the caller's ALREADY-FETCHED lane confirms is no longer open
+# (no new broker call).
+# ---------------------------------------------------------------------------
+
+
+def _position_peak_ledger(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("position_peak_r", {})
+
+
+def _position_ids_in_lane(lane: list[dict[str, Any]]) -> list[int]:
+    out: list[int] = []
+    for p in lane:
+        try:
+            pid = int(p.get("positionId") or p.get("id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            out.append(pid)
+    return out
+
+
+def _update_position_peak_ledger(
+    state: dict[str, Any],
+    symbol: str,
+    lane: list[dict[str, Any]],
+    peak_r: float | None,
+    floor_r: float | None,
+) -> None:
+    """Raise (never lower) every open lane position's recorded peak_r/
+    floor_r, then purge any THIS-SYMBOL ledger entry whose position_id is no
+    longer in ``lane``. Called with ``lane=[]`` (the flat-lane case) purges
+    every remaining entry for ``symbol`` — the lane read itself IS the
+    "position no longer open" evidence, no extra broker call needed."""
+    ledger = _position_peak_ledger(state)
+    live_ids = set(_position_ids_in_lane(lane))
+    if peak_r is not None:
+        for pid in live_ids:
+            key = str(pid)
+            entry = ledger.get(key) or {}
+            prev_peak = _f(entry.get("peak_r"), peak_r)
+            new_entry: dict[str, Any] = {
+                "symbol": symbol,
+                "peak_r": max(prev_peak, float(peak_r)),
+                "updated_at": utc_now_iso(),
+            }
+            if floor_r is not None:
+                new_entry["floor_r"] = float(floor_r)
+            elif "floor_r" in entry:
+                new_entry["floor_r"] = entry["floor_r"]
+            ledger[key] = new_entry
+    for key in list(ledger.keys()):
+        entry = ledger.get(key) or {}
+        if str(entry.get("symbol") or "") != symbol:
+            continue  # a peer symbol's entries are untouched by this call
+        try:
+            pid = int(key)
+        except ValueError:
+            ledger.pop(key, None)
+            continue
+        if pid not in live_ids:
+            ledger.pop(key, None)
+
+
+def _seed_peak_r_from_ledger(
+    state: dict[str, Any], lane: list[dict[str, Any]], reset_peak_r: float
+) -> float:
+    """When a fresh basket_runtime is about to start peak_r at
+    ``reset_peak_r`` (``_update_peak_r``'s own "new basket" reset guard just
+    fired), resume from the highest recorded peak any position_id CURRENTLY
+    in ``lane`` already has in the durability ledger, if higher. Never
+    returns less than ``reset_peak_r`` — this only ever raises the starting
+    point, exactly like the ledger's own raise-only update rule."""
+    ledger = _position_peak_ledger(state)
+    best = float(reset_peak_r)
+    for pid in _position_ids_in_lane(lane):
+        entry = ledger.get(str(pid))
+        if isinstance(entry, dict):
+            best = max(best, _f(entry.get("peak_r"), reset_peak_r))
+    return best
+
+
 def _f(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -1899,8 +1999,15 @@ def _execute_live_entry(
     repair: bool = False,
     risk_usd_override: float | None = None,
     smart_exit: dict[str, Any] | None = None,
+    repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolve account state and place a live micro-entry. Never raises."""
+    """Resolve account state and place a live micro-entry. Never raises.
+
+    ``repair_context`` (additive, default None): forwarded to
+    ``executor.execute_repair_leg`` unchanged — see
+    ``Dexter3Executor._build_repair_lineage`` for the expected shape.
+    Ignored on the non-repair path (2026-07-15 repair-lineage-enrichment
+    fix)."""
     account_state: dict[str, Any] = {}
     # get_balance() intermittently returns without traderId (observed live
     # 2026-07-05 11:00:21Z → demo gate refused a valid entry). One short
@@ -1924,6 +2031,7 @@ def _execute_live_entry(
                 today_entry_count=today_entry_count,
                 today_losing_count=today_losing_count,
                 risk_usd_override=risk_usd_override,
+                repair_context=repair_context,
             )
         else:
             result = executor.execute_entry(
@@ -1943,6 +2051,32 @@ def _execute_live_entry(
         f"position_id={result.get('position_id')} verified={result.get('verified')}"
     )
     return result
+
+
+def _parent_position_ids_oldest_first(lane: list[dict[str, Any]]) -> list[int]:
+    """Open lane position ids for repair-lineage journaling, OLDEST leg
+    first (index 0) so ``Dexter3Executor._build_repair_lineage`` resolves
+    ``parent_setup`` from the ORIGINAL leg's own entry_executed row, not an
+    arbitrary/later one (2026-07-15 repair-lineage-enrichment fix). Mirrors
+    ``basket_live._position_open_ts``'s key-fallback chain (duplicated per
+    this module's own no-cross-import-of-a-peer-module's-private-helpers
+    convention — see basket_live.py's docstring) purely to sort; never
+    raises on malformed entries."""
+
+    def _open_ts(p: dict[str, Any]) -> str:
+        return str(
+            p.get("openTime") or p.get("openTimestamp") or p.get("open_ts")
+            or p.get("openedAt") or p.get("ts") or ""
+        ).strip()
+
+    def _pid(p: dict[str, Any]) -> int:
+        try:
+            return int(p.get("positionId") or p.get("id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ordered = sorted((p for p in lane if _pid(p) > 0), key=_open_ts)
+    return [_pid(p) for p in ordered]
 
 
 def _repair_geometry(
@@ -2026,6 +2160,10 @@ def _manage_lane_basket(
     elif act == "add_repair_leg":
         repair_side = str(action.get("side") or ("sell" if basket_side == "buy" else "buy"))
         entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)
+        # Same source normal entries use (hunter_brain.decide()) — 2026-07-15
+        # repair-lineage-enrichment fix: previously omitted entirely, which
+        # left every repair entry_executed row stamped session="".
+        session_label = str(lens.get("session_context", {}).get("value") or "unknown")
         repair_decision = hunter_brain.Decision(
             ts_close=ts_close,
             symbol=symbol,
@@ -2044,7 +2182,17 @@ def _manage_lane_basket(
                 f"aggregate_r={agg.get('aggregate_r')}, legs={agg.get('legs')}",
             ],
             features={"basket": {k: agg.get(k) for k in ("legs", "aggregate_pnl_usd", "aggregate_r", "sides")}},
+            session=session_label,
         )
+        repair_context = {
+            "parent_position_ids": _parent_position_ids_oldest_first(lane),
+            "basket_id": agg.get("oldest_open_ts"),
+            "basket_side": basket_side,
+            "basket_agg_r_at_repair": agg.get("aggregate_r"),
+            "basket_pnl_at_repair": agg.get("aggregate_pnl_usd"),
+            "level_lost": evidence.get("level_lost"),
+            "close_beyond": evidence.get("m5_close_beyond"),
+        }
         executed["exec"] = _execute_live_entry(
             executor,
             repair_decision,
@@ -2057,6 +2205,7 @@ def _manage_lane_basket(
                 repair_decision,
                 _f(agg.get("base_risk_usd"), executor.config.risk_usd),
             ),
+            repair_context=repair_context,
         )
         if executed["exec"].get("action") == "entered":
             daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -2324,6 +2473,11 @@ def run_om_tick(
     if not lane:
         is_grok = bool((state.get("grok_v10_flags") or {}).get("is_grok_scalp"))
         _clear_basket_runtime(state, symbol, grok=is_grok)
+        # 2026-07-15 OM-blindspot fix #2: this IS the "position no longer
+        # open" evidence for the durability ledger too — purge every
+        # remaining entry for this symbol using the lane read already in
+        # hand (empty), no extra broker call.
+        _update_position_peak_ledger(state, symbol, [], None, None)
         state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = 0.0
         return "om_no_lane"
 
@@ -2368,8 +2522,31 @@ def run_om_tick(
     lane_oldest_ts = agg_probe.get("oldest_open_ts")
     if isinstance(regime_entry, dict) and lane_oldest_ts and regime_entry.get("oldest_open_ts") != lane_oldest_ts:
         regime_entry["oldest_open_ts"] = lane_oldest_ts
+
+    # 2026-07-15 OM-blindspot fix #2: basket_runtime is ABOUT to reset (a
+    # brand-new basket, or amnesia from a transient empty-lane read / a
+    # label-family boundary crossing — see _update_position_peak_ledger's
+    # docstring) whenever its own oldest_open_ts disagrees with what THIS
+    # tick's lane will produce. Re-seed the starting peak from the
+    # position_id-keyed durability ledger (never below what a normal reset
+    # would give) BEFORE opening_manager.evaluate() ever sees it, so a reset
+    # never silently drops real history for a position that never actually
+    # closed.
+    existing_runtime = (state.get(runtime_key) or {}).get(symbol)
+    if lane_oldest_ts and (
+        not isinstance(existing_runtime, dict) or existing_runtime.get("oldest_open_ts") != lane_oldest_ts
+    ):
+        seeded_peak = _seed_peak_r_from_ledger(state, lane, _f(agg_probe.get("aggregate_r"), 0.0))
+        existing_runtime = {
+            "oldest_open_ts": lane_oldest_ts,
+            "peak_r": seeded_peak,
+            "ticks_since_peak": 0,
+            "ticks_open": 0,
+            "last_pyramid_peak": None,
+        }
+
     om_state = {
-        "basket_runtime": (state.get(runtime_key) or {}).get(symbol),
+        "basket_runtime": existing_runtime,
         "now_utc_iso": utc_now_iso(),
         "daily_state": {"daily_loss_baskets": int(_daily_state(state).get("loss_baskets", 0))},
         "basket_cfg": _basket_config_from_env(),
@@ -2384,6 +2561,11 @@ def run_om_tick(
     new_runtime = action.get("basket_runtime")
     if new_runtime is not None:
         state.setdefault(runtime_key, {})[symbol] = new_runtime
+
+    # Raise (never lower) the durability ledger from whatever peak_r/floor_r
+    # this tick's OM decision computed, and purge any of THIS symbol's
+    # entries no longer in ``lane`` (2026-07-15 OM-blindspot fix #2).
+    _update_position_peak_ledger(state, symbol, lane, action.get("peak_r"), action.get("floor_r"))
 
     act = str(action.get("action") or "hold")
     if act == "add_repair_leg" and (state.get("governor") or {}).get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
@@ -2435,6 +2617,11 @@ def run_om_tick(
         if prefix:
             entry, sl, tp = _repair_geometry(prefix, repair_side, spread_abs)
             ts_close = hunter_brain._bar_close_ts(str(prefix[-1].get("ts") or ""))
+            # Same source normal entries use (hunter_brain.decide()) —
+            # 2026-07-15 repair-lineage-enrichment fix: previously omitted
+            # entirely, which left every fast-tick repair entry_executed row
+            # stamped session="".
+            session_label = str(market_lens.session_context(ts_close).get("value") or "unknown")
             repair_decision = hunter_brain.Decision(
                 ts_close=ts_close,
                 symbol=symbol,
@@ -2453,7 +2640,17 @@ def run_om_tick(
                     f"conviction={action.get('conviction')}",
                 ],
                 features={"om_action": {k: v for k, v in action.items() if k != "basket_runtime"}},
+                session=session_label,
             )
+            repair_context = {
+                "parent_position_ids": _parent_position_ids_oldest_first(lane),
+                "basket_id": agg_probe.get("oldest_open_ts"),
+                "basket_side": action.get("basket_side"),
+                "basket_agg_r_at_repair": action.get("basket_agg_r_at_repair"),
+                "basket_pnl_at_repair": action.get("basket_pnl_at_repair"),
+                "level_lost": action.get("level_lost"),
+                "close_beyond": action.get("close_beyond"),
+            }
             daily = _daily_state(state)
             executed = _execute_live_entry(
                 executor,
@@ -2467,6 +2664,7 @@ def run_om_tick(
                     repair_decision,
                     _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
                 ),
+                repair_context=repair_context,
             )
             if executed.get("action") == "entered":
                 daily["entries"] = int(daily.get("entries", 0)) + 1
@@ -2488,6 +2686,9 @@ def run_om_tick(
             "aggregate_pnl_usd": agg_probe.get("aggregate_pnl_usd"),
             "aggregate_unreliable": bool(agg_probe.get("unreliable")),
             "pnl_sources": agg_probe.get("pnl_sources"),
+            # 2026-07-15 OM-blindspot fix #1 observability: per-position spot
+            # age at enrichment time, journaled forever alongside pnl_sources.
+            "pnl_spot_ages": agg_probe.get("pnl_spot_ages"),
             "unreliable_pnl_position_ids": agg_probe.get("unreliable_pnl_position_ids"),
             "executed": executed,
         },
