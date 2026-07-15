@@ -222,6 +222,71 @@ def resolve_port(port: int | None) -> int:
     return int(os.environ.get(PORT_ENV_VAR, DEFAULT_PORT) or DEFAULT_PORT)
 
 
+# Entry-vs-target field-confusion sanity guard (2026-07-15, P0 live-PnL
+# forensics: the OM's live PnL was found flip-flopping between an
+# entry-based number and a number matching (take_profit - spot) exactly to
+# the cent, on positions with a fresh spot — i.e. NOT a staleness bug.
+# ``entry_price`` here is ``ProtoOAPosition.price`` (confirmed against the
+# installed protobuf descriptor: fields are positionId/tradeData/
+# positionStatus/swap/price/stopLoss/takeProfit/... — ``price`` is the
+# position's own open/entry price, there is no separate "current price"
+# field on this message). A real broker fill coinciding to the sanity
+# tolerance with its OWN stop_loss/take_profit is practically impossible in
+# live trading (both are always placed at a deliberate distance from
+# entry) — so if it ever happens, a field-mapping regression (entry_price
+# silently reading take_profit/stop_loss instead of ``price``) is the far
+# more likely explanation, and every downstream OM decision (ladder/take/
+# smart-exit) would then run on a netProfit silently wrong by exactly
+# |entry-take_profit|. This must never be silent again.
+DEFAULT_ENTRY_TARGET_SANITY_PRICE = 0.01
+ENTRY_TARGET_SANITY_ENV_VAR = "DEXTER3_ENTRY_TARGET_SANITY_PRICE"
+
+
+def resolve_entry_target_sanity_price() -> float:
+    """Env override for the entry-vs-target coincidence tolerance (price
+    units, e.g. USD/oz for XAUUSD), else the documented default."""
+    raw = str(os.environ.get(ENTRY_TARGET_SANITY_ENV_VAR, "") or "").strip()
+    try:
+        val = float(raw) if raw else DEFAULT_ENTRY_TARGET_SANITY_PRICE
+    except ValueError:
+        return DEFAULT_ENTRY_TARGET_SANITY_PRICE
+    return val if val > 0 else DEFAULT_ENTRY_TARGET_SANITY_PRICE
+
+
+def _entry_matches_target(entry_price: float, target_price: float, tol: float) -> bool:
+    """Pure: True when ``entry_price``/``target_price`` are both real
+    (>0) and coincide within ``tol``. Split out from the logging wrapper so
+    the coincidence rule itself is unit-testable without a logger."""
+    return entry_price > 0 and target_price > 0 and abs(entry_price - target_price) < tol
+
+
+def _warn_if_entry_matches_targets(
+    position_id: int, entry_price: float, stop_loss: float, take_profit: float
+) -> None:
+    """Log (never raise) when a normalized position's own entry_price
+    coincides with its stop_loss or take_profit — see the sanity-guard
+    rationale above ``DEFAULT_ENTRY_TARGET_SANITY_PRICE``. A broken guard
+    must never break reconcile/normalization itself."""
+    try:
+        tol = resolve_entry_target_sanity_price()
+        if _entry_matches_target(entry_price, take_profit, tol):
+            logger.warning(
+                "position %s: entry_price=%.5f suspiciously coincides with take_profit=%.5f "
+                "(tol=%.5f) — possible entry/take-profit field-mapping bug; any pnl computed "
+                "from entry_price here would be indistinguishable from a take-profit-based "
+                "miscalculation",
+                position_id, entry_price, take_profit, tol,
+            )
+        if _entry_matches_target(entry_price, stop_loss, tol):
+            logger.warning(
+                "position %s: entry_price=%.5f suspiciously coincides with stop_loss=%.5f "
+                "(tol=%.5f) — possible entry/stop-loss field-mapping bug",
+                position_id, entry_price, stop_loss, tol,
+            )
+    except Exception:  # noqa: BLE001 - a sanity guard must never break normalization
+        logger.exception("entry/target sanity guard failed for position %s", position_id)
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers with no I/O and no protobuf dependency — always importable,
 # always unit-testable, never touch a wall clock or the network themselves.
@@ -733,15 +798,39 @@ def _normalize_position(position: Any, symbol_map: dict[int, str]) -> dict:
     trade = dict(raw.get("tradeData") or {})
     symbol_id = _safe_int(trade.get("symbolId"), _safe_int(raw.get("symbolId"), 0))
     side_token = str(trade.get("tradeSide") or raw.get("tradeSide") or "").strip().upper()
+    position_id = _safe_int(raw.get("positionId"), 0)
+    # ``price`` is ProtoOAPosition's own open/entry price (confirmed against
+    # the installed protobuf descriptor — see the sanity-guard rationale on
+    # ``DEFAULT_ENTRY_TARGET_SANITY_PRICE`` above); it must never be read
+    # from ``stopLoss``/``takeProfit``. Guarded immediately below.
+    entry_price = _safe_float(raw.get("price"), 0.0)
+    stop_loss = _safe_float(raw.get("stopLoss"), 0.0)
+    take_profit = _safe_float(raw.get("takeProfit"), 0.0)
+    _warn_if_entry_matches_targets(position_id, entry_price, stop_loss, take_profit)
+    # 2026-07-15 P0 fix: swap/commission/usedMargin are raw broker integers
+    # scaled by moneyDigits (same convention ``_normalize_deal`` below already
+    # divides by, at ~L838-844) — this site read them UNSCALED for as long as
+    # it existed, so on XAU (moneyDigits=2) an open position's commission/swap
+    # were reported ~100x too large. Proven live on open short 653082985:
+    # raw commission=-12 -> unscaled path fed -12.0 into netProfit instead of
+    # -0.12, poisoning the OM's live PnL (netProfit=-17.54 vs true gross
+    # -5.54, delta ~= the unscaled commission itself). ``money_digits`` was
+    # already captured below but never applied to these three fields; fixed
+    # by applying the identical scale ``_normalize_deal`` uses. Deals/realized
+    # PnL paths were never affected (they always divided) — only open-position
+    # netProfit (basket_live/OM/shadow_runner/executor consumers) was poisoned.
+    money_digits = _safe_int(raw.get("moneyDigits"), 2)
+    money_digits = max(0, min(8, money_digits))  # sane clamp; malformed proto value must never explode/invert the scale
+    scale = float(10 ** money_digits) if money_digits > 0 else 1.0
     return {
-        "position_id": _safe_int(raw.get("positionId"), 0),
+        "position_id": position_id,
         "symbol_id": symbol_id,
         "symbol": str(symbol_map.get(symbol_id, "") or "").strip().upper(),
         "direction": "long" if side_token == "BUY" else ("short" if side_token == "SELL" else ""),
         "volume": _safe_int(trade.get("volume"), 0),
-        "entry_price": _safe_float(raw.get("price"), 0.0),
-        "stop_loss": _safe_float(raw.get("stopLoss"), 0.0),
-        "take_profit": _safe_float(raw.get("takeProfit"), 0.0),
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
         "label": str(trade.get("label", "") or raw.get("label", "") or ""),
         "comment": str(trade.get("comment", "") or raw.get("comment", "") or ""),
         "open_timestamp_ms": _safe_int(trade.get("openTimestamp"), 0),
@@ -749,10 +838,14 @@ def _normalize_position(position: Any, symbol_map: dict[int, str]) -> dict:
         "updated_timestamp_ms": _safe_int(raw.get("utcLastUpdateTimestamp"), 0),
         "updated_utc": _ms_to_iso(raw.get("utcLastUpdateTimestamp")),
         "status": str(raw.get("positionStatus", "") or ""),
-        "swap": _safe_float(raw.get("swap"), 0.0),
-        "commission": _safe_float(raw.get("commission"), 0.0),
-        "used_margin": _safe_float(raw.get("usedMargin"), 0.0),
-        "money_digits": _safe_int(raw.get("moneyDigits"), 2),
+        "swap": _safe_float(raw.get("swap"), 0.0) / scale,
+        "commission": _safe_float(raw.get("commission"), 0.0) / scale,
+        "used_margin": _safe_float(raw.get("usedMargin"), 0.0) / scale,
+        "money_digits": money_digits,
+        # NOTE: ``mirroringCommission`` (if present) lives only inside
+        # ``raw['raw']`` today — it is not surfaced as a normalized field by
+        # this function, so it is intentionally left unscaled/untouched here;
+        # scale it the same way if it is ever promoted to a normalized field.
         "raw": raw,
     }
 

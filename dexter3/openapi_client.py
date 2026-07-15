@@ -234,6 +234,154 @@ _USD_POINT_VALUE_PER_UNIT = {
     "XAUUSD": 1.0,
 }
 
+# Entry-vs-target field-confusion sanity guard (2026-07-15, P0 live-PnL
+# forensics — see the sibling guard in dexter3/openapi_daemon.py::
+# _warn_if_entry_matches_targets for the normalization-site half of this
+# defense). The OM's live PnL was found flip-flopping between an
+# entry-based number and a number matching (take_profit - spot) exactly to
+# the cent on positions with a FRESH spot (pnl_spot_age_sec 0.05-0.7s) — not
+# a staleness bug. This client is the ONE place that actually computes
+# netProfit from a live spot, so it is also the best place to catch ANY
+# pnl — including a value that arrived already stamped from elsewhere
+# (e.g. a future daemon-side computation, or the local-MCP transport's
+# broker-supplied ``profit``) — that is silently wrong by exactly
+# |entry-take_profit|. ``_pnl_implied_entry`` inverts the enrichment
+# formula: given a (gross) pnl and the live bid/ask, it solves for the
+# entry price that would have produced it; comparing that back-solved
+# price against the position's OWN entry_price field catches a
+# regression that swaps ``entry`` for ``take_profit``/``stop_loss``
+# immediately instead of letting it run silent.
+DEFAULT_PNL_ENTRY_SANITY_PRICE = 0.05
+PNL_ENTRY_SANITY_ENV_VAR = "DEXTER3_PNL_ENTRY_SANITY_PRICE"
+
+# Entry-vs-target coincidence tolerance (price units) — same rule as
+# dexter3/openapi_daemon.py::DEFAULT_ENTRY_TARGET_SANITY_PRICE, duplicated
+# rather than imported (this client and the daemon are only loosely coupled
+# over HTTP/subprocess, never a direct Python import — matches this
+# repo's established "duplicate small pure helpers" posture, e.g.
+# basket_live.py's own module docstring).
+DEFAULT_ENTRY_TARGET_SANITY_PRICE = 0.01
+ENTRY_TARGET_SANITY_ENV_VAR = "DEXTER3_ENTRY_TARGET_SANITY_PRICE"
+
+
+def resolve_entry_target_sanity_price() -> float:
+    """Env override for the entry-vs-target coincidence tolerance, else the
+    documented default. Shares its env var name with the daemon-side guard
+    on purpose — one knob tunes both sites."""
+    raw = str(os.environ.get(ENTRY_TARGET_SANITY_ENV_VAR, "") or "").strip()
+    try:
+        val = float(raw) if raw else DEFAULT_ENTRY_TARGET_SANITY_PRICE
+    except ValueError:
+        return DEFAULT_ENTRY_TARGET_SANITY_PRICE
+    return val if val > 0 else DEFAULT_ENTRY_TARGET_SANITY_PRICE
+
+
+def _entry_matches_target(entry_price: float, target_price: float, tol: float) -> bool:
+    """Pure: True when ``entry_price``/``target_price`` are both real (>0)
+    and coincide within ``tol``."""
+    return entry_price > 0 and target_price > 0 and abs(entry_price - target_price) < tol
+
+
+def _warn_if_entry_matches_targets(
+    position_id: Any, entry_price: float, stop_loss: float, take_profit: float
+) -> None:
+    """Log (never raise) when a normalized position's own entryPrice
+    coincides with its stopLoss or takeProfit — see the sanity-guard
+    rationale above ``DEFAULT_PNL_ENTRY_SANITY_PRICE``."""
+    try:
+        tol = resolve_entry_target_sanity_price()
+        log = logging.getLogger("dexter3.openapi_client")
+        if _entry_matches_target(entry_price, take_profit, tol):
+            log.warning(
+                "position %s: entryPrice=%.5f suspiciously coincides with takeProfit=%.5f "
+                "(tol=%.5f) — possible entry/take-profit field-mapping bug; any pnl computed "
+                "from entryPrice here would be indistinguishable from a take-profit-based "
+                "miscalculation",
+                position_id, entry_price, take_profit, tol,
+            )
+        if _entry_matches_target(entry_price, stop_loss, tol):
+            log.warning(
+                "position %s: entryPrice=%.5f suspiciously coincides with stopLoss=%.5f "
+                "(tol=%.5f) — possible entry/stop-loss field-mapping bug",
+                position_id, entry_price, stop_loss, tol,
+            )
+    except Exception:  # noqa: BLE001 - a sanity guard must never break normalization
+        logging.getLogger("dexter3.openapi_client").exception(
+            "entry/target sanity guard failed for position %s", position_id
+        )
+
+
+def resolve_pnl_entry_sanity_price() -> float:
+    """Env override for the implied-entry-vs-stated-entry tolerance (price
+    units, e.g. USD/oz for XAUUSD), else the documented default."""
+    raw = str(os.environ.get(PNL_ENTRY_SANITY_ENV_VAR, "") or "").strip()
+    try:
+        val = float(raw) if raw else DEFAULT_PNL_ENTRY_SANITY_PRICE
+    except ValueError:
+        return DEFAULT_PNL_ENTRY_SANITY_PRICE
+    return val if val > 0 else DEFAULT_PNL_ENTRY_SANITY_PRICE
+
+
+def _pnl_implied_entry(
+    side: str, gross_pnl: float, bid: float, ask: float, vol: float, point_value: float
+) -> float | None:
+    """Pure: invert the enrichment formula (``gross = price_diff * vol *
+    point_value`` where ``price_diff`` is ``bid - entry`` for BUY / ``entry
+    - ask`` for SELL) to solve for the entry price ``gross_pnl`` implies.
+    Returns ``None`` when the inversion is meaningless (non-positive volume
+    or point value, or an unrecognized side) rather than dividing by zero
+    or guessing."""
+    if vol <= 0 or point_value <= 0:
+        return None
+    price_diff = gross_pnl / (vol * point_value)
+    if side == "BUY":
+        return bid - price_diff
+    if side == "SELL":
+        return ask + price_diff
+    return None
+
+
+def _pnl_entry_sanity_diff(
+    side: str, entry: float, gross_pnl: float, bid: float, ask: float, vol: float, point_value: float
+) -> float | None:
+    """Pure: ``abs(implied_entry - entry)`` for the sanity guard below, or
+    ``None`` when ``_pnl_implied_entry`` can't be computed. Split out from
+    the logging wrapper so the check itself is unit-testable without a
+    logger — this is what the caller compares against
+    ``resolve_pnl_entry_sanity_price()``."""
+    implied = _pnl_implied_entry(side, gross_pnl, bid, ask, vol, point_value)
+    if implied is None:
+        return None
+    return abs(implied - entry)
+
+
+def _warn_if_pnl_implies_wrong_entry(
+    position_id: Any, side: str, entry: float, gross_pnl: float, bid: float, ask: float, vol: float, point_value: float
+) -> None:
+    """Log (never raise) when the just-computed ``gross_pnl`` implies an
+    entry price that disagrees with the position's own ``entryPrice``
+    field beyond ``resolve_pnl_entry_sanity_price()`` — see the module-level
+    rationale above ``DEFAULT_PNL_ENTRY_SANITY_PRICE``. A broken guard must
+    never break live-pnl enrichment itself."""
+    try:
+        implied = _pnl_implied_entry(side, gross_pnl, bid, ask, vol, point_value)
+        if implied is None:
+            return
+        diff = abs(implied - entry)
+        tol = resolve_pnl_entry_sanity_price()
+        if diff > tol:
+            logging.getLogger("dexter3.openapi_client").warning(
+                "position %s: computed grossProfit=%.4f implies entry=%.5f but the position's "
+                "own entryPrice=%.5f (diff=%.5f > sanity=%.5f) — netProfit may have been computed "
+                "against the wrong reference price (e.g. take_profit/stop_loss) instead of entry",
+                position_id, gross_pnl, implied, entry, diff, tol,
+            )
+    except Exception:  # noqa: BLE001 - a sanity guard must never break enrichment
+        logging.getLogger("dexter3.openapi_client").exception(
+            "pnl/entry sanity guard failed for position %s", position_id
+        )
+
+
 DEFAULT_TIMEOUT_SEC = 25.0
 DEFAULT_HEALTH_TIMEOUT_SEC = 18.0
 DEFAULT_QUOTE_DURATION_SEC = 3
@@ -822,6 +970,26 @@ class Dexter3OpenApiClient:
             else:
                 continue
             gross = price_diff * vol * float(point_value)
+            # Sanity guard (2026-07-15, P0 live-PnL forensics — see module
+            # docstring above DEFAULT_PNL_ENTRY_SANITY_PRICE): back-solve the
+            # entry ``gross`` implies from (side, bid, ask) and compare it
+            # against a FRESH, independent re-read of ``pos["entryPrice"]``
+            # — deliberately NOT the local ``entry`` variable above. If a
+            # future regression made ``entry`` read the wrong key (e.g.
+            # ``pos.get("takeProfit")``), comparing against that same local
+            # variable would be tautological and never fire; re-reading the
+            # position's own field independently is what actually catches
+            # it (proven via a deliberate-break rehearsal during this fix).
+            _warn_if_pnl_implies_wrong_entry(
+                pos.get("positionId"),
+                side,
+                float(pos.get("entryPrice", 0.0) or 0.0),
+                gross,
+                bid,
+                ask,
+                vol,
+                float(point_value),
+            )
             net = gross + float(pos.get("swap", 0.0) or 0.0) + float(pos.get("commission", 0.0) or 0.0)
             pos["netProfit"] = round(net, 4)
             pos["grossProfit"] = round(gross, 4)
@@ -986,6 +1154,17 @@ class Dexter3OpenApiClient:
         volume_units = _raw_volume_to_units(p.get("volume", 0))
         open_ms = p.get("open_timestamp_ms", 0)
         symbol = str(p.get("symbol") or "").strip().upper()
+        entry_price = float(p.get("entry_price", 0.0) or 0.0)
+        stop_loss = float(p.get("stop_loss", 0.0) or 0.0)
+        take_profit = float(p.get("take_profit", 0.0) or 0.0)
+        # Sanity guard (2026-07-15, P0 live-PnL forensics — mirrors
+        # dexter3/openapi_daemon.py::_warn_if_entry_matches_targets at the
+        # sibling normalization site): this re-maps the daemon/subprocess
+        # worker's already-normalized ``entry_price`` into the camelCase
+        # shape dexter3 code reads. Confirm it never silently coincides
+        # with stop_loss/take_profit before handing it to the enrichment
+        # step below.
+        _warn_if_entry_matches_targets(p.get("position_id"), entry_price, stop_loss, take_profit)
         return {
             "positionId": int(p.get("position_id", 0) or 0),
             "id": int(p.get("position_id", 0) or 0),
@@ -995,18 +1174,25 @@ class Dexter3OpenApiClient:
             "side": trade_side,
             "volume": volume_units,
             "volumeInUnits": volume_units,
-            "entryPrice": float(p.get("entry_price", 0.0) or 0.0),
-            "price": float(p.get("entry_price", 0.0) or 0.0),
-            "stopLoss": float(p.get("stop_loss", 0.0) or 0.0),
-            "takeProfit": float(p.get("take_profit", 0.0) or 0.0),
+            "entryPrice": entry_price,
+            "price": entry_price,
+            "stopLoss": stop_loss,
+            "takeProfit": take_profit,
             "label": str(p.get("label") or ""),
             "comment": str(p.get("comment") or ""),
             "openTime": _ms_to_iso_with_millis(open_ms),
             "openTimestamp": int(open_ms or 0),
             "status": str(p.get("status") or ""),
+            # swap/commission/usedMargin: source is scaled at the daemon
+            # (dexter3/openapi_daemon.py::_normalize_position, 2026-07-15
+            # money-digits fix) -- do NOT re-scale here, that would
+            # reintroduce the bug at 1/100x. money_digits is carried through
+            # below for observability/downstream recoverability only.
             "swap": float(p.get("swap", 0.0) or 0.0),
             "commission": float(p.get("commission", 0.0) or 0.0),
             "usedMargin": float(p.get("used_margin", 0.0) or 0.0),
+            "money_digits": int(p.get("money_digits", 2) or 2),
+            "moneyDigits": int(p.get("money_digits", 2) or 2),
             # PnL is attached by _enrich_positions_with_live_pnl after a
             # fresh daemon spot read; absent a fresh quote it stays missing
             # and basket_live deliberately holds fail-closed.
