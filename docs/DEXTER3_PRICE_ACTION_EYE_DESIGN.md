@@ -69,6 +69,40 @@ Wiring (flagged):
 Gate: replay Layer 1 over 6000 bars with the geometry harness — verdict must
 improve the accepted stream on BOTH segments before `veto` is proposed.
 
+## Pattern Catalog — the knowledge base (and who gets power)
+
+The two 2026-07-15 flagged trades are ACCEPTANCE FIXTURES only — the minimum
+bar, not the knowledge base. The Eye ships a broad detector CATALOG drawn
+from the full price-action corpus (Brooks-style + classical candlestick +
+market structure), each detector a pure function emitting a journaled
+feature:
+
+- **Single-bar:** trend bar / doji / pin bar (hammer, shooting star),
+  strong-close bar, exhaustion bar (climactic range vs ATR).
+- **Multi-bar:** inside/outside (ii, ioi), engulfing, two-bar reversal,
+  H2/L2 second entries (pullback counting), three-push wedge, microchannel
+  (consecutive bars with no pullback), spike-then-channel, breakout bar +
+  follow-through vs breakout FAILURE (one-bar false break).
+- **Structure/location:** micro swing highs/lows, break-of-structure vs
+  failed break, sweep-and-reclaim at a swing point, micro double top/bottom,
+  round-number magnet proximity, measuring-gap continuation.
+- **Context:** Brooks "always-in" direction (the formal version of the
+  owner's "รู้ว่ามันจะไปทางไหนก็กระโดดเข้าทางนั้น"), bar-count position
+  within the current leg, trading-range vs trend day detection.
+- **Tick-level (L2/L3):** pressure ratio, velocity bursts, delta proxy,
+  micro-trend state on synthetic tick bars.
+
+**Promotion policy (the honest part):** knowing a textbook pattern is NOT
+evidence it pays on XAU M1/M5 in this regime — this repo has killed many
+plausible rules in replay (bucket lists, empirical sizing, 240 exit combos,
+VP rolling-WF). So every detector starts as a JOURNALED FEATURE with zero
+power. A detector is promoted to vote/veto only when its own journaled+replay
+buckets show outcome separation (support-vs-oppose mean-R gap on enough
+samples, both replay segments where replayable). The catalog is the
+curriculum; the promotion gate decides which lessons the lanes are allowed
+to act on. Detectors that fail stay journaled (free future training data)
+but powerless.
+
 ## Layer 2 — Tick Pulse — daemon collector + mode
 
 The daemon already holds a live spot stream. Add a rolling tick ring buffer
