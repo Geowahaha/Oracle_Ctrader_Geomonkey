@@ -1,8 +1,15 @@
 """Dexter3 executor — the ONLY dexter3 module allowed to call mutating MCP
 methods (place_market_order / amend_position / close_position).
 
-Every order carries ``LABEL = "dexter3:fable:m5h-v1"`` (blueprint
+Every order carries ``LABEL = f"{LABEL_FAMILY}:{VERSION}"`` (blueprint
 "Non-negotiables" #2 — label isolation; loops/peers ignore foreign labels).
+``VERSION`` comes from env ``DEXTER3_FABLE_VERSION`` (sanitized; see
+``sanitize_label_version``) so every trade is attributable to the exact code
+version that placed it (owner directive, 2026-07-15 "versioned labels").
+Ownership/matching checks (``is_our_position``, lane reconciliation) use
+FAMILY-PREFIX matching (``label_matches_family``) rather than exact-label
+equality, so a version bump never orphans positions/journal rows a PRIOR
+version of this same lane opened — see that function's docstring.
 Demo-only by hard refusal (blueprint #3): ``execute_entry`` will not place an
 order unless the bound account can be confirmed as demo.
 
@@ -30,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -44,7 +52,106 @@ from dexter3.mcp_client import (
 )
 from dexter3.smart_exit import disaster_stop_distance
 
-LABEL = "dexter3:fable:m5h-v1"
+# -- versioned broker label (owner directive, 2026-07-15) --------------------
+# LABEL_FAMILY identifies the LANE (fable); it never changes across a version
+# bump — every "is this mine" check below matches on FAMILY, not the exact
+# versioned string, so a version bump never orphans a position/journal row a
+# prior version of this same lane wrote. Grok/VP keep their own frozen,
+# UNCHANGED label constants (dexter3.grok_v10.GROK_LABEL,
+# dexter3.volume_profile.VP_LABEL) — only their FAMILY roots
+# ("dexter3:grok" / "dexter3:vp", see _KNOWN_LABEL_FAMILIES below)
+# participate in this same matching mechanism.
+LABEL_FAMILY = "dexter3:fable"
+
+# Same env var dexter3.shadow_runner already reads (previously only for a log
+# line — see run_loop's ``fable_version``) — this is what actually wires it
+# into the broker-facing LABEL. Default mirrors shadow_runner's own default so
+# an unset env var is byte-identical to today's logged value.
+DEXTER3_FABLE_VERSION_ENV = "DEXTER3_FABLE_VERSION"
+DEFAULT_FABLE_VERSION = "v1.7-selective-edge"
+
+# cTrader label ceiling: dexter3.openapi_client's place_market_order/_execute_order
+# payload construction truncates any incoming label to 64 chars
+# (``label=str(label or "")[:64]`` — see that module) before it ever reaches
+# the broker. 60 keeps "family:version" comfortably under that hard ceiling
+# with headroom to spare, without needing to touch the broker-facing
+# truncation itself.
+MAX_LABEL_LEN = 60
+
+# Anything outside [A-Za-z0-9._-] (spaces, colons, Thai/unicode text, or any
+# other value an operator might set DEXTER3_FABLE_VERSION to) collapses to a
+# single '-' — the assembled label must always be a broker-safe ASCII token.
+_VERSION_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def sanitize_label_version(raw: Any) -> str:
+    """Collapse invalid characters to '-'; empty/all-invalid input -> "unknown"
+    rather than producing an empty/degenerate version segment."""
+    cleaned = _VERSION_SANITIZE_RE.sub("-", str(raw or "")).strip("-")
+    return cleaned or "unknown"
+
+
+def build_versioned_label(family: str, version: str, *, max_len: int = MAX_LABEL_LEN) -> str:
+    """``f"{family}:{sanitize_label_version(version)}"``, truncated (from the
+    version's tail — the family root must never be cut) so the assembled
+    label never exceeds ``max_len``."""
+    family = str(family or "")
+    safe_version = sanitize_label_version(version)
+    label = f"{family}:{safe_version}"
+    if len(label) > max_len:
+        keep = max(1, max_len - len(family) - 1)  # "-1" = room for the ":" separator
+        safe_version = safe_version[:keep]
+        label = f"{family}:{safe_version}"
+    return label
+
+
+VERSION = sanitize_label_version(os.environ.get(DEXTER3_FABLE_VERSION_ENV, DEFAULT_FABLE_VERSION))
+LABEL = build_versioned_label(LABEL_FAMILY, VERSION)
+
+
+def label_matches_family(label: Any, family: Any) -> bool:
+    """Family-prefix ownership match: True when ``label`` IS ``family``
+    exactly, or begins with it — covers every past/future VERSION of that
+    family's label (e.g. both the pre-2026-07-15 "dexter3:fable:m5h-v1" and
+    today's "dexter3:fable:v1.7-selective-edge" match family "dexter3:fable").
+
+    Deliberately a PLAIN prefix check (no mandatory ':' boundary after
+    ``family``) rather than the stricter ``label.startswith(family + ':')``:
+    Grok's pre-existing, deliberately-UNCHANGED label
+    ("dexter3:grok-v1.0:scalper") separates its version with a HYPHEN, not a
+    colon, so a colon-bound rule would silently stop matching family
+    "dexter3:grok" against Grok's OWN label. Safe given this repo's actual
+    family roots (dexter3:fable / dexter3:grok / dexter3:vp) are mutually
+    non-prefixing — mirrors the plain ``.startswith()`` convention
+    ``dexter3.basket_live.lane_positions`` already uses.
+    """
+    label_s = str(label or "")
+    family_s = str(family or "")
+    if not family_s:
+        return False
+    return label_s == family_s or label_s.startswith(family_s)
+
+
+# Known family roots this module can recognize on an arbitrary CURRENT
+# ``LABEL`` value (module global, patched per-process by shadow_runner for
+# grok/vp — see run_loop/main). Grok/VP's constants are duplicated here as
+# plain string literals (not imported) — same "no cross-imports, duplicate
+# small pure logic" convention dexter3.basket_live documents for itself, to
+# avoid coupling this module to grok_v10/volume_profile.
+_KNOWN_LABEL_FAMILIES = (LABEL_FAMILY, "dexter3:grok", "dexter3:vp")
+
+
+def _label_family_root(label: Any) -> str:
+    """Best-known family root for ``label`` (typically the CURRENT ``LABEL``
+    module global). Falls back to ``label`` itself (an exact-match-only
+    singleton family) for anything unrecognized, so ownership checks never
+    silently widen to "any dexter3 label" for a label this module doesn't
+    know about."""
+    label_s = str(label or "")
+    for root in _KNOWN_LABEL_FAMILIES:
+        if label_matches_family(label_s, root):
+            return root
+    return label_s
 
 # -- config defaults (spec section 2) ---------------------------------------
 DEFAULT_MAX_SPREAD_BPS = 15.0
@@ -230,8 +337,13 @@ def position_take_profit_of(position: dict[str, Any]) -> float:
 
 
 def is_our_position(position: dict[str, Any]) -> bool:
-    """Peer isolation: only positions carrying exactly our LABEL are ours."""
-    return position_label_of(position) == LABEL
+    """Peer isolation: a position is ours when its label belongs to the SAME
+    FAMILY as the currently active ``LABEL`` (module global; grok/vp patch
+    ``LABEL`` per-process at startup — see shadow_runner.run_loop/main), not
+    merely an exact match against today's exact versioned string. This lets a
+    version bump keep managing every position a PRIOR version of the SAME
+    lane opened (owner directive, 2026-07-15 "versioned labels")."""
+    return label_matches_family(position_label_of(position), _label_family_root(LABEL))
 
 
 def verify_entry_snapshot(
@@ -374,6 +486,11 @@ class Dexter3Executor:
         # share one process (tests) — captured here, it is byte-identical to
         # the live per-process patch-then-construct order.
         self._own_label = LABEL
+        # FAMILY counterpart of the above (2026-07-15 versioned labels): the
+        # candidate filter in reconcile_vanished_lane_positions matches on
+        # FAMILY (spans every version of this lane), while self._own_label
+        # above stays the exact string stamped onto NEW writes.
+        self._own_label_family = _label_family_root(LABEL)
 
     # -- journaling helper ----------------------------------------------
 
@@ -1074,8 +1191,9 @@ class Dexter3Executor:
         without this reconcile those outcomes stay invisible to
         ``empirical_stats`` (the biggest coverage gap after 2026-07-10's
         learner repair). Candidates are this executor's OWN ``entry_executed``
-        rows (label == ``self._own_label``; foreign-lane and unlabeled rows
-        are never candidates, same exclusion rule empirical_stats.py's
+        rows (label FAMILY-matches ``self._own_label_family`` — see
+        ``label_matches_family``; foreign-lane and unlabeled rows are never
+        candidates, same exclusion rule empirical_stats.py's
         ``_exec_events_outcome_rows`` uses) with NO close row yet — the
         journal write below IS the dedup marker, so every vanish is recorded
         exactly once, restart-safe.
@@ -1117,7 +1235,7 @@ class Dexter3Executor:
                 except json.JSONDecodeError:
                     entry_payload = {}
                 row_label = str(entry_payload.get("label") or "")
-                if row_label != str(self._own_label):
+                if not label_matches_family(row_label, self._own_label_family):
                     continue  # foreign lane or unlabeled entry row — never ours to reconcile
                 candidates.append((pid, entry_payload))
             if not candidates:

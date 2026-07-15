@@ -35,7 +35,12 @@ from dexter3.basket_manager import (
 
 Position = dict[str, Any]
 
-DEFAULT_LABEL_PREFIX = "dexter3:fable:m5h-v1"
+# FAMILY root (2026-07-15 versioned-labels design), not a full versioned
+# label — callers pass a family (e.g. dexter3.executor.LABEL_FAMILY /
+# shadow_runner._active_label_family()) so this filter spans every past AND
+# future version of a lane's label; lane_positions' own `.startswith()` below
+# already implements the family-prefix match, unchanged.
+DEFAULT_LABEL_PREFIX = "dexter3:fable"
 
 # repair-leg action tokens (mirrors basket_manager.ACTION_ADD_REPAIR_LEG /
 # ACTION_HEDGE_LOCK but expressed as the two distinct repair *sides* this

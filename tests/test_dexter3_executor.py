@@ -743,10 +743,19 @@ def test_verify_entry_snapshot_insufficient_volume_fails():
     assert meta["volume_ok"] is False
 
 
-def test_is_our_position_matches_exact_label_only():
+def test_is_our_position_matches_family_prefix_not_exact_version():
+    """2026-07-15 versioned-labels design: is_our_position switched from
+    exact-label equality to FAMILY-PREFIX matching so a version bump never
+    orphans a position a PRIOR version of this same lane opened."""
     assert is_our_position({"label": LABEL}) is True
-    assert is_our_position({"label": LABEL + ":extra"}) is False
+    # A pre-version-bump label of the SAME family (fable) must still match —
+    # this is the whole point of the fix, not a regression of the old
+    # exact-match test this one replaces.
+    assert is_our_position({"label": "dexter3:fable:m5h-v1"}) is True
+    # Genuinely foreign labels (a different bot's naming convention, or a
+    # different dexter3 lane) must still be excluded.
     assert is_our_position({"label": "dexter-scalp:codex:v3.7-m1-close-entry"}) is False
+    assert is_our_position({"label": "dexter3:grok-v1.0:scalper"}) is False
     assert is_our_position({}) is False
 
 

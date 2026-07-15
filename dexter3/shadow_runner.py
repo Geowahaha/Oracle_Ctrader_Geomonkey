@@ -74,7 +74,9 @@ from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.weekly_risk import weekly_close_policy
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
-from dexter3.executor import Dexter3Executor, ExecutorConfig
+from dexter3.executor import VERSION as FABLE_VERSION
+from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
+from dexter3.executor import Dexter3Executor, ExecutorConfig, label_matches_family
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 from dexter3.opening_manager import OMConfig, OpeningManager
 from dexter3.transport import make_client
@@ -82,10 +84,11 @@ from dexter3.transport import make_client
 # Grok_v1.0 (optional import for docs / direct use)
 try:
     from dexter3 import grok_v10 as grok_v10  # independent parallel scalping
-    from dexter3.grok_v10 import GROK_LABEL, GrokV10OpeningManager
+    from dexter3.grok_v10 import GROK_LABEL, GROK_LABEL_FAMILY, GrokV10OpeningManager
 except Exception:
     grok_v10 = None  # type: ignore
     GROK_LABEL = None
+    GROK_LABEL_FAMILY = None
     GrokV10OpeningManager = None  # type: ignore
 from dexter3.smart_exit import SmartExitConfig, resolve_stop_regime
 from dexter3.v16_entry_quality import (
@@ -172,6 +175,30 @@ def _active_order_label(mode: str | None = None) -> str:
 
         return VP_LABEL
     return LIVE_ORDER_LABEL
+
+
+def _active_label_family(mode: str | None = None) -> str:
+    """FAMILY counterpart of ``_active_order_label`` (2026-07-15
+    versioned-labels design): spans every version of the current lane's
+    label (fable's family never changes across a ``DEXTER3_FABLE_VERSION``
+    bump), rather than pinning to today's exact versioned string.
+
+    Use this wherever a caller needs to MATCH rows/positions written under
+    ANY past version of this lane (``lane_positions``, ``_lane_realized_today``,
+    ``empirical_stats.compute_from_journal``, ``skip_evaluator.*``). Use
+    ``_active_order_label`` (unchanged) wherever a caller needs to WRITE
+    today's exact label (journal stamps, order placement) — a version bump
+    must still be attributable in the journal/broker, only MATCHING spans
+    versions.
+    """
+    current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "grok" and GROK_LABEL_FAMILY:
+        return GROK_LABEL_FAMILY
+    if current_mode == "vp":
+        from dexter3.volume_profile import VP_LABEL_FAMILY
+
+        return VP_LABEL_FAMILY
+    return FABLE_LABEL_FAMILY
 
 
 def _active_state_file(mode: str | None = None) -> Path:
@@ -696,7 +723,7 @@ V16_WEAK_SETUPS_DEFAULT: set[str] = {
 
 
 def _effective_lane_pnl_today(mcp: Dexter3McpClient, state: dict[str, Any]) -> tuple[float, float, float]:
-    realized, _ = _lane_realized_today(mcp, label_filter=_active_order_label())
+    realized, _ = _lane_realized_today(mcp, label_filter=_active_label_family())
     floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
     floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
     return realized + floating, realized, floating
@@ -987,7 +1014,7 @@ LANE_REALIZED_CACHE_SEC = 60
 _LANE_REALIZED_CACHE: dict[str, dict[str, Any]] = {}
 
 
-def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fable") -> tuple[float, list[float]]:
+def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = FABLE_LABEL_FAMILY) -> tuple[float, list[float]]:
     """Sum of today's (UTC) realized netProfit for our lane + the ordered
     list of those close PnLs (oldest -> newest), both derived from
     ``get_deals``. Cached for ``LANE_REALIZED_CACHE_SEC`` — callers on the
@@ -1003,6 +1030,15 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
     On an MCP failure, returns the last cached value; if there has never
     been a successful read, returns (0.0, []) and logs the failure exactly
     once (not every tick) so a persistent outage does not spam the log.
+
+    ``label_filter`` (2026-07-15 versioned-labels design): a FAMILY prefix
+    (e.g. "dexter3:fable"/pass ``_active_label_family()``), matched via
+    ``label_matches_family`` — NOT the exact current versioned label. Passing
+    the exact versioned label here was the bug: a mid-day
+    ``DEXTER3_FABLE_VERSION`` bump would make the governor stop matching the
+    SAME lane's own earlier-today deals (closed under the OLD version
+    string), silently forgetting real realized PnL — the same shape of bug as
+    the cross-midnight cache staleness this function already guards against.
     """
     now_epoch = datetime.now(timezone.utc).timestamp()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1043,7 +1079,7 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = "dexter3:fab
         if not isinstance(deal, dict):
             continue
         label = str(deal.get("label") or deal.get("comment") or "")
-        if label_filter not in label:
+        if not label_matches_family(label, label_filter):
             continue
         ts = str(
             deal.get("execution_utc")  # normalized client shape (openapi daemon path)
@@ -1353,7 +1389,7 @@ class PaperBasket:
                 sl=float(decision.sl),
                 risk_usd=risk_usd,
                 opened_at_min=self._now_min,
-                label=GROK_LABEL if (grok_active and GROK_LABEL) else f"dexter3:fable:m5h-v1:{decision.setup}",
+                label=GROK_LABEL if (grok_active and GROK_LABEL) else f"{LIVE_ORDER_LABEL}:{decision.setup}",
             )
             result = self.manager.on_entry(leg)
             self.journal.insert_basket_event(
@@ -1468,7 +1504,7 @@ def run_symbol_cycle(
         lane: list[dict[str, Any]] | None = []
         if is_newest and executor is not None:
             try:
-                lane = basket_live.lane_positions(executor.client.get_positions(), _active_order_label())
+                lane = basket_live.lane_positions(executor.client.get_positions(), _active_label_family())
                 lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
             except (McpClientError, McpZombieError) as exc:
                 log_line(f"{utc_now_iso()} {symbol} lane_read_failed (no live action this bar): {exc}")
@@ -1656,7 +1692,7 @@ def _governor_entry_risk(
     the executor's static config risk (returns None), same fail-open posture
     as every other entry-sizing gate in this file."""
     try:
-        realized, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
+        realized, pnls = _lane_realized_today(mcp, label_filter=_active_label_family())
         cfg = _get_governor().config
         floating = 0.0
         if state is not None:
@@ -2078,7 +2114,7 @@ def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: D
     for symbol in symbols:
         try:
             _JOURNAL_STATS_CACHE[symbol] = empirical_stats.stats_to_journal_stats_arg(
-                empirical_stats.compute_from_journal(journal, symbol, label=_active_order_label())
+                empirical_stats.compute_from_journal(journal, symbol, label=_active_label_family())
             ) or None
         except Exception as exc:  # noqa: BLE001 - stats refresh must never break the loop
             log_error(f"empirical_stats.compute_from_journal({symbol})", exc)
@@ -2086,14 +2122,16 @@ def _refresh_learning_loops(symbols: list[str], journal: DecisionJournal, mcp: D
         # H2 (2026-07-15 cross-lane entanglement audit): each lane's learner
         # loop only ever evaluates/summarizes ITS OWN decisions — see
         # skip_evaluator.evaluate_pending_skips/fear_cost_summary's label
-        # exclusion convention.
-        active_label = _active_order_label()
-        result = skip_evaluator.evaluate_pending_skips(journal, mcp, label=active_label)
+        # exclusion convention. FAMILY (not the exact versioned label, see
+        # 2026-07-15 versioned-labels design) so a version bump never drops
+        # this lane's own earlier rows from its learner.
+        active_label_family = _active_label_family()
+        result = skip_evaluator.evaluate_pending_skips(journal, mcp, label=active_label_family)
         log_line(
             f"{utc_now_iso()} skip_evaluator checked={result['checked']} "
             f"evaluated={result['evaluated']} unevaluable={result['unevaluable']}"
         )
-        fear_cost = skip_evaluator.fear_cost_summary(journal, label=active_label)
+        fear_cost = skip_evaluator.fear_cost_summary(journal, label=active_label_family)
         log_line(
             f"{utc_now_iso()} fear_cost hours={fear_cost['hours']} "
             f"skips_evaluated={fear_cost['skips_evaluated']} "
@@ -2239,7 +2277,7 @@ def run_weekly_flatten_tick(executor: Dexter3Executor | None, symbol: str) -> st
     except (McpClientError, McpZombieError) as exc:
         log_line(f"{utc_now_iso()} {symbol} weekly_flatten_read_failed: {exc}")
         return "weekly_flatten_read_failed"
-    lane = basket_live.lane_positions(positions, _active_order_label())
+    lane = basket_live.lane_positions(positions, _active_label_family())
     ids = [position_id_of(p) for p in lane if position_id_of(p) > 0 and str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
     if not ids:
         return "weekly_flatten_no_lane"
@@ -2270,8 +2308,11 @@ def run_om_tick(
         positions = executor.client.get_positions() if executor is not None else mcp.get_positions()
         # Manage exactly one lane per process. Combining V1.6 and Grok labels
         # would merge PnL/runtime state and let one manager close the other.
-        active_label = _active_order_label()
-        lane = basket_live.lane_positions(positions, active_label)
+        # FAMILY (not the exact versioned label — see 2026-07-15
+        # versioned-labels design) so a version bump never drops this lane's
+        # own already-open positions from OM management mid-day.
+        active_label_family = _active_label_family()
+        lane = basket_live.lane_positions(positions, active_label_family)
         lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
     except (McpClientError, McpZombieError) as exc:
         _note_mcp_error(state, ok=False)
@@ -2520,7 +2561,7 @@ def run_governor_tick(
     """
     try:
         gov_state = _governor_state_for(state)
-        realized, pnls = _lane_realized_today(mcp, label_filter=_active_order_label())
+        realized, pnls = _lane_realized_today(mcp, label_filter=_active_label_family())
         floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
         floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
 
@@ -2548,14 +2589,20 @@ def run_governor_tick(
             # Close every lane position across every symbol.
             closed_summary: dict[str, Any] = {}
             if executor is not None:
+                # active_label stays the exact/full current label (needed
+                # for the active_label == GROK_LABEL identity check below);
+                # active_label_family is the FAMILY used for the lane match
+                # itself so an already-open PRIOR-version position of this
+                # same lane still gets closed on lock/stop.
                 active_label = _active_order_label()
+                active_label_family = _active_label_family()
                 for symbol in symbols:
                     try:
                         positions = executor.client.get_positions()
                     except (McpClientError, McpZombieError) as exc:
                         log_line(f"{utc_now_iso()} governor close_all read_failed {symbol}: {exc}")
                         continue
-                    lane = basket_live.lane_positions(positions, active_label)
+                    lane = basket_live.lane_positions(positions, active_label_family)
                     lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
                     if not lane:
                         continue
@@ -2683,7 +2730,12 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
-    fable_version = os.environ.get("DEXTER3_FABLE_VERSION", "v1.7-selective-edge")
+    # Single source of truth for the version string (2026-07-15
+    # versioned-labels design): dexter3.executor.VERSION already reads +
+    # sanitizes the SAME DEXTER3_FABLE_VERSION env var (default
+    # "v1.7-selective-edge") at its own module-load time — re-reading the
+    # raw env var here would drift from what actually got baked into LABEL.
+    fable_version = FABLE_VERSION
 
     # The loop ticks every fast_tick_sec. Every fast tick runs OM on the
     # active lane; the M5 entry path still runs only on poll cadence.

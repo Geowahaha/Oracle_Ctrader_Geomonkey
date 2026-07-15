@@ -168,6 +168,13 @@ def get_grok_v10_config_from_env() -> GrokV10Config:
 # =============================================================================
 
 GROK_LABEL = "dexter3:grok-v1.0:scalper"
+# Family root for GROK_LABEL (2026-07-15 versioned-labels design) — GROK_LABEL
+# itself stays frozen/unchanged, but this root participates in the same
+# family-prefix matching mechanism as dexter3.executor.LABEL_FAMILY (see
+# dexter3.executor.label_matches_family's docstring for why matching is a
+# plain prefix, not a colon-bound one — required precisely because this
+# label separates its version with a hyphen, not a colon).
+GROK_LABEL_FAMILY = "dexter3:grok"
 
 
 class GrokV10OpeningManager:

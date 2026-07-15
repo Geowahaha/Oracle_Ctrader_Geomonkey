@@ -26,7 +26,36 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
+
+try:
+    from dexter3.grok_v10 import GROK_LABEL_FAMILY  # noqa: E402
+except Exception:  # pragma: no cover - mirrors shadow_runner's own optional import
+    GROK_LABEL_FAMILY = "dexter3:grok"
+from dexter3.volume_profile import VP_LABEL_FAMILY  # noqa: E402
+
+# Family root -> short display name, checked in this order (2026-07-15
+# versioned-labels design — bucket by FAMILY, not "grok" substring vs
+# everything-else, so the VP canary lane gets its own bucket too instead of
+# being silently lumped into "fable").
+_LANE_FAMILIES: tuple[tuple[str, str], ...] = (
+    (GROK_LABEL_FAMILY, "grok"),
+    (VP_LABEL_FAMILY, "vp"),
+    (FABLE_LABEL_FAMILY, "fable"),
+)
+
+
+def _lane_family(label: str) -> str:
+    """Short lane name for an exact broker label, by family-prefix match
+    (plain ``.startswith`` — see dexter3.executor.label_matches_family's
+    docstring for why this is not colon-bounded). Falls back to "other" for
+    a dexter3-prefixed label that matches none of the known families rather
+    than silently mis-bucketing it as fable."""
+    for family_root, name in _LANE_FAMILIES:
+        if label == family_root or label.startswith(family_root):
+            return name
+    return "other"
 
 
 def _parse_utc(raw: str) -> datetime:
@@ -69,9 +98,43 @@ def tally_deals(deals: list[dict], *, today: str | None = None, since: datetime 
             pnl_value = float(pnl)
         except (TypeError, ValueError):
             continue
-        lane = "grok" if "grok" in lbl else "fable"
+        lane = _lane_family(lbl)
         by_lane_day[(lane, day)].append(pnl_value)
     return by_lane_day
+
+
+def tally_deals_by_full_label(
+    deals: list[dict], *, today: str | None = None, since: datetime | None = None
+) -> dict[tuple[str, str], list[float]]:
+    """Same filtering as ``tally_deals`` but keyed by the EXACT broker label
+    (not the family) — gives per-VERSION attribution within a family, so the
+    owner can see e.g. how ``dexter3:fable:m5h-v1`` performed vs
+    ``dexter3:fable:v1.7-selective-edge`` on the same day (2026-07-15
+    versioned-labels design)."""
+    by_label_day: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for d in deals:
+        if not isinstance(d, dict):
+            continue
+        lbl = str(d.get("label") or "")
+        if "dexter3" not in lbl:
+            continue
+        executed_at = _deal_time(d)
+        if executed_at is None:
+            continue
+        day = executed_at.strftime("%Y-%m-%d")
+        if today and day != today:
+            continue
+        if since and executed_at < since:
+            continue
+        pnl = d.get("netProfit", d.get("net_profit"))
+        if pnl is None:
+            pnl = d.get("grossProfit")
+        try:
+            pnl_value = float(pnl)
+        except (TypeError, ValueError):
+            continue
+        by_label_day[(lbl, day)].append(pnl_value)
+    return by_label_day
 
 
 def main() -> int:
@@ -130,6 +193,17 @@ def main() -> int:
         )
     if not by_lane_day:
         print("no dexter3-labeled deals in window")
+
+    # Per-full-label sub-breakdown (2026-07-15 versioned-labels design): the
+    # per-family view above answers "is this LANE supplementing or
+    # destroying"; this answers "which VERSION of it" — direct per-code-
+    # version attribution once a version bump changes the broker label.
+    by_label_day = tally_deals_by_full_label(deals, today=today if args.today else None, since=since)
+    if by_label_day:
+        print("\n-- per-version breakdown (exact broker label) --")
+        for (label, day), pnls in sorted(by_label_day.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+            net = sum(pnls)
+            print(f"{label:40} {day} N={len(pnls):>3} net={net:>+8.2f}")
     return 1 if (args.today and alert) else 0
 
 

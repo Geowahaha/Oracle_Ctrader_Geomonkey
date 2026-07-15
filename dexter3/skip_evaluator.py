@@ -241,16 +241,19 @@ def evaluate_pending_skips(
     already references it. Never raises — MCP/history failures degrade a
     single decision to "unevaluable" and move on to the next one.
 
-    ``label`` (H2, 2026-07-15 cross-lane entanglement audit, optional): when
-    provided, restricts eligible decisions to rows carrying EXACTLY this
-    label — same exclusion convention as ``dexter3.empirical_stats``'s own
-    ``label`` param (``None`` = no filter/legacy pooled behavior; a value
-    excludes both unlabeled rows AND a peer lane's rows). Two lanes sharing
-    this journal previously raced to evaluate the SAME unlabeled skip rows
-    (each writing its own skip_outcomes row for identical decisions); passing
-    each lane's own label here means every lane only ever claims its OWN
-    rows, which incidentally also kills that duplicate-evaluation race — no
-    unique index needed, the label filter alone makes the row sets disjoint.
+    ``label`` (H2, 2026-07-15 cross-lane entanglement audit; FAMILY-PREFIX
+    semantics added 2026-07-15 versioned-labels design): when provided,
+    restricts eligible decisions to rows whose label equals this value OR
+    begins with it (a FAMILY prefix, e.g. "dexter3:fable" — spans every
+    version of that lane's label) — same exclusion convention as
+    ``dexter3.empirical_stats``'s own ``label`` param (``None`` = no
+    filter/legacy pooled behavior; a value excludes both unlabeled rows AND a
+    peer lane's rows). Two lanes sharing this journal previously raced to
+    evaluate the SAME unlabeled skip rows (each writing its own skip_outcomes
+    row for identical decisions); passing each lane's own label/family here
+    means every lane only ever claims its OWN rows, which incidentally also
+    kills that duplicate-evaluation race — no unique index needed, the label
+    filter alone makes the row sets disjoint.
     """
     now = now or datetime.now(timezone.utc)
     conn = getattr(journal, "_conn", journal)
@@ -303,9 +306,14 @@ def _fetch_pending_skip_rows(
     if label is not None:
         # H2 exclusion convention (matches empirical_stats.py): a lane must
         # only ever evaluate ITS OWN decisions — legacy unlabeled rows and a
-        # peer lane's rows are excluded, never pooled in.
-        query += " AND d.label = ?"
+        # peer lane's rows are excluded, never pooled in. FAMILY-PREFIX match
+        # (2026-07-15 versioned-labels design): equals `label` exactly OR
+        # begins with it, so a version bump keeps evaluating every version of
+        # the SAME lane's rows. Family values in this repo never contain SQL
+        # LIKE wildcards (%, _), so a plain LIKE-prefix is safe here.
+        query += " AND (d.label = ? OR d.label LIKE ?)"
         params.append(label)
+        params.append(f"{label}%")
     query += " ORDER BY d.id ASC LIMIT ?"
     params.append(int(limit))
     rows = conn.execute(query, tuple(params)).fetchall()
@@ -372,12 +380,14 @@ def fear_cost_summary(
     KPI is honest about coverage gaps.  Legacy rows whose side was derived
     from future bars are excluded and reported as ``invalid_lookahead``.
 
-    ``label`` (H2, 2026-07-15 cross-lane entanglement audit, optional):
-    restricts the KPI to the decisions carrying EXACTLY this label — same
-    exclusion convention as ``evaluate_pending_skips``/``empirical_stats``
-    (``None`` = no filter, legacy pooled-across-lanes behavior). Filters on
-    the DECISION's own label (the source of truth), not skip_outcomes'
-    redundant copy.
+    ``label`` (H2, 2026-07-15 cross-lane entanglement audit; FAMILY-PREFIX
+    semantics added 2026-07-15 versioned-labels design): restricts the KPI to
+    decisions whose label equals this value OR begins with it (a FAMILY
+    prefix — spans every version of that lane's label) — same exclusion
+    convention as ``evaluate_pending_skips``/``empirical_stats`` (``None`` =
+    no filter, legacy pooled-across-lanes behavior). Filters on the
+    DECISION's own label (the source of truth), not skip_outcomes' redundant
+    copy.
     """
     conn = getattr(journal, "_conn", journal)
     cutoff = _iso_z((now or datetime.now(timezone.utc)) - timedelta(hours=hours))
@@ -389,8 +399,10 @@ def fear_cost_summary(
     """
     params: list[Any] = [cutoff]
     if label is not None:
-        query += " AND d.label = ?"
+        # Family-prefix match — see _fetch_pending_skip_rows's comment above.
+        query += " AND (d.label = ? OR d.label LIKE ?)"
         params.append(label)
+        params.append(f"{label}%")
     rows = conn.execute(query, tuple(params)).fetchall()
 
     skips_evaluated = 0

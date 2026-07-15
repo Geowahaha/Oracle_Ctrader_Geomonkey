@@ -42,6 +42,11 @@ Bar = dict[str, Any]
 # foreign-labelled positions). shadow_runner forces executor.LABEL to this
 # when DEXTER3_MODE=vp.
 VP_LABEL = "dexter3:vp:canary"
+# Family root for VP_LABEL (2026-07-15 versioned-labels design) — VP_LABEL
+# itself stays frozen/unchanged; this root participates in the same
+# family-prefix matching mechanism as dexter3.executor.LABEL_FAMILY (see
+# dexter3.executor.label_matches_family's docstring).
+VP_LABEL_FAMILY = "dexter3:vp"
 
 # -- tunables (module constants, auditable in one place) ---------------------
 PROFILE_WINDOW = 288          # bars in the rolling profile (24h of M5)

@@ -19,6 +19,21 @@ import sqlite3
 from typing import Any
 
 MIN_SAMPLES = 10
+
+
+def _label_matches_family(label: Any, family: Any) -> bool:
+    """Family-prefix match (2026-07-15 versioned-labels design): ``label`` is
+    "in" ``family`` when it equals it exactly or begins with it. ``label``
+    callers pass here is now documented as a FAMILY prefix (e.g.
+    "dexter3:fable"), not necessarily a full versioned label — this lets a
+    version bump keep pooling stats across every version of the SAME lane,
+    never a peer lane's. Duplicated locally rather than importing
+    ``dexter3.executor.label_matches_family`` — same "no cross-imports of
+    live/mutating internals, duplicate small pure logic" convention
+    ``dexter3.basket_live`` documents for itself."""
+    label_s = str(label or "")
+    family_s = str(family or "")
+    return bool(family_s) and (label_s == family_s or label_s.startswith(family_s))
 BASE_BLEND_WEIGHT = 0.5
 EMPIRICAL_BLEND_WEIGHT = 0.5
 LAPLACE_ALPHA = 1.0  # add-one smoothing numerator
@@ -169,7 +184,7 @@ def _exec_events_outcome_rows(
         session = payload.get("session") or result.get("session")
         pnl = payload.get("pnl", result.get("pnl"))
         row_label = payload.get("label") or result.get("label")
-        if label is not None and str(row_label or "") != str(label):
+        if label is not None and not _label_matches_family(row_label, label):
             continue
         if setup is None or session is None or pnl is None:
             continue
