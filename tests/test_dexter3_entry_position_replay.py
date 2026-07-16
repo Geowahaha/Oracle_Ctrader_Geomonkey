@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.dexter3_entry_position_replay import (
+    _anchor_bias_fields,
     _dir_allows,
     _limit_fill,
     _score,
@@ -139,15 +140,82 @@ def test_trade_r_market_uses_original_risk():
 # ---------------------------------------------------------------------------
 
 
+def _ctx(tsign: int = 0, **extra) -> dict:
+    return {"trend_sign": tsign, **extra}
+
+
 def test_dir_allows_matrix():
-    assert _dir_allows("none", "buy", -1)
-    assert not _dir_allows("nobuy-h1down", "buy", -1)
-    assert _dir_allows("nobuy-h1down", "sell", -1)      # sells never blocked
-    assert _dir_allows("nobuy-h1down", "buy", 1)
-    assert not _dir_allows("nocounter", "buy", -1)
-    assert not _dir_allows("nocounter", "sell", 1)
-    assert _dir_allows("nocounter", "sell", -1)
-    assert _dir_allows("nocounter", "buy", 0)           # no-trend never blocked
+    assert _dir_allows("none", "buy", _ctx(-1))
+    assert not _dir_allows("nobuy-h1down", "buy", _ctx(-1))
+    assert _dir_allows("nobuy-h1down", "sell", _ctx(-1))   # sells never blocked
+    assert _dir_allows("nobuy-h1down", "buy", _ctx(1))
+    assert not _dir_allows("nocounter", "buy", _ctx(-1))
+    assert not _dir_allows("nocounter", "sell", _ctx(1))
+    assert _dir_allows("nocounter", "sell", _ctx(-1))
+    assert _dir_allows("nocounter", "buy", _ctx(0))        # no-trend never blocked
+
+
+def test_dir_allows_dayopen_bias():
+    # ต่ำเปิด (below the day open, 2h in): sells only, buys blocked.
+    below = _ctx(bias_d22=-1, hrs_d22=2.0)
+    assert not _dir_allows("dayopen22-h1", "buy", below)
+    assert _dir_allows("dayopen22-h1", "sell", below)
+    # ยืนเปิด (above the day open): buys only.
+    above = _ctx(bias_d0=1, hrs_d0=2.0)
+    assert _dir_allows("dayopen0-h1", "buy", above)
+    assert not _dir_allows("dayopen0-h1", "sell", above)
+    # bias too YOUNG for the mode's min-hours gate -> neutral, both allowed
+    # (same raw bias, mode requires 3h but only 2h have passed).
+    young = _ctx(bias_d22=-1, hrs_d22=2.0)
+    assert _dir_allows("dayopen22-h3", "buy", young)
+    assert _dir_allows("dayopen22-h3", "sell", young)
+    # session-anchored variant reads bias_sess
+    sess = _ctx(bias_sess=1, hrs_sess=1.5)
+    assert _dir_allows("sessopen-h1", "buy", sess)
+    assert not _dir_allows("sessopen-h1", "sell", sess)
+
+
+# ---------------------------------------------------------------------------
+# _anchor_bias_fields -- day/session open detection on hand-built timestamps
+# ---------------------------------------------------------------------------
+
+
+def _tbar(ts: str, o: float, c: float) -> dict:
+    return {"ts": ts, "open": o, "high": max(o, c), "low": min(o, c), "close": c}
+
+
+def test_anchor_bias_day_open_and_hours():
+    # Day opens at 00:00Z with open 100; by 02:00Z close is 99 -> bias_d0=-1,
+    # hrs_d0=2.0 (ต่ำเปิด). The 22:00Z anchor of the PREVIOUS day anchors the
+    # first bar (hrs_d22 = 2h after midnight = 26h... no: most recent 22:00 is
+    # 2h before midnight, so at 02:00Z hrs_d22 = 4.0) and its open is the
+    # first bar's open (100) because the series starts after that anchor.
+    bars = [
+        _tbar("2026-07-14T00:00:00Z", 100.0, 101.0),   # day open bar, closes up
+        _tbar("2026-07-14T02:00:00Z", 101.0, 99.0),    # now below the open
+    ]
+    rows = _anchor_bias_fields(bars)
+    assert rows[0]["bias_d0"] == 1                      # 101 > 100
+    assert rows[0]["hrs_d0"] == pytest.approx(0.0)
+    assert rows[1]["bias_d0"] == -1                     # 99 < 100 = ต่ำเปิด
+    assert rows[1]["hrs_d0"] == pytest.approx(2.0)
+    assert rows[1]["hrs_d22"] == pytest.approx(4.0)     # anchor 13th 22:00Z
+
+
+def test_anchor_bias_session_reset():
+    # London anchor 07:00Z re-anchors the session open: a bar at 07:00Z opens
+    # 105, and at 08:00Z close 104 -> bias_sess=-1 vs the SESSION open (105)
+    # even though price is still above the 00:00Z day open (100).
+    bars = [
+        _tbar("2026-07-14T00:00:00Z", 100.0, 102.0),
+        _tbar("2026-07-14T07:00:00Z", 105.0, 106.0),
+        _tbar("2026-07-14T08:00:00Z", 106.0, 104.0),
+    ]
+    rows = _anchor_bias_fields(bars)
+    assert rows[2]["bias_d0"] == 1                      # 104 > 100 day-open bias up
+    assert rows[2]["bias_sess"] == -1                   # 104 < 105 session bias down
+    assert rows[2]["hrs_sess"] == pytest.approx(1.0)
+    assert rows[1]["hrs_sess"] == pytest.approx(0.0)    # fresh session anchor
 
 
 # ---------------------------------------------------------------------------

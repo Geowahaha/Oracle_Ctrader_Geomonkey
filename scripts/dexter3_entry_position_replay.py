@@ -169,17 +169,74 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
 
 
 # ---------------------------------------------------------------------------
-# Lever 1 -- direction filter (decision-time H1 trend sign, no lookahead)
+# Lever 1 -- direction filters (all decision-time data, no lookahead)
 # ---------------------------------------------------------------------------
 
+# Owner idea 2026-07-16 ("เทรนของวัน" -- solid line on the owner's DZ/SZ
+# indicator = the DAY OPEN): after 1-3 hours, price BELOW the day open
+# ("ต่ำเปิด") = look for sells only; price ABOVE it ("ยืนเปิด") = buys only;
+# a session change means wait and re-judge. Anchors here:
+#   d0   = 00:00 UTC daily open;
+#   d22  = 22:00 UTC daily open (the gold/Globex day roll -- closest to the
+#          broker "day" the owner's chart draws);
+#   sess = most recent of 00/07/12 UTC (asia/london/ny session opens -- the
+#          "เปลี่ยนทามโซน ให้รอพิจารณาใหม่" reset, re-anchored each session).
+# The raw bias is sign(close - anchor open); each MODE applies its own
+# min-hours gate (bias too young -> neutral -> both sides allowed). Sunday
+# reopen note: the d0 anchor's "open" on Sundays is the reopen bar itself
+# (no 00:00Z bar exists), so its early-hours bias is weak there; d22 does
+# not have this problem, which is why both anchors are tested.
+BIAS_ANCHORS: dict[str, list[int]] = {"d0": [0], "d22": [22], "sess": [0, 7, 12]}
 
-def _dir_allows(mode: str, side: str, trend_sign: int) -> bool:
+
+def _anchor_bias_fields(m5: list, anchors: dict[str, list[int]] = BIAS_ANCHORS) -> list[dict]:
+    """Per-bar {bias_<key>: -1|0|+1, hrs_<key>: float} for each anchor set.
+    The anchor period's OPEN is the open of the first bar at/after the most
+    recent anchor hour; bias compares the CURRENT bar's close to it (both
+    decision-time facts). One O(n) pass, no lookahead."""
+    out: list[dict] = []
+    prev_anchor: dict[str, float | None] = {k: None for k in anchors}
+    open_px: dict[str, float | None] = {k: None for k in anchors}
+    for b in m5:
+        e = _epoch(str(b.get("ts") or ""))
+        row: dict = {}
+        for key, hours in anchors.items():
+            cand = max(((e - h * 3600) // 86400) * 86400 + h * 3600 for h in hours)
+            if cand != prev_anchor[key]:
+                prev_anchor[key] = cand
+                open_px[key] = float(b.get("open", 0.0))
+            if open_px[key] is None or e <= 0:
+                row[f"bias_{key}"] = 0
+                row[f"hrs_{key}"] = 0.0
+            else:
+                diff = float(b.get("close", 0.0)) - float(open_px[key])
+                row[f"bias_{key}"] = 1 if diff > 0 else (-1 if diff < 0 else 0)
+                row[f"hrs_{key}"] = (e - float(prev_anchor[key])) / 3600.0
+        out.append(row)
+    return out
+
+
+def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
+    """ctx carries the decision-time direction facts stamped on the trade:
+    trend_sign (H1 6-bar) + bias_d0/bias_d22/bias_sess (+ hrs_*)."""
     if mode == "none":
         return True
+    tsign = int(ctx.get("trend_sign", 0))
     if mode == "nobuy-h1down":
-        return not (side == "buy" and trend_sign == -1)
+        return not (side == "buy" and tsign == -1)
     if mode == "nocounter":
-        return not ((side == "buy" and trend_sign == -1) or (side == "sell" and trend_sign == 1))
+        return not ((side == "buy" and tsign == -1) or (side == "sell" and tsign == 1))
+    if mode.startswith("dayopen") or mode.startswith("sessopen"):
+        # dayopen0-h1 / dayopen22-h3 / sessopen-h1 -> (anchor key, min hours)
+        head, _, h_part = mode.partition("-h")
+        min_h = float(h_part)
+        key = {"dayopen0": "d0", "dayopen22": "d22", "sessopen": "sess"}[head]
+        bias = int(ctx.get(f"bias_{key}", 0))
+        if float(ctx.get(f"hrs_{key}", 0.0)) < min_h:
+            bias = 0                      # too young -> neutral, allow both
+        if bias == 0:
+            return True
+        return (side == "buy") == (bias > 0)
     raise ValueError(f"unknown dir mode: {mode}")
 
 
@@ -271,6 +328,7 @@ def main() -> int:
     print(f"M5 ATR (mean TR, whole series) = {atr:.3f} pts")
 
     # -- phase 1: decisions ONCE per bar, H1 trend sign stamped at decision time
+    bias_rows = _anchor_bias_fields(m5)
     decisions: list[tuple[int, object, int]] = []
     for i in range(MIN_M5, len(m5) - 2):
         prefix = m5[: i + 1]
@@ -321,7 +379,7 @@ def main() -> int:
             accepted.append({
                 "i": i, "side": str(d.side), "entry": float(d.entry),
                 "sl": float(d.sl), "tp": float(d.tp), "future": m5[i + 1:],
-                "trend_sign": tsign,
+                "trend_sign": tsign, **bias_rows[i],
             })
         derive_all = [t for t in accepted if t["i"] < split_bar]
         validate_all = [t for t in accepted if t["i"] >= split_bar]
@@ -347,8 +405,8 @@ def main() -> int:
         ladder_ref_net: float | None = None
 
         for dmode in dir_modes:
-            derive_t = [t for t in derive_all if _dir_allows(dmode, t["side"], t["trend_sign"])]
-            validate_t = [t for t in validate_all if _dir_allows(dmode, t["side"], t["trend_sign"])]
+            derive_t = [t for t in derive_all if _dir_allows(dmode, t["side"], t)]
+            validate_t = [t for t in validate_all if _dir_allows(dmode, t["side"], t)]
             print(f"\n-- dir={dmode}: derive {len(derive_t)}/{len(derive_all)}, "
                   f"validate {len(validate_t)}/{len(validate_all)} --")
             print(header)
