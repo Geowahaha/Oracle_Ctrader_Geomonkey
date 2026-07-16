@@ -652,6 +652,8 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--drev-arm-atr", type=float, default=12.0,
+                    help="dayreversal: capitulation arming threshold (day range in ATR)")
     ap.add_argument("--dt-range-cap-atr", type=float, default=0.0,
                     help="daytrend G1: skip entries once the day's high-low range "
                          "exceeds this x ATR (0=off) -- capitulation exhaustion guard")
@@ -708,7 +710,8 @@ def main() -> int:
                                       range_cap_atr=args.dt_range_cap_atr,
                                       last_entry_hour=args.dt_last_hour)
             else:
-                sig = decide_dayreversal(prefix, bias_rows[i], atr)
+                sig = decide_dayreversal(prefix, bias_rows[i], atr,
+                                         range_arm_atr=args.drev_arm_atr)
             if sig is None:
                 continue
             from types import SimpleNamespace
