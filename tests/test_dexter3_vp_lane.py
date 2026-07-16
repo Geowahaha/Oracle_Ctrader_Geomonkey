@@ -228,6 +228,57 @@ def test_om_convex_branch_fires_trail_and_time_stop(monkeypatch):
     assert act3["reason"] == "convex_hold"
 
 
+# ---------------------------------------------------------------------------
+# hunt-lane ports (owner 2026-07-16: apply today's proven layers to fable/grok)
+# ---------------------------------------------------------------------------
+
+
+def test_hunt_dayopen_bias_downsizes_counter_side(monkeypatch):
+    from dexter3.shadow_runner import _apply_hunt_dayopen_bias
+
+    monkeypatch.setenv("DEXTER3_HUNT_DAYOPEN_BIAS", "downsize")
+    monkeypatch.setenv("DEXTER3_HUNT_BIAS_DOWNSIZE_MULT", "0.25")
+    monkeypatch.setenv("DEXTER3_HUNT_BIAS_MIN_HOURS", "1")
+    prefix = [
+        _bar("2026-07-14T00:00:00Z", 100.0, 101.0, 99.5, 100.5),   # day open 100
+        _bar("2026-07-14T02:00:00Z", 100.0, 100.2, 98.8, 99.0),    # ต่ำเปิด 2h in
+    ]
+    d_buy = _FakeDecision(side="buy")
+    d_sell = _FakeDecision(side="sell")
+    assert _apply_hunt_dayopen_bias(d_buy, prefix, 12.0) == pytest.approx(3.0)   # x0.25
+    assert d_buy.features["hunt_dayopen_bias"]["counter"] is True
+    assert _apply_hunt_dayopen_bias(d_sell, prefix, 12.0) == pytest.approx(12.0)  # with-bias
+    # env off -> untouched (fable/grok default behavior)
+    monkeypatch.delenv("DEXTER3_HUNT_DAYOPEN_BIAS")
+    assert _apply_hunt_dayopen_bias(d_buy, prefix, 12.0) == pytest.approx(12.0)
+
+
+def test_lane_limit_entry_gating(monkeypatch):
+    from dexter3.shadow_runner import _lane_limit_entry_enabled
+
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    monkeypatch.delenv("DEXTER3_MODE", raising=False)
+    monkeypatch.delenv("DEXTER3_HUNT_LIMIT_DIP_R", raising=False)
+    assert not _lane_limit_entry_enabled()                    # hunt default: off
+    monkeypatch.setenv("DEXTER3_HUNT_LIMIT_DIP_R", "0.4")
+    assert _lane_limit_entry_enabled()                        # hunt opt-in
+    monkeypatch.setenv("DEXTER3_MODE", "vp")
+    monkeypatch.delenv(vp_lane.ENV_LIMIT_DIP_R, raising=False)
+    assert not _lane_limit_entry_enabled()                    # vp reads VP env only
+    monkeypatch.setenv(vp_lane.ENV_LIMIT_DIP_R, "0.4")
+    assert _lane_limit_entry_enabled()
+
+
+def test_make_limit_intent_prefer_signal_tp_keeps_structural_target(monkeypatch):
+    monkeypatch.delenv(vp_lane.ENV_LIMIT_DIP_R, raising=False)
+    d = _FakeDecision()   # buy 2000 sl 1998 tp 2004
+    hunt = vp_lane.make_limit_intent(d, [], 4.0, "2026-07-14T03:00:00Z",
+                                     dip_r=0.4, ttl_min=30.0, prefer_signal_tp=True)
+    assert hunt["tp"] == pytest.approx(2004.0)                # structural TP unchanged
+    vp = vp_lane.make_limit_intent(d, [], 4.0, "2026-07-14T03:00:00Z")
+    assert vp["tp"] == pytest.approx(1999.2 + 12 * 1.2)       # VP far cap unchanged
+
+
 def test_om_ladder_untouched_when_env_absent(monkeypatch):
     from dexter3.basket_manager import BasketConfig
     from dexter3.opening_manager import OMConfig, OpeningManager

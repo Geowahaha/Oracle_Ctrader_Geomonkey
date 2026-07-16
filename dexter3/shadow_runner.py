@@ -1761,6 +1761,12 @@ def run_symbol_cycle(
                         risk_usd_override = _apply_v16_profit_controls(
                             mcp, state, decision, float(risk_usd_override)
                         )
+                        # day-open bias downsize (owner 2026-07-16) — the
+                        # two-window-proven direction layer, applied to the
+                        # hunt lanes as sizing, never a block (demo rule).
+                        risk_usd_override = _apply_hunt_dayopen_bias(
+                            decision, prefix, float(risk_usd_override)
+                        )
 
                     # Stamp Grok_v1.0 scalping mode for this entry (independent parallel path)
                     # leader_score high is good. This entry will use fast Grok small-lock (0.25-0.45R)
@@ -1789,53 +1795,66 @@ def run_symbol_cycle(
                     # day-open bias + no-trade window from the 3-window replay
                     # proof, same result shape as the v16 gate so the blocked
                     # path below is shared. Only ever evaluated in VP mode.
-                    if quality.get("allow", True) and _vp_producer_enabled():
-                        quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
+                    if quality.get("allow", True):
+                        if _vp_producer_enabled():
+                            quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
+                        elif vp_lane.in_no_trade_window(
+                            utc_now_iso(), os.environ.get("DEXTER3_HUNT_NO_TRADE_UTC", "")
+                        ):
+                            # owner 2026-07-16 ("ควรมีเวลาที่ไม่ควรเทรด"):
+                            # entry pause around the daily close/reopen —
+                            # env-gated off by default; open positions are
+                            # untouched (OM keeps managing them).
+                            quality = {"allow": False, "reason": "hunt_no_trade_window",
+                                       "a_plus": False, "a_plus_reason": "",
+                                       "cooldown_bypassed": False, "features": {}}
                     if not quality.get("allow", True):
                         status += f":live_blocked_{quality.get('reason', 'quality')}"
-                    elif _vp_producer_enabled() and vp_lane.limit_entry_enabled():
-                        # Synthetic LIMIT (replay's proven entry): store the
-                        # intent; the fast tick fires a market order when the
-                        # touch-side quote reaches the level, or expires it at
-                        # the TTL. Newest allowed signal replaces any pending
-                        # intent (the replay treats each signal independently;
-                        # the lane can hold only one).
-                        intent = vp_lane.make_limit_intent(
-                            decision, prefix, float(risk_usd_override), utc_now_iso()
-                        )
-                        replaced = bool(state.get("vp_limit_intent"))
-                        state["vp_limit_intent"] = intent
-                        log_line(
-                            f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
-                            f"level={intent['level']} sl={intent['sl']} ttl_min="
-                            f"{(intent['deadline_epoch'] - intent['created_epoch']) / 60:.0f} "
-                            f"replaced={replaced}"
-                        )
-                        status += ":vp_limit_intent_set"
                     else:
                         risk_usd_override = _apply_v18_size_levers(
                             quality, float(base_risk_usd), float(risk_usd_override)
                         )
-                        exec_result = _execute_live_entry(
-                            executor,
-                            decision,
-                            today_entry_count=int(daily.get("entries", 0)),
-                            today_losing_count=int(daily.get("loss_baskets", 0)),
-                            risk_usd_override=risk_usd_override,
-                            smart_exit=smart_exit_meta,
-                        )
-                        if exec_result.get("action") == "entered":
-                            daily["entries"] = int(daily.get("entries", 0)) + 1
-                            # Clear cool-down after a real fill so A+ / allowed
-                            # entries do not leave a stale same-side stamp.
-                            if not _is_grok_mode():
-                                state.pop("v16_entry_cooldown", None)
-                            # oldest_open_ts stays None here (the position was
-                            # just placed; its broker-side open timestamp is not
-                            # yet known) — run_om_tick backfills it with the real
-                            # lane timestamp on the first fast tick that observes
-                            # this basket (see its own smart-exit backfill block).
-                        status += f":live_{exec_result.get('action', 'unknown')}"
+                        if _lane_limit_entry_enabled():
+                            # Synthetic LIMIT (the two-window/3-window proven
+                            # entry layer, producer-agnostic): store the
+                            # intent; the fast tick fires a market order when
+                            # the touch-side quote reaches the level, or
+                            # expires it at the TTL. Newest allowed signal
+                            # replaces any pending intent.
+                            intent = _lane_make_limit_intent(
+                                decision, prefix, float(risk_usd_override)
+                            )
+                            replaced = bool(state.get("vp_limit_intent"))
+                            state["vp_limit_intent"] = intent
+                            log_line(
+                                f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
+                                f"level={intent['level']} sl={intent['sl']} ttl_min="
+                                f"{(intent['deadline_epoch'] - intent['created_epoch']) / 60:.0f} "
+                                f"replaced={replaced}"
+                            )
+                            status += ":vp_limit_intent_set"
+                            exec_result = {"action": "limit_intent_set"}
+                        else:
+                            exec_result = _execute_live_entry(
+                                executor,
+                                decision,
+                                today_entry_count=int(daily.get("entries", 0)),
+                                today_losing_count=int(daily.get("loss_baskets", 0)),
+                                risk_usd_override=risk_usd_override,
+                                smart_exit=smart_exit_meta,
+                            )
+                            if exec_result.get("action") == "entered":
+                                daily["entries"] = int(daily.get("entries", 0)) + 1
+                                # Clear cool-down after a real fill so A+ / allowed
+                                # entries do not leave a stale same-side stamp.
+                                if not _is_grok_mode():
+                                    state.pop("v16_entry_cooldown", None)
+                                # oldest_open_ts stays None here (the position was
+                                # just placed; its broker-side open timestamp is not
+                                # yet known) — run_om_tick backfills it with the real
+                                # lane timestamp on the first fast tick that observes
+                                # this basket (see its own smart-exit backfill block).
+                            status += f":live_{exec_result.get('action', 'unknown')}"
 
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
@@ -2064,6 +2083,61 @@ def _maybe_alert_account_guard(client: Any, result: dict[str, Any] | None) -> bo
         return False
 
 
+def _apply_hunt_dayopen_bias(
+    decision: hunter_brain.Decision, m5_prefix: list[dict[str, Any]], risk_usd: float
+) -> float:
+    """Day-open bias DOWNSIZE for the hunt lanes (owner 2026-07-16: "เอาสิ่งที่
+    เราเจอวันนี้ไปปรับปรุง [fable/grok]"). Two-window proven layer on the hunt
+    producer at the live ladder (6k −148→−93/−66→−44, 10k −187→−105/−127→−82:
+    bleed roughly halved, still net-negative — a loss-reducer, not an edge).
+    DOWNSIZE, never block, per the standing demo rule: a counter-bias entry
+    still fires at DEXTER3_HUNT_BIAS_DOWNSIZE_MULT x risk. Env-gated
+    DEXTER3_HUNT_DAYOPEN_BIAS=downsize, default off; classification always
+    journaled onto decision.features."""
+    if os.environ.get("DEXTER3_HUNT_DAYOPEN_BIAS", "").strip().lower() != "downsize":
+        return risk_usd
+    try:
+        anchor_hour = int(_env_float("DEXTER3_HUNT_BIAS_ANCHOR_HOUR", 0))
+        min_hours = _env_float("DEXTER3_HUNT_BIAS_MIN_HOURS", 1.0)
+        mult = _env_float("DEXTER3_HUNT_BIAS_DOWNSIZE_MULT", 0.25)
+        bias, hours = vp_lane.dayopen_bias(m5_prefix, anchor_hour)
+        counter = (
+            bias != 0 and hours >= min_hours
+            and ((str(decision.side) == "buy") != (bias > 0))
+        )
+        if isinstance(decision.features, dict):
+            decision.features["hunt_dayopen_bias"] = {
+                "bias": bias, "hours": round(hours, 2), "counter": counter,
+                "mult": mult if counter else 1.0,
+            }
+        return risk_usd * mult if counter else risk_usd
+    except Exception:
+        return risk_usd
+
+
+def _lane_limit_entry_enabled() -> bool:
+    """Trough-limit entry gating per producer: VP lanes read the VP env;
+    hunt lanes opt in via DEXTER3_HUNT_LIMIT_DIP_R>0 (two-window proven
+    entry layer on the hunt producer — moves ONLY the entry; ladder/TP
+    exits stay the live config)."""
+    if _vp_producer_enabled():
+        return vp_lane.limit_entry_enabled()
+    return _env_float("DEXTER3_HUNT_LIMIT_DIP_R", 0.0) > 0.0
+
+
+def _lane_make_limit_intent(
+    decision: hunter_brain.Decision, prefix: list[dict[str, Any]], risk_usd: float
+) -> dict[str, Any]:
+    if _vp_producer_enabled():
+        return vp_lane.make_limit_intent(decision, prefix, risk_usd, utc_now_iso())
+    return vp_lane.make_limit_intent(
+        decision, prefix, risk_usd, utc_now_iso(),
+        dip_r=_env_float("DEXTER3_HUNT_LIMIT_DIP_R", 0.4),
+        ttl_min=_env_float("DEXTER3_HUNT_LIMIT_TTL_MIN", 30.0),
+        prefer_signal_tp=True,
+    )
+
+
 def _service_vp_limit_intent(
     mcp: Dexter3McpClient,
     state: dict[str, Any],
@@ -2108,8 +2182,12 @@ def _service_vp_limit_intent(
     )
     if exec_result.get("action") == "entered":
         daily["entries"] = int(daily.get("entries", 0)) + 1
+        if not _is_grok_mode():
+            # same cool-down clear a direct market fill performs
+            state.pop("v16_entry_cooldown", None)
         # Stamp the convex-exit inputs for run_om_tick (atr measured at
-        # signal time, stop distance of the FILLED geometry).
+        # signal time, stop distance of the FILLED geometry). Inert for
+        # ladder lanes — only read when DEXTER3_OM_TRAIL_MODE=convex.
         state["vp_convex"] = {
             "atr_pts": _f(intent.get("atr_pts"), 0.0),
             "stop_pts": _f(intent.get("stop_pts"), 0.0),
@@ -4067,7 +4145,9 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
                 for symbol in symbols:
                     try:
                         run_weekly_flatten_tick(executor, symbol)
-                        if _vp_producer_enabled() and executor is not None:
+                        if executor is not None:
+                            # no-ops without a pending intent; serves VP and
+                            # hunt lanes alike (owner 2026-07-16 layer port)
                             _service_vp_limit_intent(mcp, state, symbol, executor)
                         run_om_tick(mcp, journal, state, symbol, executor=executor)
                     except McpZombieError as exc:

@@ -55,6 +55,15 @@ Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
 # DOWNSIZE not skip — owner rule: no hard blockers on demo; grok keeps trading
 # (its own A/B sample stays valid), at half risk when it is the follower.
 Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+# 2026-07-16 owner order: day-open bias DOWNSIZE + close/reopen entry pause
+# ported from the VP research (two-window proven on the shared hunt
+# producer). NO limit-entry here: that layer was proven against ladder/convex
+# exits only — grok's scalp small-lock exits were never measured with it.
+Environment=DEXTER3_HUNT_DAYOPEN_BIAS=downsize
+Environment=DEXTER3_HUNT_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_HUNT_BIAS_MIN_HOURS=1
+Environment=DEXTER3_HUNT_BIAS_DOWNSIZE_MULT=0.25
+Environment=DEXTER3_HUNT_NO_TRADE_UTC=20:45-22:15
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok
 
 [Install]

@@ -194,22 +194,40 @@ def mean_true_range(m5_prefix: list, window: int = ATR_WINDOW_BARS) -> float:
 
 
 def make_limit_intent(decision: Any, m5_prefix: list, risk_usd: float,
-                      now_iso: str) -> dict[str, Any]:
-    """Build the pending-intent record from an ALLOWED VP enter decision.
+                      now_iso: str, *, dip_r: float | None = None,
+                      ttl_min: float | None = None,
+                      far_tp_r: float | None = None,
+                      prefer_signal_tp: bool = False) -> dict[str, Any]:
+    """Build the pending-intent record from an ALLOWED enter decision.
     Level = entry -/+ dip_r * risk (risk = |entry - sl|); SL stays at the
     decision's structural level; TP is a far protective cap at
     ``far_tp_r`` x the FILLED stop distance from the level (executor geometry
-    requires a TP; the convex trail is the real exit)."""
+    requires a TP). Producer-agnostic (owner 2026-07-16: the same trough-limit
+    layer is two-window proven on the HUNT producer too): the keyword
+    overrides let a hunt lane pass its own env-derived knobs while the VP
+    lane keeps reading the VP envs by default. For a hunt lane the signal's
+    ORIGINAL tp is kept when it is farther than the protective cap would be
+    (hunt TPs are structural; never bring a TP closer)."""
     side = str(decision.side)
     entry = _f(decision.entry)
     sl = _f(decision.sl)
     risk_pts = abs(entry - sl)
-    dip_r = _env_float(ENV_LIMIT_DIP_R, 0.4)
-    ttl_min = _env_float(ENV_LIMIT_TTL_MIN, 30.0)
-    far_tp_r = _env_float(ENV_FAR_TP_R, 12.0)
+    dip_r = _env_float(ENV_LIMIT_DIP_R, 0.4) if dip_r is None else float(dip_r)
+    ttl_min = _env_float(ENV_LIMIT_TTL_MIN, 30.0) if ttl_min is None else float(ttl_min)
+    far_tp_r = _env_float(ENV_FAR_TP_R, 12.0) if far_tp_r is None else float(far_tp_r)
     level = entry - dip_r * risk_pts if side == "buy" else entry + dip_r * risk_pts
     stop_pts = abs(level - sl)
-    tp = level + far_tp_r * stop_pts if side == "buy" else level - far_tp_r * stop_pts
+    signal_tp = _f(getattr(decision, "tp", None), 0.0)
+    tp_valid = (signal_tp > level) if side == "buy" else (0.0 < signal_tp < level)
+    if prefer_signal_tp and tp_valid:
+        # hunt lanes keep their structural TP unchanged — the limit layer
+        # moves only the ENTRY; exits (ladder + broker TP) stay exactly the
+        # live config the two-window proof measured against.
+        tp = signal_tp
+    else:
+        # VP lane: far protective cap only (executor geometry needs a TP;
+        # the convex trail is the real exit and must be free to ride).
+        tp = level + far_tp_r * stop_pts if side == "buy" else level - far_tp_r * stop_pts
     now_e = _epoch(now_iso)
     return {
         "symbol": str(decision.symbol),

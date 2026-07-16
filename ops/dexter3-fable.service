@@ -82,6 +82,21 @@ Environment=DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE=1
 # follower still trades (keeps both lanes' A/B sample intact for the 07-22
 # verdicts), at half risk. Escalate to "skip" only if downsize proves too weak.
 Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+# 2026-07-16 owner order ("เอาสิ่งที่เราเจอวันนี้ไปปรับปรุง"): the two-window
+# proven entry layers ported from the VP research — day-open bias DOWNSIZE
+# (counter-bias entries x0.25, never blocked, demo rule), trough-limit entry
+# at signal-0.4R (SL structural, TTL 30min; exits/TP unchanged = the exact
+# config the proof measured), and the daily close/reopen entry pause.
+# Replay economics on the hunt producer: bleed -$62..74/day -> -$27..30/day.
+# HONEST LIMIT: these reduce loss, they do NOT make hunt profitable — no
+# hunt config ever passed both segments; VP lane is the edge candidate.
+Environment=DEXTER3_HUNT_DAYOPEN_BIAS=downsize
+Environment=DEXTER3_HUNT_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_HUNT_BIAS_MIN_HOURS=1
+Environment=DEXTER3_HUNT_BIAS_DOWNSIZE_MULT=0.25
+Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.4
+Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
+Environment=DEXTER3_HUNT_NO_TRADE_UTC=20:45-22:15
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
 [Install]
