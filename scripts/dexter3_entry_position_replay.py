@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from bisect import bisect_left
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -174,6 +175,68 @@ def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r:
     return ("no_confirm" if touched else "no_touch"), None, None
 
 
+def _zone_confirm_entry_m1(side: str, entry: float, sl: float, m1_future: list,
+                           dip_r: float, deadline_epoch: float
+                           ) -> tuple[str, float | None, float | None]:
+    """Owner idea 2026-07-16 ("เข้าจุดที่ดีที่สุดใน M1 โดย pattern ที่ M5 ไฟเขียว"):
+    the SAME zone mechanism, but confirmation runs on M1 bars — the M5 pattern
+    supplies the zone (green light), M1 supplies the trigger. Vs the M5-close
+    confirm this enters ~5x sooner after the touch, so the price is closer to
+    the zone (recovering most of the limit's discount) while keeping the
+    knife-protection (an M1 CLOSE beyond the SL kills the setup — and is seen
+    up to 4 minutes sooner than the M5 close). Walks ``m1_future`` (M1 bars at/
+    after the signal close) until ``deadline_epoch``. Returns
+    (status, entry_px, entry_epoch)."""
+    risk = abs(entry - sl)
+    if risk <= 0 or dip_r <= 0 or dip_r >= 1.0:
+        return "no_touch", None, None
+    zone_top = entry - dip_r * risk if side == "buy" else entry + dip_r * risk
+    touched = False
+    for bar in m1_future:
+        e = _epoch(str(bar.get("ts") or ""))
+        if e >= deadline_epoch:
+            break
+        o = float(bar.get("open", 0.0))
+        c = float(bar.get("close", 0.0))
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        if side == "buy":
+            if c <= sl:
+                return "zone_break", None, None
+            if not touched and lo <= zone_top:
+                touched = True
+            if touched and c > o and c > zone_top and c < entry:
+                return "filled", c, e
+        else:
+            if c >= sl:
+                return "zone_break", None, None
+            if not touched and hi >= zone_top:
+                touched = True
+            if touched and c < o and c < zone_top and c > entry:
+                return "filled", c, e
+    return ("no_confirm" if touched else "no_touch"), None, None
+
+
+def _m1_entry_to_m5_exit(side: str, entry_px: float, sl: float, entry_epoch: float,
+                         m1_future: list, m5_future: list) -> tuple[list, bool]:
+    """Bridge an M1-timed entry back onto the M5 exit stream with NO blind
+    spot: the remainder of the entry's own M5 period is checked for SL wicks
+    on the REAL M1 bars (favorable excursion there is ignored — pessimistic,
+    same convention as the fill-bar rule elsewhere). Returns (m5_bars_from_
+    next_period, stopped_in_entry_period)."""
+    boundary = (entry_epoch // 300) * 300 + 300
+    for bar in m1_future:
+        e = _epoch(str(bar.get("ts") or ""))
+        if e <= entry_epoch or e >= boundary:
+            continue
+        lo = float(bar.get("low", 0.0))
+        hi = float(bar.get("high", 0.0))
+        if (side == "buy" and lo <= sl) or (side == "sell" and hi >= sl):
+            return [], True
+    rest = [b for b in m5_future if _epoch(str(b.get("ts") or "")) >= boundary]
+    return rest, False
+
+
 def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
              exit_kind: str, exit_params: dict, atr: float, max_hold: int,
              spread_abs: float, commission_r: float) -> tuple[str, float | None]:
@@ -205,7 +268,7 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
         if status == "filled_stopped":
             return "taken", -1.0 - cost
         sim_future = future[fill_idx + 1:]
-    else:  # "zone" -- touch + real-break check + reversal confirmation
+    elif entry_model == "zone":  # touch + real-break check + reversal confirmation
         status, fill_price, fill_idx = _zone_confirm_entry(side, entry, sl, future,
                                                            dip_r, window_bars)
         if status != "filled":
@@ -214,6 +277,23 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
         if abs(sim_entry - sim_sl) <= 0:
             return "skip", None
         sim_future = future[fill_idx + 1:]
+    else:  # "zone_m1" -- M5 green-light zone, M1-resolution confirm + break check
+        m1_future = trade.get("m1_future") or []
+        if not m1_future:
+            return "miss_no_m1", None
+        deadline = trade["close_epoch"] + window_bars * 300
+        status, fill_price, fill_epoch = _zone_confirm_entry_m1(side, entry, sl, m1_future,
+                                                                dip_r, deadline)
+        if status != "filled":
+            return f"miss_{status}", None
+        sim_entry, sim_sl = float(fill_price), sl
+        if abs(sim_entry - sim_sl) <= 0:
+            return "skip", None
+        sim_future, stopped = _m1_entry_to_m5_exit(side, sim_entry, sl, float(fill_epoch),
+                                                   m1_future, future)
+        if stopped:
+            new_risk = abs(sim_entry - sim_sl)
+            return "taken", -1.0 - (spread_abs / new_risk + commission_r)
 
     risk = abs(sim_entry - sim_sl)
     cost = spread_abs / risk + commission_r
@@ -387,6 +467,10 @@ def main() -> int:
     ap.add_argument("--zone-variants", default="",
                     help="dip_r:window_bars ZONE-CONFIRM entry variants (touch + real-break "
                          "check + reversal-close entry) -- owner directive 2026-07-16")
+    ap.add_argument("--zone-m1-variants", default="",
+                    help="dip_r:window_bars zone variants confirmed on M1 bars (M5 green "
+                         "light, M1 best-entry trigger) -- owner idea 2026-07-16. NOTE: "
+                         "daemon M1 history is ~14 days; rows outside it report miss_no_m1")
     ap.add_argument("--producer", choices=("hunt", "vp"), default="hunt",
                     help="signal producer: hunt = live decide_hunt committee; vp = "
                          "volume_profile.decide_vp (the only gate-passer in repo history). "
@@ -468,6 +552,19 @@ def main() -> int:
             continue
         dip_s, win_s = part.strip().split(":")
         zone_variants.append((float(dip_s), int(win_s)))
+    zone_m1_variants = []
+    for part in args.zone_m1_variants.split(","):
+        if not part.strip():
+            continue
+        dip_s, win_s = part.strip().split(":")
+        zone_m1_variants.append((float(dip_s), int(win_s)))
+    m1: list = []
+    m1_epochs: list[float] = []
+    if zone_m1_variants:
+        m1 = c.get_trendbars(args.symbol, "m1", 50000)   # daemon caps at its max history
+        m1_epochs = [_epoch(str(b.get("ts") or "")) for b in m1]
+        print(f"M1 bars for zone-m1 confirm: {len(m1)} "
+              f"({m1[0]['ts'] if m1 else '-'} -> {m1[-1]['ts'] if m1 else '-'})")
 
     split_bar = MIN_M5 + int((len(m5) - 2 - MIN_M5) * args.split)
     v_days = max(0.1, (_epoch(str(m5[-1]["ts"])) - _epoch(str(m5[split_bar]["ts"]))) / 86400.0)
@@ -488,6 +585,8 @@ def main() -> int:
         entries.append((f"limit -{dip:.1f}R w{win}", "limit", dip, win))
     for dip, win in zone_variants:
         entries.append((f"zone -{dip:.1f}R w{win}", "zone", dip, win))
+    for dip, win in zone_m1_variants:
+        entries.append((f"zoneM1 -{dip:.1f}R w{win}", "zone_m1", dip, win))
 
     for mode in gate_modes:
         accepted: list[dict] = []
@@ -495,11 +594,15 @@ def main() -> int:
             gate = _apply_entry_gate(d, mode if mode != "none" else "none", str(d.ts_close or ""))
             if not bool(gate.get("allow", True)):
                 continue
-            accepted.append({
+            close_epoch = _epoch(str(m5[i].get("ts") or "")) + 300
+            rec = {
                 "i": i, "side": str(d.side), "entry": float(d.entry),
                 "sl": float(d.sl), "tp": float(d.tp), "future": m5[i + 1:],
-                "trend_sign": tsign, **bias_rows[i],
-            })
+                "trend_sign": tsign, "close_epoch": close_epoch, **bias_rows[i],
+            }
+            if m1:
+                rec["m1_future"] = m1[bisect_left(m1_epochs, close_epoch):]
+            accepted.append(rec)
         derive_all = [t for t in accepted if t["i"] < split_bar]
         validate_all = [t for t in accepted if t["i"] >= split_bar]
         print(f"\n=== gate={mode}: accepted {len(accepted)} (derive {len(derive_all)} / validate {len(validate_all)}) ===")

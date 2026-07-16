@@ -19,9 +19,11 @@ from scripts.dexter3_entry_position_replay import (
     _anchor_bias_fields,
     _dir_allows,
     _limit_fill,
+    _m1_entry_to_m5_exit,
     _score,
     _trade_r,
     _zone_confirm_entry,
+    _zone_confirm_entry_m1,
 )
 
 RUNGS = [(0.25, 0.02), (0.50, 0.15), (0.80, 0.40), (1.20, 0.80), (2.00, 1.45), (3.00, 2.25)]
@@ -258,6 +260,68 @@ def test_score_zone_miss_classes():
     n_b, cf_b = sc["miss_by"]["break"]
     assert n_b == 1
     assert cf_b == pytest.approx(-1.0 - 0.09)
+
+
+# ---------------------------------------------------------------------------
+# _zone_confirm_entry_m1 + _m1_entry_to_m5_exit -- M5 green light, M1 trigger
+# (owner idea 2026-07-16: "เข้าจุดที่ดีที่สุดใน M1 โดย pattern ที่ M5 ไฟเขียว")
+# ---------------------------------------------------------------------------
+
+
+def _m1bar(ts: str, o: float, h: float, l: float, c: float) -> dict:
+    return {"ts": ts, "open": o, "high": h, "low": l, "close": c}
+
+
+def _epoch_of(ts: str) -> float:
+    from scripts.dexter3_edge_discovery import _epoch
+    return _epoch(ts)
+
+
+def test_zone_m1_confirms_earlier_at_better_price():
+    # buy entry 2000, sl 1998, dip 0.4 -> zone_top 1999.2. M1 stream: dip
+    # touches 1999.15 at :01, the very next M1 closes green at 1999.30 --
+    # confirm 4 minutes before any M5 close could, at a price much closer
+    # to the zone than a typical M5 reversal close.
+    m1 = [
+        _m1bar("2026-07-10T00:00:00Z", 1999.6, 1999.7, 1999.4, 1999.5),
+        _m1bar("2026-07-10T00:01:00Z", 1999.5, 1999.5, 1999.15, 1999.18),  # touch
+        _m1bar("2026-07-10T00:02:00Z", 1999.18, 1999.35, 1999.1, 1999.30),  # green > zone_top
+    ]
+    status, px, e = _zone_confirm_entry_m1("buy", 2000.0, 1998.0, m1,
+                                           0.4, _epoch_of("2026-07-10T00:30:00Z"))
+    assert status == "filled"
+    assert px == pytest.approx(1999.30)
+    assert e == pytest.approx(_epoch_of("2026-07-10T00:02:00Z"))
+
+
+def test_zone_m1_break_and_deadline():
+    # an M1 CLOSE below the SL kills it; bars at/after the deadline are ignored.
+    m1_break = [_m1bar("2026-07-10T00:01:00Z", 1999.3, 1999.3, 1997.6, 1997.9)]
+    assert _zone_confirm_entry_m1("buy", 2000.0, 1998.0, m1_break, 0.4,
+                                  _epoch_of("2026-07-10T00:30:00Z"))[0] == "zone_break"
+    # touch happens only AFTER the deadline -> no_touch
+    late = [_m1bar("2026-07-10T01:00:00Z", 1999.5, 1999.5, 1999.0, 1999.3)]
+    assert _zone_confirm_entry_m1("buy", 2000.0, 1998.0, late, 0.4,
+                                  _epoch_of("2026-07-10T00:30:00Z"))[0] == "no_touch"
+
+
+def test_m1_bridge_checks_entry_period_wicks_then_hands_to_m5():
+    # entry at :02 inside the 00:00-00:05 M5 period. A later M1 bar at :04
+    # wicks to 1997.9 (<= sl) -> stopped inside the entry period.
+    entry_epoch = _epoch_of("2026-07-10T00:02:00Z")
+    m1 = [
+        _m1bar("2026-07-10T00:02:00Z", 1999.2, 1999.35, 1999.1, 1999.30),
+        _m1bar("2026-07-10T00:04:00Z", 1999.3, 1999.3, 1997.9, 1998.4),   # SL wick
+    ]
+    m5_future = [{"ts": "2026-07-10T00:05:00Z", "open": 1998.5, "high": 1999.0,
+                  "low": 1998.2, "close": 1998.8}]
+    rest, stopped = _m1_entry_to_m5_exit("buy", 1999.30, 1998.0, entry_epoch, m1, m5_future)
+    assert stopped is True
+    # clean period -> hands off exactly the M5 bars from the NEXT period
+    m1_clean = [m1[0]]
+    rest, stopped = _m1_entry_to_m5_exit("buy", 1999.30, 1998.0, entry_epoch, m1_clean, m5_future)
+    assert stopped is False
+    assert len(rest) == 1 and rest[0]["ts"] == "2026-07-10T00:05:00Z"
 
 
 # ---------------------------------------------------------------------------
