@@ -144,6 +144,27 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--leader-buckets",
+        action="store_true",
+        help=(
+            "leader_score bucket replay diagnostic (2026-07-16, REPORT-ONLY, no "
+            "filtering of trades): the 48-trade live journal sample showed the "
+            "hunt committee's own leader_score conviction ANTI-predictive "
+            "(0.10-0.18 -> +13.24R/56.2%%WR; 0.18-0.25 -> -31.84R/35.7%%WR; "
+            "0.25-0.35 -> -13.53R/33.3%%WR; 0.35+ -> +1.00R/40%%WR) while the "
+            "live gate's min_leader_score=0.18 admits the losing bands and "
+            "excludes the only profitable one. N=48 is far too small to act "
+            "on -- this prints the derive/validate replay verdict (plus "
+            "gate=none SIDE and SETUP cuts) needed before anyone proposes a "
+            "gate change. Buckets a trade for the table only; never filters."
+        ),
+    )
+    ap.add_argument(
+        "--leader-bucket-edges",
+        default="0.10,0.18,0.25,0.35",
+        help="comma leader_score bucket edges (open lower / closed upper -> next edge; last bucket is [edge,inf))",
+    )
+    ap.add_argument(
         "--brain",
         action="store_true",
         help="deprecated alias for --producer brain",
@@ -216,6 +237,12 @@ def main() -> int:
                 "tp": float(d.tp),
                 "future": m5[i + 1:],
                 "vp_regime": profile_regime(m5[:i]),
+                # carried for --leader-buckets (2026-07-16, report-only) --
+                # every producer returns the shared hunter_brain.Decision
+                # dataclass, so these fields always exist.
+                "leader_score": float(d.leader_score),
+                "p_win_est": float(d.p_win_est),
+                "setup": str(d.setup or "none"),
             }
             if args.pa_eye:
                 # Report-only replay evidence (2026-07-15 Phase A): the Eye
@@ -408,6 +435,94 @@ def main() -> int:
                         f"{segment:<9} {mode:<12} {verdict:<8} {len(rs):>5} "
                         f"{mean_r:>+7.3f} {net:>+8.2f} {pf:>6.2f}"
                     )
+    if args.leader_buckets:
+        # LEADER-SCORE BUCKET DIAGNOSTIC (2026-07-16): report-only, mirrors
+        # the PA-Eye diagnostic above -- NO trades are filtered by
+        # leader_score here; this table is the out-of-sample check the
+        # 48-trade live journal finding needs before anyone touches
+        # min_leader_score=0.18 (owner directive: this class of finding --
+        # VP, bucket-router, PA-Eye, empirical sizing -- has died
+        # out-of-sample 4 times already in this repo; regime-local until
+        # proven otherwise). R uses the CURRENT-LIVE ref exit combo (same
+        # `ref` as the PA-Eye table) so buckets compare on an identical exit.
+        edges = sorted(float(x) for x in args.leader_bucket_edges.split(",") if x.strip())
+        bucket_bounds = [0.0] + edges + [float("inf")]
+
+        def _bucket_label(lo: float, hi: float) -> str:
+            hi_s = "inf" if hi == float("inf") else f"{hi:.2f}"
+            return f"[{lo:.2f},{hi_s})"
+
+        def _cut_row(rows: list[dict]) -> tuple[int, float, float, float, float] | None:
+            rs = [
+                r for t in rows
+                if (r := _combo_r(t, ref["style"], ref["max_hold"], ref["disaster"], ref["sl_mult"],
+                                   args.spread_abs, args.commission_r)) is not None
+            ]
+            if not rs:
+                return None
+            net, pf, _dd = _equity(rs)
+            wr = 100.0 * sum(1 for r in rs if r > 0) / len(rs)
+            return len(rs), net / len(rs), net, pf, wr
+
+        # the live gate's min_leader_score=0.18 confounds the raw relationship
+        # -- gate=none is the key cut; v17 is the current-live gate for
+        # comparison. Falls back to whatever --gates provided if neither
+        # requested mode is present (same fallback posture as ref_gate above).
+        target_gates = [g for g in ("none", "v17") if g in accepted_by_gate]
+        if not target_gates:
+            target_gates = gate_modes[:1]
+            print(f"\nnote: neither 'none' nor 'v17' in --gates; leader-score buckets using '{target_gates[0]}' instead")
+
+        print("\n=== LEADER-SCORE BUCKET DIAGNOSTIC (report-only; no filtering applied) ===")
+        print(
+            f"{'segment':<9} {'gate':<12} {'bucket':<13} {'N':>5} {'meanR':>7} {'netR':>8} {'PF':>6} {'WR%':>6}"
+        )
+        for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+            for mode in target_gates:
+                rows = [t for t in accepted_by_gate.get(mode, []) if pred(t)]
+                for lo, hi in zip(bucket_bounds[:-1], bucket_bounds[1:]):
+                    subset = [t for t in rows if lo <= t["leader_score"] < hi]
+                    cut = _cut_row(subset)
+                    if cut is None:
+                        continue
+                    n, mean_r, net, pf, wr = cut
+                    print(
+                        f"{segment:<9} {mode:<12} {_bucket_label(lo, hi):<13} {n:>5} "
+                        f"{mean_r:>+7.3f} {net:>+8.2f} {pf:>6.2f} {wr:>6.1f}"
+                    )
+
+        if "none" in accepted_by_gate:
+            print("\n=== LEADER-SCORE CONTEXT: SIDE CUT (gate=none, report-only) ===")
+            print(f"{'segment':<9} {'side':<6} {'N':>5} {'meanR':>7} {'netR':>8} {'WR%':>6}")
+            for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+                rows = [t for t in accepted_by_gate["none"] if pred(t)]
+                for side in ("buy", "sell"):
+                    cut = _cut_row([t for t in rows if t["side"] == side])
+                    if cut is None:
+                        continue
+                    n, mean_r, net, _pf, wr = cut
+                    print(f"{segment:<9} {side:<6} {n:>5} {mean_r:>+7.3f} {net:>+8.2f} {wr:>6.1f}")
+
+            print("\n=== LEADER-SCORE CONTEXT: SETUP CUT (gate=none, report-only) ===")
+            print(f"{'segment':<9} {'setup':<28} {'N':>5} {'meanR':>7} {'netR':>8} {'WR%':>6}")
+            for segment, pred in (("derive", lambda t: t["i"] < split_bar), ("validate", lambda t: t["i"] >= split_bar)):
+                rows = [t for t in accepted_by_gate["none"] if pred(t)]
+                for setup in sorted({t["setup"] for t in rows}):
+                    cut = _cut_row([t for t in rows if t["setup"] == setup])
+                    if cut is None:
+                        continue
+                    n, mean_r, net, _pf, wr = cut
+                    print(f"{segment:<9} {setup:<28} {n:>5} {mean_r:>+7.3f} {net:>+8.2f} {wr:>6.1f}")
+        else:
+            print("\n(gate=none not in --gates; SIDE/SETUP cuts skipped -- add 'none' to --gates to see them)")
+
+        print("\nRULES (leader-score buckets): a bucket/side/setup cut only earns power if the "
+              "pattern holds on BOTH derive and validate segments -- report/act on VALIDATE "
+              "numbers only. This exact class of finding (a raw-looking edge in a small live "
+              "sample) has died out-of-sample 4 times already in this repo (VP, bucket-router, "
+              "PA-Eye, empirical sizing) -- treat a single-segment or N=48-sized pattern as noise "
+              "until this 10k-bar replay confirms it on both segments.")
+
     print("\nRULES: report/act on VALIDATE numbers only; canary requires both-segments-positive "
           "AND beats the current-live ref on validate. Replay approximates live OM exits — a "
           "canary must still prove itself forward before any scale-up.")
