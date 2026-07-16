@@ -1,0 +1,12 @@
+# Dexter3 nightly flywheel — the system grades its own day (2026-07-17).
+[Unit]
+Description=Dexter3 day ledger (nightly self-review)
+After=dexter3-openapi-daemon.service
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dexter_pro
+Environment=PYTHONPATH=/opt/dexter_pro
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_OPENAPI_DAEMON_TIMEOUT_SEC=120
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 ops/dexter3_day_ledger.py

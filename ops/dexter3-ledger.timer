@@ -1,0 +1,7 @@
+[Unit]
+Description=Nightly dexter3 day ledger at 23:45Z
+[Timer]
+OnCalendar=*-*-* 23:45:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target
