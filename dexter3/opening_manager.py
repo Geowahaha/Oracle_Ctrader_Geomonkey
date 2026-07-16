@@ -439,6 +439,20 @@ class OpeningManager:
             # peak - giveback_atr x ATR (floor MAY be negative; below the
             # broker SL it simply never fires = the replay's SL-first
             # semantics), plus a hard max-age stop (replay h48 = 240min).
+            # -- PLAIN mode (daytrend lane, owner deploy 2026-07-16): broker
+            # SL/TP + basket caps (incl. time stop) are the ENTIRE exit; the
+            # OM must not profit-exit at all — the daytrend proof's exit is
+            # the signal's own TP at the day extreme, and both the ladder
+            # and convex measurably destroy that producer.
+            if vp_lane.trail_mode() == "plain":
+                return {
+                    "action": "hold",
+                    "reason": "plain_hold",
+                    "peak_r": round(peak_r, 4),
+                    "live_r": round(live_r, 4),
+                    "basket_runtime": basket_runtime,
+                }
+
             if vp_lane.convex_trail_enabled():
                 cvx = st.get("vp_convex") or {}
                 floor_cvx = vp_lane.convex_floor_r(

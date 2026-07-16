@@ -358,8 +358,17 @@ def intent_to_decision(intent: dict[str, Any], decision_cls: Any, now_iso: str,
 # ---------------------------------------------------------------------------
 
 
+def trail_mode() -> str | None:
+    """None (classic ladder) | "convex" (VP lane) | "plain" (daytrend lane —
+    broker SL/TP + basket caps ONLY; the OM must not profit-exit at all:
+    the daytrend proof's exit is plain TP at the day extreme, and both the
+    ladder and convex measurably destroy it)."""
+    raw = os.environ.get(ENV_TRAIL_MODE, "").strip().lower()
+    return raw if raw in ("convex", "plain") else None
+
+
 def convex_trail_enabled() -> bool:
-    return os.environ.get(ENV_TRAIL_MODE, "").strip().lower() == "convex"
+    return trail_mode() == "convex"
 
 
 def convex_floor_r(peak_r: float, atr_pts: float, stop_pts: float) -> float | None:

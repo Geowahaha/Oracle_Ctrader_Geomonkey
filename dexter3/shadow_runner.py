@@ -103,6 +103,7 @@ RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
 GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
 VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
+DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -110,9 +111,11 @@ LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # _active_log_file below), so keeping it as-is means zero breakage there.
 GROK_LOG_FILE = RUNTIME / "dexter3_grok_shadow.log"
 VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
+DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
+DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -163,6 +166,23 @@ def _vp_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "vp"
 
 
+def _daytrend_producer_enabled() -> bool:
+    """DAYTREND lane (owner deploy 2026-07-16): with-the-day pullback
+    continuation — dexter3/daytrend.py carries the evidence block."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "daytrend":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "daytrend"
+
+
+def _alt_producer_enabled() -> bool:
+    """Non-hunt producers (vp / daytrend) share the same runner posture:
+    v16 gate bypass (no hunt-committee features), hunt sizing-selector
+    bypass (their proofs sized flat), the VP entry gate (day-open bias +
+    no-trade window; trivially true for daytrend whose signals are
+    with-bias by construction), and the deep 340-bar M5 fetch."""
+    return _vp_producer_enabled() or _daytrend_producer_enabled()
+
+
 def _active_order_label(mode: str | None = None) -> str:
     """Broker label owned by the current Dexter3 process.
 
@@ -176,6 +196,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.volume_profile import VP_LABEL
 
         return VP_LABEL
+    if current_mode == "daytrend":
+        from dexter3.daytrend import DAYTREND_LABEL
+
+        return DAYTREND_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -200,6 +224,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.volume_profile import VP_LABEL_FAMILY
 
         return VP_LABEL_FAMILY
+    if current_mode == "daytrend":
+        from dexter3.daytrend import DAYTREND_LABEL_FAMILY
+
+        return DAYTREND_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -209,6 +237,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return GROK_STATE_FILE
     if current_mode == "vp":
         return VP_STATE_FILE
+    if current_mode == "daytrend":
+        return DAYTREND_STATE_FILE
     return STATE_FILE
 
 
@@ -223,6 +253,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return GROK_LOG_FILE
     if current_mode == "vp":
         return VP_LOG_FILE
+    if current_mode == "daytrend":
+        return DAYTREND_LOG_FILE
     return LOG_FILE
 
 
@@ -950,8 +982,8 @@ def _apply_v16_entry_quality_gate(
     entirely otherwise, so a near-zero leader_score signal was reaching
     live entry unfiltered, e.g. leader_score=0.056 on 2026-07-15). Journals
     features on decision."""
-    if _vp_producer_enabled():
-        # VP lane (owner deploy 2026-07-16): the v16 gate scores
+    if _alt_producer_enabled():
+        # VP/daytrend lanes (owner deploy 2026-07-16): the v16 gate scores
         # hunt-committee features (leader_score etc.) that VP decisions do
         # not carry — leader_score=0.0 would block EVERY VP entry on
         # min_leader_score. The 3-window replay proof ran gates=none; the
@@ -1298,6 +1330,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = GROK_LOCK_FILE, "grok-v1.0"
     elif mode == "vp":
         lock_file, lock_name = VP_LOCK_FILE, "vp-canary"
+    elif mode == "daytrend":
+        lock_file, lock_name = DAYTREND_LOCK_FILE, "daytrend-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1320,6 +1354,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = GROK_LOCK_FILE
     elif mode == "vp":
         lock_file = VP_LOCK_FILE
+    elif mode == "daytrend":
+        lock_file = DAYTREND_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1598,7 +1634,7 @@ def run_symbol_cycle(
     # bar with "bars<291" — the exact latent gap that surfaced at first
     # enable 2026-07-16), and the day-open bias must see back to the 00Z
     # anchor bar (worst case 288 bars; 340 covers ~28h, > any anchor age).
-    m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _vp_producer_enabled() else MIN_M5_BARS)
+    m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _alt_producer_enabled() else MIN_M5_BARS)
     if len(m5_bars) < MIN_M5_BARS:
         return f"insufficient_m5_bars({len(m5_bars)})"
 
@@ -1666,6 +1702,14 @@ def run_symbol_cycle(
             decision, basket_action = _manage_lane_basket(
                 executor, symbol, bar_ts, prefix, lane, state, spread_abs
             )
+        elif is_newest and _daytrend_producer_enabled():
+            # DAYTREND lane (owner deploy 2026-07-16) — with-the-day pullback
+            # continuation; evidence + parity notes in dexter3/daytrend.py.
+            from dexter3 import daytrend as _daytrend
+            from dexter3 import market_lens as _ml
+
+            dt_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dt_session)
         elif is_newest and _vp_producer_enabled():
             # Volume-profile producer canary (2026-07-11): the FIRST candidate
             # to pass the promotion gate on BOTH hold-out splits (60/40:
@@ -1747,8 +1791,8 @@ def run_symbol_cycle(
                     base_risk_usd = (risk_info or {}).get("risk_usd")
                     if base_risk_usd is None:
                         base_risk_usd = executor.config.risk_usd
-                    if _vp_producer_enabled():
-                        # VP lane (2026-07-16): the hunt sizing selectors
+                    if _alt_producer_enabled():
+                        # VP/daytrend lanes (2026-07-16): the hunt sizing selectors
                         # (anti-chase / pullback / v16 profit controls) read
                         # hunt-committee features VP decisions do not carry,
                         # and the 3-window proof sized every accepted VP
@@ -1796,7 +1840,7 @@ def run_symbol_cycle(
                     # proof, same result shape as the v16 gate so the blocked
                     # path below is shared. Only ever evaluated in VP mode.
                     if quality.get("allow", True):
-                        if _vp_producer_enabled():
+                        if _alt_producer_enabled():
                             quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
                         elif (
                             os.environ.get("DEXTER3_HUNT_DAYOPEN_BIAS", "").strip().lower() == "skip"
@@ -4139,6 +4183,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     mode = os.environ.get("DEXTER3_MODE", "v16").lower().strip()
     is_grok = mode == "grok"
     is_vp = mode == "vp"
+    is_daytrend = mode == "daytrend"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -4155,12 +4200,23 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _VP_LABEL
         print(f"[VP] Forced executor LABEL to {_VP_LABEL}", flush=True)
 
+    if is_daytrend:
+        from dexter3.daytrend import DAYTREND_LABEL as _DT_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DT_LABEL
+        print(f"[DAYTREND] Forced executor LABEL to {_DT_LABEL}", flush=True)
+
     if is_grok and GROK_LABEL:
         active_label = GROK_LABEL
     elif is_vp:
         from dexter3.volume_profile import VP_LABEL as _VP_LABEL
 
         active_label = _VP_LABEL
+    elif is_daytrend:
+        from dexter3.daytrend import DAYTREND_LABEL as _DT_LABEL
+
+        active_label = _DT_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
@@ -4296,6 +4352,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _VP_LABEL
         print(f"[VP] Forced executor LABEL to {_VP_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "daytrend":
+        from dexter3.daytrend import DAYTREND_LABEL as _DT_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DT_LABEL
+        print(f"[DAYTREND] Forced executor LABEL to {_DT_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.
