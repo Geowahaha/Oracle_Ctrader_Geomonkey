@@ -70,7 +70,47 @@ Measured on 6000 M5 XAU bars (2026-06-16 → 07-16), SL-first honest, 986 trades
 
 ---
 
-## 4. THE ONE MISSING MEASUREMENT (do this first)
+## 4. ✅ THE v18 RUN CAME BACK — the live baseline is now MEASURED
+
+Collected 2026-07-16 ~05:40Z (VM `/tmp/convex_v18.log`, 6000 M5 bars, gate=v18 =
+the real live config, 1275 accepted / derive 738 / validate 537):
+
+| combo | derive net (PF) | validate net (PF) | WR% | $/day (val) |
+|---|---|---|---|---|
+| **LADDER-BASELINE (= what the system actually runs)** | **-194.90 (0.39)** | **-91.87 (0.47)** | 44.3 | **-86** |
+| PLAIN-TP (reference) | -253.89 (0.67) | -10.52 (0.98) | 42.6 | -10 |
+| convex arm1.0 gb3.0 h48 | -231.48 (0.71) | **+95.20 (1.19)** | 32.6 | +89 |
+| convex arm2.0 gb3.0 h24 | -275.59 (0.64) | **+95.00 (1.21)** | 38.5 | +89 |
+
+**What this settles:**
+
+1. **The wrong-gate error did NOT change the verdict.** v18 ladder PF **0.39 / 0.47**
+   vs the retracted v17 figures 0.38 / 0.44 — materially identical. **The live
+   system is certified catastrophic at its REAL config**: -91.87R on validate
+   (≈ **-$86/day**), WR 44.3%. This is now a fact, not a retracted claim.
+2. **NOTHING passes both segments.** Every convex combo is derive-negative.
+3. **The ladder is the BEST exit in the crash (derive) and the WORST in the flat
+   market (validate)** — ladder -194.90 vs convex -231/-275 on derive; ladder
+   -91.87 vs convex **+95.20** on validate. Coherent mechanism: cutting fast
+   protects in a crash and bleeds in chop. **Same shape on all four gates
+   (v17 / v17-mission / v18 / none) — this is structural, not gate-specific.**
+4. **In the CURRENT regime (flat — validate is the last 12.8 days and XAU is
+   still ~4034), swapping the ladder for convex is a ~+187R swing** (-91.87 →
+   +95.20). But that is a **regime bet, not an edge** — a crash flips it.
+5. **Even a perfect regime-switched exit doesn't save the year:** best-derive
+   (ladder -194.90) + best-validate (convex +95.20) = **-99.70 net**. The crash
+   month is unsalvageable *by exits alone*.
+
+**The two diseases are now separable and they are different per regime:**
+- **derive (XAU -467 pts) is killed by the BUY side** (gate=none: buy -453 vs sell +332).
+- **validate (flat +4.8 pts) is killed by the LADDER** (-91.87 vs convex +95.20).
+→ A compound fix (don't buy into a downtrend + convex exit) is the first
+hypothesis that addresses both, but **each half is unproven at v18 and the
+compound has never been tested. Do not deploy it on this evidence.**
+
+---
+
+## 4b. How to re-run / extend (harness is sound)
 
 ```
 ssh VM; cd /opt/dexter_pro
