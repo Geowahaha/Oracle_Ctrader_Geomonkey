@@ -241,10 +241,13 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
              exit_kind: str, exit_params: dict, atr: float, max_hold: int,
              spread_abs: float, commission_r: float) -> tuple[str, float | None]:
     """One accepted signal under one (entry_model, exit) row. Returns
-    (status, r_net): "taken" (r_net counts), "skip" (degenerate risk), or a
+    (status, r_net, resolve_offset): "taken" (r_net counts), "skip", or a
     miss class ("miss_no_touch" limit/zone never reached; "miss_no_confirm"
     zone touched but no reversal bar; "miss_break" zone broken by a close
     beyond the SL -- the knife the break-check refused to catch).
+    ``resolve_offset`` = 0-based offset into ``future`` where the trade
+    resolved (None for misses/skips) -- the --no-overlap mode needs it to
+    model a single-position lane.
 
     R is measured against the TAKEN stop distance (market: the signal's own
     risk; limit: (1-dip_r) x risk; zone: |confirm close - original SL|),
@@ -252,64 +255,67 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
     side, entry, sl, future = trade["side"], trade["entry"], trade["sl"], trade["future"]
     risk1 = abs(entry - sl)
     if risk1 <= 0:
-        return "skip", None
+        return "skip", None, None
 
+    base_idx = 0
     if entry_model == "market":
         sim_entry, sim_sl, sim_future = entry, sl, future
     elif entry_model == "limit":
         status, fill_price, fill_idx = _limit_fill(side, entry, sl, future, dip_r, window_bars)
         if status == "miss":
-            return "miss_no_touch", None
+            return "miss_no_touch", None, None
         sim_entry, sim_sl = float(fill_price), sl
         new_risk = abs(sim_entry - sim_sl)
         if new_risk <= 0:
-            return "skip", None
+            return "skip", None, None
         cost = spread_abs / new_risk + commission_r
         if status == "filled_stopped":
-            return "taken", -1.0 - cost
-        sim_future = future[fill_idx + 1:]
+            return "taken", -1.0 - cost, fill_idx
+        base_idx = fill_idx + 1
+        sim_future = future[base_idx:]
     elif entry_model == "zone":  # touch + real-break check + reversal confirmation
         status, fill_price, fill_idx = _zone_confirm_entry(side, entry, sl, future,
                                                            dip_r, window_bars)
         if status != "filled":
-            return f"miss_{status}", None
+            return f"miss_{status}", None, None
         sim_entry, sim_sl = float(fill_price), sl
         if abs(sim_entry - sim_sl) <= 0:
-            return "skip", None
-        sim_future = future[fill_idx + 1:]
+            return "skip", None, None
+        base_idx = fill_idx + 1
+        sim_future = future[base_idx:]
     else:  # "zone_m1" -- M5 green-light zone, M1-resolution confirm + break check
         m1_future = trade.get("m1_future") or []
         if not m1_future:
-            return "miss_no_m1", None
+            return "miss_no_m1", None, None
         deadline = trade["close_epoch"] + window_bars * 300
         status, fill_price, fill_epoch = _zone_confirm_entry_m1(side, entry, sl, m1_future,
                                                                 dip_r, deadline)
         if status != "filled":
-            return f"miss_{status}", None
+            return f"miss_{status}", None, None
         sim_entry, sim_sl = float(fill_price), sl
         if abs(sim_entry - sim_sl) <= 0:
-            return "skip", None
+            return "skip", None, None
         sim_future, stopped = _m1_entry_to_m5_exit(side, sim_entry, sl, float(fill_epoch),
                                                    m1_future, future)
         if stopped:
             new_risk = abs(sim_entry - sim_sl)
-            return "taken", -1.0 - (spread_abs / new_risk + commission_r)
+            return "taken", -1.0 - (spread_abs / new_risk + commission_r), 0
 
     risk = abs(sim_entry - sim_sl)
     cost = spread_abs / risk + commission_r
     if exit_kind == "ladder":
-        _outcome, r, _held = _simulate_ladder(side, sim_entry, sim_sl, sim_future,
-                                              exit_params["rungs"], max_hold)
+        _outcome, r, held = _simulate_ladder(side, sim_entry, sim_sl, sim_future,
+                                             exit_params["rungs"], max_hold)
     elif exit_kind == "plain":
         # the signal's own TP price (VP's gate-winning posture was plain h48);
         # from a discounted entry the same TP level is simply further in R.
-        _outcome, r, _held = _simulate(side, sim_entry, sim_sl, float(trade["tp"]),
-                                       sim_future, max_hold)
+        _outcome, r, held = _simulate(side, sim_entry, sim_sl, float(trade["tp"]),
+                                      sim_future, max_hold)
     else:  # "convex"
-        _outcome, r, _held = _simulate_convex(side, sim_entry, sim_sl, sim_future,
-                                              exit_params["arm_at"], exit_params["giveback_atr"],
-                                              atr, max_hold)
-    return "taken", r - cost
+        _outcome, r, held = _simulate_convex(side, sim_entry, sim_sl, sim_future,
+                                             exit_params["arm_at"], exit_params["giveback_atr"],
+                                             atr, max_hold)
+    return "taken", r - cost, base_idx + max(0, int(held))
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +452,7 @@ def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
 
 def _score(trades: list[dict], entry_model: str, dip_r: float, window_bars: int,
            exit_kind: str, exit_params: dict, atr: float, max_hold: int,
-           spread_abs: float, commission_r: float) -> dict | None:
+           spread_abs: float, commission_r: float, no_overlap: bool = False) -> dict | None:
     """Score one row on one segment. Misses are counted PER CLASS and each
     class's counterfactual (market entry, SAME exit) is accumulated so both
     the limit rows' selection bias AND the zone rows' break-check savings
@@ -454,15 +460,20 @@ def _score(trades: list[dict], entry_model: str, dip_r: float, window_bars: int,
     if the break-check is doing its knife-refusal job)."""
     rs: list[float] = []
     miss_cf: dict[str, list[float]] = {"no_touch": [], "no_confirm": [], "break": []}
-    for t in trades:
-        status, r = _trade_r(t, entry_model, dip_r, window_bars, exit_kind, exit_params,
-                             atr, max_hold, spread_abs, commission_r)
+    busy_until = -1
+    for t in sorted(trades, key=lambda x: x.get("i", 0)):
+        if no_overlap and t.get("i", 0) < busy_until:
+            continue                    # single-position lane is still in a trade
+        status, r, resolve_off = _trade_r(t, entry_model, dip_r, window_bars, exit_kind,
+                                          exit_params, atr, max_hold, spread_abs, commission_r)
         if status == "taken" and r is not None:
             rs.append(r)
+            if no_overlap and resolve_off is not None:
+                busy_until = t.get("i", 0) + 1 + int(resolve_off)
         elif status.startswith("miss"):
             key = status.replace("miss_", "").replace("zone_", "") or "no_touch"
-            _s2, r_cf = _trade_r(t, "market", 0.0, 0, exit_kind, exit_params,
-                                 atr, max_hold, spread_abs, commission_r)
+            _s2, r_cf, _ro = _trade_r(t, "market", 0.0, 0, exit_kind, exit_params,
+                                      atr, max_hold, spread_abs, commission_r)
             if r_cf is not None:
                 miss_cf.setdefault(key, []).append(r_cf)
     if not rs:
@@ -535,6 +546,10 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--no-overlap", action="store_true",
+                    help="model a SINGLE-POSITION lane: a signal is skipped while a prior "
+                         "trade is still open -- the lane-realistic number (overlapping "
+                         "signals otherwise overstate one lane capture)")
     ap.add_argument("--base-risk-usd", type=float, default=12.0)
     ap.add_argument("--min-derive-trades", type=int, default=60)
     args = ap.parse_args()
@@ -719,9 +734,11 @@ def main() -> int:
             for e_label, e_model, dip, win in entries:
                 for x_label, x_kind, x_params, x_hold in exits:
                     d_sc = _score(derive_t, e_model, dip, win, x_kind, x_params, atr,
-                                  x_hold, args.spread_abs, args.commission_r)
+                                  x_hold, args.spread_abs, args.commission_r,
+                                  no_overlap=args.no_overlap)
                     v_sc = _score(validate_t, e_model, dip, win, x_kind, x_params, atr,
-                                  x_hold, args.spread_abs, args.commission_r)
+                                  x_hold, args.spread_abs, args.commission_r,
+                                  no_overlap=args.no_overlap)
                     label = f"{e_label} x {x_label}"
                     is_ref = dmode == "none" and e_model == "market" and x_kind == "ladder"
                     if is_ref and v_sc is not None:

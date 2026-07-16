@@ -104,7 +104,7 @@ def _limit_trade() -> dict:
 
 
 def test_trade_r_limit_ladder_hand_computed():
-    status, r = _trade_r(_limit_trade(), "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
+    status, r, _ro = _trade_r(_limit_trade(), "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
                          atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
     assert status == "taken"
     # r = 0.40 floor - costs; costs = 0.12/1.2 + 0.03 = 0.13 (NEW risk units)
@@ -114,7 +114,7 @@ def test_trade_r_limit_ladder_hand_computed():
 def test_trade_r_limit_same_bar_stop_is_minus_one_new_risk():
     t = _limit_trade()
     t["future"] = [_bar(1999.8, 2000.1, 1997.9, 1998.2)]
-    status, r = _trade_r(t, "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
+    status, r, _ro = _trade_r(t, "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
                          atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
     assert status == "taken"
     assert r == pytest.approx(-1.0 - 0.13)
@@ -124,14 +124,14 @@ def test_trade_r_limit_miss_returns_none():
     t = _limit_trade()
     t["future"] = [_bar(2000.0, 2000.5, 1999.5, 2000.3)]
     assert _trade_r(t, "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
-                    atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM) == ("miss_no_touch", None)
+                    atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM) == ("miss_no_touch", None, None)
 
 
 def test_trade_r_market_uses_original_risk():
     # market entry on the same trade: risk = 2.0, so the exit bar's peak_r =
     # (2000.5-2000)/2 = 0.25 on the FILL bar (counted for market) -> rung
     # (0.25, 0.02) arms; adverse (1999.0-2000)/2 = -0.5 <= 0.02 -> floor 0.02.
-    status, r = _trade_r(_limit_trade(), "market", 0.0, 0, "ladder", {"rungs": RUNGS},
+    status, r, _ro = _trade_r(_limit_trade(), "market", 0.0, 0, "ladder", {"rungs": RUNGS},
                          atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
     assert status == "taken"
     # costs in ORIGINAL risk units = 0.12/2 + 0.03 = 0.09
@@ -217,7 +217,7 @@ def test_trade_r_zone_ladder_hand_computed():
             _bar(1999.9, 2001.6, 1999.9, 2001.0),      # runner bar, exits at floor
         ],
     }
-    status, r = _trade_r(t, "zone", 0.4, 6, "ladder", {"rungs": RUNGS},
+    status, r, _ro = _trade_r(t, "zone", 0.4, 6, "ladder", {"rungs": RUNGS},
                          atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
     assert status == "taken"
     assert r == pytest.approx(0.40 - (SPREAD / 1.8 + COMM))
@@ -229,7 +229,7 @@ def test_trade_r_plain_exit_reaches_signal_tp():
         "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
         "future": [_bar(2000.2, 2004.5, 1999.9, 2004.0)],
     }
-    status, r = _trade_r(t, "market", 0.0, 0, "plain", {},
+    status, r, _ro = _trade_r(t, "market", 0.0, 0, "plain", {},
                          atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
     assert status == "taken"
     assert r == pytest.approx(2.0 - 0.09)
