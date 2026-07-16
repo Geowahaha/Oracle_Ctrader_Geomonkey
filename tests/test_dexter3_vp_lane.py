@@ -279,6 +279,68 @@ def test_make_limit_intent_prefer_signal_tp_keeps_structural_target(monkeypatch)
     assert vp["tp"] == pytest.approx(1999.2 + 12 * 1.2)       # VP far cap unchanged
 
 
+# ---------------------------------------------------------------------------
+# reversal-confirm entries (owner 2026-07-16: "เบรคและกลับตัวเท่านั้น ไม่รับมีด")
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_mode_env(monkeypatch):
+    monkeypatch.delenv(vp_lane.ENV_ENTRY_CONFIRM, raising=False)
+    assert vp_lane.confirm_mode() is None
+    monkeypatch.setenv(vp_lane.ENV_ENTRY_CONFIRM, "m1")
+    assert vp_lane.confirm_mode() == "m1"
+    monkeypatch.setenv(vp_lane.ENV_ENTRY_CONFIRM, "banana")
+    assert vp_lane.confirm_mode() is None
+
+
+def _confirm_intent() -> dict:
+    # buy signal 2000 sl 1998 -> level 1999.2 (dip 0.4), stop_pts 1.2
+    return {"symbol": "XAUUSD", "side": "buy", "level": 1999.2, "sl": 1998.0,
+            "signal_entry": 2000.0, "deadline_epoch": 9e9}
+
+
+def test_advance_confirm_fill_and_knife_refusal():
+    intent = _confirm_intent()
+    # bar 1: wick THROUGH the SL (1997.5) but closes back at 1998.6 -> the
+    # blind limit would be filled_stopped here; confirm mode survives it.
+    v, px = vp_lane.advance_confirm_intent(intent, [
+        _bar("2026-07-16T12:01:00Z", 1999.5, 1999.6, 1997.5, 1998.6)])
+    assert (v, px) == (None, None) and intent["confirm_touched"] is True
+    # bar 2: green close back above the level, discount intact -> FILL at close
+    v, px = vp_lane.advance_confirm_intent(intent, [
+        _bar("2026-07-16T12:02:00Z", 1998.7, 1999.5, 1998.4, 1999.4)])
+    assert v == "fill" and px == pytest.approx(1999.4)
+
+
+def test_advance_confirm_kills_on_close_beyond_sl():
+    intent = _confirm_intent()
+    v, _ = vp_lane.advance_confirm_intent(intent, [
+        _bar("2026-07-16T12:01:00Z", 1999.5, 1999.6, 1997.5, 1997.8)])
+    assert v == "killed"                       # knife refused, no trade at all
+
+
+def test_advance_confirm_never_reprocesses_bars():
+    intent = _confirm_intent()
+    bar = _bar("2026-07-16T12:01:00Z", 1999.3, 1999.9, 1999.1, 1999.8)  # touch+confirm
+    v, px = vp_lane.advance_confirm_intent(intent, [bar])
+    assert v == "fill" and px == pytest.approx(1999.8)
+    # same bar again (restart / repeated tick) -> already processed, no refill
+    assert vp_lane.advance_confirm_intent(intent, [bar]) == (None, None)
+
+
+def test_hunt_bias_skip_classifier(monkeypatch):
+    from dexter3.shadow_runner import _hunt_bias_is_counter
+
+    monkeypatch.setenv("DEXTER3_HUNT_BIAS_ANCHOR_HOUR", "0")
+    monkeypatch.setenv("DEXTER3_HUNT_BIAS_MIN_HOURS", "1")
+    prefix = [
+        _bar("2026-07-14T00:00:00Z", 100.0, 101.0, 99.5, 100.5),   # day open 100
+        _bar("2026-07-14T02:00:00Z", 100.0, 100.2, 98.8, 99.0),    # ต่ำเปิด 2h in
+    ]
+    assert _hunt_bias_is_counter(_FakeDecision(side="buy"), prefix) is True
+    assert _hunt_bias_is_counter(_FakeDecision(side="sell"), prefix) is False
+
+
 def test_om_ladder_untouched_when_env_absent(monkeypatch):
     from dexter3.basket_manager import BasketConfig
     from dexter3.opening_manager import OMConfig, OpeningManager

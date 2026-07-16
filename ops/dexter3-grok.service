@@ -59,7 +59,7 @@ Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
 # ported from the VP research (two-window proven on the shared hunt
 # producer). NO limit-entry here: that layer was proven against ladder/convex
 # exits only — grok's scalp small-lock exits were never measured with it.
-Environment=DEXTER3_HUNT_DAYOPEN_BIAS=downsize
+Environment=DEXTER3_HUNT_DAYOPEN_BIAS=skip
 Environment=DEXTER3_HUNT_BIAS_ANCHOR_HOUR=0
 Environment=DEXTER3_HUNT_BIAS_MIN_HOURS=1
 Environment=DEXTER3_HUNT_BIAS_DOWNSIZE_MULT=0.25

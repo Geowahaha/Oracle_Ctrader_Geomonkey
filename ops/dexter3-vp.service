@@ -53,6 +53,8 @@ Environment=DEXTER3_VP_BIAS_MIN_HOURS=1
 Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
 Environment=DEXTER3_VP_LIMIT_DIP_R=0.4
 Environment=DEXTER3_VP_LIMIT_TTL_MIN=30
+# owner 2026-07-16: reversal-confirm entries ONLY (zone-M1, 3-window survivor)
+Environment=DEXTER3_ENTRY_CONFIRM=m1
 Environment=DEXTER3_VP_FAR_TP_R=12
 Environment=DEXTER3_OM_TRAIL_MODE=convex
 Environment=DEXTER3_OM_CONVEX_ARM_R=1.0

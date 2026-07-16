@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 # -- env keys (single source of truth) ---------------------------------------
+ENV_ENTRY_CONFIRM = "DEXTER3_ENTRY_CONFIRM"            # off|m1|m5: reversal-confirm entries
 ENV_BIAS_ENABLED = "DEXTER3_VP_DAYOPEN_BIAS"           # "1" -> gate active
 ENV_BIAS_ANCHOR_HOUR = "DEXTER3_VP_BIAS_ANCHOR_HOUR"   # UTC hour, default 0
 ENV_BIAS_MIN_HOURS = "DEXTER3_VP_BIAS_MIN_HOURS"       # default 1.0
@@ -248,6 +249,67 @@ def make_limit_intent(decision: Any, m5_prefix: list, risk_usd: float,
     }
 
 
+def confirm_mode() -> str | None:
+    """off (None) | "m1" | "m5" — owner order 2026-07-16 ("กรองต่อ M5 M1
+    เบรคและกลับตัวเท่านั้น ไม่รับมีด"): when set, a pending intent NEVER fills
+    on a bare touch (the blind limit catches every falling knife by
+    construction); it fills only on a CONFIRMED reversal close on the
+    confirm timeframe, and a close beyond the structural SL KILLS the setup
+    with no trade at all. Live twin of the replay's zone-confirm /
+    zone-M1 entries (3-window survivors on the VP producer)."""
+    raw = os.environ.get(ENV_ENTRY_CONFIRM, "").strip().lower()
+    return raw if raw in ("m1", "m5") else None
+
+
+def advance_confirm_intent(intent: dict[str, Any], closed_bars: list
+                           ) -> tuple[str | None, float | None]:
+    """Drive one pending intent through the zone-confirm state machine using
+    newly CLOSED confirm-TF bars (ascending). Bar-for-bar identical to the
+    replay's ``_zone_confirm_entry`` / ``_zone_confirm_entry_m1``:
+      * touch: bar range reaches the level;
+      * REAL-BREAK KILL: a bar CLOSE beyond the structural SL -> ("killed",
+        None) — the knife is refused outright; a WICK beyond the SL without
+        such a close is survived (no position exists yet);
+      * REVERSAL FILL: at/after the touch, the first bar closing back in the
+        entry direction beyond the level while the discount vs the signal
+        entry is still intact -> ("fill", that close).
+    Mutates ``intent`` (confirm_touched / confirm_last_ts) so restarts and
+    repeated ticks never re-process a bar. Returns (None, None) to keep
+    waiting."""
+    side = str(intent.get("side"))
+    level = _f(intent.get("level"))
+    sl = _f(intent.get("sl"))
+    signal_entry = _f(intent.get("signal_entry"))
+    touched = bool(intent.get("confirm_touched"))
+    last_ts = str(intent.get("confirm_last_ts") or "")
+    for b in closed_bars:
+        ts = str(b.get("ts") or "")
+        if not ts or ts <= last_ts:
+            continue
+        intent["confirm_last_ts"] = ts
+        o = _f(b.get("open"))
+        c = _f(b.get("close"))
+        hi = _f(b.get("high"))
+        lo = _f(b.get("low"))
+        if side == "buy":
+            if c <= sl:
+                return "killed", None
+            if not touched and lo <= level:
+                touched = True
+                intent["confirm_touched"] = True
+            if touched and c > o and c > level and c < signal_entry:
+                return "fill", c
+        else:
+            if c >= sl:
+                return "killed", None
+            if not touched and hi >= level:
+                touched = True
+                intent["confirm_touched"] = True
+            if touched and c < o and c < level and c > signal_entry:
+                return "fill", c
+    return None, None
+
+
 def check_intent_fill(intent: dict[str, Any], bid: float, ask: float,
                       now_iso: str) -> str | None:
     """"fill" when the touch-side quote reaches the level (buy fills when the
@@ -262,17 +324,19 @@ def check_intent_fill(intent: dict[str, Any], bid: float, ask: float,
     return "fill" if (bid > 0 and bid >= level) else None
 
 
-def intent_to_decision(intent: dict[str, Any], decision_cls: Any, now_iso: str) -> Any:
+def intent_to_decision(intent: dict[str, Any], decision_cls: Any, now_iso: str,
+                       entry_px: float | None = None) -> Any:
     """Materialize the executor-facing Decision at FILL time: entry = the
-    level (the executor computes stop pips from entry-sl, so the placed
-    SL/TP land at the intent's absolute prices within one quote of drift)."""
+    level (touch fills) or the CONFIRM close (reversal-confirmed fills, via
+    ``entry_px``) — the executor computes stop pips from entry-sl, so the
+    placed SL/TP land at the filled geometry within one quote of drift."""
     return decision_cls(
         ts_close=now_iso,
         symbol=str(intent.get("symbol")),
         action="enter",
         side=str(intent.get("side")),
         entry_type="market",
-        entry=_f(intent.get("level")),
+        entry=_f(entry_px) if entry_px is not None else _f(intent.get("level")),
         sl=_f(intent.get("sl")),
         tp=_f(intent.get("tp")),
         size_class="small",

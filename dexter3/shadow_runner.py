@@ -1798,6 +1798,17 @@ def run_symbol_cycle(
                     if quality.get("allow", True):
                         if _vp_producer_enabled():
                             quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
+                        elif (
+                            os.environ.get("DEXTER3_HUNT_DAYOPEN_BIAS", "").strip().lower() == "skip"
+                            and _hunt_bias_is_counter(decision, prefix)
+                        ):
+                            # owner order 2026-07-16 (option A, overriding the
+                            # old no-hard-blockers rule): counter-bias hunt
+                            # entries are BLOCKED outright — the exact filter
+                            # the two-window proof measured. ต่ำเปิดห้าม buy.
+                            quality = {"allow": False, "reason": "hunt_dayopen_bias",
+                                       "a_plus": False, "a_plus_reason": "",
+                                       "cooldown_bypassed": False, "features": {}}
                         elif vp_lane.in_no_trade_window(
                             utc_now_iso(), os.environ.get("DEXTER3_HUNT_NO_TRADE_UTC", "")
                         ):
@@ -2083,6 +2094,29 @@ def _maybe_alert_account_guard(client: Any, result: dict[str, Any] | None) -> bo
         return False
 
 
+def _hunt_bias_is_counter(
+    decision: hunter_brain.Decision, m5_prefix: list[dict[str, Any]]
+) -> bool:
+    """True when the decision's side runs AGAINST an established day-open
+    bias (shared classification for both the skip and downsize modes).
+    Always journals onto decision.features; never raises (fail-open)."""
+    try:
+        anchor_hour = int(_env_float("DEXTER3_HUNT_BIAS_ANCHOR_HOUR", 0))
+        min_hours = _env_float("DEXTER3_HUNT_BIAS_MIN_HOURS", 1.0)
+        bias, hours = vp_lane.dayopen_bias(m5_prefix, anchor_hour)
+        counter = (
+            bias != 0 and hours >= min_hours
+            and ((str(decision.side) == "buy") != (bias > 0))
+        )
+        if isinstance(decision.features, dict):
+            decision.features["hunt_dayopen_bias"] = {
+                "bias": bias, "hours": round(hours, 2), "counter": counter,
+            }
+        return counter
+    except Exception:
+        return False
+
+
 def _apply_hunt_dayopen_bias(
     decision: hunter_brain.Decision, m5_prefix: list[dict[str, Any]], risk_usd: float
 ) -> float:
@@ -2097,19 +2131,10 @@ def _apply_hunt_dayopen_bias(
     if os.environ.get("DEXTER3_HUNT_DAYOPEN_BIAS", "").strip().lower() != "downsize":
         return risk_usd
     try:
-        anchor_hour = int(_env_float("DEXTER3_HUNT_BIAS_ANCHOR_HOUR", 0))
-        min_hours = _env_float("DEXTER3_HUNT_BIAS_MIN_HOURS", 1.0)
         mult = _env_float("DEXTER3_HUNT_BIAS_DOWNSIZE_MULT", 0.25)
-        bias, hours = vp_lane.dayopen_bias(m5_prefix, anchor_hour)
-        counter = (
-            bias != 0 and hours >= min_hours
-            and ((str(decision.side) == "buy") != (bias > 0))
-        )
-        if isinstance(decision.features, dict):
-            decision.features["hunt_dayopen_bias"] = {
-                "bias": bias, "hours": round(hours, 2), "counter": counter,
-                "mult": mult if counter else 1.0,
-            }
+        counter = _hunt_bias_is_counter(decision, m5_prefix)
+        if isinstance(decision.features, dict) and "hunt_dayopen_bias" in decision.features:
+            decision.features["hunt_dayopen_bias"]["mult"] = mult if counter else 1.0
         return risk_usd * mult if counter else risk_usd
     except Exception:
         return risk_usd
@@ -2153,25 +2178,59 @@ def _service_vp_limit_intent(
     intent = state.get("vp_limit_intent")
     if not isinstance(intent, dict) or str(intent.get("symbol")) != symbol:
         return None
-    try:
-        spot = mcp.get_spot_price(symbol)
-    except Exception as exc:
-        log_line(f"{utc_now_iso()} {symbol} vp_intent_spot_read_failed: {exc}")
-        return None
-    bid = _f(spot.get("bid"), 0.0)
-    ask = _f(spot.get("ask"), 0.0)
-    verdict = vp_lane.check_intent_fill(intent, bid=bid, ask=ask, now_iso=utc_now_iso())
-    if verdict == "expired":
-        state.pop("vp_limit_intent", None)
-        log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
-                 f"side={intent.get('side')}")
-        save_shadow_state(state)
-        return None
-    if verdict != "fill":
-        return None
+    fill_px: float | None = None
+    confirm_tf = vp_lane.confirm_mode()
+    if confirm_tf:
+        # owner order 2026-07-16 ("เบรคและกลับตัวเท่านั้น ไม่รับมีด"): never
+        # fill on a bare touch — drive the zone-confirm state machine on
+        # CLOSED confirm-TF bars. A close beyond the structural SL kills the
+        # setup with NO trade (the knife the blind limit would have caught).
+        now_e = _iso_to_epoch(utc_now_iso())
+        if now_e > _f(intent.get("deadline_epoch")):
+            state.pop("vp_limit_intent", None)
+            log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
+                     f"side={intent.get('side')} confirm_tf={confirm_tf}")
+            save_shadow_state(state)
+            return None
+        tf_sec = 60 if confirm_tf == "m1" else 300
+        try:
+            bars = mcp.get_trendbars(symbol, confirm_tf, 8)
+        except Exception as exc:
+            log_line(f"{utc_now_iso()} {symbol} vp_intent_confirm_bars_failed: {exc}")
+            return None
+        closed = [b for b in bars if _iso_to_epoch(str(b.get("ts") or "")) + tf_sec <= now_e + 1]
+        verdict, fill_px = vp_lane.advance_confirm_intent(intent, closed)
+        if verdict == "killed":
+            state.pop("vp_limit_intent", None)
+            log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_killed_break level={intent.get('level')} "
+                     f"sl={intent.get('sl')} side={intent.get('side')} confirm_tf={confirm_tf}")
+            save_shadow_state(state)
+            return None
+        if verdict != "fill":
+            save_shadow_state(state)   # persist confirm_touched/confirm_last_ts
+            return None
+        touch_px = _f(fill_px)
+    else:
+        try:
+            spot = mcp.get_spot_price(symbol)
+        except Exception as exc:
+            log_line(f"{utc_now_iso()} {symbol} vp_intent_spot_read_failed: {exc}")
+            return None
+        bid = _f(spot.get("bid"), 0.0)
+        ask = _f(spot.get("ask"), 0.0)
+        verdict = vp_lane.check_intent_fill(intent, bid=bid, ask=ask, now_iso=utc_now_iso())
+        if verdict == "expired":
+            state.pop("vp_limit_intent", None)
+            log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
+                     f"side={intent.get('side')}")
+            save_shadow_state(state)
+            return None
+        if verdict != "fill":
+            return None
+        touch_px = ask if str(intent.get("side")) == "buy" else bid
     state.pop("vp_limit_intent", None)
-    decision = vp_lane.intent_to_decision(intent, hunter_brain.Decision, utc_now_iso())
-    touch_px = ask if str(intent.get("side")) == "buy" else bid
+    decision = vp_lane.intent_to_decision(intent, hunter_brain.Decision, utc_now_iso(),
+                                          entry_px=fill_px)
     daily = _daily_state(state)
     exec_result = _execute_live_entry(
         executor,
@@ -2186,11 +2245,12 @@ def _service_vp_limit_intent(
             # same cool-down clear a direct market fill performs
             state.pop("v16_entry_cooldown", None)
         # Stamp the convex-exit inputs for run_om_tick (atr measured at
-        # signal time, stop distance of the FILLED geometry). Inert for
-        # ladder lanes — only read when DEXTER3_OM_TRAIL_MODE=convex.
+        # signal time, stop distance of the FILLED geometry — the confirm
+        # close for reversal-confirmed fills, the level for touch fills).
+        # Inert for ladder lanes — only read when DEXTER3_OM_TRAIL_MODE=convex.
         state["vp_convex"] = {
             "atr_pts": _f(intent.get("atr_pts"), 0.0),
-            "stop_pts": _f(intent.get("stop_pts"), 0.0),
+            "stop_pts": abs(_f(decision.entry) - _f(decision.sl)) or _f(intent.get("stop_pts"), 0.0),
         }
     log_line(
         f"{utc_now_iso()} {symbol} vp_limit_intent_{exec_result.get('action', 'unknown')} "
