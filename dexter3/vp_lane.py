@@ -246,6 +246,12 @@ def make_limit_intent(decision: Any, m5_prefix: list, risk_usd: float,
         "deadline_epoch": now_e + ttl_min * 60.0,
         "atr_pts": round(mean_true_range(m5_prefix), 4),
         "stop_pts": round(stop_pts, 5),
+        # replay parity (caught live 2026-07-16 16:10Z on the VP lane's first
+        # fill): the confirm state machine must only see bars CLOSED AFTER
+        # the intent exists — the replay's zone entry walks future bars only.
+        # Seeding confirm_last_ts with the signal close ts makes
+        # advance_confirm_intent skip every earlier bar.
+        "confirm_last_ts": str(decision.ts_close or now_iso),
     }
 
 

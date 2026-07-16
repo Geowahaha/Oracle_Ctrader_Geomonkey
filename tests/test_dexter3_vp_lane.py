@@ -356,3 +356,18 @@ def test_om_ladder_untouched_when_env_absent(monkeypatch):
     assert act["action"] == "close_all"
     assert act["reason"] == "ladder_floor"
     assert act["reason"] != "convex_trail"
+
+
+def test_confirm_ignores_bars_before_signal(monkeypatch):
+    """Replay parity (live catch 2026-07-16): M1 bars that closed BEFORE the
+    intent existed must never touch/confirm it."""
+    monkeypatch.setenv(vp_lane.ENV_LIMIT_DIP_R, "0.4")
+    d = _FakeDecision(ts_close="2026-07-16T16:10:00Z")
+    intent = vp_lane.make_limit_intent(d, [], 4.0, "2026-07-16T16:10:00Z")
+    # a perfect touch+confirm bar -- but from BEFORE the signal close
+    early = _bar("2026-07-16T16:08:00Z", 1999.3, 1999.9, 1999.1, 1999.8)
+    assert vp_lane.advance_confirm_intent(intent, [early]) == (None, None)
+    # the same shape AFTER the signal close fills normally
+    late = _bar("2026-07-16T16:11:00Z", 1999.3, 1999.9, 1999.1, 1999.8)
+    v, px = vp_lane.advance_confirm_intent(intent, [late])
+    assert v == "fill" and px == pytest.approx(1999.8)
