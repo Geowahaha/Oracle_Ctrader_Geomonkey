@@ -1698,10 +1698,28 @@ def run_symbol_cycle(
         # -- decision source routing -----------------------------------------
         basket_action: dict[str, Any] | None = None
         if is_newest and executor is not None and lane:
-            # BASKET ACTIVE → this bar's action is campaign management
-            decision, basket_action = _manage_lane_basket(
-                executor, symbol, bar_ts, prefix, lane, state, spread_abs
-            )
+            if vp_lane.trail_mode():
+                # convex/plain trail lanes (vp/daytrend, 2026-07-16): the OM
+                # fast tick + broker SL/TP + caps are the ONLY exits the
+                # proofs measured. The hunt-era M5 campaign brain
+                # (_manage_lane_basket: close_all_in_profit on level_lost,
+                # repair legs, resolve targets) closed the VP lane's FIRST
+                # live position at +1.71R via level_lost 16:15Z — profitable
+                # that time, but an unproven second exit brain. HOLD only.
+                decision = hunter_brain.Decision(
+                    ts_close=utc_now_iso(), symbol=symbol, action="manage",
+                    side=None, entry_type=None, entry=None, sl=None, tp=None,
+                    size_class="small", leader_score=0.0, p_win_est=0.0,
+                    setup="basket_hold",
+                    reasons=[f"trail_mode={vp_lane.trail_mode()}: campaign brain deferred "
+                             "(OM trail + broker SL/TP + caps are the only exits)"],
+                    session="", features={},
+                )
+            else:
+                # BASKET ACTIVE → this bar's action is campaign management
+                decision, basket_action = _manage_lane_basket(
+                    executor, symbol, bar_ts, prefix, lane, state, spread_abs
+                )
         elif is_newest and _daytrend_producer_enabled():
             # DAYTREND lane (owner deploy 2026-07-16) — with-the-day pullback
             # continuation; evidence + parity notes in dexter3/daytrend.py.
