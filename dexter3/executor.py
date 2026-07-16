@@ -190,6 +190,26 @@ DEFAULT_DEMO_TRADER_IDS = (9922808, 3555162, 46670728)
 # ``Dexter3Executor._account_open_risk_cap_refusal``.
 DEFAULT_ACCOUNT_MAX_OPEN_RISK_USD = 40.0
 
+# Twin-entry cross-lane duplicate guard (2026-07-15 17:04Z-00:54Z live audit,
+# docs/AGENT_SYNC_BOARD.md): both the fable and grok lanes run the SAME
+# producer (decide_hunt) over the SAME bars, so they can fire near-identical
+# trades on the same symbol+side within seconds/minutes of each other with
+# zero diversification (net -34.00 / 19 trades that window; e.g. 18:40Z buy
+# hunt_swing_structure sl_dist=10.35 + 18:45Z buy hunt_swing_structure
+# sl_dist=7.31, both full-SL losses; 19:05Z both lanes buy
+# hunt_sweep_reclaim with IDENTICAL sl_dist=4.65). Env
+# ``DEXTER3_CROSS_LANE_DEDUP``: "off" (default -- byte-identical pre-fix
+# behavior) | "skip" (refuse the duplicate entry, same refusal shape as
+# every other pre-flight gate) | "downsize" (place it anyway at
+# ``DEXTER3_CROSS_LANE_DEDUP_MULT`` x risk instead of refusing outright).
+# Any unrecognized value collapses to "off" -- an operator typo must never
+# silently start gating/downsizing live entries.
+DEXTER3_CROSS_LANE_DEDUP_ENV = "DEXTER3_CROSS_LANE_DEDUP"
+DEXTER3_CROSS_LANE_DEDUP_WINDOW_MIN_ENV = "DEXTER3_CROSS_LANE_DEDUP_WINDOW_MIN"
+DEXTER3_CROSS_LANE_DEDUP_MULT_ENV = "DEXTER3_CROSS_LANE_DEDUP_MULT"
+DEFAULT_CROSS_LANE_DEDUP_WINDOW_MIN = 30.0
+DEFAULT_CROSS_LANE_DEDUP_MULT = 0.5
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -460,6 +480,31 @@ def _to_pips(distance: float, pip_size: float) -> int:
     return max(1, int(round(abs(float(distance)) / max(float(pip_size), 1e-9))))
 
 
+# -- cross-lane duplicate-entry guard: env readers --------------------------
+
+
+def _cross_lane_dedup_mode() -> str:
+    """"off" (default) | "skip" | "downsize". Anything else -> "off"."""
+    raw = str(os.environ.get(DEXTER3_CROSS_LANE_DEDUP_ENV, "off") or "off").strip().lower()
+    return raw if raw in ("off", "skip", "downsize") else "off"
+
+
+def _cross_lane_dedup_window_min() -> float:
+    try:
+        raw = os.environ.get(DEXTER3_CROSS_LANE_DEDUP_WINDOW_MIN_ENV, "")
+        return float(raw) if raw.strip() else DEFAULT_CROSS_LANE_DEDUP_WINDOW_MIN
+    except ValueError:
+        return DEFAULT_CROSS_LANE_DEDUP_WINDOW_MIN
+
+
+def _cross_lane_dedup_mult() -> float:
+    try:
+        raw = os.environ.get(DEXTER3_CROSS_LANE_DEDUP_MULT_ENV, "")
+        return float(raw) if raw.strip() else DEFAULT_CROSS_LANE_DEDUP_MULT
+    except ValueError:
+        return DEFAULT_CROSS_LANE_DEDUP_MULT
+
+
 class Dexter3Executor:
     """Places/manages LIVE micro-entries for Dexter3 decisions (demo only)."""
 
@@ -634,6 +679,23 @@ class Dexter3Executor:
                 open_position_ids=[position_id_of(p) for p in our_open],
             )
 
+        # Cross-lane duplicate-entry guard (2026-07-15 twin-entry audit): only
+        # the "skip" mode refuses here -- "downsize" is a sizing adjustment,
+        # not a refusal, and is applied later in execute_entry (after
+        # sizing's own inputs are available); "off" (default) never even
+        # calls the matcher, byte-identical to pre-fix behavior.
+        if _cross_lane_dedup_mode() == "skip":
+            cross_lane_dup = self._cross_lane_duplicate_match(symbol, side, open_positions)
+            if cross_lane_dup is not None:
+                return self._refuse(
+                    symbol,
+                    "cross_lane_duplicate",
+                    foreign_position_id=position_id_of(cross_lane_dup),
+                    foreign_label=position_label_of(cross_lane_dup),
+                    side=side,
+                    window_min=_cross_lane_dedup_window_min(),
+                )
+
         if today_entry_count >= self.config.max_live_entries_per_day:
             return self._refuse(
                 symbol,
@@ -727,6 +789,60 @@ class Dexter3Executor:
             self._journal(
                 symbol,
                 "account_open_risk_gate_failed",
+                payload={"error": str(exc), "note": "fail-open — entry proceeds ungated by this check"},
+            )
+            return None
+
+    def _cross_lane_duplicate_match(
+        self, symbol: str, side: str, open_positions: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """First OPEN position belonging to a DIFFERENT dexter3 lane (label
+        starts with "dexter3" but is NOT our own family — an own-family
+        duplicate is the existing ``duplicate_label_position_open`` gate's
+        job, never this one's) on the SAME symbol, in the SAME side, opened
+        within ``DEXTER3_CROSS_LANE_DEDUP_WINDOW_MIN`` minutes of now.
+
+        Reads open time via ``basket_live._position_open_ts``'s own
+        key-fallback chain (openTime/openTimestamp/open_ts/openedAt/ts —
+        the exact shape ``dexter3.openapi_client._normalize_position_for_dexter3``
+        emits) and ``basket_live._age_minutes`` for the ISO-epoch diff — the
+        SAME helpers the basket engine already uses for basket age, no new
+        parsing logic duplicated here. Missing/unparseable open-time is
+        treated as WITHIN the window (conservative: the position IS
+        currently open, so silently excluding it on a missing timestamp
+        could hide a live twin entry).
+
+        Fail-open on any exception (consistent with this file's other
+        optional gates, e.g. ``_account_open_risk_cap_refusal``) — a bug in
+        this check must never block an entry the rest of the pipeline
+        already approved.
+        """
+        try:
+            from dexter3.basket_live import _age_minutes, _position_open_ts
+
+            window_min = _cross_lane_dedup_window_min()
+            now_iso = utc_now_iso()
+            for pos in open_positions or []:
+                if not isinstance(pos, dict):
+                    continue
+                if position_symbol_of(pos) != symbol:
+                    continue
+                label = position_label_of(pos)
+                if not label.startswith("dexter3"):
+                    continue
+                if is_our_position(pos):
+                    continue  # own family -- the duplicate_label_position_open gate's job
+                if position_side_of(pos) != side:
+                    continue
+                age_min = _age_minutes(_position_open_ts(pos), now_iso)
+                if age_min is not None and age_min > window_min:
+                    continue  # stale -- outside the dedup window
+                return pos
+            return None
+        except Exception as exc:  # noqa: BLE001 - fail-open: a gate bug must never block an approved entry
+            self._journal(
+                symbol,
+                "cross_lane_dedup_gate_failed",
                 payload={"error": str(exc), "note": "fail-open — entry proceeds ungated by this check"},
             )
             return None
@@ -852,6 +968,29 @@ class Dexter3Executor:
             broker_sl_distance = sl_distance
 
         risk_usd = self.config.risk_usd if risk_usd_override is None else float(risk_usd_override)
+        # Cross-lane duplicate-entry guard, "downsize" mode (2026-07-15
+        # twin-entry audit): halve (or DEXTER3_CROSS_LANE_DEDUP_MULT x) this
+        # entry's risk when a foreign-lane duplicate is open, instead of
+        # refusing outright -- see _pre_flight's "skip" branch for the
+        # refusal counterpart. "off"/"skip" never reach here with a
+        # multiplier != 1.0 (mode check below short-circuits for both).
+        if _cross_lane_dedup_mode() == "downsize":
+            cross_lane_dup = self._cross_lane_duplicate_match(symbol, side, open_positions)
+            if cross_lane_dup is not None:
+                mult = _cross_lane_dedup_mult()
+                downsized_risk_usd = risk_usd * mult
+                self._journal(
+                    symbol,
+                    "cross_lane_dedup_downsized",
+                    payload={
+                        "foreign_position_id": position_id_of(cross_lane_dup),
+                        "foreign_label": position_label_of(cross_lane_dup),
+                        "mult": mult,
+                        "base_risk_usd": risk_usd,
+                        "downsized_risk_usd": round(downsized_risk_usd, 6),
+                    },
+                )
+                risk_usd = downsized_risk_usd
         volume, volume_meta = planned_volume_units(
             symbol_details, broker_sl_distance, risk_usd, self.config.max_volume_units
         )

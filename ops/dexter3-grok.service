@@ -50,6 +50,11 @@ Environment=DEXTER3_PULLBACK_ENABLED=1
 # VM-intentional (post-cutover): shadow observers + weekend safety
 Environment=DEXTER3_PA_EYE=shadow
 Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+# 2026-07-16 twin-entry plug (see fable unit's note): grok shares fable's
+# producer, so its entries duplicated fable's same-side risk within minutes.
+# DOWNSIZE not skip — owner rule: no hard blockers on demo; grok keeps trading
+# (its own A/B sample stays valid), at half risk when it is the follower.
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok
 
 [Install]

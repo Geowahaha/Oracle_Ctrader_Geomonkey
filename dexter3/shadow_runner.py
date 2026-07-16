@@ -2604,8 +2604,55 @@ def _rsh_position_sl(p: dict[str, Any]) -> float:
     return _f(p.get("stopLoss", p.get("stopLossPrice", 0.0)))
 
 
+def _rsh_position_volume(p: dict[str, Any]) -> float:
+    for key in ("volumeInUnits", "volume", "volumeUnits"):
+        try:
+            value = float(p.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
 def _rsh_opposite(side: str) -> str:
     return "sell" if side == "buy" else "buy"
+
+
+# -- multi-leg shadow observation (DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE) --
+# 2026-07-16: the harvester's single-leg-only episode-open requirement
+# starves it of shadow data whenever the basket's own repair-leg engine has
+# already added a second leg BEFORE aggregate_r reaches -trigger_r (the
+# normal, expected case for a basket that eventually becomes multi-leg) --
+# every one of those baskets was silently skipped (``rsh_skip_multileg``,
+# never even observed). This flag lets a SHADOW-only episode open on a
+# multi-leg basket using its NET direction instead of a single parent leg;
+# see ``_maybe_open_multileg_shadow_episode``. Default 0 (off, byte-identical
+# legacy skip behavior).
+
+
+def _repair_harvest_multileg_observe_enabled() -> bool:
+    raw = str(os.environ.get("DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE", "0") or "0").strip()
+    return raw == "1"
+
+
+def _rsh_basket_net_direction(lane: list[dict[str, Any]]) -> tuple[str | None, float]:
+    """Net directional bias of a MULTI-leg basket: sum of signed leg volumes
+    (buy legs positive, sell legs negative). A flat/tied net (exactly 0.0) is
+    directionless -- returns (None, 0.0), never guessed as buy or sell."""
+    net = 0.0
+    for p in lane:
+        side = _rsh_position_side(p)
+        vol = _rsh_position_volume(p)
+        if side == "buy":
+            net += vol
+        elif side == "sell":
+            net -= vol
+    if net > 0:
+        return "buy", round(net, 8)
+    if net < 0:
+        return "sell", round(net, 8)
+    return None, 0.0
 
 
 def _shadow_scalp_bar_outcome(
@@ -2685,6 +2732,17 @@ def _maybe_open_repair_harvest_episode(
         return
     if n > 1:
         ids = sorted(_rsh_position_id(p) for p in lane)
+        # DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE=1 (default 0, off):
+        # unblock SHADOW-only data collection on a multi-leg basket instead
+        # of starving forever on the single-leg requirement below. Mode is
+        # re-checked here (never trusted from the caller) so this can NEVER
+        # take effect in "live" mode -- see _maybe_open_multileg_shadow_episode's
+        # own belt-and-suspenders guard for the second, independent check.
+        if _repair_harvest_multileg_observe_enabled():
+            mode = _repair_harvest_mode_from_env()
+            if mode == "shadow":
+                _maybe_open_multileg_shadow_episode(journal, state, symbol, lane, ids, cfg, base_risk_usd, mode)
+                return
         warned = state.setdefault("repair_harvest_multileg_warned", {})
         if warned.get(symbol) != ids:
             warned[symbol] = ids
@@ -2741,6 +2799,107 @@ def _maybe_open_repair_harvest_episode(
     log_line(
         f"{utc_now_iso()} {symbol} rsh_episode_opened parent={parent_pid} side={parent_side} "
         f"aggregate_r={aggregate_r:.4f} mode={mode}"
+    )
+
+
+def _maybe_open_multileg_shadow_episode(
+    journal: DecisionJournal,
+    state: dict[str, Any],
+    symbol: str,
+    lane: list[dict[str, Any]],
+    ids: list[int],
+    cfg: RepairHarvestConfig,
+    base_risk_usd: float,
+    mode: str,
+) -> None:
+    """MULTILEG SHADOW OBSERVATION (``DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE=1``,
+    shadow mode ONLY): a trapped multi-leg basket may still open a SHADOW
+    episode using the basket's NET direction (sum of signed leg volumes)
+    instead of requiring a single parent leg. Purpose: unblock shadow data
+    collection for baskets the harvester currently starves on forever
+    (2026-07-16 observation: the basket's own repair-leg engine routinely
+    adds a second leg on structural evidence BEFORE aggregate_r reaches
+    -trigger_r, so the single-leg episode-open requirement never fires).
+
+    Second, independent guard (belt-and-suspenders on top of the caller's
+    own ``mode == "shadow"`` check): this function refuses to open anything
+    unless ``mode == "shadow"`` -- a future refactor of the caller cannot
+    silently start live multi-leg episodes by accident.
+    """
+    if mode != "shadow":
+        journal.insert_basket_event(
+            0,
+            "rsh_multileg_observe_blocked_non_shadow",
+            {"symbol": symbol, "mode": mode, "legs": len(lane), "position_ids": ids},
+            label=_active_order_label(),
+        )
+        return
+
+    net_side, net_volume = _rsh_basket_net_direction(lane)
+    if net_side is None:
+        warned = state.setdefault("repair_harvest_flat_net_warned", {})
+        if warned.get(symbol) != ids:
+            warned[symbol] = ids
+            journal.insert_basket_event(
+                0,
+                "rsh_skip_flat_net",
+                {"symbol": symbol, "legs": len(lane), "position_ids": ids},
+                label=_active_order_label(),
+            )
+        return
+
+    agg = basket_live.aggregate_lane(lane, base_risk_usd=base_risk_usd)
+    if bool(agg.get("unreliable")):
+        return  # fail-closed -- never harvest on an unreliable pnl snapshot
+    aggregate_r = _f(agg.get("aggregate_r"), 0.0)
+    if aggregate_r > -abs(cfg.trigger_r):
+        return  # not trapped yet
+
+    # Representative "parent" entry/sl for scalp sizing: the oldest leg on
+    # the net side (closest analog to the single-leg "parent" -- never a
+    # synthetic/invented position). Falls back to the basket's first leg
+    # only if, degenerately, no leg actually matches the net side (shouldn't
+    # happen given net_side is derived FROM these same legs' signed volumes).
+    same_side_legs = [p for p in lane if _rsh_position_side(p) == net_side]
+    reference_leg = same_side_legs[0] if same_side_legs else lane[0]
+
+    episode = {
+        "parent_position_id": _rsh_position_id(reference_leg),
+        "parent_position_ids": list(ids),
+        "is_multileg_shadow": True,
+        "parent_side": net_side,
+        "parent_entry": _rsh_position_entry(reference_leg),
+        "parent_sl": _rsh_position_sl(reference_leg),
+        "started_ts": utc_now_iso(),
+        "trigger_r_at_open": round(aggregate_r, 4),
+        "mode": "shadow",
+        "cum_scalp_r": 0.0,
+        "scalps": [],
+        "open_scalp": None,
+        "last_m5_close_ts": None,
+        "loss_stopped": False,
+        "net_volume_at_open": net_volume,
+    }
+    state.setdefault("repair_harvest", {})[symbol] = episode
+    journal.insert_basket_event(
+        0,
+        "rsh_episode_opened",
+        {
+            "symbol": symbol,
+            "parent_position_id": episode["parent_position_id"],
+            "parent_position_ids": list(ids),
+            "parent_side": net_side,
+            "aggregate_r": round(aggregate_r, 4),
+            "trigger_r": cfg.trigger_r,
+            "mode": "shadow",
+            "multileg_shadow": True,
+            "net_volume": net_volume,
+        },
+        label=_active_order_label(),
+    )
+    log_line(
+        f"{utc_now_iso()} {symbol} rsh_episode_opened(multileg_shadow) parent_ids={ids} side={net_side} "
+        f"aggregate_r={aggregate_r:.4f} net_volume={net_volume:.4f}"
     )
 
 
@@ -3193,12 +3352,25 @@ def _run_repair_harvest_tick(
         if episode is None:
             return
     else:
-        parent_pid = int(episode.get("parent_position_id") or 0)
-        parent_lane = [p for p in lane if _rsh_position_id(p) == parent_pid]
-        if not parent_lane:
-            _close_repair_harvest_episode(journal, symbol, executor, episode, m5_bars, reason="parent_resolved")
-            store.pop(symbol, None)
-            return
+        if episode.get("is_multileg_shadow"):
+            # Multi-leg shadow episode (DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE):
+            # parent tracking is a SET of leg ids from episode-open time --
+            # the episode ends when the basket EMPTIES of all of them (any
+            # single leg's own close/vanish does not end it, unlike the
+            # legacy single-parent path below).
+            tracked_ids = {int(x) for x in (episode.get("parent_position_ids") or [])}
+            parent_lane = [p for p in lane if _rsh_position_id(p) in tracked_ids]
+            if not parent_lane:
+                _close_repair_harvest_episode(journal, symbol, executor, episode, m5_bars, reason="parent_resolved")
+                store.pop(symbol, None)
+                return
+        else:
+            parent_pid = int(episode.get("parent_position_id") or 0)
+            parent_lane = [p for p in lane if _rsh_position_id(p) == parent_pid]
+            if not parent_lane:
+                _close_repair_harvest_episode(journal, symbol, executor, episode, m5_bars, reason="parent_resolved")
+                store.pop(symbol, None)
+                return
         # Best-effort proxy for "parent outcome if knowable" at episode-close
         # time — the last RELIABLE aggregate observed for the parent leg
         # while it was still open (never a broker-verified realized pnl,

@@ -70,6 +70,18 @@ Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
 Environment=DEXTER3_REPAIR_HARVEST=shadow
 Environment=DEXTER3_REPAIR_HARVEST_BANK_TARGET_R=0.4
 Environment=DEXTER3_REPAIR_HARVEST_SCALP_SL_FRAC=0.5
+# 2026-07-16: harvest shadow starved (0 episodes / 5 trapped baskets) because
+# the classic repair-leg makes the basket multi-leg BEFORE agg_r hits -1.2R,
+# and episode-open required exactly one leg. Observe-only unblock; hard-blocked
+# in live mode by two independent guards.
+Environment=DEXTER3_REPAIR_HARVEST_MULTILEG_OBSERVE=1
+# 2026-07-16 twin-entry plug: both lanes run the SAME producer (decide_hunt) on
+# the same bars -> near-simultaneous same-side entries doubled risk with zero
+# diversification (3 pairs = ~-34.8 of the -34.00 overnight net). DOWNSIZE (not
+# skip) per the owner's standing rule: never add hard blockers on demo — the
+# follower still trades (keeps both lanes' A/B sample intact for the 07-22
+# verdicts), at half risk. Escalate to "skip" only if downsize proves too weak.
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
 [Install]
