@@ -1710,6 +1710,14 @@ def run_symbol_cycle(
 
             dt_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dt_session)
+            if decision.action != "enter" and _daytrend.dayreversal_enabled():
+                # DAYREVERSAL twin (owner order 2026-07-16 "เปิดเลย"): when
+                # continuation has nothing (incl. the range_cap handoff), hunt
+                # the DZ/SZ structure-flip. Rare by construction — precedence
+                # is irrelevant in practice, continuation-first by design.
+                rev = _daytrend.decide_dayreversal(symbol, prefix, spread_abs, session=dt_session)
+                if rev.action == "enter":
+                    decision = rev
         elif is_newest and _vp_producer_enabled():
             # Volume-profile producer canary (2026-07-11): the FIRST candidate
             # to pass the promotion gate on BOTH hold-out splits (60/40:
@@ -1841,7 +1849,16 @@ def run_symbol_cycle(
                     # path below is shared. Only ever evaluated in VP mode.
                     if quality.get("allow", True):
                         if _alt_producer_enabled():
-                            quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
+                            if str(getattr(decision, "setup", "")).startswith("dayreversal"):
+                                # the reversal is counter-bias BY DESIGN (the
+                                # DZ/SZ flip) — only the no-trade window
+                                # applies, never the day-open bias gate.
+                                if vp_lane.in_no_trade_window(utc_now_iso()):
+                                    quality = {"allow": False, "reason": "vp_no_trade_window",
+                                               "a_plus": False, "a_plus_reason": "",
+                                               "cooldown_bypassed": False, "features": {}}
+                            else:
+                                quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
                         elif (
                             os.environ.get("DEXTER3_HUNT_DAYOPEN_BIAS", "").strip().lower() == "skip"
                             and _hunt_bias_is_counter(decision, prefix)

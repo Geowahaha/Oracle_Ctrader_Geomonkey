@@ -55,6 +55,18 @@ Environment=DEXTER3_DAYTREND_SWING_BARS=6
 Environment=DEXTER3_DAYTREND_BUFFER_ATR=0.1
 Environment=DEXTER3_DAYTREND_MIN_HOURS=1
 Environment=DEXTER3_DAYTREND_MAX_RISK_ATR=2.0
+# 2026-07-16 owner orders (after day-1: two continuation sells died to the
+# DZ rebound; "ไม่ต้องการ shadow เพราะโอกาสแบบนี้หายาก เปิดเลย"):
+# the capitulation handoff — beyond 12xATR day range the continuation STOPS
+# (G1) and the DZ/SZ structure-flip reversal hunt takes over, LIVE.
+# Reversal is exempt from the day-open bias gate BY DESIGN (counter-bias at
+# the extreme is the whole idea); no-trade window still applies.
+Environment=DEXTER3_DAYTREND_RANGE_CAP_ATR=12
+Environment=DEXTER3_DAYREVERSAL=1
+Environment=DEXTER3_DAYREV_ARM_ATR=12
+Environment=DEXTER3_DAYREV_NEAR_ATR=2.0
+Environment=DEXTER3_DAYREV_RETRACE=0.5
+Environment=DEXTER3_DAYREV_SWING_K=2
 # shared lane hygiene
 Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
 Environment=DEXTER3_SMART_EXIT_ENABLED=0

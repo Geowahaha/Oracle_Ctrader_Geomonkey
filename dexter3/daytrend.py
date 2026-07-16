@@ -45,6 +45,20 @@ ENV_BUFFER_ATR = "DEXTER3_DAYTREND_BUFFER_ATR"       # default 0.1
 ENV_MIN_HOURS = "DEXTER3_DAYTREND_MIN_HOURS"         # default 1.0
 ENV_MAX_RISK_ATR = "DEXTER3_DAYTREND_MAX_RISK_ATR"   # default 2.0
 ENV_ANCHOR_HOUR = "DEXTER3_DAYTREND_ANCHOR_HOUR"     # default 0 (00Z)
+# G1 capitulation guard (owner 2026-07-16, after the first live day: two
+# continuation sells died to the DZ rebound at ~14x ATR day range): once the
+# day has traveled this far, continuation entries STOP. 0 = off.
+ENV_RANGE_CAP_ATR = "DEXTER3_DAYTREND_RANGE_CAP_ATR"
+# DAYREVERSAL (owner order 2026-07-16 "โอกาสแบบนี้หายาก เปิดเลย"): the mirror
+# twin — the SAME capitulation condition ARMS the reversal hunt at the day
+# extreme. Rare by construction (2-9 occurrences per 10 replay weeks even at
+# 8x — backtest cannot judge it; deployed LIVE at canary size on explicit
+# owner order, forward numbers are the trial).
+ENV_DAYREV_ENABLED = "DEXTER3_DAYREVERSAL"           # "1" -> live
+ENV_DAYREV_ARM_ATR = "DEXTER3_DAYREV_ARM_ATR"        # default 12.0
+ENV_DAYREV_NEAR_ATR = "DEXTER3_DAYREV_NEAR_ATR"      # default 2.0
+ENV_DAYREV_RETRACE = "DEXTER3_DAYREV_RETRACE"        # default 0.5
+ENV_DAYREV_SWING_K = "DEXTER3_DAYREV_SWING_K"        # default 2 (fractal k)
 
 
 def _f(v: Any, default: float) -> float:
@@ -96,6 +110,15 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
     c = _f(last.get("close"), 0.0)
     day_bars = min(len(m5_prefix), max(swing_bars + 2, int(hours * 12) + 1))
     day = m5_prefix[-day_bars:]
+    # G1 capitulation guard: beyond the cap the extreme is a DZ/SZ, not a
+    # continuation target — the reversal producer takes over from here.
+    range_cap = _env(ENV_RANGE_CAP_ATR, 0.0)
+    if range_cap > 0:
+        d_hi = max(_f(b.get("high"), 0.0) for b in day)
+        d_lo = min(_f(b.get("low"), 0.0) for b in day)
+        if (d_hi - d_lo) > range_cap * atr:
+            return _skip(ts_close, symbol, session,
+                         f"range_cap ({(d_hi - d_lo):.1f} > {range_cap:g}x{atr:.2f}ATR)")
     features = {"daytrend": {"bias": bias, "hours": round(hours, 2),
                              "atr": round(atr, 4), "day_bars": day_bars}}
 
@@ -135,5 +158,118 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
         leader_score=0.0, p_win_est=0.0, setup="daytrend_pullback_resume",
         reasons=[f"ยืนเปิด {hours:.1f}h: pullback {pullback:.2f} off day high "
                  f"{extreme:.2f}, green resume close; sl<{swing_lo:.2f} swing"],
+        session=session, features=features,
+    )
+
+def dayreversal_enabled() -> bool:
+    return os.environ.get(ENV_DAYREV_ENABLED, "0").strip() == "1"
+
+
+def decide_dayreversal(symbol: str, m5_prefix: list, spread_abs: float,
+                       session: str = "unknown") -> Decision:
+    """DZ/SZ exhaustion-reversal (owner order 2026-07-16 "เปิดเลย"): the
+    mirror twin of the continuation producer — the SAME capitulation
+    condition that stops daytrend ARMS this hunt. BAR-IDENTICAL to the
+    replay's ``decide_dayreversal`` (parity-tested):
+      * day bias >= min_hours -> there IS a day extreme;
+      * capitulation: day range >= arm x ATR;
+      * price within near x ATR of the day extreme (the DZ/SZ);
+      * classic structure flip: higher swing low (ยก low, fractal k) AND the
+        newest bar CLOSES above the last swing high (ยก high);
+      * SL beyond the DZ, TP at the retrace fraction of the capitulation leg.
+    Rare by construction — every occurrence is journaled with full features."""
+    ts_close = str(m5_prefix[-1].get("ts") or "") if m5_prefix else ""
+    swing_k = int(_env(ENV_DAYREV_SWING_K, 2))
+    if len(m5_prefix) < swing_k * 2 + 8:
+        return _skip(ts_close, symbol, session, "dayrev_bars_short")
+    atr = vp_lane.mean_true_range(m5_prefix)
+    if atr <= 0:
+        return _skip(ts_close, symbol, session, "dayrev_no_atr")
+    anchor_hour = int(_env(ENV_ANCHOR_HOUR, 0))
+    min_hours = _env(ENV_MIN_HOURS, 1.0)
+    bias, hours = vp_lane.dayopen_bias(m5_prefix, anchor_hour)
+    if bias == 0 or hours < min_hours:
+        return _skip(ts_close, symbol, session, "dayrev_no_bias")
+    arm_atr = _env(ENV_DAYREV_ARM_ATR, 12.0)
+    near_atr = _env(ENV_DAYREV_NEAR_ATR, 2.0)
+    retrace = _env(ENV_DAYREV_RETRACE, 0.5)
+    buffer_atr = _env(ENV_BUFFER_ATR, 0.1)
+    max_risk_atr = _env(ENV_MAX_RISK_ATR, 2.0)
+    day_bars = min(len(m5_prefix), max(swing_k * 2 + 8, int(hours * 12) + 1))
+    day = m5_prefix[-day_bars:]
+    d_hi = max(_f(b.get("high"), 0.0) for b in day)
+    d_lo = min(_f(b.get("low"), 0.0) for b in day)
+    day_range = d_hi - d_lo
+    if day_range < arm_atr * atr:
+        return _skip(ts_close, symbol, session,
+                     f"dayrev_not_armed (range {day_range:.1f} < {arm_atr:g}xATR)")
+    c = _f(m5_prefix[-1].get("close"), 0.0)
+
+    def _swings(vals: list, is_low: bool) -> list:
+        out = []
+        for j in range(swing_k, len(vals) - swing_k):
+            w = vals[j - swing_k: j + swing_k + 1]
+            if (is_low and vals[j] == min(w)) or ((not is_low) and vals[j] == max(w)):
+                out.append((j, vals[j]))
+        return out
+
+    lows = [_f(b.get("low"), 0.0) for b in day]
+    highs = [_f(b.get("high"), 0.0) for b in day]
+    features = {"dayreversal": {"bias": bias, "hours": round(hours, 2),
+                                "atr": round(atr, 4), "day_range": round(day_range, 2),
+                                "d_hi": round(d_hi, 2), "d_lo": round(d_lo, 2)}}
+    if bias < 0:                                   # sell day -> BUY the DZ flip
+        if c - d_lo > near_atr * atr:
+            return _skip(ts_close, symbol, session, "dayrev_not_in_zone")
+        sw_lo = _swings(lows, True)
+        sw_hi = _swings(highs, False)
+        if len(sw_lo) < 2 or not sw_hi:
+            return _skip(ts_close, symbol, session, "dayrev_no_swings")
+        (_, prev_low), (last_idx, last_low) = sw_lo[-2], sw_lo[-1]
+        if not (last_low > prev_low):
+            return _skip(ts_close, symbol, session, "dayrev_no_higher_low")
+        hi_after = [v for j, v in sw_hi if j >= last_idx - swing_k]
+        ref_hi = hi_after[-1] if hi_after else sw_hi[-1][1]
+        if not (c > ref_hi):
+            return _skip(ts_close, symbol, session, "dayrev_no_break")
+        sl = min(d_lo, last_low) - buffer_atr * atr
+        risk = c - sl
+        if risk <= 0 or risk > max_risk_atr * atr:
+            return _skip(ts_close, symbol, session, f"dayrev_risk_band ({risk:.2f})")
+        return Decision(
+            ts_close=ts_close, symbol=symbol, action="enter", side="buy",
+            entry_type="market", entry=c, sl=sl, tp=d_lo + retrace * day_range,
+            size_class="small", leader_score=0.0, p_win_est=0.0,
+            setup="dayreversal_structure_flip",
+            reasons=[f"DZ flip: capitulation {day_range:.1f}pts, ยก low {prev_low:.2f}->"
+                     f"{last_low:.2f}, close {c:.2f} broke swing-high {ref_hi:.2f}; "
+                     f"sl<{sl:.2f} tp@{retrace:g} retrace"],
+            session=session, features=features,
+        )
+    if d_hi - c > near_atr * atr:                  # buy day -> SELL the SZ flip
+        return _skip(ts_close, symbol, session, "dayrev_not_in_zone")
+    sw_hi = _swings(highs, False)
+    sw_lo = _swings(lows, True)
+    if len(sw_hi) < 2 or not sw_lo:
+        return _skip(ts_close, symbol, session, "dayrev_no_swings")
+    (_, prev_hi), (last_idx, last_hi) = sw_hi[-2], sw_hi[-1]
+    if not (last_hi < prev_hi):
+        return _skip(ts_close, symbol, session, "dayrev_no_lower_high")
+    lo_after = [v for j, v in sw_lo if j >= last_idx - swing_k]
+    ref_lo = lo_after[-1] if lo_after else sw_lo[-1][1]
+    if not (c < ref_lo):
+        return _skip(ts_close, symbol, session, "dayrev_no_break")
+    sl = max(d_hi, last_hi) + buffer_atr * atr
+    risk = sl - c
+    if risk <= 0 or risk > max_risk_atr * atr:
+        return _skip(ts_close, symbol, session, f"dayrev_risk_band ({risk:.2f})")
+    return Decision(
+        ts_close=ts_close, symbol=symbol, action="enter", side="sell",
+        entry_type="market", entry=c, sl=sl, tp=d_hi - retrace * day_range,
+        size_class="small", leader_score=0.0, p_win_est=0.0,
+        setup="dayreversal_structure_flip",
+        reasons=[f"SZ flip: capitulation {day_range:.1f}pts, ยก high ลง {prev_hi:.2f}->"
+                 f"{last_hi:.2f}, close {c:.2f} broke swing-low {ref_lo:.2f}; "
+                 f"sl>{sl:.2f} tp@{retrace:g} retrace"],
         session=session, features=features,
     )
