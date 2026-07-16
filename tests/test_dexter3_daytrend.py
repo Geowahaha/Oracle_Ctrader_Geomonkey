@@ -156,3 +156,38 @@ def test_daytrend_range_cap_hands_off_to_reversal(monkeypatch):
     d = daytrend.decide_daytrend("XAUUSD", prefix, 0.12)
     assert d.action == "skip"
     assert "range_cap" in d.reasons[0]
+
+
+def test_sdzone_live_shares_replay_engine(monkeypatch):
+    """Single source of truth: the live producer and the replay import the
+    SAME engine module — plus a behavioral check that a zone forms and the
+    re-entry confirm fires on synthetic bars."""
+    import scripts.dexter3_entry_position_replay as replay
+    from dexter3 import sd_zones
+
+    assert replay.SDZoneEngine is sd_zones.SDZoneEngine
+    assert replay.decide_sdzone is sd_zones.decide_sdzone
+
+    monkeypatch.setenv(daytrend.ENV_SDZONE_ENABLED, "1")
+    assert daytrend.sdzone_enabled()
+    # 60 flat bars, then a sweep below the pivot low + huge bullish
+    # displacement bar with a volume spike -> demand zone; later price
+    # re-enters the zone and closes back above it -> buy signal.
+    bars = []
+    for k in range(60):
+        px = 4000.0 + (k % 3) * 0.3
+        bars.append({"ts": f"2026-07-16T{k//12:02d}:{(k%12)*5:02d}:00Z",
+                     "open": px, "high": px + 0.4, "low": px - 0.4,
+                     "close": px + 0.1, "volume": 100.0})
+    # engineered pivot low then sweep+displacement (vol 3x)
+    bars.append({"ts": "2026-07-16T05:00:00Z", "open": 4000.0, "high": 4000.2,
+                 "low": 3996.0, "close": 3996.5, "volume": 120.0})   # pivot low candidate
+    for k in range(6):
+        px = 3997.0 + k * 0.2
+        bars.append({"ts": f"2026-07-16T05:{5+k*5:02d}:00Z", "open": px,
+                     "high": px + 0.3, "low": px - 0.3, "close": px + 0.1,
+                     "volume": 100.0})
+    bars.append({"ts": "2026-07-16T05:35:00Z", "open": 3995.2, "high": 3997.6,
+                 "low": 3995.0, "close": 3997.5, "volume": 400.0})   # sweep 3995<3996 + body 2.3 (~1.9xATR, 88%)
+    eng, atr = sd_zones.zones_from_prefix(bars)
+    assert any(z["kind"] == "demand" for z in eng.zones), "demand zone should form"

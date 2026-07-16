@@ -1736,6 +1736,14 @@ def run_symbol_cycle(
                 rev = _daytrend.decide_dayreversal(symbol, prefix, spread_abs, session=dt_session)
                 if rev.action == "enter":
                     decision = rev
+            if decision.action != "enter" and _daytrend.sdzone_enabled():
+                # SD-ZONE entries (owner order 2026-07-17 "โอกาสหายาก เปิดเลย"):
+                # third producer — zone re-entry confirm from the shared
+                # dexter3/sd_zones.py engine; the day-open bias gate applies
+                # downstream (the proven x-bias combo).
+                sdz = _daytrend.decide_sdzone_live(symbol, prefix, spread_abs, session=dt_session)
+                if sdz.action == "enter":
+                    decision = sdz
         elif is_newest and _vp_producer_enabled():
             # Volume-profile producer canary (2026-07-11): the FIRST candidate
             # to pass the promotion gate on BOTH hold-out splits (60/40:

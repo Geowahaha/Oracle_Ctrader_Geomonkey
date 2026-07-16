@@ -67,6 +67,13 @@ Environment=DEXTER3_DAYREV_ARM_ATR=12
 Environment=DEXTER3_DAYREV_NEAR_ATR=2.0
 Environment=DEXTER3_DAYREV_RETRACE=0.5
 Environment=DEXTER3_DAYREV_SWING_K=2
+# 2026-07-17 owner order ("โอกาสหายาก เปิดเลย"): SD-zone re-entry producer
+# (shared dexter3/sd_zones.py engine = the replay proof, x day-open bias via
+# the vp_entry_gate below; ~1 signal/day, plain exits unchanged).
+Environment=DEXTER3_SDZONE=1
+Environment=DEXTER3_VP_DAYOPEN_BIAS=1
+Environment=DEXTER3_VP_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_VP_BIAS_MIN_HOURS=1
 # shared lane hygiene
 Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
 Environment=DEXTER3_SMART_EXIT_ENABLED=0

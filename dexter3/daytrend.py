@@ -273,3 +273,43 @@ def decide_dayreversal(symbol: str, m5_prefix: list, spread_abs: float,
                  f"sl>{sl:.2f} tp@{retrace:g} retrace"],
         session=session, features=features,
     )
+
+ENV_SDZONE_ENABLED = "DEXTER3_SDZONE"                # "1" -> zone entries live
+
+
+def sdzone_enabled() -> bool:
+    return os.environ.get(ENV_SDZONE_ENABLED, "0").strip() == "1"
+
+
+def decide_sdzone_live(symbol: str, m5_prefix: list, spread_abs: float,
+                       session: str = "unknown") -> Decision:
+    """Owner order 2026-07-17 ("โอกาสหายาก เปิดเลย"): zone-anchored entries
+    from the SAME engine the replay proved (dexter3/sd_zones.py — single
+    source of truth, parity by construction). Zones recomputed statelessly
+    from the lane's 340-bar prefix each M5 close; entry when price re-enters
+    a live zone and CLOSES back outside it in the zone's direction; SL
+    beyond the zone; TP = RR2. The day-open bias gate applies via the
+    runner's vp_entry_gate (the proven x-bias combo), and the lane's plain
+    exit mode leaves broker SL/TP + the 240min cap as the only exits."""
+    from dexter3.sd_zones import decide_sdzone, zones_from_prefix
+
+    ts_close = str(m5_prefix[-1].get("ts") or "") if m5_prefix else ""
+    if len(m5_prefix) < 40:
+        return _skip(ts_close, symbol, session, "sdzone_bars_short")
+    engine, atr = zones_from_prefix(m5_prefix)
+    if atr <= 0:
+        return _skip(ts_close, symbol, session, "sdzone_no_atr")
+    sig = decide_sdzone(m5_prefix, len(m5_prefix) - 1, engine, atr)
+    if sig is None:
+        return _skip(ts_close, symbol, session,
+                     f"sdzone_no_setup (zones={len(engine.zones)})")
+    zinfo = [{"kind": z["kind"], "top": round(z["top"], 2),
+              "bottom": round(z["bottom"], 2)} for z in engine.zones[:4]]
+    return Decision(
+        ts_close=ts_close, symbol=symbol, action="enter", side=sig["side"],
+        entry_type="market", entry=sig["entry"], sl=sig["sl"], tp=sig["tp"],
+        size_class="small", leader_score=0.0, p_win_est=0.0,
+        setup="sdzone_reentry_confirm",
+        reasons=[f"SD zone re-entry confirm ({sig['side']}); zones={zinfo}"],
+        session=session, features={"sdzone": {"zones": zinfo, "atr": round(atr, 3)}},
+    )
