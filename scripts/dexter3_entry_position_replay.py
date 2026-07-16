@@ -360,6 +360,61 @@ def _anchor_bias_fields(m5: list, anchors: dict[str, list[int]] = BIAS_ANCHORS) 
     return out
 
 
+def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
+                    pull_atr: float = 0.8, swing_bars: int = 6,
+                    buffer_atr: float = 0.1, min_hours: float = 1.0,
+                    max_risk_atr: float = 2.0) -> dict | None:
+    """WITH-BIAS continuation producer (owner live lesson 2026-07-16: a
+    40-pt sell-only day where every counter-trend producer was correctly
+    bias-blocked and every with-trend hunt signal was gate-blocked — the
+    system had direction and entry machinery but NO producer firing WITH
+    the day). Pre-registered, minimal params:
+      * day bias established (>=min_hours, from the SAME 00Z anchor the live
+        gate uses);
+      * price has PULLED BACK >= pull_atr x ATR against the bias from the
+        day's running extreme (sell day: bounce off the low — the retest of
+        what just broke, the owner's "ราคาพัก" read);
+      * the newest bar CLOSES back in the bias direction (reversal-resume);
+      * SL beyond the pullback swing (max/min of the last swing_bars) +
+        buffer; skip if that risk > max_risk_atr x ATR (blown structure).
+    TP = the day extreme (retest target). Returns {side, entry, sl, tp} or
+    None. Uses ONLY closed-bar data (no lookahead)."""
+    if len(m5_prefix) < swing_bars + 3 or atr <= 0:
+        return None
+    bias = int(bias_row.get("bias_d0", 0))
+    if bias == 0 or float(bias_row.get("hrs_d0", 0.0)) < min_hours:
+        return None
+    last = m5_prefix[-1]
+    o, c = float(last.get("open", 0.0)), float(last.get("close", 0.0))
+    # bars since the day anchor (approx: use trailing window of the day so
+    # far — the bias hours tell us how deep to look)
+    day_bars = min(len(m5_prefix), max(swing_bars + 2, int(float(bias_row.get("hrs_d0", 0.0)) * 12) + 1))
+    day = m5_prefix[-day_bars:]
+    if bias < 0:  # sell-only day: extreme = the day's low
+        extreme = min(float(b.get("low", 0.0)) for b in day)
+        pullback = c - extreme
+        resumes = c < o                       # red close = resuming down
+        if not (pullback >= pull_atr * atr and resumes):
+            return None
+        swing_hi = max(float(b.get("high", 0.0)) for b in m5_prefix[-swing_bars:])
+        sl = swing_hi + buffer_atr * atr
+        risk = sl - c
+        if risk <= 0 or risk > max_risk_atr * atr:
+            return None
+        return {"side": "sell", "entry": c, "sl": sl, "tp": extreme}
+    extreme = max(float(b.get("high", 0.0)) for b in day)
+    pullback = extreme - c
+    resumes = c > o
+    if not (pullback >= pull_atr * atr and resumes):
+        return None
+    swing_lo = min(float(b.get("low", 0.0)) for b in m5_prefix[-swing_bars:])
+    sl = swing_lo - buffer_atr * atr
+    risk = c - sl
+    if risk <= 0 or risk > max_risk_atr * atr:
+        return None
+    return {"side": "buy", "entry": c, "sl": sl, "tp": extreme}
+
+
 def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
     """ctx carries the decision-time direction facts stamped on the trade:
     trend_sign (H1 6-bar) + bias_d0/bias_d22/bias_sess (+ hrs_*)."""
@@ -471,10 +526,11 @@ def main() -> int:
                     help="dip_r:window_bars zone variants confirmed on M1 bars (M5 green "
                          "light, M1 best-entry trigger) -- owner idea 2026-07-16. NOTE: "
                          "daemon M1 history is ~14 days; rows outside it report miss_no_m1")
-    ap.add_argument("--producer", choices=("hunt", "vp"), default="hunt",
+    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend"), default="hunt",
                     help="signal producer: hunt = live decide_hunt committee; vp = "
-                         "volume_profile.decide_vp (the only gate-passer in repo history). "
-                         "vp forces gates=none (the v16 gate reads hunt-committee features)")
+                         "volume_profile.decide_vp (the only gate-passer in repo history); "
+                         "daytrend = with-bias pullback-continuation (owner live lesson "
+                         "2026-07-16). vp/daytrend force gates=none")
     ap.add_argument("--exits", default="ladder,convex",
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
@@ -519,6 +575,16 @@ def main() -> int:
                 tsign = _h1_trend_sign(h1c)
             decisions.append((i, d, tsign))
             continue
+        if args.producer == "daytrend":
+            sig = decide_daytrend(prefix, bias_rows[i], atr)
+            if sig is None:
+                continue
+            from types import SimpleNamespace
+            d = SimpleNamespace(action="enter", side=sig["side"], entry=sig["entry"],
+                                sl=sig["sl"], tp=sig["tp"], ts_close=ts,
+                                setup="daytrend", features={})
+            decisions.append((i, d, 0))
+            continue
         m15c = [b for b in m15 if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
         h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
         try:
@@ -532,8 +598,8 @@ def main() -> int:
     print(f"decisions: {len(decisions)} enter candidates (producer={args.producer})")
 
     gate_modes = [g.strip() for g in args.gates.split(",") if g.strip()]
-    if args.producer == "vp" and gate_modes != ["none"]:
-        print("producer=vp: forcing gates=none (v16 gate reads hunt-committee features)")
+    if args.producer in ("vp", "daytrend") and gate_modes != ["none"]:
+        print(f"producer={args.producer}: forcing gates=none")
         gate_modes = ["none"]
     rungs = _parse_ladder_csv(args.ladder_csv)
     convex_combos = []
@@ -589,10 +655,27 @@ def main() -> int:
         entries.append((f"zoneM1 -{dip:.1f}R w{win}", "zone_m1", dip, win))
 
     for mode in gate_modes:
+        # "v18-align-chase" / "v18-align-all" (owner live lesson 2026-07-16:
+        # during a 40-pt with-bias collapse the v18 gate blocked EVERY
+        # continuation sell via chase_hard_block / min_leader_score): run the
+        # BASE gate, then un-block a refused entry when its side is ALIGNED
+        # with an established day-open bias — "chase" un-blocks only
+        # chase-class reasons, "all" un-blocks any gate reason.
+        base_mode, _, align_kind = mode.partition("-align-")
         accepted: list[dict] = []
         for i, d, tsign in decisions:
-            gate = _apply_entry_gate(d, mode if mode != "none" else "none", str(d.ts_close or ""))
-            if not bool(gate.get("allow", True)):
+            gate = _apply_entry_gate(d, base_mode if base_mode != "none" else "none", str(d.ts_close or ""))
+            allow = bool(gate.get("allow", True))
+            if not allow and align_kind:
+                bias = int(bias_rows[i].get("bias_d0", 0))
+                aligned = (
+                    bias != 0 and float(bias_rows[i].get("hrs_d0", 0.0)) >= 1.0
+                    and ((str(d.side) == "buy") == (bias > 0))
+                )
+                reason = str(gate.get("reason") or "")
+                if aligned and (align_kind == "all" or "chase" in reason):
+                    allow = True
+            if not allow:
                 continue
             close_epoch = _epoch(str(m5[i].get("ts") or "")) + 300
             rec = {

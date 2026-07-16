@@ -325,6 +325,42 @@ def test_m1_bridge_checks_entry_period_wicks_then_hands_to_m5():
 
 
 # ---------------------------------------------------------------------------
+# decide_daytrend -- with-bias pullback-continuation producer (2026-07-16)
+# ---------------------------------------------------------------------------
+
+
+def test_daytrend_sell_day_pullback_resume():
+    from scripts.dexter3_entry_position_replay import decide_daytrend
+
+    # sell-bias day (bias -1, 3h in). Day low 3990; price bounced to 3999.4
+    # (pullback 9.4 > 0.8*5.0 ATR = 4.0) and the newest bar closes RED ->
+    # sell at the close, SL above the 6-bar swing high + 0.1*ATR buffer.
+    prefix = [
+        _tbar("2026-07-16T09:50:00Z", 4008.0, 4006.0),
+        _tbar("2026-07-16T09:55:00Z", 4006.0, 4005.0),
+        _tbar("2026-07-16T10:00:00Z", 4005.0, 3998.0),
+        {"ts": "2026-07-16T10:05:00Z", "open": 3998.0, "high": 3999.0, "low": 3990.0, "close": 3992.0},
+        {"ts": "2026-07-16T10:10:00Z", "open": 3992.0, "high": 4000.5, "low": 3991.5, "close": 4000.2},
+        {"ts": "2026-07-16T10:15:00Z", "open": 4000.2, "high": 4001.0, "low": 3998.8, "close": 3999.4},
+    ]
+    sig = decide_daytrend(prefix, {"bias_d0": -1, "hrs_d0": 3.0}, atr=5.0,
+                          swing_bars=3)
+    assert sig is not None and sig["side"] == "sell"
+    assert sig["entry"] == pytest.approx(3999.4)
+    assert sig["sl"] == pytest.approx(4001.0 + 0.5)     # swing high + 0.1*ATR
+    assert sig["tp"] == pytest.approx(3990.0)           # retest of the day low
+    # green (counter) close -> no signal; no bias -> no signal
+    prefix_green = prefix[:-1] + [
+        {"ts": "2026-07-16T10:15:00Z", "open": 3998.8, "high": 4001.0, "low": 3998.5, "close": 4000.6}]
+    assert decide_daytrend(prefix_green, {"bias_d0": -1, "hrs_d0": 3.0}, 5.0, swing_bars=3) is None
+    assert decide_daytrend(prefix, {"bias_d0": 0, "hrs_d0": 3.0}, 5.0, swing_bars=3) is None
+    # pullback too shallow -> no signal (extreme 3990, close 3992 -> 2.0 < 4.0)
+    shallow = prefix[:5] + [
+        {"ts": "2026-07-16T10:15:00Z", "open": 3993.0, "high": 3993.5, "low": 3991.0, "close": 3992.0}]
+    assert decide_daytrend(shallow, {"bias_d0": -1, "hrs_d0": 3.0}, 5.0, swing_bars=3) is None
+
+
+# ---------------------------------------------------------------------------
 # _dir_allows -- decision-time direction filter
 # ---------------------------------------------------------------------------
 
