@@ -369,7 +369,8 @@ def _anchor_bias_fields(m5: list, anchors: dict[str, list[int]] = BIAS_ANCHORS) 
 def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
                     pull_atr: float = 0.8, swing_bars: int = 6,
                     buffer_atr: float = 0.1, min_hours: float = 1.0,
-                    max_risk_atr: float = 2.0) -> dict | None:
+                    max_risk_atr: float = 2.0, range_cap_atr: float = 0.0,
+                    last_entry_hour: float = 0.0) -> dict | None:
     """WITH-BIAS continuation producer (owner live lesson 2026-07-16: a
     40-pt sell-only day where every counter-trend producer was correctly
     bias-blocked and every with-trend hunt signal was gate-blocked — the
@@ -388,14 +389,28 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
     if len(m5_prefix) < swing_bars + 3 or atr <= 0:
         return None
     bias = int(bias_row.get("bias_d0", 0))
-    if bias == 0 or float(bias_row.get("hrs_d0", 0.0)) < min_hours:
+    hrs = float(bias_row.get("hrs_d0", 0.0))
+    if bias == 0 or hrs < min_hours:
+        return None
+    # G2 (owner 2026-07-16, after the first live SL: "แนวนี้คงเป็น DZ ของวัน
+    # มีโอกาสรีบาวด์"): session maturity -- no NEW continuation entries
+    # after this many hours into the day (late extreme = the day's DZ/SZ).
+    if last_entry_hour > 0 and hrs > last_entry_hour:
         return None
     last = m5_prefix[-1]
     o, c = float(last.get("open", 0.0)), float(last.get("close", 0.0))
     # bars since the day anchor (approx: use trailing window of the day so
     # far — the bias hours tell us how deep to look)
-    day_bars = min(len(m5_prefix), max(swing_bars + 2, int(float(bias_row.get("hrs_d0", 0.0)) * 12) + 1))
+    day_bars = min(len(m5_prefix), max(swing_bars + 2, int(hrs * 12) + 1))
     day = m5_prefix[-day_bars:]
+    # G1 (same owner observation): capitulation-day exhaustion -- when the
+    # day has already traveled more than range_cap_atr x ATR high-to-low,
+    # the extreme is a demand/supply zone, not a continuation target.
+    if range_cap_atr > 0:
+        d_hi = max(float(b.get("high", 0.0)) for b in day)
+        d_lo = min(float(b.get("low", 0.0)) for b in day)
+        if (d_hi - d_lo) > range_cap_atr * atr:
+            return None
     if bias < 0:  # sell-only day: extreme = the day's low
         extreme = min(float(b.get("low", 0.0)) for b in day)
         pullback = c - extreme
@@ -419,6 +434,97 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
     if risk <= 0 or risk > max_risk_atr * atr:
         return None
     return {"side": "buy", "entry": c, "sl": sl, "tp": extreme}
+
+
+def decide_dayreversal(m5_prefix: list, bias_row: dict, atr: float,
+                       range_arm_atr: float = 12.0, near_extreme_atr: float = 2.0,
+                       swing_k: int = 2, buffer_atr: float = 0.1,
+                       retrace_frac: float = 0.5, min_hours: float = 1.0,
+                       max_risk_atr: float = 2.0) -> dict | None:
+    """DZ/SZ EXHAUSTION-REVERSAL producer (owner question 2026-07-16: "ในเมื่อ
+    เป็น DZ ของวันแล้ว ทำไมไม่เปลี่ยนเป็น Buy เมื่อยก low ยก high — สัญญาณกลับตัว
+    classic"). The mirror twin of daytrend: the SAME capitulation condition
+    that should stop continuation entries ARMS the reversal hunt.
+
+    Pre-registered conditions (sell-day mirror for buys; all closed-bar):
+      1. day bias established (>=min_hours) -> there IS a day extreme;
+      2. CAPITULATION: day high-low range >= range_arm_atr x ATR (the G1
+         trigger, reused as the arming condition);
+      3. price within near_extreme_atr x ATR of the day extreme zone;
+      4. CLASSIC STRUCTURE FLIP on M5: the last swing low is HIGHER than the
+         previous swing low (ยก low, fractal k=swing_k) AND the newest bar
+         CLOSES above the last swing high (ยก high = micro-structure break);
+      5. SL below min(day low, last swing low) - buffer (beyond the DZ);
+         TP at extreme + retrace_frac x day range (the 50% retrace of the
+         capitulation leg). Skip if risk > max_risk_atr x ATR.
+    Returns {side, entry, sl, tp} or None."""
+    n = len(m5_prefix)
+    if n < swing_k * 2 + 8 or atr <= 0:
+        return None
+    bias = int(bias_row.get("bias_d0", 0))
+    hrs = float(bias_row.get("hrs_d0", 0.0))
+    if bias == 0 or hrs < min_hours:
+        return None
+    day_bars = min(n, max(swing_k * 2 + 8, int(hrs * 12) + 1))
+    day = m5_prefix[-day_bars:]
+    d_hi = max(float(b.get("high", 0.0)) for b in day)
+    d_lo = min(float(b.get("low", 0.0)) for b in day)
+    day_range = d_hi - d_lo
+    if day_range < range_arm_atr * atr:
+        return None                                   # no capitulation -> no reversal hunt
+    last = m5_prefix[-1]
+    c = float(last.get("close", 0.0))
+
+    def _swings(vals: list, is_low: bool) -> list:
+        out = []
+        for j in range(swing_k, len(vals) - swing_k):
+            w = vals[j - swing_k: j + swing_k + 1]
+            if (is_low and vals[j] == min(w)) or ((not is_low) and vals[j] == max(w)):
+                out.append((j, vals[j]))
+        return out
+
+    if bias < 0:                                      # sell day -> hunt the BUY reversal at the DZ
+        if c - d_lo > near_extreme_atr * atr:
+            return None                               # not at the extreme zone
+        lows = [float(b.get("low", 0.0)) for b in day]
+        highs = [float(b.get("high", 0.0)) for b in day]
+        sw_lo = _swings(lows, True)
+        sw_hi = _swings(highs, False)
+        if len(sw_lo) < 2 or not sw_hi:
+            return None
+        (_, prev_low), (last_idx, last_low) = sw_lo[-2], sw_lo[-1]
+        if not (last_low > prev_low):                 # ยก low
+            return None
+        hi_after = [v for j, v in sw_hi if j >= last_idx - swing_k]
+        ref_hi = hi_after[-1] if hi_after else sw_hi[-1][1]
+        if not (c > ref_hi):                          # ยก high: close breaks the last swing high
+            return None
+        sl = min(d_lo, last_low) - buffer_atr * atr
+        risk = c - sl
+        if risk <= 0 or risk > max_risk_atr * atr:
+            return None
+        return {"side": "buy", "entry": c, "sl": sl, "tp": d_lo + retrace_frac * day_range}
+    # buy day -> hunt the SELL reversal at the SZ (mirror)
+    if d_hi - c > near_extreme_atr * atr:
+        return None
+    lows = [float(b.get("low", 0.0)) for b in day]
+    highs = [float(b.get("high", 0.0)) for b in day]
+    sw_hi = _swings(highs, False)
+    sw_lo = _swings(lows, True)
+    if len(sw_hi) < 2 or not sw_lo:
+        return None
+    (_, prev_hi), (last_idx, last_hi) = sw_hi[-2], sw_hi[-1]
+    if not (last_hi < prev_hi):
+        return None
+    lo_after = [v for j, v in sw_lo if j >= last_idx - swing_k]
+    ref_lo = lo_after[-1] if lo_after else sw_lo[-1][1]
+    if not (c < ref_lo):
+        return None
+    sl = max(d_hi, last_hi) + buffer_atr * atr
+    risk = sl - c
+    if risk <= 0 or risk > max_risk_atr * atr:
+        return None
+    return {"side": "sell", "entry": c, "sl": sl, "tp": d_hi - retrace_frac * day_range}
 
 
 def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
@@ -537,7 +643,7 @@ def main() -> int:
                     help="dip_r:window_bars zone variants confirmed on M1 bars (M5 green "
                          "light, M1 best-entry trigger) -- owner idea 2026-07-16. NOTE: "
                          "daemon M1 history is ~14 days; rows outside it report miss_no_m1")
-    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend"), default="hunt",
+    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend", "dayreversal"), default="hunt",
                     help="signal producer: hunt = live decide_hunt committee; vp = "
                          "volume_profile.decide_vp (the only gate-passer in repo history); "
                          "daytrend = with-bias pullback-continuation (owner live lesson "
@@ -546,6 +652,12 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--dt-range-cap-atr", type=float, default=0.0,
+                    help="daytrend G1: skip entries once the day's high-low range "
+                         "exceeds this x ATR (0=off) -- capitulation exhaustion guard")
+    ap.add_argument("--dt-last-hour", type=float, default=0.0,
+                    help="daytrend G2: no new entries after this many hours into the "
+                         "day (0=off) -- late extreme = the day's DZ/SZ")
     ap.add_argument("--no-overlap", action="store_true",
                     help="model a SINGLE-POSITION lane: a signal is skipped while a prior "
                          "trade is still open -- the lane-realistic number (overlapping "
@@ -590,14 +702,19 @@ def main() -> int:
                 tsign = _h1_trend_sign(h1c)
             decisions.append((i, d, tsign))
             continue
-        if args.producer == "daytrend":
-            sig = decide_daytrend(prefix, bias_rows[i], atr)
+        if args.producer in ("daytrend", "dayreversal"):
+            if args.producer == "daytrend":
+                sig = decide_daytrend(prefix, bias_rows[i], atr,
+                                      range_cap_atr=args.dt_range_cap_atr,
+                                      last_entry_hour=args.dt_last_hour)
+            else:
+                sig = decide_dayreversal(prefix, bias_rows[i], atr)
             if sig is None:
                 continue
             from types import SimpleNamespace
             d = SimpleNamespace(action="enter", side=sig["side"], entry=sig["entry"],
                                 sl=sig["sl"], tp=sig["tp"], ts_close=ts,
-                                setup="daytrend", features={})
+                                setup=args.producer, features={})
             decisions.append((i, d, 0))
             continue
         m15c = [b for b in m15 if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
@@ -613,7 +730,7 @@ def main() -> int:
     print(f"decisions: {len(decisions)} enter candidates (producer={args.producer})")
 
     gate_modes = [g.strip() for g in args.gates.split(",") if g.strip()]
-    if args.producer in ("vp", "daytrend") and gate_modes != ["none"]:
+    if args.producer in ("vp", "daytrend", "dayreversal") and gate_modes != ["none"]:
         print(f"producer={args.producer}: forcing gates=none")
         gate_modes = ["none"]
     rungs = _parse_ladder_csv(args.ladder_csv)
