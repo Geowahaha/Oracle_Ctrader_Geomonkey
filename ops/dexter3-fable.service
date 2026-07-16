@@ -52,6 +52,15 @@ Environment=DEXTER3_BASE_RISK_FRAC=0.0175
 Environment=DEXTER3_SMART_EXIT_ENABLED=0
 Environment=DEXTER3_MAX_ENTRIES_PER_DAY=60
 Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# 2026-07-16 owner: "exit มีปัญหา OM ทำงานไม่ดี ปิดกำไรเร็วไป" — re-measured
+# at the CURRENT entry stack (bias-skip + limit + confirm; 3 windows,
+# no-overlap): the ladder is now the WORST exit (-141.8R total) vs plain
+# structural TP (-35.5R; better in EVERY window, +16/+26/+44R). Flip to
+# plain: broker SL/TP + 240min time stop + caps are the exits; the ladder
+# CSV stays for rollback. NAMED TRADEOFF: trail-mode lanes defer the M5
+# campaign brain -> repair legs / harvest-shadow episodes pause on fable.
+Environment=DEXTER3_OM_TRAIL_MODE=plain
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=240
 Environment=DEXTER3_OM_LADDER_CSV=0.25:0.02,0.50:0.15,0.80:0.40,1.20:0.80,2.00:1.45,3.00:2.25
 Environment=DEXTER3_ANTICHASE_ENABLED=1
 Environment=DEXTER3_PULLBACK_ENABLED=1
