@@ -78,6 +78,7 @@ from scripts.dexter3_edge_discovery import (  # noqa: E402
     _completed_by,
     _epoch,
     _h1_trend_sign,
+    _simulate,
     _stamp_entry_gate_features,
 )
 from scripts.dexter3_convex_exit_replay import (  # noqa: E402
@@ -87,7 +88,7 @@ from scripts.dexter3_convex_exit_replay import (  # noqa: E402
     _simulate_ladder,
 )
 from scripts.dexter3_geometry_optimizer import _equity  # noqa: E402
-from dexter3 import hunt_mode  # noqa: E402
+from dexter3 import hunt_mode, market_lens, volume_profile  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
 
@@ -126,16 +127,65 @@ def _limit_fill(side: str, entry: float, sl: float, future: list, dip_r: float,
     return "miss", None, None
 
 
+def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r: float,
+                        window_bars: int) -> tuple[str, float | None, int | None]:
+    """Owner directive 2026-07-16: "เปลี่ยนจากวาง limit เป็นโซน ตรวจสอบเบรคจริง
+    + สัญญาณกลับตัว" -- the discount level becomes a ZONE instead of a resting
+    LIMIT:
+      * TOUCH: a bar's range reaches zone_top = entry -/+ dip_r * risk;
+      * REAL-BREAK CHECK: any bar that CLOSES beyond the original SL kills the
+        setup ("zone_break", no trade) -- but a WICK beyond the SL is survived,
+        because there is no position yet. This is the mechanism a blind limit
+        cannot have: the same wick fills-and-stops the limit at -1R;
+      * REVERSAL SIGNAL: at/after the touch, the first bar that closes back in
+        the entry direction (green close above zone_top for a buy) while the
+        discount is still intact (close still below the signal entry) ->
+        ENTER at that bar's CLOSE (M5-close decision = live-faithful market
+        order). The touch bar itself may confirm.
+    The confirmed entry is WORSE-priced than the limit (close in
+    (zone_top, entry) vs exactly zone_top) -- knife protection is bought with
+    entry price; whether that trade is net-positive is what the replay
+    measures. Returns (status, entry_px, idx):
+    filled | no_touch | no_confirm | zone_break."""
+    risk = abs(entry - sl)
+    if risk <= 0 or dip_r <= 0 or dip_r >= 1.0:
+        return "no_touch", None, None
+    zone_top = entry - dip_r * risk if side == "buy" else entry + dip_r * risk
+    touched = False
+    for idx, bar in enumerate(future[:window_bars]):
+        o = float(bar.get("open", 0.0))
+        c = float(bar.get("close", 0.0))
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        if side == "buy":
+            if c <= sl:                              # CONFIRMED break -- thesis dead
+                return "zone_break", None, None
+            if not touched and lo <= zone_top:
+                touched = True
+            if touched and c > o and c > zone_top and c < entry:
+                return "filled", c, idx
+        else:
+            if c >= sl:
+                return "zone_break", None, None
+            if not touched and hi >= zone_top:
+                touched = True
+            if touched and c < o and c < zone_top and c > entry:
+                return "filled", c, idx
+    return ("no_confirm" if touched else "no_touch"), None, None
+
+
 def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
              exit_kind: str, exit_params: dict, atr: float, max_hold: int,
              spread_abs: float, commission_r: float) -> tuple[str, float | None]:
     """One accepted signal under one (entry_model, exit) row. Returns
-    (status, r_net) where status is "taken" (r_net counts), "miss" (limit
-    never filled -- r_net is None), or "skip" (degenerate risk).
+    (status, r_net): "taken" (r_net counts), "skip" (degenerate risk), or a
+    miss class ("miss_no_touch" limit/zone never reached; "miss_no_confirm"
+    zone touched but no reversal bar; "miss_break" zone broken by a close
+    beyond the SL -- the knife the break-check refused to catch).
 
     R is measured against the TAKEN stop distance (market: the signal's own
-    risk; limit: |fill - original SL| = (1-dip_r) x risk), i.e. own-risk
-    units -- the unit live $-risk sizing actually pays out in."""
+    risk; limit: (1-dip_r) x risk; zone: |confirm close - original SL|),
+    i.e. own-risk units -- the unit live $-risk sizing pays out in."""
     side, entry, sl, future = trade["side"], trade["entry"], trade["sl"], trade["future"]
     risk1 = abs(entry - sl)
     if risk1 <= 0:
@@ -143,10 +193,10 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
 
     if entry_model == "market":
         sim_entry, sim_sl, sim_future = entry, sl, future
-    else:  # "limit"
+    elif entry_model == "limit":
         status, fill_price, fill_idx = _limit_fill(side, entry, sl, future, dip_r, window_bars)
         if status == "miss":
-            return "miss", None
+            return "miss_no_touch", None
         sim_entry, sim_sl = float(fill_price), sl
         new_risk = abs(sim_entry - sim_sl)
         if new_risk <= 0:
@@ -155,12 +205,26 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
         if status == "filled_stopped":
             return "taken", -1.0 - cost
         sim_future = future[fill_idx + 1:]
+    else:  # "zone" -- touch + real-break check + reversal confirmation
+        status, fill_price, fill_idx = _zone_confirm_entry(side, entry, sl, future,
+                                                           dip_r, window_bars)
+        if status != "filled":
+            return f"miss_{status}", None
+        sim_entry, sim_sl = float(fill_price), sl
+        if abs(sim_entry - sim_sl) <= 0:
+            return "skip", None
+        sim_future = future[fill_idx + 1:]
 
     risk = abs(sim_entry - sim_sl)
     cost = spread_abs / risk + commission_r
     if exit_kind == "ladder":
         _outcome, r, _held = _simulate_ladder(side, sim_entry, sim_sl, sim_future,
                                               exit_params["rungs"], max_hold)
+    elif exit_kind == "plain":
+        # the signal's own TP price (VP's gate-winning posture was plain h48);
+        # from a discounted entry the same TP level is simply further in R.
+        _outcome, r, _held = _simulate(side, sim_entry, sim_sl, float(trade["tp"]),
+                                       sim_future, max_hold)
     else:  # "convex"
         _outcome, r, _held = _simulate_convex(side, sim_entry, sim_sl, sim_future,
                                               exit_params["arm_at"], exit_params["giveback_atr"],
@@ -248,29 +312,34 @@ def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
 def _score(trades: list[dict], entry_model: str, dip_r: float, window_bars: int,
            exit_kind: str, exit_params: dict, atr: float, max_hold: int,
            spread_abs: float, commission_r: float) -> dict | None:
-    """Score one row on one segment. Misses are counted and their
-    counterfactual (market entry, SAME exit) is accumulated so the limit
-    rows' selection bias is visible in the output."""
+    """Score one row on one segment. Misses are counted PER CLASS and each
+    class's counterfactual (market entry, SAME exit) is accumulated so both
+    the limit rows' selection bias AND the zone rows' break-check savings
+    are visible in the output (cf of miss_break should be deeply negative
+    if the break-check is doing its knife-refusal job)."""
     rs: list[float] = []
-    miss_cf: list[float] = []
+    miss_cf: dict[str, list[float]] = {"no_touch": [], "no_confirm": [], "break": []}
     for t in trades:
         status, r = _trade_r(t, entry_model, dip_r, window_bars, exit_kind, exit_params,
                              atr, max_hold, spread_abs, commission_r)
         if status == "taken" and r is not None:
             rs.append(r)
-        elif status == "miss":
+        elif status.startswith("miss"):
+            key = status.replace("miss_", "").replace("zone_", "") or "no_touch"
             _s2, r_cf = _trade_r(t, "market", 0.0, 0, exit_kind, exit_params,
                                  atr, max_hold, spread_abs, commission_r)
             if r_cf is not None:
-                miss_cf.append(r_cf)
+                miss_cf.setdefault(key, []).append(r_cf)
     if not rs:
         return None
     net, pf, dd = _equity(rs)
     wr = 100.0 * sum(1 for r in rs if r > 0) / len(rs)
+    all_miss = [x for v in miss_cf.values() for x in v]
     return {
         "n": len(rs), "net": net, "pf": pf, "dd": dd, "wr": wr,
-        "miss_n": len(miss_cf), "miss_net": sum(miss_cf),
-        "fill_pct": 100.0 * len(rs) / max(1, len(rs) + len(miss_cf)),
+        "miss_n": len(all_miss), "miss_net": sum(all_miss),
+        "fill_pct": 100.0 * len(rs) / max(1, len(rs) + len(all_miss)),
+        "miss_by": {k: (len(v), sum(v)) for k, v in miss_cf.items() if v},
     }
 
 
@@ -292,6 +361,10 @@ def _print_row(dir_mode: str, label: str, d: dict | None, v: dict | None, v_days
     print(f"{dir_mode:<14} {label:<30} | {d['n']:>4} {d['net']:>+8.2f} {d['pf']:>5.2f} | "
           f"{v['n']:>4} {v['net']:>+8.2f} {v['pf']:>5.2f} {v['wr']:>5.1f} | "
           f"{v['fill_pct']:>5.1f} {v['miss_n']:>5} {v['miss_net']:>+8.2f} | {usd_day:>+7.0f} {verdict}")
+    if d.get("miss_by") and len(d["miss_by"]) > 1:
+        def _mb(sc: dict) -> str:
+            return " ".join(f"{k}:{n}cf{s:+.0f}" for k, (n, s) in sorted(sc["miss_by"].items()))
+        print(f"{'':<14} {'  zone miss classes':<30} | d[{_mb(d)}] v[{_mb(v)}]")
 
 
 def main() -> int:
@@ -311,6 +384,16 @@ def main() -> int:
     ap.add_argument("--limit-variants", default="0.3:6,0.4:6,0.5:6,0.4:12",
                     help="dip_r:window_bars limit-entry variants; 0.4:6 is the registered "
                          "primary (trough p50 bar0/p75 bar4, runner MAE p50 0.40R)")
+    ap.add_argument("--zone-variants", default="",
+                    help="dip_r:window_bars ZONE-CONFIRM entry variants (touch + real-break "
+                         "check + reversal-close entry) -- owner directive 2026-07-16")
+    ap.add_argument("--producer", choices=("hunt", "vp"), default="hunt",
+                    help="signal producer: hunt = live decide_hunt committee; vp = "
+                         "volume_profile.decide_vp (the only gate-passer in repo history). "
+                         "vp forces gates=none (the v16 gate reads hunt-committee features)")
+    ap.add_argument("--exits", default="ladder,convex",
+                    help="comma set from ladder,plain,convex; plain h48 = VP's "
+                         "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
     ap.add_argument("--base-risk-usd", type=float, default=12.0)
     ap.add_argument("--min-derive-trades", type=int, default=60)
@@ -329,11 +412,29 @@ def main() -> int:
 
     # -- phase 1: decisions ONCE per bar, H1 trend sign stamped at decision time
     bias_rows = _anchor_bias_fields(m5)
+    dir_modes = [x.strip() for x in args.dir_modes.split(",") if x.strip()]
+    needs_h1_sign = args.producer == "hunt" or any(
+        m in ("nobuy-h1down", "nocounter") for m in dir_modes)
+    start_i = MIN_M5 if args.producer == "hunt" else max(300, volume_profile.MIN_BARS)
     decisions: list[tuple[int, object, int]] = []
-    for i in range(MIN_M5, len(m5) - 2):
+    for i in range(start_i, len(m5) - 2):
         prefix = m5[: i + 1]
         ts = str(m5[i].get("ts") or "")
         close_epoch = _epoch(ts) + 300
+        if args.producer == "vp":
+            session = str(market_lens.session_context(ts).get("value") or "unknown")
+            try:
+                d = volume_profile.decide_vp(args.symbol, prefix, args.spread_abs, session=session)
+            except Exception:
+                continue
+            if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
+                continue
+            tsign = 0
+            if needs_h1_sign:
+                h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
+                tsign = _h1_trend_sign(h1c)
+            decisions.append((i, d, tsign))
+            continue
         m15c = [b for b in m15 if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
         h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
         try:
@@ -344,9 +445,12 @@ def main() -> int:
             continue
         _stamp_entry_gate_features(d, prefix, h1c)
         decisions.append((i, d, _h1_trend_sign(h1c)))
-    print(f"decisions: {len(decisions)} enter candidates")
+    print(f"decisions: {len(decisions)} enter candidates (producer={args.producer})")
 
     gate_modes = [g.strip() for g in args.gates.split(",") if g.strip()]
+    if args.producer == "vp" and gate_modes != ["none"]:
+        print("producer=vp: forcing gates=none (v16 gate reads hunt-committee features)")
+        gate_modes = ["none"]
     rungs = _parse_ladder_csv(args.ladder_csv)
     convex_combos = []
     for part in args.convex_combos.split(","):
@@ -354,21 +458,36 @@ def main() -> int:
         convex_combos.append((float(arm_s), float(gb_s), int(mh_s)))
     limit_variants = []
     for part in args.limit_variants.split(","):
+        if not part.strip():
+            continue
         dip_s, win_s = part.strip().split(":")
         limit_variants.append((float(dip_s), int(win_s)))
-    dir_modes = [x.strip() for x in args.dir_modes.split(",") if x.strip()]
+    zone_variants = []
+    for part in args.zone_variants.split(","):
+        if not part.strip():
+            continue
+        dip_s, win_s = part.strip().split(":")
+        zone_variants.append((float(dip_s), int(win_s)))
 
     split_bar = MIN_M5 + int((len(m5) - 2 - MIN_M5) * args.split)
     v_days = max(0.1, (_epoch(str(m5[-1]["ts"])) - _epoch(str(m5[split_bar]["ts"]))) / 86400.0)
     print(f"derive/validate split at bar {split_bar} (validate ~= {v_days:.1f} days)")
 
-    exits: list[tuple[str, str, dict, int]] = [("ladder(live)", "ladder", {"rungs": rungs}, args.max_hold)]
-    for arm, gb, mh in convex_combos:
-        exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh}", "convex",
-                      {"arm_at": arm, "giveback_atr": gb}, mh))
+    exit_set = {x.strip() for x in args.exits.split(",") if x.strip()}
+    exits: list[tuple[str, str, dict, int]] = []
+    if "ladder" in exit_set:
+        exits.append(("ladder(live)", "ladder", {"rungs": rungs}, args.max_hold))
+    if "plain" in exit_set:
+        exits.append((f"plain-tp h{args.max_hold}", "plain", {}, args.max_hold))
+    if "convex" in exit_set:
+        for arm, gb, mh in convex_combos:
+            exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh}", "convex",
+                          {"arm_at": arm, "giveback_atr": gb}, mh))
     entries: list[tuple[str, str, float, int]] = [("market", "market", 0.0, 0)]
     for dip, win in limit_variants:
         entries.append((f"limit -{dip:.1f}R w{win}", "limit", dip, win))
+    for dip, win in zone_variants:
+        entries.append((f"zone -{dip:.1f}R w{win}", "zone", dip, win))
 
     for mode in gate_modes:
         accepted: list[dict] = []

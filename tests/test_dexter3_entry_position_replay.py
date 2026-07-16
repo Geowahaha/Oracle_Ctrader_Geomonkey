@@ -21,6 +21,7 @@ from scripts.dexter3_entry_position_replay import (
     _limit_fill,
     _score,
     _trade_r,
+    _zone_confirm_entry,
 )
 
 RUNGS = [(0.25, 0.02), (0.50, 0.15), (0.80, 0.40), (1.20, 0.80), (2.00, 1.45), (3.00, 2.25)]
@@ -121,7 +122,7 @@ def test_trade_r_limit_miss_returns_none():
     t = _limit_trade()
     t["future"] = [_bar(2000.0, 2000.5, 1999.5, 2000.3)]
     assert _trade_r(t, "limit", 0.4, 6, "ladder", {"rungs": RUNGS},
-                    atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM) == ("miss", None)
+                    atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM) == ("miss_no_touch", None)
 
 
 def test_trade_r_market_uses_original_risk():
@@ -133,6 +134,130 @@ def test_trade_r_market_uses_original_risk():
     assert status == "taken"
     # costs in ORIGINAL risk units = 0.12/2 + 0.03 = 0.09
     assert r == pytest.approx(0.02 - 0.09)
+
+
+# ---------------------------------------------------------------------------
+# _zone_confirm_entry -- touch + real-break check + reversal close
+# (owner directive 2026-07-16: "เปลี่ยนจากวาง limit เป็นโซน ตรวจสอบเบรคจริง
+#  + สัญญาณกลับตัว")
+# ---------------------------------------------------------------------------
+
+
+def test_zone_touch_and_same_bar_confirm():
+    # buy entry 2000, sl 1998 (risk 2), dip 0.4 -> zone_top 1999.2. The bar
+    # dips to 1999.1 (touch) and closes green at 1999.8 (above zone_top,
+    # below entry) -> same-bar confirm, enter at the CLOSE 1999.8.
+    future = [_bar(1999.3, 1999.9, 1999.1, 1999.8)]
+    status, px, idx = _zone_confirm_entry("buy", 2000.0, 1998.0, future, 0.4, 6)
+    assert status == "filled"
+    assert px == pytest.approx(1999.8)
+    assert idx == 0
+
+
+def test_zone_survives_wick_through_sl_where_limit_dies():
+    # THE mechanism difference. Bar 0 wicks to 1997.5 (through SL 1998) but
+    # CLOSES back at 1998.6 -- no position yet, so the zone model survives;
+    # the blind limit is filled AND stopped on that same bar. Bar 1 closes
+    # green at 1999.4 (> zone_top 1999.2, < entry) -> zone enters at 1999.4.
+    future = [
+        _bar(1999.5, 1999.6, 1997.5, 1998.6),
+        _bar(1998.7, 1999.5, 1998.4, 1999.4),
+    ]
+    l_status, _p, _i = _limit_fill("buy", 2000.0, 1998.0, future, 0.4, 6)
+    assert l_status == "filled_stopped"                 # limit: -1R knife
+    z_status, z_px, z_idx = _zone_confirm_entry("buy", 2000.0, 1998.0, future, 0.4, 6)
+    assert z_status == "filled"
+    assert z_px == pytest.approx(1999.4)
+    assert z_idx == 1
+
+
+def test_zone_break_on_close_beyond_sl():
+    # a CLOSE at 1997.8 (< sl 1998) = confirmed break -> no trade at all.
+    future = [_bar(1999.5, 1999.6, 1997.5, 1997.8)]
+    assert _zone_confirm_entry("buy", 2000.0, 1998.0, future, 0.4, 6)[0] == "zone_break"
+
+
+def test_zone_no_confirm_and_no_touch():
+    # touched but every close stays red/below zone_top -> no_confirm;
+    # never reaches the zone at all -> no_touch.
+    touched_only = [_bar(1999.5, 1999.5, 1999.0, 1999.1), _bar(1999.1, 1999.15, 1998.6, 1998.7)]
+    assert _zone_confirm_entry("buy", 2000.0, 1998.0, touched_only, 0.4, 6)[0] == "no_confirm"
+    never = [_bar(2000.0, 2000.5, 1999.5, 2000.2)]
+    assert _zone_confirm_entry("buy", 2000.0, 1998.0, never, 0.4, 6)[0] == "no_touch"
+
+
+def test_zone_confirm_above_entry_rejected():
+    # the reversal bar closes at 2000.4 (> signal entry 2000) -- the discount
+    # is gone, chasing is exactly what this model refuses -> no_confirm.
+    future = [_bar(1999.3, 1999.4, 1999.0, 1999.1), _bar(1999.1, 2000.6, 1999.0, 2000.4)]
+    assert _zone_confirm_entry("buy", 2000.0, 1998.0, future, 0.4, 2)[0] == "no_confirm"
+
+
+def test_zone_sell_mirror():
+    # sell entry 2000, sl 2002 (risk 2), dip 0.4 -> zone_top 2000.8. Bar
+    # opens 2000.5, spikes to 2000.9 (touch) and closes RED at 2000.3
+    # (c < o, < zone_top, > entry) -> confirm at 2000.3.
+    future = [_bar(2000.5, 2000.9, 2000.1, 2000.3)]
+    status, px, _idx = _zone_confirm_entry("sell", 2000.0, 2002.0, future, 0.4, 6)
+    assert status == "filled"
+    assert px == pytest.approx(2000.3)
+
+
+def test_trade_r_zone_ladder_hand_computed():
+    # zone confirm at 1999.8 (test above), SL stays 1998 -> new risk = 1.8.
+    # Exit bar: peak_r = (2001.6-1999.8)/1.8 = 1.0 -> rung (0.80, 0.40) armed;
+    # adverse_r = (1999.9-1999.8)/1.8 = 0.0556 <= 0.40 -> ladder floor 0.40.
+    # costs = 0.12/1.8 + 0.03 = 0.0967 (new-risk units).
+    t = {
+        "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
+        "future": [
+            _bar(1999.3, 1999.9, 1999.1, 1999.8),      # touch + confirm bar
+            _bar(1999.9, 2001.6, 1999.9, 2001.0),      # runner bar, exits at floor
+        ],
+    }
+    status, r = _trade_r(t, "zone", 0.4, 6, "ladder", {"rungs": RUNGS},
+                         atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
+    assert status == "taken"
+    assert r == pytest.approx(0.40 - (SPREAD / 1.8 + COMM))
+
+
+def test_trade_r_plain_exit_reaches_signal_tp():
+    # market entry, plain exit: TP 2004 (risk 2 -> +2R), hit on bar 0 high.
+    t = {
+        "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
+        "future": [_bar(2000.2, 2004.5, 1999.9, 2004.0)],
+    }
+    status, r = _trade_r(t, "market", 0.0, 0, "plain", {},
+                         atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
+    assert status == "taken"
+    assert r == pytest.approx(2.0 - 0.09)
+
+
+def test_score_zone_miss_classes():
+    # one confirm-fill, one zone_break, one no_touch -> miss_by carries the
+    # per-class counterfactuals (break cf is the knife the check refused).
+    fill = {
+        "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
+        "future": [_bar(1999.3, 1999.9, 1999.1, 1999.8), _bar(1999.9, 2001.6, 1999.9, 2001.0)],
+    }
+    broke = {
+        "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
+        "future": [_bar(1999.5, 1999.6, 1997.5, 1997.8)],
+    }
+    never = {
+        "side": "buy", "entry": 2000.0, "sl": 1998.0, "tp": 2004.0,
+        "future": [_bar(2000.0, 2000.6, 1999.5, 2000.3)],
+    }
+    sc = _score([fill, broke, never], "zone", 0.4, 6, "ladder", {"rungs": RUNGS},
+                atr=4.5, max_hold=48, spread_abs=SPREAD, commission_r=COMM)
+    assert sc is not None
+    assert sc["n"] == 1
+    assert sc["miss_n"] == 2
+    assert set(sc["miss_by"]) == {"break", "no_touch"}
+    # break counterfactual: market entry, bar low 1997.5 <= sl -> -1R - 0.09
+    n_b, cf_b = sc["miss_by"]["break"]
+    assert n_b == 1
+    assert cf_b == pytest.approx(-1.0 - 0.09)
 
 
 # ---------------------------------------------------------------------------
