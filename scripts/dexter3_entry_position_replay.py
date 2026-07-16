@@ -531,7 +531,7 @@ def decide_channelfade(m5_prefix: list, atr: float, window: int = 36,
                        min_h_atr: float = 1.5, max_h_atr: float = 4.0,
                        max_eff: float = 0.35, edge_frac: float = 0.2,
                        min_touches: int = 2, sl_buf_atr: float = 0.35,
-                       max_risk_atr: float = 2.0) -> dict | None:
+                       max_risk_atr: float = 2.0, tp_frac: float = 0.5) -> dict | None:
     """CHANNEL-EDGE FADE producer (owner 2026-07-16/17: "ตลาด sideway ใน H1 DZ
     มี ch ชัดเจน เราไม่ควรเข้ากลางทาง ควรเก็บ Sell/Buy ขอบ ch บนล่าง") — the
     RANGE phase of the day grammar, the one phase no lane covers. All
@@ -577,12 +577,12 @@ def decide_channelfade(m5_prefix: list, atr: float, window: int = 36,
         sl = ch_hi + sl_buf_atr * atr
         risk = sl - c
         if 0 < risk <= max_risk_atr * atr:
-            return {"side": "sell", "entry": c, "sl": sl, "tp": mid}
+            return {"side": "sell", "entry": c, "sl": sl, "tp": ch_hi - tp_frac * height}
     if lo <= ch_lo + band and c > o and c < mid:
         sl = ch_lo - sl_buf_atr * atr
         risk = c - sl
         if 0 < risk <= max_risk_atr * atr:
-            return {"side": "buy", "entry": c, "sl": sl, "tp": mid}
+            return {"side": "buy", "entry": c, "sl": sl, "tp": ch_lo + tp_frac * height}
     return None
 
 
@@ -711,6 +711,9 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--chf-tp-frac", type=float, default=0.5,
+                    help="channelfade TP as fraction of box height from the faded edge "
+                         "(0.5=mid primary, 0.85=near opposite edge secondary)")
     ap.add_argument("--drev-arm-atr", type=float, default=12.0,
                     help="dayreversal: capitulation arming threshold (day range in ATR)")
     ap.add_argument("--dt-range-cap-atr", type=float, default=0.0,
@@ -772,7 +775,7 @@ def main() -> int:
                 sig = decide_dayreversal(prefix, bias_rows[i], atr,
                                          range_arm_atr=args.drev_arm_atr)
             else:
-                sig = decide_channelfade(prefix, atr)
+                sig = decide_channelfade(prefix, atr, tp_frac=args.chf_tp_frac)
             if sig is None:
                 continue
             from types import SimpleNamespace
