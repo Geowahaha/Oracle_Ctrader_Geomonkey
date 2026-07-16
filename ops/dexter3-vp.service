@@ -1,29 +1,28 @@
-# Dexter3 VOLUME-PROFILE canary lane — DO NOT ENABLE WITHOUT OWNER SIGN-OFF.
+# Dexter3 VOLUME-PROFILE canary lane — OWNER SIGN-OFF GIVEN 2026-07-16
+# ("ไม่ต้องทำ shadow แล้ว deploy เลย"), shadow phase explicitly waived.
 #
-# Evidence (2026-07-11, AGENT_SYNC_BOARD 22:15Z/22:45Z entries): the VP
-# producer is the FIRST candidate to pass the promotion gate on BOTH hold-out
-# splits — 60/40: validate +76.4R PF 1.57 (~$85/day at $12/R); 50/50:
-# validate +67.2R PF 1.36 (~$54/day). ~20 setups/day, month window.
+# Deployed variant = the 3-window replay survivor with the largest sample
+# (scripts/dexter3_entry_position_replay.py; VM /tmp/entry_pos_vp_{6k,10k,20k}.log,
+# all six segment-cells positive):
+#   VP producer x day-open bias (00Z anchor, >=1h; ต่ำเปิด -> sells only,
+#   ยืนเปิด -> buys only) x synthetic LIMIT at entry-0.4R (SL structural,
+#   TTL 30min, fill-vs-level delta journaled) x CONVEX trail exit (arm 1.0R,
+#   giveback 3.0xATR, max age 240min; DEXTER3_OM_TRAIL_MODE=convex replaces
+#   hard-take/ladder/stall/pyramid for THIS lane only) + no-trade window
+#   around the daily close/reopen (owner 2026-07-16).
 #
 # Isolation: DEXTER3_MODE=vp gives this lane its own broker label
-# (dexter3:vp:canary), state file (dexter3_vp_shadow_state.json) and lock —
+# (dexter3:vp:*), state file (dexter3_vp_shadow_state.json) and lock —
 # same pattern as the grok lane; fable/grok never touch VP positions.
 #
-# SCOUT SIZE by design: governor 15/8 (half grok's 30/15), base risk 0.4%,
-# ratio caps inherited via .env.local. Scaling only after >=100 forward
-# trades + PF>1.2 per the standing freeze.
+# SCOUT SIZE by design: governor 15/8, base risk 0.4%. Scaling only after
+# >=100 forward trades + PF>1.2 per the standing freeze.
 #
-# EXIT POSTURE NOTE: the replay favored PLAIN exits + hold 48 bars (VP TPs
-# are structural and need time). The live OM ladder may cut VP winners early
-# — measure the first forward week BEFORE changing OM knobs; if forward PF
-# lags the replay badly, try DEXTER3_OM_LADDER_CSV with looser early rungs
-# for THIS unit only.
-#
-# ACTIVATION (after owner sign-off):
+# ACTIVATION:
 #   sudo cp ops/dexter3-vp.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-vp
 [Unit]
-Description=Dexter3 Volume-Profile canary lane (OpenAPI daemon, scout size)
+Description=Dexter3 VP lane LIVE canary (day-open bias x limit x convex)
 After=network-online.target dexter3-openapi-daemon.service
 Wants=dexter3-openapi-daemon.service
 
@@ -47,6 +46,28 @@ Environment=DEXTER3_DAILY_TARGET_USD=15
 Environment=DEXTER3_DAILY_LOSS_USD=8
 Environment=DEXTER3_BASE_RISK_FRAC=0.004
 Environment=DEXTER3_MAX_RISK_FRAC=0.008
+# --- the proven stack (owner deploy 2026-07-16) -----------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=1
+Environment=DEXTER3_VP_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_VP_BIAS_MIN_HOURS=1
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_VP_LIMIT_DIP_R=0.4
+Environment=DEXTER3_VP_LIMIT_TTL_MIN=30
+Environment=DEXTER3_VP_FAR_TP_R=12
+Environment=DEXTER3_OM_TRAIL_MODE=convex
+Environment=DEXTER3_OM_CONVEX_ARM_R=1.0
+Environment=DEXTER3_OM_CONVEX_GIVEBACK_ATR=3.0
+Environment=DEXTER3_OM_CONVEX_MAX_AGE_MIN=240
+# basket cap must outlive the convex 240min hold (default 180 would cap first)
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=250
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# hunt-lane machinery not in the proof: off for this lane
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
 [Install]

@@ -74,6 +74,7 @@ from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.weekly_risk import weekly_close_policy
+from dexter3 import vp_lane
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
@@ -272,6 +273,15 @@ def _basket_config_from_env() -> BasketConfig:
     if raw:
         try:
             kw["daily_loss_baskets"] = int(raw)
+        except ValueError:
+            pass
+    # VP lane (2026-07-16): the convex exit's proven hold is 240min (replay
+    # h48) — longer than the 180min basket default, which would cap-stop the
+    # basket before the trail's own time stop. Env-tunable, default untouched.
+    raw_ts = os.environ.get("DEXTER3_BASKET_TIME_STOP_MIN")
+    if raw_ts:
+        try:
+            kw["time_stop_min"] = int(raw_ts)
         except ValueError:
             pass
     for env, field in (
@@ -940,6 +950,21 @@ def _apply_v16_entry_quality_gate(
     entirely otherwise, so a near-zero leader_score signal was reaching
     live entry unfiltered, e.g. leader_score=0.056 on 2026-07-15). Journals
     features on decision."""
+    if _vp_producer_enabled():
+        # VP lane (owner deploy 2026-07-16): the v16 gate scores
+        # hunt-committee features (leader_score etc.) that VP decisions do
+        # not carry — leader_score=0.0 would block EVERY VP entry on
+        # min_leader_score. The 3-window replay proof ran gates=none; the
+        # VP lane's own gate (day-open bias + no-trade window) is applied
+        # by the caller right after this returns.
+        return {
+            "allow": True,
+            "reason": "vp_bypass",
+            "a_plus": False,
+            "a_plus_reason": "",
+            "cooldown_bypassed": False,
+            "features": {"vp_bypass": True},
+        }
     if _is_grok_mode():
         leader_score = float(getattr(decision, "leader_score", 0.0) or 0.0)
         min_leader_score = _env_float("DEXTER3_GROK_MIN_LEADER_SCORE", 0.10)
@@ -1717,11 +1742,20 @@ def run_symbol_cycle(
                     base_risk_usd = (risk_info or {}).get("risk_usd")
                     if base_risk_usd is None:
                         base_risk_usd = executor.config.risk_usd
-                    risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
-                    risk_usd_override = _apply_pullback_gate(decision, prefix, float(risk_usd_override))
-                    risk_usd_override = _apply_v16_profit_controls(
-                        mcp, state, decision, float(risk_usd_override)
-                    )
+                    if _vp_producer_enabled():
+                        # VP lane (2026-07-16): the hunt sizing selectors
+                        # (anti-chase / pullback / v16 profit controls) read
+                        # hunt-committee features VP decisions do not carry,
+                        # and the 3-window proof sized every accepted VP
+                        # trade at flat base risk — bypass, keep the
+                        # governor's risk_for_entry result untouched.
+                        risk_usd_override = float(base_risk_usd)
+                    else:
+                        risk_usd_override = _apply_anti_chase_gate(decision, h1_ctx, float(base_risk_usd))
+                        risk_usd_override = _apply_pullback_gate(decision, prefix, float(risk_usd_override))
+                        risk_usd_override = _apply_v16_profit_controls(
+                            mcp, state, decision, float(risk_usd_override)
+                        )
 
                     # Stamp Grok_v1.0 scalping mode for this entry (independent parallel path)
                     # leader_score high is good. This entry will use fast Grok small-lock (0.25-0.45R)
@@ -1746,8 +1780,33 @@ def run_symbol_cycle(
                     # V1.6 entry-quality pro-pack (Grok bypasses). A+ setups
                     # bypass cool-down; MCP pause / min score still apply.
                     quality = _apply_v16_entry_quality_gate(state, decision)
+                    # VP lane gate (owner deploy 2026-07-16, additive): the
+                    # day-open bias + no-trade window from the 3-window replay
+                    # proof, same result shape as the v16 gate so the blocked
+                    # path below is shared. Only ever evaluated in VP mode.
+                    if quality.get("allow", True) and _vp_producer_enabled():
+                        quality = vp_lane.vp_entry_gate(str(decision.side), prefix, utc_now_iso())
                     if not quality.get("allow", True):
                         status += f":live_blocked_{quality.get('reason', 'quality')}"
+                    elif _vp_producer_enabled() and vp_lane.limit_entry_enabled():
+                        # Synthetic LIMIT (replay's proven entry): store the
+                        # intent; the fast tick fires a market order when the
+                        # touch-side quote reaches the level, or expires it at
+                        # the TTL. Newest allowed signal replaces any pending
+                        # intent (the replay treats each signal independently;
+                        # the lane can hold only one).
+                        intent = vp_lane.make_limit_intent(
+                            decision, prefix, float(risk_usd_override), utc_now_iso()
+                        )
+                        replaced = bool(state.get("vp_limit_intent"))
+                        state["vp_limit_intent"] = intent
+                        log_line(
+                            f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
+                            f"level={intent['level']} sl={intent['sl']} ttl_min="
+                            f"{(intent['deadline_epoch'] - intent['created_epoch']) / 60:.0f} "
+                            f"replaced={replaced}"
+                        )
+                        status += ":vp_limit_intent_set"
                     else:
                         risk_usd_override = _apply_v18_size_levers(
                             quality, float(base_risk_usd), float(risk_usd_override)
@@ -1998,6 +2057,65 @@ def _maybe_alert_account_guard(client: Any, result: dict[str, Any] | None) -> bo
         return True
     except Exception:  # noqa: BLE001 - alarm must never break the loop
         return False
+
+
+def _service_vp_limit_intent(
+    mcp: Dexter3McpClient,
+    state: dict[str, Any],
+    symbol: str,
+    executor: Dexter3Executor,
+) -> dict[str, Any] | None:
+    """Fast-tick servicing of the VP lane's synthetic limit intent (owner
+    deploy 2026-07-16). Fires a MARKET entry when the touch-side quote
+    reaches the level (>= one 8s tick of slippage, journaled as fill-vs-level
+    delta so the synthetic's cost is measured); expires the intent past its
+    TTL. Never raises — the caller wraps it like run_om_tick. Returns the
+    executor result on a fill, else None."""
+    intent = state.get("vp_limit_intent")
+    if not isinstance(intent, dict) or str(intent.get("symbol")) != symbol:
+        return None
+    try:
+        spot = mcp.get_spot_price(symbol)
+    except Exception as exc:
+        log_line(f"{utc_now_iso()} {symbol} vp_intent_spot_read_failed: {exc}")
+        return None
+    bid = _f(spot.get("bid"), 0.0)
+    ask = _f(spot.get("ask"), 0.0)
+    verdict = vp_lane.check_intent_fill(intent, bid=bid, ask=ask, now_iso=utc_now_iso())
+    if verdict == "expired":
+        state.pop("vp_limit_intent", None)
+        log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
+                 f"side={intent.get('side')}")
+        save_shadow_state(state)
+        return None
+    if verdict != "fill":
+        return None
+    state.pop("vp_limit_intent", None)
+    decision = vp_lane.intent_to_decision(intent, hunter_brain.Decision, utc_now_iso())
+    touch_px = ask if str(intent.get("side")) == "buy" else bid
+    daily = _daily_state(state)
+    exec_result = _execute_live_entry(
+        executor,
+        decision,
+        today_entry_count=int(daily.get("entries", 0)),
+        today_losing_count=int(daily.get("loss_baskets", 0)),
+        risk_usd_override=_f(intent.get("risk_usd"), None),
+    )
+    if exec_result.get("action") == "entered":
+        daily["entries"] = int(daily.get("entries", 0)) + 1
+        # Stamp the convex-exit inputs for run_om_tick (atr measured at
+        # signal time, stop distance of the FILLED geometry).
+        state["vp_convex"] = {
+            "atr_pts": _f(intent.get("atr_pts"), 0.0),
+            "stop_pts": _f(intent.get("stop_pts"), 0.0),
+        }
+    log_line(
+        f"{utc_now_iso()} {symbol} vp_limit_intent_{exec_result.get('action', 'unknown')} "
+        f"level={intent.get('level')} touch_px={touch_px:.5f} "
+        f"fill_vs_level={touch_px - _f(intent.get('level')):+.5f} side={intent.get('side')}"
+    )
+    save_shadow_state(state)
+    return exec_result
 
 
 def _execute_live_entry(
@@ -3522,6 +3640,9 @@ def run_om_tick(
         "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
         "spread_abs": spread_abs,
         "smart_exit_regime": regime_map,
+        # VP convex-exit inputs (stamped at intent fill — see
+        # _service_vp_limit_intent; only read when DEXTER3_OM_TRAIL_MODE=convex)
+        "vp_convex": state.get("vp_convex"),
         # Grok_v1.0 flags (populated at entry time)
         **(state.get("grok_v10_flags") or {}),
     }
@@ -3941,6 +4062,8 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
                 for symbol in symbols:
                     try:
                         run_weekly_flatten_tick(executor, symbol)
+                        if _vp_producer_enabled() and executor is not None:
+                            _service_vp_limit_intent(mcp, state, symbol, executor)
                         run_om_tick(mcp, journal, state, symbol, executor=executor)
                     except McpZombieError as exc:
                         log_line(f"{utc_now_iso()} {symbol} OM MCP_ZOMBIE: {exc}")

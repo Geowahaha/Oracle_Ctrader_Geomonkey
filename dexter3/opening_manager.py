@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from dexter3 import basket_live, hunt_mode
+from dexter3 import basket_live, hunt_mode, vp_lane
 from dexter3.basket_manager import BasketConfig
 
 # Grok_v1.0 parallel micro-scalp lock (independent, optional)
@@ -431,6 +431,48 @@ class OpeningManager:
         # Grok_v1.0 scalping entries so the two systems run independently.
         # Only Grok small-lock handles profit taking for scalps.
         if not is_grok_scalp:
+            # -- CONVEX TRAIL mode (VP lane, owner deploy 2026-07-16;
+            # env-gated DEXTER3_OM_TRAIL_MODE=convex — fable/grok ladder
+            # lanes untouched). The 3-window replay proof's exit: no TP, no
+            # hard-take, no ladder, no stall, no pyramid/repair — a single
+            # trail that arms at peak_r >= arm and floors at
+            # peak - giveback_atr x ATR (floor MAY be negative; below the
+            # broker SL it simply never fires = the replay's SL-first
+            # semantics), plus a hard max-age stop (replay h48 = 240min).
+            if vp_lane.convex_trail_enabled():
+                cvx = st.get("vp_convex") or {}
+                floor_cvx = vp_lane.convex_floor_r(
+                    peak_r, _f(cvx.get("atr_pts"), 0.0), _f(cvx.get("stop_pts"), 0.0)
+                )
+                if vp_lane.convex_age_exceeded(
+                    str(oldest_open_ts) if oldest_open_ts else None, now_utc_iso or None
+                ):
+                    return {
+                        "action": "close_all",
+                        "reason": "convex_time_stop",
+                        "peak_r": round(peak_r, 4),
+                        "floor_r": round(floor_cvx, 4) if floor_cvx is not None else None,
+                        "live_r": round(live_r, 4),
+                        "basket_runtime": basket_runtime,
+                    }
+                if floor_cvx is not None and live_r <= floor_cvx:
+                    return {
+                        "action": "close_all",
+                        "reason": "convex_trail",
+                        "peak_r": round(peak_r, 4),
+                        "floor_r": round(floor_cvx, 4),
+                        "live_r": round(live_r, 4),
+                        "basket_runtime": basket_runtime,
+                    }
+                return {
+                    "action": "hold",
+                    "reason": "convex_hold",
+                    "peak_r": round(peak_r, 4),
+                    "floor_r": round(floor_cvx, 4) if floor_cvx is not None else None,
+                    "live_r": round(live_r, 4),
+                    "basket_runtime": basket_runtime,
+                }
+
             # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
             # ceiling captures — never wait on giveback math once the move is
             # this big) ------------------------------------------------------
