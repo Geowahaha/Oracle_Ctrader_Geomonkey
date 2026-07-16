@@ -527,6 +527,65 @@ def decide_dayreversal(m5_prefix: list, bias_row: dict, atr: float,
     return {"side": "sell", "entry": c, "sl": sl, "tp": d_hi - retrace_frac * day_range}
 
 
+def decide_channelfade(m5_prefix: list, atr: float, window: int = 36,
+                       min_h_atr: float = 1.5, max_h_atr: float = 4.0,
+                       max_eff: float = 0.35, edge_frac: float = 0.2,
+                       min_touches: int = 2, sl_buf_atr: float = 0.35,
+                       max_risk_atr: float = 2.0) -> dict | None:
+    """CHANNEL-EDGE FADE producer (owner 2026-07-16/17: "ตลาด sideway ใน H1 DZ
+    มี ch ชัดเจน เราไม่ควรเข้ากลางทาง ควรเก็บ Sell/Buy ขอบ ch บนล่าง") — the
+    RANGE phase of the day grammar, the one phase no lane covers. All
+    pre-registered, closed-bar only:
+      * channel over the trailing ``window`` M5 bars: height H in
+        [min_h_atr, max_h_atr] x ATR (too tight = spread noise, too wide =
+        trending), directional efficiency |drift|/H <= max_eff (sideways),
+        and >= min_touches bar-touches of EACH edge band (a real box, not a
+        drift);
+      * NO mid-channel entries: the newest bar must touch an edge band
+        (within edge_frac x H of the edge) AND close back INSIDE in the fade
+        direction (reversal close — the same M5-close confirm convention as
+        every other producer; the live lane's M1 ENTRY_CONFIRM refines it);
+      * SL beyond the edge + sl_buf_atr x ATR; TP = mid-channel (primary —
+        the conservative half-box target).
+    Returns {side, entry, sl, tp} or None."""
+    if len(m5_prefix) < window + 2 or atr <= 0:
+        return None
+    seg = m5_prefix[-window:]
+    highs = [float(b.get("high", 0.0)) for b in seg]
+    lows = [float(b.get("low", 0.0)) for b in seg]
+    closes = [float(b.get("close", 0.0)) for b in seg]
+    ch_hi, ch_lo = max(highs), min(lows)
+    height = ch_hi - ch_lo
+    if not (min_h_atr * atr <= height <= max_h_atr * atr):
+        return None
+    if abs(closes[-1] - closes[0]) / height > max_eff:
+        return None
+    band = edge_frac * height
+    if sum(1 for h in highs if h >= ch_hi - band) < min_touches:
+        return None
+    if sum(1 for l in lows if l <= ch_lo + band) < min_touches:
+        return None
+    last = seg[-1]
+    o = float(last.get("open", 0.0))
+    c = float(last.get("close", 0.0))
+    hi = float(last.get("high", 0.0))
+    lo = float(last.get("low", 0.0))
+    mid = (ch_hi + ch_lo) / 2.0
+    # SELL the top edge: bar touched the top band, closed red back inside,
+    # close still in the upper half (never a mid-channel entry).
+    if hi >= ch_hi - band and c < o and c > mid:
+        sl = ch_hi + sl_buf_atr * atr
+        risk = sl - c
+        if 0 < risk <= max_risk_atr * atr:
+            return {"side": "sell", "entry": c, "sl": sl, "tp": mid}
+    if lo <= ch_lo + band and c > o and c < mid:
+        sl = ch_lo - sl_buf_atr * atr
+        risk = c - sl
+        if 0 < risk <= max_risk_atr * atr:
+            return {"side": "buy", "entry": c, "sl": sl, "tp": mid}
+    return None
+
+
 def _dir_allows(mode: str, side: str, ctx: dict) -> bool:
     """ctx carries the decision-time direction facts stamped on the trade:
     trend_sign (H1 6-bar) + bias_d0/bias_d22/bias_sess (+ hrs_*)."""
@@ -643,7 +702,7 @@ def main() -> int:
                     help="dip_r:window_bars zone variants confirmed on M1 bars (M5 green "
                          "light, M1 best-entry trigger) -- owner idea 2026-07-16. NOTE: "
                          "daemon M1 history is ~14 days; rows outside it report miss_no_m1")
-    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend", "dayreversal"), default="hunt",
+    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend", "dayreversal", "channelfade"), default="hunt",
                     help="signal producer: hunt = live decide_hunt committee; vp = "
                          "volume_profile.decide_vp (the only gate-passer in repo history); "
                          "daytrend = with-bias pullback-continuation (owner live lesson "
@@ -704,14 +763,16 @@ def main() -> int:
                 tsign = _h1_trend_sign(h1c)
             decisions.append((i, d, tsign))
             continue
-        if args.producer in ("daytrend", "dayreversal"):
+        if args.producer in ("daytrend", "dayreversal", "channelfade"):
             if args.producer == "daytrend":
                 sig = decide_daytrend(prefix, bias_rows[i], atr,
                                       range_cap_atr=args.dt_range_cap_atr,
                                       last_entry_hour=args.dt_last_hour)
-            else:
+            elif args.producer == "dayreversal":
                 sig = decide_dayreversal(prefix, bias_rows[i], atr,
                                          range_arm_atr=args.drev_arm_atr)
+            else:
+                sig = decide_channelfade(prefix, atr)
             if sig is None:
                 continue
             from types import SimpleNamespace
@@ -733,7 +794,7 @@ def main() -> int:
     print(f"decisions: {len(decisions)} enter candidates (producer={args.producer})")
 
     gate_modes = [g.strip() for g in args.gates.split(",") if g.strip()]
-    if args.producer in ("vp", "daytrend", "dayreversal") and gate_modes != ["none"]:
+    if args.producer in ("vp", "daytrend", "dayreversal", "channelfade") and gate_modes != ["none"]:
         print(f"producer={args.producer}: forcing gates=none")
         gate_modes = ["none"]
     rungs = _parse_ladder_csv(args.ladder_csv)
