@@ -1593,7 +1593,12 @@ def run_symbol_cycle(
         if bool(weekly["block_entries"]):
             return f"weekly_entry_blocked:{weekly['reason']}"
 
-    m5_bars = fetch_fresh_m5(mcp, symbol)
+    # VP mode needs a much deeper prefix than hunt: decide_vp's profile
+    # window is 288 bars (+3 context = MIN_BARS 291, else it skips every
+    # bar with "bars<291" — the exact latent gap that surfaced at first
+    # enable 2026-07-16), and the day-open bias must see back to the 00Z
+    # anchor bar (worst case 288 bars; 340 covers ~28h, > any anchor age).
+    m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _vp_producer_enabled() else MIN_M5_BARS)
     if len(m5_bars) < MIN_M5_BARS:
         return f"insufficient_m5_bars({len(m5_bars)})"
 
