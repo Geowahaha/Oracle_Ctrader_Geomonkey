@@ -371,3 +371,20 @@ def test_confirm_ignores_bars_before_signal(monkeypatch):
     late = _bar("2026-07-16T16:11:00Z", 1999.3, 1999.9, 1999.1, 1999.8)
     v, px = vp_lane.advance_confirm_intent(intent, [late])
     assert v == "fill" and px == pytest.approx(1999.8)
+
+
+def test_confirm_premium_cap(monkeypatch):
+    """2026-07-17 fable surgery: a legit reversal close that pays MORE than
+    cap x stop above the level is skipped (wait for a closer bar); the next
+    closer confirm fills."""
+    monkeypatch.setenv(vp_lane.ENV_LIMIT_DIP_R, "0.4")
+    monkeypatch.setenv(vp_lane.ENV_CONFIRM_PREM_CAP, "0.25")
+    d = _FakeDecision(ts_close="2026-07-17T08:00:00Z")  # buy level 1999.2 sl 1998 -> stop 1.2
+    intent = vp_lane.make_limit_intent(d, [], 4.0, "2026-07-17T08:00:00Z")
+    # confirm close 1999.8 -> premium 0.6 > 0.25*1.2=0.3 -> SKIPPED
+    rich = _bar("2026-07-17T08:01:00Z", 1999.3, 1999.9, 1999.1, 1999.8)
+    assert vp_lane.advance_confirm_intent(intent, [rich]) == (None, None)
+    # next bar confirms at 1999.45 -> premium 0.25 <= 0.3 -> FILL
+    close_bar = _bar("2026-07-17T08:02:00Z", 1999.2, 1999.5, 1999.15, 1999.45)
+    v, px = vp_lane.advance_confirm_intent(intent, [close_bar])
+    assert v == "fill" and px == pytest.approx(1999.45)

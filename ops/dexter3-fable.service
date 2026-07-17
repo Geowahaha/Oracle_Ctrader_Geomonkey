@@ -116,6 +116,13 @@ Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.4
 Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
 # owner 2026-07-16: reversal-confirm entries ONLY (no knife catching)
 Environment=DEXTER3_ENTRY_CONFIRM=m1
+# 2026-07-17 full surgery (owner: 'เจาะละเอียดทุกไม้แล้วผ่าตัด'): buys paid
+# 8-45% of the stop in M1-confirm premium (sells got paid) -- cap 0.25x stop
+# improved 5/6 replay cells, net -40.4R -> -10.7R. BE-ratchet variant was
+# KILLED by its own test (loses to plain in every window -- the round-trips
+# are the price of the better distribution; today's 3 peaked-then-stopped
+# trades were that price, now stated in numbers).
+Environment=DEXTER3_CONFIRM_PREM_CAP=0.25
 Environment=DEXTER3_HUNT_NO_TRADE_UTC=20:45-22:15
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 

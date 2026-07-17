@@ -47,6 +47,7 @@ ENV_CONVEX_GIVEBACK_ATR = "DEXTER3_OM_CONVEX_GIVEBACK_ATR"  # default 3.0
 ENV_CONVEX_MAX_AGE_MIN = "DEXTER3_OM_CONVEX_MAX_AGE_MIN"    # default 240
 ENV_CONVEX_ATR_PTS_DEFAULT = "DEXTER3_OM_CONVEX_ATR_PTS_DEFAULT"  # default 5.0
 ENV_BANK_R = "DEXTER3_OM_BANK_R"                       # bank mode: close-based take (default 0.4)
+ENV_CONFIRM_PREM_CAP = "DEXTER3_CONFIRM_PREM_CAP"     # reject confirms paying > cap x stop above the level (0=off)
 
 ATR_WINDOW_BARS = 288   # ~1 trading day of M5 — live counterpart of the
                         # replay's whole-series mean TR (~4.96 on the proof
@@ -298,6 +299,8 @@ def advance_confirm_intent(intent: dict[str, Any], closed_bars: list
         c = _f(b.get("close"))
         hi = _f(b.get("high"))
         lo = _f(b.get("low"))
+        prem_cap = _env_float(ENV_CONFIRM_PREM_CAP, 0.0)
+        stop_pts = abs(level - sl)
         if side == "buy":
             if c <= sl:
                 return "killed", None
@@ -305,6 +308,11 @@ def advance_confirm_intent(intent: dict[str, Any], closed_bars: list
                 touched = True
                 intent["confirm_touched"] = True
             if touched and c > o and c > level and c < signal_entry:
+                if prem_cap > 0 and (c - level) > prem_cap * stop_pts:
+                    continue   # confirm too far above the zone (2026-07-17
+                               # surgery: buys paid 8-45% of the stop in
+                               # premium; cap improved 5/6 replay cells,
+                               # net -40.4R -> -10.7R) -- wait for a closer bar
                 return "fill", c
         else:
             if c >= sl:
@@ -313,6 +321,8 @@ def advance_confirm_intent(intent: dict[str, Any], closed_bars: list
                 touched = True
                 intent["confirm_touched"] = True
             if touched and c < o and c < level and c > signal_entry:
+                if prem_cap > 0 and (level - c) > prem_cap * stop_pts:
+                    continue
                 return "fill", c
     return None, None
 
