@@ -129,6 +129,38 @@ def _limit_fill(side: str, entry: float, sl: float, future: list, dip_r: float,
     return "miss", None, None
 
 
+def _simulate_bank(side: str, entry: float, sl: float, future: list, bank_r: float,
+                   max_hold: int) -> tuple[str, float, int]:
+    """v1.0 BANK-GREEN scalp exit (owner 2026-07-17 "V.1.0 original ของเรายัง
+    ทำงานดีกว่า grok"): SL-first conservative on wicks; BANK the trade at the
+    first M5 bar whose CLOSE reaches entry +/- bank_r x risk (close-based —
+    banking a confirmed green, not a wick); hard time cap at max_hold bars ->
+    mark to the last close. Parameters 0.4R/12 bars are the harvester-sweep
+    winners (derive +48.20R / validate +13.27R — the only scalp concept that
+    ever passed both segments in this repo)."""
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "skip", 0.0, 0
+    for held, bar in enumerate(future[:max_hold]):
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        c = float(bar.get("close", 0.0))
+        if side == "buy":
+            if lo <= sl:
+                return "loss", -1.0, held
+            if c >= entry + bank_r * risk:
+                return "bank", (c - entry) / risk, held
+        else:
+            if hi >= sl:
+                return "loss", -1.0, held
+            if c <= entry - bank_r * risk:
+                return "bank", (entry - c) / risk, held
+    held = min(max_hold, len(future)) - 1
+    last = float(future[held].get("close", entry)) if future else entry
+    r = (last - entry) / risk if side == "buy" else (entry - last) / risk
+    return ("win" if r > 0 else "loss"), r, max(0, held)
+
+
 def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r: float,
                         window_bars: int) -> tuple[str, float | None, int | None]:
     """Owner directive 2026-07-16: "เปลี่ยนจากวาง limit เป็นโซน ตรวจสอบเบรคจริง
@@ -307,6 +339,10 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
     if exit_kind == "ladder":
         _outcome, r, held = _simulate_ladder(side, sim_entry, sim_sl, sim_future,
                                              exit_params["rungs"], max_hold)
+    elif exit_kind == "bank":
+        _outcome, r, held = _simulate_bank(side, sim_entry, sim_sl, sim_future,
+                                           exit_params.get("bank_r", 0.4),
+                                           max_hold)
     elif exit_kind == "plain":
         # the signal's own TP price (VP's gate-winning posture was plain h48);
         # from a discounted entry the same TP level is simply further in R.
@@ -712,6 +748,10 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--bank-r", type=float, default=0.4,
+                    help="bank exit: close-based take at this R (harvester-proven 0.4)")
+    ap.add_argument("--bank-hold", type=int, default=12,
+                    help="bank exit: hard time cap in M5 bars (harvester-proven 12)")
     ap.add_argument("--sdz-rr", type=float, default=2.0,
                     help="sdzone TP as RR multiple of the zone-anchored risk")
     ap.add_argument("--chf-tp-frac", type=float, default=0.5,
@@ -870,6 +910,9 @@ def main() -> int:
         exits.append(("ladder(live)", "ladder", {"rungs": rungs}, args.max_hold))
     if "plain" in exit_set:
         exits.append((f"plain-tp h{args.max_hold}", "plain", {}, args.max_hold))
+    if "bank" in exit_set:
+        exits.append((f"bank {args.bank_r:g}R h{args.bank_hold}", "bank",
+                      {"bank_r": args.bank_r}, args.bank_hold))
     if "convex" in exit_set:
         for arm, gb, mh in convex_combos:
             exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh}", "convex",
