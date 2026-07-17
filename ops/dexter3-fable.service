@@ -35,8 +35,16 @@ Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=12
 Environment=DEXTER3_FABLE_VERSION=v1.8-size-the-edge
 # v16 mode is default
-Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=1
-Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=1
+# 2026-07-17 owner: fable day was 'ผิดปกติอย่างมาก' — anatomy: ONE trade
+# (654047528) lost -23.80 = 47% of the -50.20 day because V18 WINNER-BOOST
+# multiplied size x1.6 to the $25 governor cap on an 'elite_score' A+ buy
+# at the London top. The 10k conviction study proved leader_score has NO
+# predictive content; ledger day-1 showed the score gate blocking +6.94R of
+# winners; day-2 the boost sized the day's worst trade. Sizing levers keyed
+# to measured noise are OFF. B_TIER stays ON for its scheduled 07-22
+# verdict (separate mechanism, judged on its own numbers).
+Environment=DEXTER3_V18_WINNER_BOOST_ENABLED=0
+Environment=DEXTER3_V18_CHASE_RESCUE_ENABLED=0
 Environment=DEXTER3_V18_B_TIER_ENABLED=1
 Environment=DEXTER3_DAILY_TARGET_USD=100
 Environment=DEXTER3_DAILY_LOSS_USD=50
