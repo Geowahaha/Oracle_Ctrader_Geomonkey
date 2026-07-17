@@ -70,7 +70,10 @@ Environment=DEXTER3_DAYREV_SWING_K=2
 # 2026-07-17 owner order ("โอกาสหายาก เปิดเลย"): SD-zone re-entry producer
 # (shared dexter3/sd_zones.py engine = the replay proof, x day-open bias via
 # the vp_entry_gate below; ~1 signal/day, plain exits unchanged).
-Environment=DEXTER3_SDZONE=1
+# 2026-07-17: sdzone producer MOVED to the dedicated scalp lane
+# (dexter3-scalp.service, bank-green exits) — running it on both
+# lanes would recreate the grok/fable twin-entry disease.
+Environment=DEXTER3_SDZONE=0
 Environment=DEXTER3_VP_DAYOPEN_BIAS=1
 Environment=DEXTER3_VP_BIAS_ANCHOR_HOUR=0
 Environment=DEXTER3_VP_BIAS_MIN_HOURS=1

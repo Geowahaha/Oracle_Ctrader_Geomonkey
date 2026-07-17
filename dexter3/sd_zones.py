@@ -17,6 +17,9 @@ longer windows (multi-day zones are rare and usually broken by then).
 """
 from __future__ import annotations
 
+SCALP_LABEL = "dexter3:scalp:canary"
+SCALP_LABEL_FAMILY = "dexter3:scalp"
+
 
 class SDZoneEngine:
     """Faithful port of the owner's Pine v6 Supply & Demand Zones indicator

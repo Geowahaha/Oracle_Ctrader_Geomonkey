@@ -439,6 +439,41 @@ class OpeningManager:
             # peak - giveback_atr x ATR (floor MAY be negative; below the
             # broker SL it simply never fires = the replay's SL-first
             # semantics), plus a hard max-age stop (replay h48 = 240min).
+            # -- BANK mode (scalp lane, owner order 2026-07-17 "ถ้าผ่าน เปิด
+            # scalp lane เลย"): v1.0 bank-green — close the single-leg lane
+            # when the LATEST CLOSED M5 bar's close is >= bank_r x risk in
+            # profit (close-based, matching the replay's _simulate_bank; the
+            # sdzone x bias x bank verdict: 5/6 cells positive, WR 81-87%).
+            # Losses exit via broker SL; time cap via basket time_stop_min.
+            if vp_lane.trail_mode() == "bank" and m5_bars:
+                bank_r = _f(__import__("os").environ.get(vp_lane.ENV_BANK_R), 0.4) or 0.4
+                if len(positions) == 1:
+                    pos = positions[0]
+                    p_entry = _f(pos.get("entryPrice") or pos.get("entry_price"), 0.0)
+                    p_sl = _f(pos.get("stopLoss") or pos.get("stop_loss"), 0.0)
+                    p_side = str(pos.get("tradeSide") or pos.get("side") or "").lower()
+                    risk_pts = abs(p_entry - p_sl)
+                    last_close = _f(m5_bars[-1].get("close"), 0.0)
+                    if risk_pts > 0 and p_entry > 0 and last_close > 0:
+                        r_close = ((last_close - p_entry) / risk_pts
+                                   if p_side.startswith("buy")
+                                   else (p_entry - last_close) / risk_pts)
+                        if r_close >= bank_r:
+                            return {
+                                "action": "close_all",
+                                "reason": "bank_green",
+                                "peak_r": round(peak_r, 4),
+                                "live_r": round(live_r, 4),
+                                "basket_runtime": basket_runtime,
+                            }
+                return {
+                    "action": "hold",
+                    "reason": "bank_hold",
+                    "peak_r": round(peak_r, 4),
+                    "live_r": round(live_r, 4),
+                    "basket_runtime": basket_runtime,
+                }
+
             # -- PLAIN mode (daytrend lane, owner deploy 2026-07-16): broker
             # SL/TP + basket caps (incl. time stop) are the ENTIRE exit; the
             # OM must not profit-exit at all — the daytrend proof's exit is

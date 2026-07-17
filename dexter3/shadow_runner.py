@@ -104,6 +104,7 @@ STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
 GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
 VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
+SCALP_STATE_FILE = RUNTIME / "dexter3_scalp_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -112,10 +113,12 @@ LOG_FILE = RUNTIME / "dexter3_shadow.log"
 GROK_LOG_FILE = RUNTIME / "dexter3_grok_shadow.log"
 VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
 DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
+SCALP_LOG_FILE = RUNTIME / "dexter3_scalp_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
 DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
+SCALP_LOCK_FILE = RUNTIME / "dexter3_scalp_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -174,13 +177,21 @@ def _daytrend_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "daytrend"
 
 
+def _scalp_producer_enabled() -> bool:
+    """SCALP lane (owner order 2026-07-17, grok's successor): sdzone x bias x
+    bank-green — dexter3/sd_zones.py carries the evidence block."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "scalp":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "scalp"
+
+
 def _alt_producer_enabled() -> bool:
     """Non-hunt producers (vp / daytrend) share the same runner posture:
     v16 gate bypass (no hunt-committee features), hunt sizing-selector
     bypass (their proofs sized flat), the VP entry gate (day-open bias +
     no-trade window; trivially true for daytrend whose signals are
     with-bias by construction), and the deep 340-bar M5 fetch."""
-    return _vp_producer_enabled() or _daytrend_producer_enabled()
+    return _vp_producer_enabled() or _daytrend_producer_enabled() or _scalp_producer_enabled()
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -200,6 +211,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.daytrend import DAYTREND_LABEL
 
         return DAYTREND_LABEL
+    if current_mode == "scalp":
+        from dexter3.sd_zones import SCALP_LABEL
+
+        return SCALP_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -228,6 +243,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.daytrend import DAYTREND_LABEL_FAMILY
 
         return DAYTREND_LABEL_FAMILY
+    if current_mode == "scalp":
+        from dexter3.sd_zones import SCALP_LABEL_FAMILY
+
+        return SCALP_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -239,6 +258,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return VP_STATE_FILE
     if current_mode == "daytrend":
         return DAYTREND_STATE_FILE
+    if current_mode == "scalp":
+        return SCALP_STATE_FILE
     return STATE_FILE
 
 
@@ -255,6 +276,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return VP_LOG_FILE
     if current_mode == "daytrend":
         return DAYTREND_LOG_FILE
+    if current_mode == "scalp":
+        return SCALP_LOG_FILE
     return LOG_FILE
 
 
@@ -1332,6 +1355,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = VP_LOCK_FILE, "vp-canary"
     elif mode == "daytrend":
         lock_file, lock_name = DAYTREND_LOCK_FILE, "daytrend-canary"
+    elif mode == "scalp":
+        lock_file, lock_name = SCALP_LOCK_FILE, "scalp-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1356,6 +1381,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = VP_LOCK_FILE
     elif mode == "daytrend":
         lock_file = DAYTREND_LOCK_FILE
+    elif mode == "scalp":
+        lock_file = SCALP_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1720,6 +1747,15 @@ def run_symbol_cycle(
                 decision, basket_action = _manage_lane_basket(
                     executor, symbol, bar_ts, prefix, lane, state, spread_abs
                 )
+        elif is_newest and _scalp_producer_enabled():
+            # SCALP lane (owner order 2026-07-17): sdzone producer ONLY —
+            # zone re-entry confirm; day-open bias via vp_entry_gate; exits
+            # = OM bank mode (close-based +bank_r) + broker SL + 60min cap.
+            from dexter3 import daytrend as _daytrend
+            from dexter3 import market_lens as _ml
+
+            sc_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = _daytrend.decide_sdzone_live(symbol, prefix, spread_abs, session=sc_session)
         elif is_newest and _daytrend_producer_enabled():
             # DAYTREND lane (owner deploy 2026-07-16) — with-the-day pullback
             # continuation; evidence + parity notes in dexter3/daytrend.py.
@@ -4227,6 +4263,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_grok = mode == "grok"
     is_vp = mode == "vp"
     is_daytrend = mode == "daytrend"
+    is_scalp = mode == "scalp"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -4250,6 +4287,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _DT_LABEL
         print(f"[DAYTREND] Forced executor LABEL to {_DT_LABEL}", flush=True)
 
+    if is_scalp:
+        from dexter3.sd_zones import SCALP_LABEL as _SC_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _SC_LABEL
+        print(f"[SCALP] Forced executor LABEL to {_SC_LABEL}", flush=True)
+
     if is_grok and GROK_LABEL:
         active_label = GROK_LABEL
     elif is_vp:
@@ -4260,6 +4304,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.daytrend import DAYTREND_LABEL as _DT_LABEL
 
         active_label = _DT_LABEL
+    elif is_scalp:
+        from dexter3.sd_zones import SCALP_LABEL as _SC_LABEL
+
+        active_label = _SC_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"

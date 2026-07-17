@@ -46,6 +46,7 @@ ENV_CONVEX_ARM_R = "DEXTER3_OM_CONVEX_ARM_R"           # default 1.0
 ENV_CONVEX_GIVEBACK_ATR = "DEXTER3_OM_CONVEX_GIVEBACK_ATR"  # default 3.0
 ENV_CONVEX_MAX_AGE_MIN = "DEXTER3_OM_CONVEX_MAX_AGE_MIN"    # default 240
 ENV_CONVEX_ATR_PTS_DEFAULT = "DEXTER3_OM_CONVEX_ATR_PTS_DEFAULT"  # default 5.0
+ENV_BANK_R = "DEXTER3_OM_BANK_R"                       # bank mode: close-based take (default 0.4)
 
 ATR_WINDOW_BARS = 288   # ~1 trading day of M5 — live counterpart of the
                         # replay's whole-series mean TR (~4.96 on the proof
@@ -370,7 +371,7 @@ def trail_mode() -> str | None:
     the daytrend proof's exit is plain TP at the day extreme, and both the
     ladder and convex measurably destroy it)."""
     raw = os.environ.get(ENV_TRAIL_MODE, "").strip().lower()
-    return raw if raw in ("convex", "plain") else None
+    return raw if raw in ("convex", "plain", "bank") else None
 
 
 def convex_trail_enabled() -> bool:

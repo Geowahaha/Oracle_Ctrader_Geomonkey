@@ -191,3 +191,50 @@ def test_sdzone_live_shares_replay_engine(monkeypatch):
                  "low": 3995.0, "close": 3997.5, "volume": 400.0})   # sweep 3995<3996 + body 2.3 (~1.9xATR, 88%)
     eng, atr = sd_zones.zones_from_prefix(bars)
     assert any(z["kind"] == "demand" for z in eng.zones), "demand zone should form"
+
+
+def test_scalp_mode_routing_and_bank_om(monkeypatch):
+    """grok's successor (2026-07-17): scalp mode identity + the OM bank-green
+    branch (close-based +0.4R take on the latest CLOSED bar; hold otherwise)."""
+    from dexter3.shadow_runner import (
+        _active_label_family,
+        _active_order_label,
+        _active_state_file,
+        _scalp_producer_enabled,
+    )
+
+    monkeypatch.setenv("DEXTER3_MODE", "scalp")
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert _scalp_producer_enabled()
+    assert _active_order_label() == "dexter3:scalp:canary"
+    assert _active_label_family() == "dexter3:scalp"
+    assert _active_state_file().name == "dexter3_scalp_shadow_state.json"
+
+    from dexter3.basket_manager import BasketConfig
+    from dexter3.opening_manager import OMConfig, OpeningManager
+
+    monkeypatch.setenv(vp_lane.ENV_TRAIL_MODE, "bank")
+    monkeypatch.setenv(vp_lane.ENV_BANK_R, "0.4")
+    om = OpeningManager(None, None, OMConfig())
+    st = {
+        "base_risk_usd": 4.0,
+        "now_utc_iso": "2026-07-17T04:10:00Z",
+        "basket_cfg": BasketConfig(time_stop_min=60),
+        "basket_runtime": {"oldest_open_ts": "2026-07-17T04:00:00Z", "peak_r": 0.5,
+                           "ticks_since_peak": 2, "ticks_open": 20, "last_pyramid_peak": None},
+    }
+    pos = [{"positionId": 1, "symbol": "XAUUSD", "tradeSide": "BUY", "volume": 1.0,
+            "entryPrice": 4000.0, "stopLoss": 3996.0, "takeProfit": 4008.0,
+            "netProfit": 1.8, "openTimestamp": "2026-07-17T04:00:00Z"}]
+    # latest CLOSED bar close 4001.7 -> r_close = 1.7/4 = 0.425 >= 0.4 -> bank
+    bars = [{"ts": "2026-07-17T04:05:00Z", "open": 4000.5, "high": 4002.0,
+             "low": 4000.2, "close": 4001.7}]
+    act = om.evaluate("XAUUSD", pos, None, bars, [], [], st)
+    assert act["action"] == "close_all"
+    assert act["reason"] == "bank_green"
+    # close below the bank line -> hold (no ladder/stall interference)
+    bars2 = [{"ts": "2026-07-17T04:05:00Z", "open": 4000.5, "high": 4001.4,
+              "low": 4000.0, "close": 4001.0}]
+    act2 = om.evaluate("XAUUSD", pos, None, bars2, [], [], st)
+    assert act2["action"] == "hold"
+    assert act2["reason"] == "bank_hold"
