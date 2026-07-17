@@ -94,6 +94,9 @@ from dexter3.sd_zones import SDZoneEngine, decide_sdzone  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
 
+_ZONE_PREM_CAP = [0.0]   # set from --zone-prem-cap in main()
+
+
 # ---------------------------------------------------------------------------
 # Lever 2 -- trough-limit entry
 # ---------------------------------------------------------------------------
@@ -129,6 +132,47 @@ def _limit_fill(side: str, entry: float, sl: float, future: list, dip_r: float,
     return "miss", None, None
 
 
+def _simulate_plain_be(side: str, entry: float, sl: float, tp: float, future: list,
+                       arm_r: float, be_floor_r: float, max_hold: int
+                       ) -> tuple[str, float, int]:
+    """PLAIN + one-step BREAKEVEN RATCHET (owner surgery 2026-07-17: fable
+    trades peaked +0.99/+0.83/+1.60R and ALL round-tripped to full -1R under
+    plain — "เห็นกำไรแล้วปล่อยตาย"). Same SL-first/TP conventions as
+    _simulate, plus: once the favorable excursion reaches ``arm_r``, the
+    stop ratchets ONCE to ``be_floor_r`` (entry + epsilon) — a single
+    protective step, NOT the multi-rung ladder the 3-window measure already
+    killed. Arm/exit same-bar allowed (ladder-sim convention)."""
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "skip", 0.0, 0
+    armed = False
+    for held, bar in enumerate(future[:max_hold]):
+        hi = float(bar.get("high", 0.0))
+        lo = float(bar.get("low", 0.0))
+        if side == "buy":
+            if lo <= sl:
+                return "loss", -1.0, held
+            if hi >= tp:
+                return "win", (tp - entry) / risk, held
+            if not armed and (hi - entry) / risk >= arm_r:
+                armed = True
+            if armed and (lo - entry) / risk <= be_floor_r:
+                return "be", be_floor_r, held
+        else:
+            if hi >= sl:
+                return "loss", -1.0, held
+            if lo <= tp:
+                return "win", (entry - tp) / risk, held
+            if not armed and (entry - lo) / risk >= arm_r:
+                armed = True
+            if armed and (entry - hi) / risk <= be_floor_r:
+                return "be", be_floor_r, held
+    held = min(max_hold, len(future)) - 1
+    last = float(future[held].get("close", entry)) if future else entry
+    r = (last - entry) / risk if side == "buy" else (entry - last) / risk
+    return ("win" if r > 0 else "loss"), r, max(0, held)
+
+
 def _simulate_bank(side: str, entry: float, sl: float, future: list, bank_r: float,
                    max_hold: int) -> tuple[str, float, int]:
     """v1.0 BANK-GREEN scalp exit (owner 2026-07-17 "V.1.0 original ของเรายัง
@@ -162,7 +206,8 @@ def _simulate_bank(side: str, entry: float, sl: float, future: list, bank_r: flo
 
 
 def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r: float,
-                        window_bars: int) -> tuple[str, float | None, int | None]:
+                        window_bars: int, prem_cap: float = 0.0
+                        ) -> tuple[str, float | None, int | None]:
     """Owner directive 2026-07-16: "เปลี่ยนจากวาง limit เป็นโซน ตรวจสอบเบรคจริง
     + สัญญาณกลับตัว" -- the discount level becomes a ZONE instead of a resting
     LIMIT:
@@ -191,12 +236,15 @@ def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r:
         c = float(bar.get("close", 0.0))
         hi = float(bar.get("high", 0.0))
         lo = float(bar.get("low", 0.0))
+        stop_pts = abs(zone_top - sl)
         if side == "buy":
             if c <= sl:                              # CONFIRMED break -- thesis dead
                 return "zone_break", None, None
             if not touched and lo <= zone_top:
                 touched = True
             if touched and c > o and c > zone_top and c < entry:
+                if prem_cap > 0 and (c - zone_top) > prem_cap * stop_pts:
+                    continue                         # confirm too far from the zone -- wait
                 return "filled", c, idx
         else:
             if c >= sl:
@@ -204,6 +252,8 @@ def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r:
             if not touched and hi >= zone_top:
                 touched = True
             if touched and c < o and c < zone_top and c > entry:
+                if prem_cap > 0 and (zone_top - c) > prem_cap * stop_pts:
+                    continue
                 return "filled", c, idx
     return ("no_confirm" if touched else "no_touch"), None, None
 
@@ -308,7 +358,8 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
         sim_future = future[base_idx:]
     elif entry_model == "zone":  # touch + real-break check + reversal confirmation
         status, fill_price, fill_idx = _zone_confirm_entry(side, entry, sl, future,
-                                                           dip_r, window_bars)
+                                                           dip_r, window_bars,
+                                                           prem_cap=_ZONE_PREM_CAP[0])
         if status != "filled":
             return f"miss_{status}", None, None
         sim_entry, sim_sl = float(fill_price), sl
@@ -339,6 +390,10 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
     if exit_kind == "ladder":
         _outcome, r, held = _simulate_ladder(side, sim_entry, sim_sl, sim_future,
                                              exit_params["rungs"], max_hold)
+    elif exit_kind == "plain_be":
+        _outcome, r, held = _simulate_plain_be(side, sim_entry, sim_sl, float(trade["tp"]),
+                                               sim_future, exit_params.get("arm_r", 0.7),
+                                               exit_params.get("be_floor_r", 0.05), max_hold)
     elif exit_kind == "bank":
         _outcome, r, held = _simulate_bank(side, sim_entry, sim_sl, sim_future,
                                            exit_params.get("bank_r", 0.4),
@@ -748,6 +803,11 @@ def main() -> int:
                     help="comma set from ladder,plain,convex; plain h48 = VP's "
                          "gate-winning posture (signal TP, SL-first, hold 48)")
     ap.add_argument("--dir-modes", default="none,nobuy-h1down,nocounter")
+    ap.add_argument("--zone-prem-cap", type=float, default=0.0,
+                    help="zone-confirm entry: reject confirms paying more than this "
+                         "fraction of the stop above the level (0=off)")
+    ap.add_argument("--be-arms", default="0.6,0.8",
+                    help="plain_be exit: arm thresholds (peak R) for the one-step BE ratchet")
     ap.add_argument("--bank-r", type=float, default=0.4,
                     help="bank exit: close-based take at this R (harvester-proven 0.4)")
     ap.add_argument("--bank-hold", type=int, default=12,
@@ -773,6 +833,7 @@ def main() -> int:
     ap.add_argument("--min-derive-trades", type=int, default=60)
     args = ap.parse_args()
 
+    _ZONE_PREM_CAP[0] = args.zone_prem_cap
     c = make_client()
     m5 = c.get_trendbars(args.symbol, "m5", args.count)
     m15 = c.get_trendbars(args.symbol, "m15", args.count)
@@ -910,6 +971,10 @@ def main() -> int:
         exits.append(("ladder(live)", "ladder", {"rungs": rungs}, args.max_hold))
     if "plain" in exit_set:
         exits.append((f"plain-tp h{args.max_hold}", "plain", {}, args.max_hold))
+    if "plain_be" in exit_set:
+        for arm in (float(x) for x in args.be_arms.split(",") if x.strip()):
+            exits.append((f"plainBE arm{arm:g} h{args.max_hold}", "plain_be",
+                          {"arm_r": arm, "be_floor_r": 0.05}, args.max_hold))
     if "bank" in exit_set:
         exits.append((f"bank {args.bank_r:g}R h{args.bank_hold}", "bank",
                       {"bank_r": args.bank_r}, args.bank_hold))
