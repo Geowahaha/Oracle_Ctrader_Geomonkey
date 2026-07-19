@@ -463,3 +463,97 @@ def test_score_counts_miss_counterfactual():
     assert sc["miss_net"] == pytest.approx(0.02 - 0.09)
     assert sc["fill_pct"] == pytest.approx(50.0)
     assert sc["net"] == pytest.approx(0.40 - 0.13)
+
+
+# ---------------------------------------------------------------------------
+# _confirm_quality_ok -- owner framework 2026-07-19 (Trend/Zone/Rejection):
+# the confirm bar must be a REAL rejection candle (pin wick / engulfing /
+# volume-backed), not merely any reversal close. Hand-computed bars.
+# ---------------------------------------------------------------------------
+from scripts.dexter3_entry_position_replay import (  # noqa: E402
+    _CONFIRM_QUALITY,
+    _CONFIRM_VOL_K,
+    _CONFIRM_WICK_K,
+    _confirm_quality_ok,
+    _stamp_volma,
+)
+
+
+@pytest.fixture()
+def _quality_reset():
+    yield
+    _CONFIRM_QUALITY[0] = ""
+    _CONFIRM_WICK_K[0] = 0.33
+    _CONFIRM_VOL_K[0] = 0.0
+
+
+def test_confirm_quality_wick_buy(_quality_reset):
+    _CONFIRM_QUALITY[0] = "wick"
+    _CONFIRM_WICK_K[0] = 0.33
+    # range 3.0, lower wick = min(o,c)-lo = 101.5-100.0 = 1.5 >= 0.33*3 -> pin
+    pin = _bar(101.5, 103.0, 100.0, 102.5)
+    # range 3.0, lower wick = 100.1-100.0 = 0.1 < 0.99 -> momentum bar, refused
+    momo = _bar(100.1, 103.1, 100.0, 103.0)
+    assert _confirm_quality_ok("buy", pin, None) is True
+    assert _confirm_quality_ok("buy", momo, None) is False
+
+
+def test_confirm_quality_wick_sell(_quality_reset):
+    _CONFIRM_QUALITY[0] = "wick"
+    _CONFIRM_WICK_K[0] = 0.33
+    # upper wick = hi-max(o,c) = 103.0-101.5 = 1.5 >= 0.99 -> pin
+    pin = _bar(101.5, 103.0, 100.0, 100.5)
+    momo = _bar(102.9, 103.0, 100.0, 100.1)
+    assert _confirm_quality_ok("sell", pin, None) is True
+    assert _confirm_quality_ok("sell", momo, None) is False
+
+
+def test_confirm_quality_engulf(_quality_reset):
+    _CONFIRM_QUALITY[0] = "engulf"
+    prev_red = _bar(102.0, 102.5, 100.8, 101.0)      # red body 101.0..102.0
+    engulf = _bar(100.9, 103.2, 100.7, 102.4)        # green body 100.9..102.4 covers it
+    inside = _bar(101.2, 102.0, 101.0, 101.8)        # green but inside prior body
+    assert _confirm_quality_ok("buy", engulf, prev_red) is True
+    assert _confirm_quality_ok("buy", inside, prev_red) is False
+    # no prior bar -> engulf can never qualify
+    assert _confirm_quality_ok("buy", engulf, None) is False
+
+
+def test_confirm_quality_volume_gate(_quality_reset):
+    _CONFIRM_VOL_K[0] = 1.5
+    strong = dict(_bar(100.0, 103.0, 99.9, 102.5), volume=300.0, volma=100.0)
+    weak = dict(_bar(100.0, 103.0, 99.9, 102.5), volume=120.0, volma=100.0)
+    no_ma = dict(_bar(100.0, 103.0, 99.9, 102.5), volume=1.0)   # missing volma passes
+    assert _confirm_quality_ok("buy", strong, None) is True
+    assert _confirm_quality_ok("buy", weak, None) is False
+    assert _confirm_quality_ok("buy", no_ma, None) is True
+
+
+def test_stamp_volma_trailing():
+    bars = [dict(_bar(0, 0, 0, 0), volume=float(v)) for v in (10, 20, 30)]
+    _stamp_volma(bars, period=2)
+    assert bars[0]["volma"] == pytest.approx(10.0)     # only itself
+    assert bars[1]["volma"] == pytest.approx(15.0)     # (10+20)/2
+    assert bars[2]["volma"] == pytest.approx(25.0)     # (20+30)/2 -- trailing window
+
+
+def test_zone_confirm_waits_for_quality_bar(_quality_reset):
+    """Wired path: a momentum reversal close is SKIPPED under wick mode; the
+    fill lands on the later pin bar (same skip-and-wait convention as the
+    premium cap)."""
+    _CONFIRM_QUALITY[0] = "wick"
+    _CONFIRM_WICK_K[0] = 0.33
+    entry, sl = 2000.0, 1998.0                         # risk 2.0, dip 0.4 -> zone_top 1999.2
+    future = [
+        _bar(1999.5, 1999.6, 1999.0, 1999.1),          # touch (lo <= 1999.2), red
+        _bar(1999.1, 1999.8, 1999.05, 1999.75),        # green close > zone_top BUT wick 0.05/0.75 -> refused
+        _bar(1999.3, 1999.9, 1999.0, 1999.6),          # green, lower wick 0.3/0.9 = 0.33 -> pin, fills
+    ]
+    status, px, idx = _zone_confirm_entry("buy", entry, sl, future, 0.4, 6)
+    assert status == "filled"
+    assert px == pytest.approx(1999.6)
+    assert idx == 2
+    # baseline (no quality gate) fills the momentum bar instead
+    _CONFIRM_QUALITY[0] = ""
+    status2, px2, idx2 = _zone_confirm_entry("buy", entry, sl, future, 0.4, 6)
+    assert (status2, px2, idx2) == ("filled", pytest.approx(1999.75), 1)

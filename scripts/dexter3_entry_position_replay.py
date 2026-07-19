@@ -95,6 +95,65 @@ from dexter3.transport import make_client  # noqa: E402
 
 
 _ZONE_PREM_CAP = [0.0]   # set from --zone-prem-cap in main()
+_CONFIRM_QUALITY = [""]  # ""|wick|engulf|wick-or-engulf -- --confirm-quality
+_CONFIRM_WICK_K = [0.33]  # rejection wick >= K x bar range -- --confirm-wick-k
+_CONFIRM_VOL_K = [0.0]   # confirm bar volume >= K x volMA20 (0=off) -- --confirm-vol
+
+
+def _confirm_quality_ok(side: str, bar: dict, prev: dict | None) -> bool:
+    """Owner directive 2026-07-19 (AJ Karn Trend/Zone/Rejection framework):
+    the confirm bar must be a REAL rejection candle, not merely any close back
+    in the entry direction. Modes (pre-registered, measured before live):
+      * wick      -- pin-bar reading: the wick probing INTO the zone (lower
+                     wick for a buy) >= K x the bar's full range;
+      * engulf    -- the confirm body engulfs the prior bar's opposite-color
+                     body (bullish engulfing at demand for a buy);
+      * wick-or-engulf -- either reading qualifies.
+    Independently, --confirm-vol requires bar volume >= K x its trailing
+    volMA20 (stamped as bar["volma"] in main; a bar without volMA passes --
+    the gate must never silently veto on missing data)."""
+    mode = _CONFIRM_QUALITY[0]
+    o = float(bar.get("open", 0.0))
+    c = float(bar.get("close", 0.0))
+    hi = float(bar.get("high", 0.0))
+    lo = float(bar.get("low", 0.0))
+    if mode:
+        rng = hi - lo
+        wick_ok = False
+        if rng > 0:
+            wick = (min(o, c) - lo) if side == "buy" else (hi - max(o, c))
+            wick_ok = wick >= _CONFIRM_WICK_K[0] * rng
+        eng_ok = False
+        if prev is not None:
+            po = float(prev.get("open", 0.0))
+            pc = float(prev.get("close", 0.0))
+            if side == "buy":
+                eng_ok = c > o and pc < po and c >= po and o <= pc
+            else:
+                eng_ok = c < o and pc > po and c <= po and o >= pc
+        if mode == "wick" and not wick_ok:
+            return False
+        if mode == "engulf" and not eng_ok:
+            return False
+        if mode == "wick-or-engulf" and not (wick_ok or eng_ok):
+            return False
+    if _CONFIRM_VOL_K[0] > 0:
+        vma = float(bar.get("volma") or 0.0)
+        vol = float(bar.get("volume") or 0.0)
+        if vma > 0 and vol < _CONFIRM_VOL_K[0] * vma:
+            return False
+    return True
+
+
+def _stamp_volma(bars: list, period: int = 20) -> None:
+    """Trailing volume SMA stamped in-place as bar["volma"] (running sum,
+    trailing-only -- bar i sees volumes of bars [i-19..i])."""
+    run = 0.0
+    for k, b in enumerate(bars):
+        run += float(b.get("volume", 0.0) or 0.0)
+        if k >= period:
+            run -= float(bars[k - period].get("volume", 0.0) or 0.0)
+        b["volma"] = run / min(k + 1, period)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +304,8 @@ def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r:
             if touched and c > o and c > zone_top and c < entry:
                 if prem_cap > 0 and (c - zone_top) > prem_cap * stop_pts:
                     continue                         # confirm too far from the zone -- wait
+                if not _confirm_quality_ok("buy", bar, future[idx - 1] if idx >= 1 else None):
+                    continue                         # not a real rejection candle -- wait
                 return "filled", c, idx
         else:
             if c >= sl:
@@ -253,6 +314,8 @@ def _zone_confirm_entry(side: str, entry: float, sl: float, future: list, dip_r:
                 touched = True
             if touched and c < o and c < zone_top and c > entry:
                 if prem_cap > 0 and (zone_top - c) > prem_cap * stop_pts:
+                    continue
+                if not _confirm_quality_ok("sell", bar, future[idx - 1] if idx >= 1 else None):
                     continue
                 return "filled", c, idx
     return ("no_confirm" if touched else "no_touch"), None, None
@@ -275,6 +338,7 @@ def _zone_confirm_entry_m1(side: str, entry: float, sl: float, m1_future: list,
         return "no_touch", None, None
     zone_top = entry - dip_r * risk if side == "buy" else entry + dip_r * risk
     touched = False
+    prev_bar: dict | None = None
     for bar in m1_future:
         e = _epoch(str(bar.get("ts") or ""))
         if e >= deadline_epoch:
@@ -289,14 +353,17 @@ def _zone_confirm_entry_m1(side: str, entry: float, sl: float, m1_future: list,
             if not touched and lo <= zone_top:
                 touched = True
             if touched and c > o and c > zone_top and c < entry:
-                return "filled", c, e
+                if _confirm_quality_ok("buy", bar, prev_bar):
+                    return "filled", c, e
         else:
             if c >= sl:
                 return "zone_break", None, None
             if not touched and hi >= zone_top:
                 touched = True
             if touched and c < o and c < zone_top and c > entry:
-                return "filled", c, e
+                if _confirm_quality_ok("sell", bar, prev_bar):
+                    return "filled", c, e
+        prev_bar = bar
     return ("no_confirm" if touched else "no_touch"), None, None
 
 
@@ -814,6 +881,22 @@ def main() -> int:
                     help="bank exit: hard time cap in M5 bars (harvester-proven 12)")
     ap.add_argument("--sdz-rr", type=float, default=2.0,
                     help="sdzone TP as RR multiple of the zone-anchored risk")
+    ap.add_argument("--sdz-tp", choices=("rr", "zone", "zone-minrr1"), default="rr",
+                    help="sdzone TP placement (owner framework 2026-07-19 'TP ที่ Zone "
+                         "ถัดไป'): rr = fixed --sdz-rr (live today); zone = nearest "
+                         "OPPOSING zone edge, fallback rr when none exists; zone-minrr1 "
+                         "= zone target but SKIP the signal when that target pays <1R")
+    ap.add_argument("--confirm-quality", choices=("", "wick", "engulf", "wick-or-engulf"),
+                    default="",
+                    help="zone-confirm rejection-quality gate (owner framework "
+                         "2026-07-19): the confirm bar must be a pin-bar (wick) and/or "
+                         "engulfing candle, not merely any reversal close")
+    ap.add_argument("--confirm-wick-k", type=float, default=0.33,
+                    help="wick mode: rejection wick must be >= this fraction of the "
+                         "confirm bar's full range")
+    ap.add_argument("--confirm-vol", type=float, default=0.0,
+                    help="confirm bar volume must be >= this x trailing volMA20 "
+                         "(0=off); bars without volMA pass")
     ap.add_argument("--chf-tp-frac", type=float, default=0.5,
                     help="channelfade TP as fraction of box height from the faded edge "
                          "(0.5=mid primary, 0.85=near opposite edge secondary)")
@@ -834,6 +917,9 @@ def main() -> int:
     args = ap.parse_args()
 
     _ZONE_PREM_CAP[0] = args.zone_prem_cap
+    _CONFIRM_QUALITY[0] = args.confirm_quality
+    _CONFIRM_WICK_K[0] = args.confirm_wick_k
+    _CONFIRM_VOL_K[0] = args.confirm_vol
     c = make_client()
     m5 = c.get_trendbars(args.symbol, "m5", args.count)
     m15 = c.get_trendbars(args.symbol, "m15", args.count)
@@ -842,6 +928,8 @@ def main() -> int:
         print(f"not enough M5 bars: {len(m5)}")
         return 2
     print(f"bars: M5={len(m5)} ({m5[0]['ts']} -> {m5[-1]['ts']})")
+    if args.confirm_vol > 0:
+        _stamp_volma(m5)
     atr = _atr_mean(m5)
     print(f"M5 ATR (mean TR, whole series) = {atr:.3f} pts")
 
@@ -890,6 +978,36 @@ def main() -> int:
             sig = decide_sdzone(m5, i, _sd_engine, _atr14[i], rr=args.sdz_rr)
             if sig is None:
                 continue
+            if args.confirm_quality or args.confirm_vol > 0:
+                # sdzone's OWN reversal-close bar is its confirm (the lane
+                # enters at this bar's close) -- the rejection-quality gate
+                # must therefore read THIS bar, not the zone-confirm walk.
+                # The producer re-fires on later qualifying bars, so a
+                # refusal here is exactly "wait for a real rejection candle".
+                dbar = dict(m5[i])
+                dbar["volma"] = _volma[i]
+                if not _confirm_quality_ok(sig["side"], dbar,
+                                           m5[i - 1] if i >= 1 else None):
+                    continue
+            if args.sdz_tp != "rr":
+                # owner framework 2026-07-19: "ตั้ง Take Profit ที่ Zone ถัดไป" --
+                # TP at the nearest OPPOSING zone edge (a buy exits where supply
+                # begins). No zone beyond the entry -> keep the RR fallback;
+                # zone-minrr1 additionally SKIPS signals whose zone target pays
+                # <1R (the framework's own "poor RR to target = no trade").
+                e_px, s_px = float(sig["entry"]), float(sig["sl"])
+                z_risk = abs(e_px - s_px)
+                if sig["side"] == "buy":
+                    tgts = [z["bottom"] for z in _sd_engine.zones
+                            if z["kind"] == "supply" and z["born"] < i and z["bottom"] > e_px]
+                else:
+                    tgts = [z["top"] for z in _sd_engine.zones
+                            if z["kind"] == "demand" and z["born"] < i and z["top"] < e_px]
+                if tgts:
+                    tgt = min(tgts) if sig["side"] == "buy" else max(tgts)
+                    if args.sdz_tp == "zone-minrr1" and z_risk > 0 and abs(tgt - e_px) < z_risk:
+                        continue
+                    sig["tp"] = tgt
             from types import SimpleNamespace
             d = SimpleNamespace(action="enter", side=sig["side"], entry=sig["entry"],
                                 sl=sig["sl"], tp=sig["tp"], ts_close=ts,
@@ -957,6 +1075,8 @@ def main() -> int:
     m1_epochs: list[float] = []
     if zone_m1_variants:
         m1 = c.get_trendbars(args.symbol, "m1", 50000)   # daemon caps at its max history
+        if args.confirm_vol > 0:
+            _stamp_volma(m1)
         m1_epochs = [_epoch(str(b.get("ts") or "")) for b in m1]
         print(f"M1 bars for zone-m1 confirm: {len(m1)} "
               f"({m1[0]['ts'] if m1 else '-'} -> {m1[-1]['ts'] if m1 else '-'})")
