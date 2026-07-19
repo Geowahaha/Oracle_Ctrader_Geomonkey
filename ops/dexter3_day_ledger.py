@@ -50,6 +50,9 @@ LANES = {
     "grok": {"family": "dexter3:grok", "log": "dexter3_grok_shadow.log"},
     "vp": {"family": "dexter3:vp", "log": "dexter3_vp_shadow.log"},
     "daytrend": {"family": "dexter3:dtr", "log": "dexter3_daytrend_shadow.log"},
+    # scalp lane live 2026-07-17 (grok's successor) — added 2026-07-19 so the
+    # 07-21/22 verdict can see it; label prefix matches dexter3:scalp:canary.
+    "scalp": {"family": "dexter3:scalp", "log": "dexter3_scalp_shadow.log"},
 }
 
 BLOCK_RE = re.compile(r"cycle_status=decided:enter:([a-z0-9_]+):(?:live_blocked_|governor_)([a-z0-9_]+)")
