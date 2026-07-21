@@ -138,6 +138,7 @@ __all__ = [
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKER_PATH = ROOT / "ops" / "ctrader_execute_once.py"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 # The account this migration is pinned to (design doc: demo login 9922808,
 # ctidTraderAccountId 46670728). Env override is for a FUTURE account swap
@@ -538,6 +539,7 @@ class Dexter3OpenApiClient:
                 timeout=max(5, int(timeout_sec or 20)),
                 cwd=str(ROOT),
                 env=env,
+                creationflags=_NO_WINDOW,
             )
             parsed = self._extract_json_line(proc.stdout)
             if parsed:

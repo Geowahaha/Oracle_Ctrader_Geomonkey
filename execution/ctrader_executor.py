@@ -30,6 +30,8 @@ from utils.atomic_write import atomic_json_read, atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+
 
 def _safe_float(value, default: float = 0.0) -> float:
     try:
@@ -4533,6 +4535,7 @@ class CTraderExecutor:
                 timeout=max(5, int(timeout_sec or 20)),
                 cwd=str(Path(__file__).resolve().parent.parent),
                 env=env,
+                creationflags=_NO_WINDOW,
             )
             parsed = self._extract_json_line(proc.stdout)
             if parsed:

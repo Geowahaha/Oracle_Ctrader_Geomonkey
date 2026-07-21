@@ -91,12 +91,14 @@ def _pid_running(pid: int) -> bool:
     if os.name == "nt":
         try:
             import subprocess
+            _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid_i}", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=False,
+                creationflags=_no_window,
             )
             out = str(proc.stdout or "").strip()
             if (not out) or ("no tasks are running" in out.lower()):

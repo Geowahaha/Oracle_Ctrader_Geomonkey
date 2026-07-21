@@ -49,9 +49,11 @@ def _get_current_installed_version() -> Optional[str]:
     # Try npm CLI
     try:
         import subprocess
+        _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         result = subprocess.run(
             ["npm", "list", "-g", "openclaw", "--depth=0", "--json"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            creationflags=_no_window,
         )
         data = json.loads(result.stdout or "{}")
         deps = data.get("dependencies", {})
@@ -63,9 +65,11 @@ def _get_current_installed_version() -> Optional[str]:
     # Try openclaw --version
     try:
         import subprocess
+        _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         result = subprocess.run(
             ["openclaw", "--version"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            creationflags=_no_window,
         )
         v = (result.stdout or result.stderr or "").strip()
         if v:
@@ -207,12 +211,14 @@ def do_update() -> dict:
 
     state = _load_state()
     latest = state.get("latest_version", "latest")
+    _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
     # Step 1: npm update
     try:
         result = subprocess.run(
             ["npm", "i", "-g", f"openclaw@{latest}"],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=120,
+            creationflags=_no_window,
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "npm failed")[:300]
@@ -255,11 +261,13 @@ def _restart_gateway() -> None:
         from config import config
         gateway_url = str(getattr(config, "OPENCLAW_GATEWAY_URL", "") or "").strip()
         if gateway_url:
+            _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             proc = subprocess.Popen(
                 ["openclaw", "gateway", "start"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                creationflags=_no_window,
             )
             state["gateway_pid"] = proc.pid
             state["gateway_started_at"] = datetime.now(timezone.utc).isoformat()

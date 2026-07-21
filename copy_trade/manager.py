@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKER_PATH = _ROOT / "ops" / "ctrader_execute_once.py"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -857,6 +858,7 @@ class CopyTradeManager:
                 timeout=max(5, int(timeout_sec)),
                 cwd=str(_ROOT),
                 env=env,
+                creationflags=_NO_WINDOW,
             )
 
             parsed = self._extract_json(proc.stdout)
