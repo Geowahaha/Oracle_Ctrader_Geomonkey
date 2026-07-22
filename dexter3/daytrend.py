@@ -49,6 +49,16 @@ ENV_ANCHOR_HOUR = "DEXTER3_DAYTREND_ANCHOR_HOUR"     # default 0 (00Z)
 # continuation sells died to the DZ rebound at ~14x ATR day range): once the
 # day has traveled this far, continuation entries STOP. 0 = off.
 ENV_RANGE_CAP_ATR = "DEXTER3_DAYTREND_RANGE_CAP_ATR"
+# Deep-pullback bypass of G1 (owner miss 2026-07-22: a strong ยืนเปิด trend
+# day ran 65-73pts > the 12xATR cap, so ALL 57 continuation evaluations
+# 09-15Z were range_cap-skipped — including the textbook ~28pt pullback-to-
+# DZ + resume that then ran +30pts; the guard built for capitulation-chasing
+# also killed every deep-retrace resume, which is a different anatomy: the
+# entry is AFTER a retrace, not AT the extreme). When > 0 and the pullback
+# off the day extreme is >= this x ATR, the range cap does not skip; the
+# normal pullback/resume/risk-band logic still applies. 0 = off (bitwise
+# pre-2026-07-22 behavior). GATED ON REPLAY EVIDENCE before any live enable.
+ENV_CAP_PULLBACK_BYPASS_ATR = "DEXTER3_DAYTREND_CAP_PULLBACK_BYPASS_ATR"
 # DAYREVERSAL (owner order 2026-07-16 "โอกาสแบบนี้หายาก เปิดเลย"): the mirror
 # twin — the SAME capitulation condition ARMS the reversal hunt at the day
 # extreme. Rare by construction (2-9 occurrences per 10 replay weeks even at
@@ -112,15 +122,25 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
     day = m5_prefix[-day_bars:]
     # G1 capitulation guard: beyond the cap the extreme is a DZ/SZ, not a
     # continuation target — the reversal producer takes over from here.
+    # Deep-pullback bypass (2026-07-22): a retrace >= bypass x ATR off the
+    # extreme is entry-after-retrace anatomy, not capitulation-chasing — the
+    # cap stops skipping it (see ENV_CAP_PULLBACK_BYPASS_ATR).
     range_cap = _env(ENV_RANGE_CAP_ATR, 0.0)
+    cap_bypassed = False
     if range_cap > 0:
         d_hi = max(_f(b.get("high"), 0.0) for b in day)
         d_lo = min(_f(b.get("low"), 0.0) for b in day)
         if (d_hi - d_lo) > range_cap * atr:
-            return _skip(ts_close, symbol, session,
-                         f"range_cap ({(d_hi - d_lo):.1f} > {range_cap:g}x{atr:.2f}ATR)")
+            bypass_atr = _env(ENV_CAP_PULLBACK_BYPASS_ATR, 0.0)
+            pullback_now = (d_hi - c) if bias > 0 else (c - d_lo)
+            if bypass_atr > 0 and pullback_now >= bypass_atr * atr:
+                cap_bypassed = True
+            else:
+                return _skip(ts_close, symbol, session,
+                             f"range_cap ({(d_hi - d_lo):.1f} > {range_cap:g}x{atr:.2f}ATR)")
     features = {"daytrend": {"bias": bias, "hours": round(hours, 2),
-                             "atr": round(atr, 4), "day_bars": day_bars}}
+                             "atr": round(atr, 4), "day_bars": day_bars,
+                             "cap_bypassed": cap_bypassed}}
 
     if bias < 0:                                   # ต่ำเปิด -> sells only
         extreme = min(_f(b.get("low"), 0.0) for b in day)

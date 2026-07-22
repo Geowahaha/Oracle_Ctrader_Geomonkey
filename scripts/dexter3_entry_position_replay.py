@@ -529,7 +529,8 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
                     pull_atr: float = 0.8, swing_bars: int = 6,
                     buffer_atr: float = 0.1, min_hours: float = 1.0,
                     max_risk_atr: float = 2.0, range_cap_atr: float = 0.0,
-                    last_entry_hour: float = 0.0) -> dict | None:
+                    last_entry_hour: float = 0.0,
+                    cap_pullback_bypass_atr: float = 0.0) -> dict | None:
     """WITH-BIAS continuation producer (owner live lesson 2026-07-16: a
     40-pt sell-only day where every counter-trend producer was correctly
     bias-blocked and every with-trend hunt signal was gate-blocked — the
@@ -565,11 +566,18 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
     # G1 (same owner observation): capitulation-day exhaustion -- when the
     # day has already traveled more than range_cap_atr x ATR high-to-low,
     # the extreme is a demand/supply zone, not a continuation target.
+    # Deep-pullback bypass (owner miss 2026-07-22, mirrors
+    # dexter3.daytrend.ENV_CAP_PULLBACK_BYPASS_ATR): a retrace >=
+    # cap_pullback_bypass_atr x ATR off the extreme is entry-after-retrace
+    # anatomy, not capitulation-chasing -- the cap does not skip it.
     if range_cap_atr > 0:
         d_hi = max(float(b.get("high", 0.0)) for b in day)
         d_lo = min(float(b.get("low", 0.0)) for b in day)
         if (d_hi - d_lo) > range_cap_atr * atr:
-            return None
+            pullback_now = (d_hi - c) if bias > 0 else (c - d_lo)
+            if not (cap_pullback_bypass_atr > 0
+                    and pullback_now >= cap_pullback_bypass_atr * atr):
+                return None
     if bias < 0:  # sell-only day: extreme = the day's low
         extreme = min(float(b.get("low", 0.0)) for b in day)
         pullback = c - extreme
@@ -908,6 +916,11 @@ def main() -> int:
     ap.add_argument("--dt-last-hour", type=float, default=0.0,
                     help="daytrend G2: no new entries after this many hours into the "
                          "day (0=off) -- late extreme = the day's DZ/SZ")
+    ap.add_argument("--dt-cap-bypass-atr", type=float, default=0.0,
+                    help="daytrend G1 deep-pullback bypass (owner miss 2026-07-22): "
+                         "when the pullback off the day extreme >= this x ATR, the "
+                         "range cap does not skip (entry-after-retrace anatomy, not "
+                         "capitulation-chasing). 0=off")
     ap.add_argument("--no-overlap", action="store_true",
                     help="model a SINGLE-POSITION lane: a signal is skipped while a prior "
                          "trade is still open -- the lane-realistic number (overlapping "
@@ -1018,7 +1031,8 @@ def main() -> int:
             if args.producer == "daytrend":
                 sig = decide_daytrend(prefix, bias_rows[i], atr,
                                       range_cap_atr=args.dt_range_cap_atr,
-                                      last_entry_hour=args.dt_last_hour)
+                                      last_entry_hour=args.dt_last_hour,
+                                      cap_pullback_bypass_atr=args.dt_cap_bypass_atr)
             elif args.producer == "dayreversal":
                 sig = decide_dayreversal(prefix, bias_rows[i], atr,
                                          range_arm_atr=args.drev_arm_atr)

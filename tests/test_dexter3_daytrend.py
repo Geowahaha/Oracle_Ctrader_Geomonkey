@@ -48,6 +48,80 @@ def test_parity_with_replay_producer(monkeypatch):
     assert live.tp == pytest.approx(replay_sig["tp"])
 
 
+def _big_range_buy_day_prefix() -> list[dict]:
+    # ยืนเปิด day that has already run FAR past a 12xATR cap (range ~60 on
+    # tiny per-bar TR), then pulled back deep (~19pts off the 4060 high) and
+    # printed a green resume close — the 2026-07-22 owner-flagged anatomy.
+    bars = [_bar("2026-07-22T00:00:00Z", 4000.0, 4001.0, 3999.5, 4000.5)]
+    px = 4000.5
+    for i in range(1, 40):                          # slow grind up: tiny ATR
+        ts = f"2026-07-22T{i // 12:02d}:{(i % 12) * 5:02d}:00Z"
+        bars.append(_bar(ts, px, px + 1.6, px - 0.1, px + 1.5))
+        px += 1.5
+    # px ~ 4059; day range ~60; mean TR stays ~1.7
+    bars.append(_bar("2026-07-22T03:25:00Z", px, px + 1.0, px - 8.0, px - 7.5))   # pullback leg 1
+    bars.append(_bar("2026-07-22T03:30:00Z", px - 7.5, px - 7.0, px - 19.0, px - 18.5))  # deep pullback
+    bars.append(_bar("2026-07-22T03:35:00Z", px - 18.5, px - 15.0, px - 18.8, px - 15.5))  # green resume
+    return bars
+
+
+def test_range_cap_still_skips_with_bypass_off(monkeypatch):
+    monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
+    monkeypatch.setenv(daytrend.ENV_RANGE_CAP_ATR, "12")
+    monkeypatch.delenv(daytrend.ENV_CAP_PULLBACK_BYPASS_ATR, raising=False)
+    d = daytrend.decide_daytrend("XAUUSD", _big_range_buy_day_prefix(), 0.12)
+    assert d.action == "skip"
+    assert "range_cap" in d.reasons[0]
+
+
+def test_deep_pullback_bypasses_range_cap_and_parity_with_replay(monkeypatch):
+    """The 2026-07-22 miss, both fixed and parity-locked: cap 12 exceeded,
+    pullback >= 3xATR + green resume -> BOTH implementations fire the same
+    buy; features record cap_bypassed."""
+    from scripts.dexter3_entry_position_replay import decide_daytrend as replay_fn
+
+    monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
+    monkeypatch.setenv(daytrend.ENV_RANGE_CAP_ATR, "12")
+    monkeypatch.setenv(daytrend.ENV_CAP_PULLBACK_BYPASS_ATR, "3")
+    prefix = _big_range_buy_day_prefix()
+    live = daytrend.decide_daytrend("XAUUSD", prefix, 0.12)
+    assert live.action == "enter" and live.side == "buy"
+    assert live.features["daytrend"]["cap_bypassed"] is True
+
+    atr = vp_lane.mean_true_range(prefix)
+    bias, hrs = vp_lane.dayopen_bias(prefix, 0)
+    sig = replay_fn(prefix, {"bias_d0": bias, "hrs_d0": hrs}, atr, swing_bars=3,
+                    range_cap_atr=12.0, cap_pullback_bypass_atr=3.0)
+    assert sig is not None and sig["side"] == "buy"
+    assert live.entry == pytest.approx(sig["entry"])
+    assert live.sl == pytest.approx(sig["sl"])
+    assert live.tp == pytest.approx(sig["tp"])
+
+
+def test_shallow_pullback_does_not_bypass_range_cap(monkeypatch):
+    """Bypass must NOT re-open the original wound: capitulation-chasing near
+    the extreme (shallow pullback < bypass threshold) stays skipped."""
+    monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
+    monkeypatch.setenv(daytrend.ENV_RANGE_CAP_ATR, "12")
+    monkeypatch.setenv(daytrend.ENV_CAP_PULLBACK_BYPASS_ATR, "3")
+    prefix = _big_range_buy_day_prefix()[:-3]        # drop the pullback legs
+    px = float(prefix[-1]["close"])
+    prefix.append(_bar("2026-07-22T03:25:00Z", px, px + 0.4, px - 0.5, px + 0.3))  # at the extreme
+    d = daytrend.decide_daytrend("XAUUSD", prefix, 0.12)
+    assert d.action == "skip"
+    assert "range_cap" in d.reasons[0]
+
+
+def test_replay_bypass_default_off_is_pre_change_behavior():
+    from scripts.dexter3_entry_position_replay import decide_daytrend as replay_fn
+
+    prefix = _big_range_buy_day_prefix()
+    atr = vp_lane.mean_true_range(prefix)
+    bias, hrs = vp_lane.dayopen_bias(prefix, 0)
+    assert replay_fn(prefix, {"bias_d0": bias, "hrs_d0": hrs}, atr, swing_bars=3,
+                     range_cap_atr=12.0) is None
+
+
 def test_live_skips_without_bias_or_pullback(monkeypatch):
     monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
     prefix = _sell_day_prefix()
