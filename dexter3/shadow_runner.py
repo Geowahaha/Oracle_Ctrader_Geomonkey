@@ -105,6 +105,7 @@ GROK_STATE_FILE = RUNTIME / "dexter3_grok_shadow_state.json"
 VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
 SCALP_STATE_FILE = RUNTIME / "dexter3_scalp_shadow_state.json"
+DPULL_STATE_FILE = RUNTIME / "dexter3_dpull_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -114,11 +115,13 @@ GROK_LOG_FILE = RUNTIME / "dexter3_grok_shadow.log"
 VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
 DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
 SCALP_LOG_FILE = RUNTIME / "dexter3_scalp_shadow.log"
+DPULL_LOG_FILE = RUNTIME / "dexter3_dpull_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
 DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
 SCALP_LOCK_FILE = RUNTIME / "dexter3_scalp_shadow.lock"
+DPULL_LOCK_FILE = RUNTIME / "dexter3_dpull_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -185,13 +188,25 @@ def _scalp_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "scalp"
 
 
+def _dpull_producer_enabled() -> bool:
+    """DPULL lane (owner sign-off 2026-07-22): decide_daytrend producer with
+    the deep-pullback bypass stream x limit -0.5R x convex a2.0 h24 — the
+    dtcap matrix's both-segments/3-window winner. Evidence block in
+    dexter3/daytrend.py next to DPULL_LABEL."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "dpull":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "dpull"
+
+
 def _alt_producer_enabled() -> bool:
-    """Non-hunt producers (vp / daytrend) share the same runner posture:
-    v16 gate bypass (no hunt-committee features), hunt sizing-selector
-    bypass (their proofs sized flat), the VP entry gate (day-open bias +
-    no-trade window; trivially true for daytrend whose signals are
-    with-bias by construction), and the deep 340-bar M5 fetch."""
-    return _vp_producer_enabled() or _daytrend_producer_enabled() or _scalp_producer_enabled()
+    """Non-hunt producers (vp / daytrend / scalp / dpull) share the same
+    runner posture: v16 gate bypass (no hunt-committee features), hunt
+    sizing-selector bypass (their proofs sized flat), the VP entry gate
+    (day-open bias + no-trade window; trivially true for daytrend/dpull
+    whose signals are with-bias by construction), and the deep 340-bar M5
+    fetch."""
+    return (_vp_producer_enabled() or _daytrend_producer_enabled()
+            or _scalp_producer_enabled() or _dpull_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -215,6 +230,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.sd_zones import SCALP_LABEL
 
         return SCALP_LABEL
+    if current_mode == "dpull":
+        from dexter3.daytrend import DPULL_LABEL
+
+        return DPULL_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -247,6 +266,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.sd_zones import SCALP_LABEL_FAMILY
 
         return SCALP_LABEL_FAMILY
+    if current_mode == "dpull":
+        from dexter3.daytrend import DPULL_LABEL_FAMILY
+
+        return DPULL_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -260,6 +283,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return DAYTREND_STATE_FILE
     if current_mode == "scalp":
         return SCALP_STATE_FILE
+    if current_mode == "dpull":
+        return DPULL_STATE_FILE
     return STATE_FILE
 
 
@@ -278,6 +303,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return DAYTREND_LOG_FILE
     if current_mode == "scalp":
         return SCALP_LOG_FILE
+    if current_mode == "dpull":
+        return DPULL_LOG_FILE
     return LOG_FILE
 
 
@@ -1361,6 +1388,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = DAYTREND_LOCK_FILE, "daytrend-canary"
     elif mode == "scalp":
         lock_file, lock_name = SCALP_LOCK_FILE, "scalp-canary"
+    elif mode == "dpull":
+        lock_file, lock_name = DPULL_LOCK_FILE, "dpull-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1387,6 +1416,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = DAYTREND_LOCK_FILE
     elif mode == "scalp":
         lock_file = SCALP_LOCK_FILE
+    elif mode == "dpull":
+        lock_file = DPULL_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1760,6 +1791,18 @@ def run_symbol_cycle(
 
             sc_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_sdzone_live(symbol, prefix, spread_abs, session=sc_session)
+        elif is_newest and _dpull_producer_enabled():
+            # DPULL lane (owner sign-off 2026-07-22): SAME decide_daytrend
+            # producer, but the unit's env runs it with cap12 + deep-pullback
+            # bypass 3xATR, and the geometry downstream is limit -0.5R
+            # (DEXTER3_HUNT_LIMIT_DIP_R) x convex a2.0 h24 (OM env) — the
+            # dtcap matrix winner. NO dayreversal/sdzone sub-producers here:
+            # pure continuation stream, exactly what the matrix measured.
+            from dexter3 import daytrend as _daytrend
+            from dexter3 import market_lens as _ml
+
+            dp_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dp_session)
         elif is_newest and _daytrend_producer_enabled():
             # DAYTREND lane (owner deploy 2026-07-16) — with-the-day pullback
             # continuation; evidence + parity notes in dexter3/daytrend.py.
@@ -2359,11 +2402,19 @@ def _lane_make_limit_intent(
 ) -> dict[str, Any]:
     if _vp_producer_enabled():
         return vp_lane.make_limit_intent(decision, prefix, risk_usd, utc_now_iso())
+    # dpull lane (owner sign-off 2026-07-22): SAME hunt-limit env knobs for
+    # the entry (dip/ttl), but the CONVEX trail is the exit — so it needs the
+    # FAR protective TP (prefer_signal_tp=False), exactly like the VP lane,
+    # NOT the daytrend producer's signal TP (the day extreme). Keeping the
+    # signal TP would cap the +100R convex ride the dtcap matrix measured for
+    # "limit -0.5R x convex a2.0 h24" at the day extreme. Hunt lanes (limit x
+    # ladder, TP is structural) keep prefer_signal_tp=True unchanged.
+    prefer_signal_tp = not _dpull_producer_enabled()
     return vp_lane.make_limit_intent(
         decision, prefix, risk_usd, utc_now_iso(),
         dip_r=_env_float("DEXTER3_HUNT_LIMIT_DIP_R", 0.4),
         ttl_min=_env_float("DEXTER3_HUNT_LIMIT_TTL_MIN", 30.0),
-        prefer_signal_tp=True,
+        prefer_signal_tp=prefer_signal_tp,
     )
 
 
@@ -4345,6 +4396,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_vp = mode == "vp"
     is_daytrend = mode == "daytrend"
     is_scalp = mode == "scalp"
+    is_dpull = mode == "dpull"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -4375,6 +4427,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _SC_LABEL
         print(f"[SCALP] Forced executor LABEL to {_SC_LABEL}", flush=True)
 
+    if is_dpull:
+        from dexter3.daytrend import DPULL_LABEL as _DP_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DP_LABEL
+        print(f"[DPULL] Forced executor LABEL to {_DP_LABEL}", flush=True)
+
     if is_grok and GROK_LABEL:
         active_label = GROK_LABEL
     elif is_vp:
@@ -4389,6 +4448,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.sd_zones import SCALP_LABEL as _SC_LABEL
 
         active_label = _SC_LABEL
+    elif is_dpull:
+        from dexter3.daytrend import DPULL_LABEL as _DP_LABEL
+
+        active_label = _DP_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
@@ -4531,6 +4594,23 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _DT_LABEL
         print(f"[DAYTREND] Forced executor LABEL to {_DT_LABEL}", flush=True)
+
+    # Same H6 class of fix for the scalp (2026-07-17) and dpull (2026-07-22)
+    # lanes — --once with the mode env set must place entries under the
+    # lane's own label, mirroring run_loop's patches exactly.
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "scalp":
+        from dexter3.sd_zones import SCALP_LABEL as _SC_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _SC_LABEL
+        print(f"[SCALP] Forced executor LABEL to {_SC_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "dpull":
+        from dexter3.daytrend import DPULL_LABEL as _DP_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DP_LABEL
+        print(f"[DPULL] Forced executor LABEL to {_DP_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

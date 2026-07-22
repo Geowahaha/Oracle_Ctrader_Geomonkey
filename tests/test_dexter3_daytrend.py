@@ -155,6 +155,80 @@ def test_mode_routing_label_state_lock(monkeypatch):
     assert _active_label_family() == "dexter3:fable"
 
 
+def test_dpull_mode_routing_is_fully_isolated(monkeypatch):
+    """DPULL lane (owner sign-off 2026-07-22) must have its own label / family
+    / state / log / lock so it never touches fable/vp/daytrend/scalp
+    positions — same isolation contract every lane has."""
+    from dexter3.shadow_runner import (
+        DPULL_LOCK_FILE,
+        DPULL_LOG_FILE,
+        DPULL_STATE_FILE,
+        _active_label_family,
+        _active_log_file,
+        _active_order_label,
+        _active_state_file,
+        _alt_producer_enabled,
+        _daytrend_producer_enabled,
+        _dpull_producer_enabled,
+    )
+
+    monkeypatch.setenv("DEXTER3_MODE", "dpull")
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert _dpull_producer_enabled()
+    assert _alt_producer_enabled()               # gets the vp gate/bypass posture
+    assert not _daytrend_producer_enabled()      # distinct from the daytrend lane
+    assert _active_order_label() == "dexter3:dpull:canary"
+    assert _active_label_family() == "dexter3:dpull"
+    assert _active_state_file() == DPULL_STATE_FILE
+    assert _active_log_file() == DPULL_LOG_FILE
+    # unique files per lane — no collision with any sibling
+    assert len({DPULL_STATE_FILE, DPULL_LOG_FILE, DPULL_LOCK_FILE}) == 3
+    assert "dpull" in DPULL_STATE_FILE.name
+
+
+def test_dpull_producer_flag_via_producer_env(monkeypatch):
+    from dexter3.shadow_runner import _dpull_producer_enabled
+
+    monkeypatch.delenv("DEXTER3_MODE", raising=False)
+    monkeypatch.setenv("DEXTER3_PRODUCER", "dpull")
+    assert _dpull_producer_enabled()
+    monkeypatch.setenv("DEXTER3_PRODUCER", "vp")
+    assert not _dpull_producer_enabled()
+
+
+def test_dpull_limit_intent_uses_far_tp_not_signal_tp(monkeypatch):
+    """The correctness crux: dpull's exit is the convex trail, so its limit
+    intent must carry a FAR protective TP (like the VP lane), NOT the
+    daytrend producer's signal TP (the day extreme) — else the +100R convex
+    ride the matrix measured gets capped at the extreme. Contrast with a hunt
+    lane, which keeps its structural signal TP."""
+    from types import SimpleNamespace
+
+    import dexter3.shadow_runner as sr
+
+    # a simple with-bias buy decision: entry 4100, sl 4090 (risk 10), signal
+    # TP at 4108 (the day extreme, only +0.8R away — would cap convex hard)
+    dec = SimpleNamespace(side="buy", entry=4100.0, sl=4090.0, tp=4108.0,
+                          symbol="XAUUSD", ts_close="2026-07-22T05:00:00Z",
+                          setup="daytrend_pullback_resume", session="london")
+    bars = [{"ts": f"2026-07-22T0{i}:00:00Z", "open": 4100.0, "high": 4101.0,
+             "low": 4099.0, "close": 4100.0} for i in range(5)]
+
+    monkeypatch.setenv("DEXTER3_MODE", "dpull")
+    monkeypatch.setenv("DEXTER3_HUNT_LIMIT_DIP_R", "0.5")
+    monkeypatch.setenv("DEXTER3_VP_FAR_TP_R", "12")
+    dpull_intent = sr._lane_make_limit_intent(dec, bars, 5.0)
+    # far TP: level = 4100 - 0.5*10 = 4095; stop_pts = |4095-4090| = 5;
+    # far TP = 4095 + 12*5 = 4155 — nowhere near the 4108 signal TP.
+    assert dpull_intent["tp"] > 4150.0
+
+    # a hunt lane on the SAME decision keeps the structural signal TP (4108)
+    monkeypatch.setenv("DEXTER3_MODE", "v16")
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    hunt_intent = sr._lane_make_limit_intent(dec, bars, 5.0)
+    assert hunt_intent["tp"] == pytest.approx(4108.0)
+
+
 def test_om_plain_mode_never_profit_exits(monkeypatch):
     from dexter3.basket_manager import BasketConfig
     from dexter3.opening_manager import OMConfig, OpeningManager

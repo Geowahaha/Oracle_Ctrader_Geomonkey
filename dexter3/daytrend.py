@@ -39,6 +39,20 @@ DAYTREND_LABEL = "dexter3:dtr:canary"
 # prefix so a version bump never orphans open positions.
 DAYTREND_LABEL_FAMILY = "dexter3:dtr"
 
+# DPULL lane (owner sign-off 2026-07-22 "สร้างเลนใหม่เลยครับ ... deploy เทรดจริง
+# ได้เลย"): the SAME decide_daytrend producer run with cap12 + deep-pullback
+# bypass 3xATR, but the dtcap matrix's winning GEOMETRY instead of daytrend's
+# market x plain: limit entry at signal -0.5R (TTL 6 bars) x convex trail
+# arm 2.0R / giveback 3.0xATR / max age 24 bars. Evidence (VM
+# /tmp/dtcap_bypass3_{6000,10000,14000}.log, row "limit -0.5R w6 x convex
+# a2.0 gb3.0 h24"): derive/validate +35.67/+62.80, +19.32/+116.55,
+# +12.78/+100.10 — positive BOTH segments in ALL 3 windows (the bar that
+# killed BE-ratchet and the rejection-quality gates). Same-producer overlap
+# with the daytrend lane on cap12-passing signals is handled by the standing
+# DEXTER3_CROSS_LANE_DEDUP=downsize policy, NOT by forking the producer.
+DPULL_LABEL = "dexter3:dpull:canary"
+DPULL_LABEL_FAMILY = "dexter3:dpull"
+
 ENV_PULL_ATR = "DEXTER3_DAYTREND_PULL_ATR"           # default 0.8 (proven)
 ENV_SWING_BARS = "DEXTER3_DAYTREND_SWING_BARS"       # default 6
 ENV_BUFFER_ATR = "DEXTER3_DAYTREND_BUFFER_ATR"       # default 0.1

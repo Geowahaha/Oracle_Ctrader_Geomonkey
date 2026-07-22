@@ -1,0 +1,110 @@
+# Dexter3 DPULL lane — deep-pullback continuation × discount-limit × convex
+# (owner sign-off 2026-07-22: "สร้างเลนใหม่เลยครับ อย่าให้สูญเปล่า deploy เทรดจริง
+# ได้เลย").
+#
+# BORN FROM A REJECTED FIX: the daytrend range_cap deep-pullback BYPASS lost to
+# the cap at MARKET entry in every window (dtcap matrix, verdict 2026-07-22 —
+# the cap stays on the daytrend lane). But the SAME extra deep-pullback signals
+# are consistently PROFITABLE under a different GEOMETRY: discount-limit entry ×
+# convex trail. This lane is that geometry, isolated.
+#
+# Producer = decide_daytrend with cap12 + deep-pullback bypass 3×ATR
+# (DEXTER3_DAYTREND_RANGE_CAP_ATR=12 + _CAP_PULLBACK_BYPASS_ATR=3 — the bypass
+# that is OFF on the daytrend lane is ON here, because here the geometry that
+# monetizes those signals is present). NO dayreversal / sdzone sub-producers:
+# pure continuation stream, exactly what the matrix measured.
+#
+# Geometry = the dtcap winner "limit -0.5R w6 × convex a2.0 gb3.0 h24":
+#   * entry: synthetic LIMIT at signal −0.5R (DEXTER3_HUNT_LIMIT_DIP_R=0.5),
+#     TTL 30min = 6 M5 bars (DEXTER3_HUNT_LIMIT_TTL_MIN=30); the fast-tick
+#     _service_vp_limit_intent fires a MARKET order when the touch-side quote
+#     reaches the level or expires it at TTL (the proven-live limit layer).
+#     FAR protective TP (12R) so the convex trail — not a signal TP — is the
+#     exit (wired in _lane_make_limit_intent via prefer_signal_tp=False for
+#     this lane).
+#   * exit: CONVEX trail (DEXTER3_OM_TRAIL_MODE=convex) arm 2.0R / giveback
+#     3.0×ATR / max age 120min (= 24 M5 bars = h24).
+#
+# Evidence (VM /tmp/dtcap_bypass3_{6000,10000,14000}.log, row
+# "limit -0.5R w6 x convex a2.0 gb3.0 h24", --no-overlap, derive/validate):
+#   6k  +35.67 / +62.80   (PF 1.21 / 1.51)
+#   10k +19.32 / +116.55  (PF 1.07 / 1.63)
+#   14k +12.78 / +100.10  (PF 1.03 / 1.36)
+# Positive BOTH segments in ALL 3 windows — the two-segment bar that killed
+# BE-ratchet + every rejection-quality gate. CANARY size, forward numbers are
+# the trial (this repo has killed 4 exit-geometry findings out-of-sample;
+# scaling only after >=100 forward trades + PF>1.2 per the standing freeze).
+#
+# Isolation: DEXTER3_MODE=dpull → own label (dexter3:dpull:canary), state file
+# (dexter3_dpull_shadow_state.json), lock, log. fable/vp/daytrend/scalp never
+# touch its positions. Same-producer overlap with the daytrend lane on
+# cap12-passing signals is softened by the standing CROSS_LANE_DEDUP=downsize.
+#
+# ACTIVATION:
+#   sudo cp ops/dexter3-dpull.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-dpull
+[Unit]
+Description=Dexter3 DPULL lane LIVE canary (deep-pullback x limit -0.5R x convex)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=dpull
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
+# canary risk (same tier as vp/daytrend/scalp)
+Environment=DEXTER3_DAILY_TARGET_USD=15
+Environment=DEXTER3_DAILY_LOSS_USD=8
+Environment=DEXTER3_BASE_RISK_FRAC=0.004
+Environment=DEXTER3_MAX_RISK_FRAC=0.008
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# --- producer: daytrend continuation with the deep-pullback bypass ON --------
+Environment=DEXTER3_DAYTREND_PULL_ATR=0.8
+Environment=DEXTER3_DAYTREND_SWING_BARS=6
+Environment=DEXTER3_DAYTREND_BUFFER_ATR=0.1
+Environment=DEXTER3_DAYTREND_MIN_HOURS=1
+Environment=DEXTER3_DAYTREND_MAX_RISK_ATR=2.0
+Environment=DEXTER3_DAYTREND_RANGE_CAP_ATR=12
+Environment=DEXTER3_DAYTREND_CAP_PULLBACK_BYPASS_ATR=3
+# no dayreversal / sdzone here — pure continuation stream (the matrix scope)
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+# --- entry geometry: discount LIMIT −0.5R, TTL 30min (= 6 M5 bars) -----------
+Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.5
+Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
+Environment=DEXTER3_VP_FAR_TP_R=12
+# --- exit geometry: CONVEX trail arm 2.0R / giveback 3.0xATR / 120min (h24) --
+Environment=DEXTER3_OM_TRAIL_MODE=convex
+Environment=DEXTER3_OM_CONVEX_ARM_R=2.0
+Environment=DEXTER3_OM_CONVEX_GIVEBACK_ATR=3.0
+Environment=DEXTER3_OM_CONVEX_MAX_AGE_MIN=120
+# basket time-stop must outlive the convex 120min hold (default 180 is fine,
+# set explicit so a default change never caps the exit first)
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=130
+# --- lane hygiene (mirrors vp/daytrend) --------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=1
+Environment=DEXTER3_VP_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_VP_BIAS_MIN_HOURS=1
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target
