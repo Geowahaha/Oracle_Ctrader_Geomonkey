@@ -185,6 +185,26 @@ class DecisionJournal:
         self._conn.commit()
         return int(cur.lastrowid)
 
+    def update_decision_features(self, decision_id: int, features: dict[str, Any]) -> None:
+        """Re-serialize ``features_json`` for an already-inserted decision row.
+
+        2026-07-22 B-tier verdict blocker: the run loop journals an enter
+        decision BEFORE the entry gates run, but the gates stamp their
+        verdict-critical evidence (``v16_entry_quality`` incl. ``b_tier``,
+        ``anti_chase``, ``smart_exit`` meta, sizing selectors) into
+        ``decision.features`` AFTER — so none of it ever reached the journal
+        (measured: 0 of ~12 live ``pass_b_tier_scout`` admissions since 07-15
+        were queryable; the B-tier verdict had to fall back to journalctl
+        greps + timestamp guessing). The caller re-syncs features once, after
+        the whole gate chain has run. UPDATE-only by design: never touches
+        any other column, no-op on an unknown id.
+        """
+        self._conn.execute(
+            "UPDATE decisions SET features_json = ? WHERE id = ?",
+            (json.dumps(features or {}, ensure_ascii=False, default=str), int(decision_id)),
+        )
+        self._conn.commit()
+
     def recent_decisions(self, limit: int = 50, symbol: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM decisions"
         params: tuple[Any, ...] = ()

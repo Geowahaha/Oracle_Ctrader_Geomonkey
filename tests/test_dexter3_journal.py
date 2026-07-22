@@ -87,6 +87,29 @@ def test_insert_and_recent_decisions_roundtrip(journal: DecisionJournal):
     assert rows[0]["features"] == {"note": "test"}
 
 
+def test_update_decision_features_resyncs_features_json(journal: DecisionJournal):
+    """2026-07-22 B-tier verdict blocker: gate evidence (b_tier etc.) is
+    stamped into decision.features AFTER insert_decision — the resync must
+    land it in the same row, touching nothing else."""
+    rid = journal.insert_decision(_decision())
+    journal.update_decision_features(
+        rid, {"note": "test", "v16_entry_quality": {"b_tier": True, "gate_reason": "pass_b_tier_scout"}}
+    )
+    rows = journal.recent_decisions(limit=1)
+    assert rows[0]["id"] == rid
+    assert rows[0]["features"]["v16_entry_quality"]["b_tier"] is True
+    assert rows[0]["symbol"] == "XAUUSD"      # other columns untouched
+    assert rows[0]["reasons"] == ["insufficient bars"]
+
+
+def test_update_decision_features_unknown_id_is_noop(journal: DecisionJournal):
+    rid = journal.insert_decision(_decision())
+    journal.update_decision_features(999999, {"poison": True})
+    rows = journal.recent_decisions(limit=1)
+    assert rows[0]["id"] == rid
+    assert rows[0]["features"] == {"note": "test"}
+
+
 def test_recent_decisions_filters_by_symbol(journal: DecisionJournal):
     journal.insert_decision(_decision(symbol="XAUUSD"))
     journal.insert_decision(_decision(symbol="BTCUSD"))

@@ -1820,7 +1820,7 @@ def run_symbol_cycle(
         # H2 (2026-07-15 cross-lane entanglement audit): stamp this row with
         # the writing lane's own order label so per-lane journal queries
         # (empirical stats, skip fear-cost) never pool Fable/Grok/VP rows.
-        journal.insert_decision(decision, label=_active_order_label())
+        decision_row_id = journal.insert_decision(decision, label=_active_order_label())
         log_decision_line(decision, late_sec=late_sec)
 
         basket = baskets.setdefault(symbol, PaperBasket(symbol, journal))
@@ -2015,6 +2015,19 @@ def run_symbol_cycle(
                                 # lane timestamp on the first fast tick that observes
                                 # this basket (see its own smart-exit backfill block).
                             status += f":live_{exec_result.get('action', 'unknown')}"
+
+        if is_newest and decision.action == "enter" and isinstance(decision.features, dict):
+            # 2026-07-22 B-tier verdict blocker: the row above was journaled
+            # BEFORE the gate chain ran, but the gates stamp their evidence
+            # (v16_entry_quality incl. b_tier, anti_chase, pullback_gate,
+            # smart_exit meta) into decision.features AFTER — so the journal
+            # never carried any of it and the B-tier verdict was reduced to
+            # journalctl greps. One re-sync after the whole chain; never
+            # allowed to break the loop.
+            try:
+                journal.update_decision_features(decision_row_id, decision.features)
+            except Exception as exc:  # noqa: BLE001 - observability must not kill the cycle
+                log_line(f"{utc_now_iso()} {symbol} decision_features_resync_failed: {exc}")
 
         mark_m5_close_seen(state, symbol, bar_ts)
         save_shadow_state(state)
