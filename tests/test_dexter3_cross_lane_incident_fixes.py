@@ -445,6 +445,65 @@ def test_stamp_skip_bias_fallback_never_raises_on_garbage_prefix():
     assert "skip_bias_side" not in d.features  # degrades silently, no crash
 
 
+def test_governor_bypass_threshold_stays_in_sync_with_leader_strong_score():
+    """No-careless-hardcode guard (owner rule 2026-07-10): the deployed
+    DEXTER3_GOVERNOR_BYPASS_MIN_SCORE=0.74 in ops/dexter3-fable.service is
+    documented as "= market_lens.LEADER_STRONG_SCORE, not a new number
+    invented here" -- a literal duplicate the .service file cannot import.
+    This test is the enforcement the comment alone can't provide: it reads
+    the ACTUAL deployed value out of the tracked service file and asserts it
+    still equals the actual constant. If either drifts, this fails loudly
+    instead of the two silently disagreeing."""
+    import re
+    from dexter3.market_lens import LEADER_STRONG_SCORE
+
+    service_path = (
+        Path(__file__).resolve().parent.parent / "ops" / "dexter3-fable.service"
+    )
+    text = service_path.read_text(encoding="utf-8")
+    m = re.search(r"^Environment=DEXTER3_GOVERNOR_BYPASS_MIN_SCORE=([\d.]+)\s*$", text, re.MULTILINE)
+    assert m is not None, "DEXTER3_GOVERNOR_BYPASS_MIN_SCORE not found in ops/dexter3-fable.service"
+    deployed_value = float(m.group(1))
+    assert deployed_value == pytest.approx(LEADER_STRONG_SCORE)
+
+
+def test_governor_bypass_scope_assumption_vp_daytrend_scalp_stay_below_threshold():
+    """No-careless-hardcode guard: my 2026-07-22 report to the owner claimed
+    "vp/daytrend/scalp hardcode leader_score so the bypass is a structural
+    no-op there" -- self-audit caught that VP's ENTER decisions are actually
+    0.5, not 0.0 (volume_profile.py:212), unlike daytrend/scalp which really
+    are 0.0 (daytrend.py:139/158/242/269/311). The bypass is only actually
+    safe on non-fable lanes because 0.5 and 0.0 both sit below the deployed
+    0.74 threshold -- an implicit cross-file assumption nothing enforced.
+    This test makes it explicit: it fails loudly the moment either producer's
+    hardcoded score, or the deployed threshold, changes enough to close that
+    gap, forcing a conscious decision instead of a silent bypass leak onto a
+    lane that was never meant to have one."""
+    import re
+    from dexter3 import daytrend, volume_profile
+
+    service_path = (
+        Path(__file__).resolve().parent.parent / "ops" / "dexter3-fable.service"
+    )
+    text = service_path.read_text(encoding="utf-8")
+    m = re.search(r"^Environment=DEXTER3_GOVERNOR_BYPASS_MIN_SCORE=([\d.]+)\s*$", text, re.MULTILINE)
+    assert m is not None
+    deployed_threshold = float(m.group(1))
+
+    vp_entry = volume_profile._enter(
+        ts_close="2026-07-22T00:00:00Z", symbol="XAUUSD", setup="vp_lvn_rejection",
+        side="buy", entry=4000.0, sl=3995.0, tp=4010.0, session="london",
+        reasons=["test"], features={},
+    )
+    assert vp_entry is not None
+    assert vp_entry.leader_score == pytest.approx(0.5)
+    assert vp_entry.leader_score < deployed_threshold
+
+    daytrend_skip = daytrend._skip("2026-07-22T00:00:00Z", "XAUUSD", "london", "test")
+    assert daytrend_skip.leader_score == pytest.approx(0.0)
+    assert daytrend_skip.leader_score < deployed_threshold
+
+
 def test_stamp_skip_bias_fallback_respects_anchor_hour_env(monkeypatch):
     # anchor_hour=12: the "day" starts at 12:00Z, so a bar at 01:00Z belongs
     # to the PREVIOUS day's anchor window and open_px comes from the first
