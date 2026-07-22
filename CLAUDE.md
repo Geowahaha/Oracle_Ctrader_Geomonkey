@@ -8,20 +8,33 @@
 
 # ============================================================
 
+## ⚡ ONBOARDING (read in this order — nothing else needed to start)
+
+1. **`docs/AGENT_SYNC_BOARD.md` → "Quick status"** — THE canonical current state
+   (live lanes, protected baseline, due verdicts, latest deploys, VM deploy
+   discipline). Then the last 2-3 Activity-log entries at the bottom.
+2. Claude-family agents: auto-memory `handoff_fable5_dna.md` (iron rules — no
+   hardcode, additive-only, evidence-over-memory, verify-before-reporting).
+3. Everything below this section is **architecture reference** — mostly the
+   legacy `main.py` swarm system. **The live-money system since 2026-07 is
+   `dexter3/` (4 systemd lanes on the Oracle VM)** — see the sync board.
+
+Owner: mrgeo | Bangkok (UTC+7) | Windows dev machine | speaks Thai
+
 ## What This System Is
 
 Dexter Pro is a fully autonomous multi-strategy AI trading system.
-It is NOT a simple signal bot. It has:
+Two coexisting layers:
 
-* Multiple concurrent strategy families running in parallel (swarm model)
-* A neural reasoning brain that evaluates market context per signal
-* A self-learning layer that adapts confidence thresholds from live performance
-* A trading manager that orchestrates all families + guards simultaneously
-* A position manager that actively defends open trades in real-time
-* A canary system that probes experimental strategies with minimal risk
-* Live execution on cTrader and MT5 with real money
-
-Owner: mrgeo | Bangkok (UTC+7) | Windows dev machine
+* **`dexter3/` — the LIVE layer (Oracle VM, demo 9922808, XAUUSD):** 4 isolated
+  lanes (fable=hunt, vp=volume-profile, daytrend=continuation+reversal,
+  scalp=sdzone×bank-green), each its own systemd unit / broker label / state /
+  lock. Daily Mission Governor ($100 target / $50 stop / conviction bypass),
+  Opening Manager exits (plain/convex/bank), decision journal + skip
+  evaluator (fear-cost KPI), 3-window replay harness gates every change.
+* **`main.py` swarm — the legacy/scanner layer (local PC, paper-only):**
+  multi-family signal swarm, neural brain, self-learning, Telegram alerts.
+  CTRADER/MT5_ENABLED=False locally — it never trades real money.
 
 ## Full Architecture Overview
 
@@ -201,30 +214,27 @@ D:\\dexter\_pro\_v3\_fixed\\
 
 |File|Purpose|
 |-|-|
-|`scheduler.py`|Core — all routing, all scan loops, all family selectors|
-|`config.py`|All env vars parsed to typed object — source of truth|
+|`docs/AGENT_SYNC_BOARD.md`|**THE canonical entry point + bilateral agent coordination** — read Quick status at session start, append Activity log after work; owner checks progress here|
+|`dexter3/shadow_runner.py`|**LIVE loop** — lens → producer → gates → governor → executor; all 4 lanes run this module|
+|`dexter3/daily_governor.py`|Daily Mission Governor — $100 target / $50 stop / sizing ladder / conviction bypass|
+|`ops/dexter3-*.service`|**Env source of truth per lane** — every deployed flag lives here, tracked in git|
+|`scheduler.py`|Legacy swarm core — routing, scan loops, family selectors (PC scanner layer)|
+|`config.py`|All env vars parsed to typed object — source of truth (legacy layer)|
 |`.env.local`|Raw thresholds 1200+ lines — never hardcode from here|
-|`main.py`|Entry point, process start|
-|`execution/`|Order placement + position manager|
-|`api/`|All broker wrappers (cTrader OpenAPI, MT5, Binance, Bybit)|
-|`docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md`|XAU gate journal stamps, entry template + M1 bias chain, VM aggregate checklist — **mission next steps**|
-|`docs/AGENT_SYNC_BOARD.md`|**Bilateral agent coordination** — read/update at session start; owner checks progress here (no middleman for routine status)|
+|`api/`|Broker wrappers (cTrader OpenAPI, MT5, Binance, Bybit)|
+
+(Removed 2026-07-22: `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` — file no
+longer exists in the repo; do not go looking for it.)
 
 ## Session Startup
 
-```
-/add scheduler.py
-/add config.py
-/add data/runtime/trading_manager_state.json
-/add docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md
-/add docs/AGENT_SYNC_BOARD.md
-```
-
-**Agent coordination:** open **`docs/AGENT_SYNC_BOARD.md`** first — refresh **Quick status** + **Owner — latest** + append **Activity log**; peer agents monitor the same file.
-
-**XAU mission (sequenced):** open `docs/AGENT_HANDOFF_XAU_GATE_ENTRY_TEMPLATE.md` **§4.1** (phases **A→E**) and **§5**; execute in order.
-
-Optional: *"Continue from 2026-04 handoff. What is current system state?"*
+1. Read **`docs/AGENT_SYNC_BOARD.md`** → Quick status table + last 2-3 Activity
+   entries. That IS the current system state — do not re-derive it.
+2. After any work session: refresh **Quick status**, refresh **Owner — latest**
+   (≤1 paragraph), **append** an Activity-log entry. Peer agents and the owner
+   read the same file; keeping it current is what makes cross-session handoff
+   seamless.
+3. Deploying to the VM: follow the board's "VM deploy discipline" row exactly.
 
 ## Never Ask Me About
 
@@ -253,6 +263,23 @@ See `docs/TRADING_PHILOSOPHY.md` for the full EliteQuantTrader profile.
 - Statistical regime detection (HMM/clustering beyond rule-based day_type)
 
 ## Recent Changes
+
+(For anything after 2026-04 see the sync board's Activity log — it is the
+authoritative changelog for the dexter3 era; this section is not maintained
+per-change anymore.)
+
+### 2026-07-22 — fear_cost un-brick + governor conviction bypass (owner audit)
+
+`dexter3/{shadow_runner,daily_governor,skip_evaluator}.py`, `ops/dexter3-fable.service`.
+Skip decisions stamp `skip_bias_side` (fear-cost KPI was 6/2425 evaluable);
+`DailyGovernor.bypass_allowed` — fable-only `DEXTER3_GOVERNOR_BYPASS_MIN_SCORE=0.74`,
+entry-gate only. Commits `dc67446`/`f340452`/`50ca6ef`, 37 new tests, 1272 green.
+
+### 2026-07-16/17 — dexter3 4-lane surgery era (see sync board Activity log)
+
+VP + daytrend + scalp lanes deployed live; grok retired; fable full surgery
+(boost OFF, ladder→plain, prem-cap 0.25, bias-skip, M1-confirm). Protected
+baseline until the 07-22 verdicts.
 
 ### 2026-04-04 — Entry Sharpness Score + sweep reversal sharpness guard
 
