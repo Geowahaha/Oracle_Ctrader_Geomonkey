@@ -93,6 +93,44 @@ def test_determine_candidate_side_none_with_insufficient_bars_for_drift():
     assert source == "no_recorded_candidate"
 
 
+# -- bias fallback (2026-07-22 owner audit: vp/daytrend/scalp skips never ---
+# -- carried the hunt-lens shape, so they were ALWAYS unevaluable) ----------
+
+
+def test_determine_candidate_side_falls_back_to_bias_buy():
+    side, source = se.determine_candidate_side({"skip_bias_side": "buy"})
+    assert side == "buy"
+    assert source == "bias_fallback_candidate"
+
+
+def test_determine_candidate_side_falls_back_to_bias_sell():
+    side, source = se.determine_candidate_side({"skip_bias_side": "sell"})
+    assert side == "sell"
+    assert source == "bias_fallback_candidate"
+
+
+def test_determine_candidate_side_lens_features_take_priority_over_bias():
+    # a decision carrying BOTH a real hunt-lens candidate and a bias stamp
+    # must use the lens candidate — the fallback is last resort only.
+    features = dict(STRONG_SELL_FEATURES, skip_bias_side="buy")
+    side, source = se.determine_candidate_side(features)
+    assert side == "sell"
+    assert source == "features_candidate"
+
+
+def test_determine_candidate_side_ignores_invalid_bias_value():
+    side, source = se.determine_candidate_side({"skip_bias_side": "sideways"})
+    assert side is None
+    assert source == "no_recorded_candidate"
+
+
+def test_determine_candidate_side_empty_features_still_unevaluable():
+    # vp's actual skip features={} — no bias was ever stamped -> stays honest
+    side, source = se.determine_candidate_side({})
+    assert side is None
+    assert source == "no_recorded_candidate"
+
+
 # -- simulate_would_have_trade ---------------------------------------------------------
 
 

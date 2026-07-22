@@ -2,7 +2,7 @@
 
 Owner directive (2026-07-07): chase $100/day on a $1000 virtual capital base,
 aggressively but survivably. This module is PURE LOGIC ONLY — no I/O, no MCP
-calls, no journal writes. It answers exactly three questions:
+calls, no journal writes. It answers exactly four questions:
 
     1. ``status``          — given today's realized + floating PnL, are we
                               still hunting, locked at target, or stopped at
@@ -13,6 +13,12 @@ calls, no journal writes. It answers exactly three questions:
                               today's ordered close PnLs (stateless — no
                               fragile running counter that can desync from
                               the broker's own history).
+    4. ``bypass_allowed``  — given one candidate's conviction score, should
+                              it be let through anyway even though ``status``
+                              said TARGET_LOCKED/LOSS_STOPPED (owner rule,
+                              2026-07-22: strong signals must not be blocked
+                              by the daily cap)? OFF unless the caller has
+                              configured ``bypass_min_score``.
 
 Layering discipline (blueprint-equivalent non-negotiable for this module):
 the governor can only (a) refuse to let new entries fire, (b) trigger a
@@ -75,6 +81,20 @@ class GovernorConfig:
     # Session multiplier — keys MUST match market_lens.session_context()'s
     # exact "value" tag strings (asian/london/overlap/ny/off_hours/unknown).
     session_mult: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SESSION_MULT))
+    # High-conviction bypass (owner rule, 2026-07-22 audit: "good/positive
+    # opportunities must bypass every block"). None (default) = feature OFF,
+    # same opt-in posture as every other lever in this module. A live case
+    # that motivated this: a dayreversal_structure_flip candidate (a rare
+    # capitulation-reversal setup its own producer journals as "Rare by
+    # construction") was refused outright by LOSS_STOPPED on 2026-07-21 with
+    # no exception path at all -- the governor could not tell a strong
+    # signal from a weak one. Scope note: this bypass only ever loosens the
+    # ENTRY block for a specific candidate; it never touches the close-all
+    # sweep that protects capital on already-open positions (see
+    # shadow_runner.run_governor_tick), and it does not exempt any other
+    # gate in the system (range caps, no-trade windows, cross-lane dedup,
+    # etc.) -- those are separate, unaudited decisions.
+    bypass_min_score: float | None = None
 
 
 class DailyGovernor:
@@ -178,3 +198,21 @@ class DailyGovernor:
             else:
                 break
         return streak
+
+    # -- question 4: does THIS candidate clear the high-conviction bypass ---
+
+    def bypass_allowed(self, candidate_score: float | None) -> bool:
+        """True when a candidate's conviction score clears the configured
+        high-conviction bypass threshold.
+
+        Both a configured threshold (``config.bypass_min_score``) AND a real
+        ``candidate_score`` must be present for a bypass to ever fire --
+        either being ``None`` means "no opinion", never "allow" (fail-closed,
+        matching this module's existing posture: it may only ever refuse or
+        size, so an ambiguous input must land on the more conservative
+        answer). Pure comparison, no I/O, no side effects — same contract as
+        every other method here.
+        """
+        if self.config.bypass_min_score is None or candidate_score is None:
+            return False
+        return float(candidate_score) >= self.config.bypass_min_score

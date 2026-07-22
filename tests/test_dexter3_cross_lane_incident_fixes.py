@@ -341,6 +341,126 @@ def test_governor_entry_risk_reuses_the_same_cap_run_governor_tick_uses(monkeypa
 
 
 # ---------------------------------------------------------------------------
+# 4b. _governor_entry_risk — high-conviction bypass (2026-07-22 owner audit:
+# a dayreversal_structure_flip candidate was refused live by LOSS_STOPPED
+# with zero exception path — "good opportunities must bypass every block")
+# ---------------------------------------------------------------------------
+
+
+def test_governor_entry_risk_bypass_off_by_default_even_with_elite_score(monkeypatch):
+    _reset_governor(monkeypatch)  # DEXTER3_GOVERNOR_BYPASS_MIN_SCORE left unset
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (-16.32, [-16.32]))
+    d = FakeDecision(symbol="XAUUSD", features={}, leader_score=0.99)
+    result = sr._governor_entry_risk(FakeMcp(), d, {"governor": {"floating_by_symbol": {}}})
+    assert result is not None
+    assert result["allow"] is False
+    assert result["reason"] == "governor_loss_stop_pre_entry"
+
+
+def test_governor_entry_risk_bypass_allows_high_conviction_when_cap_breached(monkeypatch):
+    _reset_governor(monkeypatch)
+    monkeypatch.setenv("DEXTER3_GOVERNOR_BYPASS_MIN_SCORE", "0.74")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (-16.32, [-16.32]))
+    d = FakeDecision(symbol="XAUUSD", features={}, leader_score=0.80)
+    result = sr._governor_entry_risk(FakeMcp(), d, {"governor": {"floating_by_symbol": {}}})
+    assert result is not None
+    assert result.get("allow", True) is True
+    assert "risk_usd" in result  # normal sizing still runs, not a raw pass-through
+
+
+def test_governor_entry_risk_bypass_refuses_when_score_below_threshold(monkeypatch):
+    _reset_governor(monkeypatch)
+    monkeypatch.setenv("DEXTER3_GOVERNOR_BYPASS_MIN_SCORE", "0.74")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (-16.32, [-16.32]))
+    d = FakeDecision(symbol="XAUUSD", features={}, leader_score=0.50)
+    result = sr._governor_entry_risk(FakeMcp(), d, {"governor": {"floating_by_symbol": {}}})
+    assert result is not None
+    assert result["allow"] is False
+    assert result["reason"] == "governor_loss_stop_pre_entry"
+
+
+def test_governor_entry_risk_bypass_boundary_is_inclusive(monkeypatch):
+    _reset_governor(monkeypatch)
+    monkeypatch.setenv("DEXTER3_GOVERNOR_BYPASS_MIN_SCORE", "0.74")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (-16.32, [-16.32]))
+    d = FakeDecision(symbol="XAUUSD", features={}, leader_score=0.74)
+    result = sr._governor_entry_risk(FakeMcp(), d, {"governor": {"floating_by_symbol": {}}})
+    assert result.get("allow", True) is True
+
+
+def test_governor_entry_risk_missing_leader_score_defaults_to_zero_never_bypasses(monkeypatch):
+    # a decision with no leader_score attr at all (e.g. a producer that
+    # never sets it) must never accidentally bypass — getattr(...) default
+    # must be 0.0, not None (None would (incorrectly) never compare < threshold).
+    _reset_governor(monkeypatch)
+    monkeypatch.setenv("DEXTER3_GOVERNOR_BYPASS_MIN_SCORE", "0.0")
+    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (-16.32, [-16.32]))
+    d = SimpleNamespace(symbol="XAUUSD", features={})  # no leader_score attr
+    result = sr._governor_entry_risk(FakeMcp(), d, {"governor": {"floating_by_symbol": {}}})
+    # threshold 0.0 and default score 0.0 -> 0.0 >= 0.0 -> bypass fires
+    assert result.get("allow", True) is True
+
+
+# ---------------------------------------------------------------------------
+# 4c. _stamp_skip_bias_fallback — fear-cost bias fallback (2026-07-22 audit:
+# vp/daytrend/scalp skip rows were structurally 100% unevaluable because
+# their features never carry a hunt-lens-shaped candidate side)
+# ---------------------------------------------------------------------------
+
+
+def _bar(ts: str, o: float, h: float, l: float, c: float) -> dict:
+    return {"ts": ts, "open": o, "high": h, "low": l, "close": c}
+
+
+def test_stamp_skip_bias_fallback_buy_day():
+    prefix = [
+        _bar("2026-07-16T00:00:00Z", 4000.0, 4001.0, 3999.0, 4000.0),  # anchor/day-open bar
+        _bar("2026-07-16T01:00:00Z", 4000.0, 4012.0, 3999.5, 4010.0),  # close well above open
+    ]
+    d = FakeDecision(action="skip", features={})
+    sr._stamp_skip_bias_fallback(d, prefix)
+    assert d.features.get("skip_bias_side") == "buy"
+
+
+def test_stamp_skip_bias_fallback_sell_day():
+    prefix = [
+        _bar("2026-07-16T00:00:00Z", 4000.0, 4001.0, 3999.0, 4000.0),
+        _bar("2026-07-16T01:00:00Z", 4000.0, 4000.5, 3988.0, 3990.0),  # close well below open
+    ]
+    d = FakeDecision(action="skip", features={})
+    sr._stamp_skip_bias_fallback(d, prefix)
+    assert d.features.get("skip_bias_side") == "sell"
+
+
+def test_stamp_skip_bias_fallback_neutral_bias_leaves_features_unstamped():
+    prefix: list[dict] = []  # empty prefix -> dayopen_bias returns (0, 0.0)
+    d = FakeDecision(action="skip", features={})
+    sr._stamp_skip_bias_fallback(d, prefix)
+    assert "skip_bias_side" not in d.features
+
+
+def test_stamp_skip_bias_fallback_never_raises_on_garbage_prefix():
+    d = FakeDecision(action="skip", features={})
+    sr._stamp_skip_bias_fallback(d, [{"ts": "not-a-timestamp"}])  # malformed
+    assert "skip_bias_side" not in d.features  # degrades silently, no crash
+
+
+def test_stamp_skip_bias_fallback_respects_anchor_hour_env(monkeypatch):
+    # anchor_hour=12: the "day" starts at 12:00Z, so a bar at 01:00Z belongs
+    # to the PREVIOUS day's anchor window and open_px comes from the first
+    # bar at/after 12:00Z the PRIOR calendar day — verifies the env actually
+    # reaches vp_lane.dayopen_bias rather than being ignored.
+    monkeypatch.setenv("DEXTER3_SKIP_BIAS_ANCHOR_HOUR", "12")
+    prefix = [
+        _bar("2026-07-15T12:00:00Z", 4000.0, 4001.0, 3999.0, 4000.0),  # anchor bar @12:00Z
+        _bar("2026-07-16T01:00:00Z", 4000.0, 4012.0, 3999.5, 4010.0),  # still within the same 24h anchor window
+    ]
+    d = FakeDecision(action="skip", features={})
+    sr._stamp_skip_bias_fallback(d, prefix)
+    assert d.features.get("skip_bias_side") == "buy"
+
+
+# ---------------------------------------------------------------------------
 # 5. _apply_v16_entry_quality_gate — grok minimum leader_score floor
 # ---------------------------------------------------------------------------
 

@@ -72,6 +72,43 @@ def test_session_multiplier_shapes_size():
     assert unknown == pytest.approx(12.0 * g.config.session_mult.get("unknown", 0.8))
 
 
+# -- high-conviction bypass (2026-07-22 owner audit) ----------------------------
+
+
+def test_bypass_disabled_by_default():
+    g = gov()  # bypass_min_score defaults to None -> feature OFF
+    assert g.bypass_allowed(0.99) is False
+
+
+def test_bypass_requires_a_real_score_even_when_threshold_configured():
+    g = gov(bypass_min_score=0.74)
+    assert g.bypass_allowed(None) is False
+
+
+def test_bypass_allows_when_score_clears_threshold():
+    g = gov(bypass_min_score=0.74)
+    assert g.bypass_allowed(0.80) is True
+
+
+def test_bypass_boundary_is_inclusive():
+    g = gov(bypass_min_score=0.74)
+    assert g.bypass_allowed(0.74) is True
+
+
+def test_bypass_refuses_when_score_below_threshold():
+    g = gov(bypass_min_score=0.74)
+    assert g.bypass_allowed(0.50) is False
+
+
+def test_bypass_is_pure_no_side_effects():
+    g = gov(bypass_min_score=0.74)
+    g.bypass_allowed(0.80)
+    g.bypass_allowed(0.10)
+    # calling it never mutates config or holds state between calls
+    assert g.config.bypass_min_score == pytest.approx(0.74)
+    assert g.bypass_allowed(0.80) is True
+
+
 # -- streak derivation (stateless from today's ordered closes) ------------------
 
 

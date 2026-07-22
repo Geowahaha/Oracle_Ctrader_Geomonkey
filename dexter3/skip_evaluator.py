@@ -89,6 +89,17 @@ def determine_candidate_side(features: dict[str, Any]) -> tuple[str | None, str]
     side = _recompute_leading_side(features)
     if side is not None:
         return side, "features_candidate"
+    # Bias fallback (2026-07-22, owner audit): vp/daytrend/scalp skips never
+    # populate the hunt-lens component keys _recompute_leading_side needs, so
+    # they always fell through to here as "no_recorded_candidate" even when a
+    # clear day-open-bias direction existed at decision time (shadow_runner
+    # stamps that bias into features["skip_bias_side"] for exactly those 3
+    # lanes -- see the run loop's insert_decision call site). Kept as a
+    # distinct side_source (not "features_candidate") so fear_cost analysis
+    # can always tell a hunt-lens-scored candidate from a bias-derived one.
+    bias_side = features.get("skip_bias_side") if isinstance(features, dict) else None
+    if bias_side in ("buy", "sell"):
+        return bias_side, "bias_fallback_candidate"
     return None, "no_recorded_candidate"
 
 

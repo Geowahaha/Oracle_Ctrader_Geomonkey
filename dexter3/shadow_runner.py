@@ -459,7 +459,9 @@ def _governor_config_from_env() -> GovernorConfig:
     never crash the live loop, only leave that one knob at its default.
 
     Env vars: DEXTER3_CAPITAL_USD, DEXTER3_DAILY_TARGET_USD,
-    DEXTER3_DAILY_LOSS_USD, DEXTER3_BASE_RISK_FRAC, DEXTER3_MAX_RISK_FRAC.
+    DEXTER3_DAILY_LOSS_USD, DEXTER3_BASE_RISK_FRAC, DEXTER3_MAX_RISK_FRAC,
+    DEXTER3_GOVERNOR_BYPASS_MIN_SCORE (2026-07-22 high-conviction bypass —
+    unset/invalid = feature OFF, same posture as every knob above).
     """
     kw: dict[str, Any] = {}
     for env, field_name in (
@@ -468,6 +470,7 @@ def _governor_config_from_env() -> GovernorConfig:
         ("DEXTER3_DAILY_LOSS_USD", "daily_loss_usd"),
         ("DEXTER3_BASE_RISK_FRAC", "base_risk_frac"),
         ("DEXTER3_MAX_RISK_FRAC", "max_risk_frac"),
+        ("DEXTER3_GOVERNOR_BYPASS_MIN_SCORE", "bypass_min_score"),
     ):
         raw_val = os.environ.get(env)
         if raw_val:
@@ -479,7 +482,8 @@ def _governor_config_from_env() -> GovernorConfig:
     log_line(
         f"{utc_now_iso()} governor config: capital_usd={cfg.capital_usd} "
         f"daily_target_usd={cfg.daily_target_usd} daily_loss_usd={cfg.daily_loss_usd} "
-        f"base_risk_frac={cfg.base_risk_frac} max_risk_frac={cfg.max_risk_frac}"
+        f"base_risk_frac={cfg.base_risk_frac} max_risk_frac={cfg.max_risk_frac} "
+        f"bypass_min_score={cfg.bypass_min_score}"
     )
     return cfg
 
@@ -1811,6 +1815,8 @@ def run_symbol_cycle(
             # shadow-journals EVERY decided enter (both lanes, catch-up
             # bars included) per the Phase A design doc.
             _apply_pa_eye_shadow(decision, prefix)
+        elif decision.action == "skip":
+            _stamp_skip_bias_fallback(decision, prefix)
         # H2 (2026-07-15 cross-lane entanglement audit): stamp this row with
         # the writing lane's own order label so per-lane journal queries
         # (empirical stats, skip fear-cost) never pool Fable/Grok/VP rows.
@@ -1839,16 +1845,34 @@ def run_symbol_cycle(
             smart_exit_meta = _apply_smart_exit_gate(decision, h1_ctx, state)
             if executor is not None:
                 gov = state.get("governor") or {}
+                gov_state = str(gov.get("state") or "")
                 # Computed eagerly (even on the locked/unverified branches
                 # below, where its result goes unused) so the pre-entry cap
                 # check below has it without a second MCP-adjacent call —
                 # _lane_realized_today is cache-backed, so this is cheap.
                 risk_info = _governor_entry_risk(mcp, decision, state)
-                if gov.get("state") in ("TARGET_LOCKED", "LOSS_STOPPED"):
+                # High-conviction bypass (2026-07-22 owner audit): checked
+                # here too (not just inside _governor_entry_risk, which only
+                # ever evaluates the LOSS-cap half of this gate) because this
+                # cached gov_state also carries TARGET_LOCKED, which
+                # _governor_entry_risk never checks at all -- this is the
+                # ONLY gate standing between a locked/stopped day and a
+                # candidate strong enough to clear the bypass threshold.
+                gov_score = float(getattr(decision, "leader_score", 0.0) or 0.0)
+                gov_bypassed = (
+                    gov_state in ("TARGET_LOCKED", "LOSS_STOPPED")
+                    and _get_governor().bypass_allowed(gov_score)
+                )
+                if gov_bypassed:
+                    log_line(
+                        f"{utc_now_iso()} {decision.symbol} governor_bypass "
+                        f"state={gov_state} score={gov_score:.3f} (entry allowed)"
+                    )
+                if gov_state in ("TARGET_LOCKED", "LOSS_STOPPED") and not gov_bypassed:
                     # Owner's daily mission rule (2026-07-07) outranks
                     # participation-first for EXECUTION only — the decision above
                     # is still journaled; we just do not put money on it today.
-                    status += f":governor_{str(gov.get('state')).lower()}"
+                    status += f":governor_{gov_state.lower()}"
                 elif lane is None:
                     status += ":live_skipped_lane_unverified"
                 elif risk_info is not None and not risk_info.get("allow", True):
@@ -1857,6 +1881,8 @@ def run_symbol_cycle(
                     # tick's entry attempt — 2026-07-15).
                     status += f":live_blocked_{risk_info.get('reason', 'governor_cap')}"
                 else:
+                    if gov_bypassed:
+                        status += f":governor_{gov_state.lower()}_bypassed"
                     daily = _daily_state(state)
                     base_risk_usd = (risk_info or {}).get("risk_usd")
                     if base_risk_usd is None:
@@ -1998,6 +2024,35 @@ def run_symbol_cycle(
     return ";".join(statuses)
 
 
+def _stamp_skip_bias_fallback(decision: hunter_brain.Decision, prefix: list[dict[str, Any]]) -> None:
+    """fear-cost bias fallback (2026-07-22, owner audit): vp/daytrend/scalp
+    skip decisions never carry the hunt-lens component keys
+    (liquidity_sweep/displacement/compression_release/close_location_pressure/
+    swing_structure) that market_lens.leader_score() scores against -- vp
+    stamps features={} outright, daytrend/scalp stamp their own
+    producer-specific shape. Every skip from those 3 lanes was therefore
+    GUARANTEED score=0 -> side=None -> permanently "no_determinable_side" in
+    skip_evaluator (measured: 398/400 unevaluable skip_outcomes rows). Stamp
+    the SAME day-open-bias direction these lanes' own entry gates already
+    gate on, into ``decision.features["skip_bias_side"]``, as a fallback
+    candidate side ``skip_evaluator.determine_candidate_side`` can fall back
+    to when the hunt-lens score comes up empty (it always tries the hunt-lens
+    score FIRST, so this never overrides a real hunt-derived side). A neutral
+    bias (0, no clear anchor yet) is left unstamped on purpose -- there is
+    genuinely no directional lean to simulate. Mutates ``decision.features``
+    in place; never raises -- a bad/short prefix just leaves the skip
+    unevaluable, same as before this fallback existed."""
+    try:
+        anchor_hour = int(os.environ.get("DEXTER3_SKIP_BIAS_ANCHOR_HOUR", "0"))
+        bias, _hours = vp_lane.dayopen_bias(prefix, anchor_hour)
+        if bias > 0:
+            decision.features["skip_bias_side"] = "buy"
+        elif bias < 0:
+            decision.features["skip_bias_side"] = "sell"
+    except Exception:
+        pass
+
+
 def _governor_entry_risk(
     mcp: Dexter3McpClient, decision: hunter_brain.Decision, state: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
@@ -2013,30 +2068,43 @@ def _governor_entry_risk(
     ``_get_governor().config``, never duplicated). This closes the race
     window between one fast tick's governor evaluation and the NEXT tick's
     entry attempt — a fresh 19-second-old position was let through and then
-    immediately closed by the governor's loss-stop (2026-07-15).
+    immediately closed by the governor's loss-stop (2026-07-15). Unless the
+    decision's own ``leader_score`` clears the configured high-conviction
+    bypass (``DailyGovernor.bypass_allowed``, 2026-07-22 owner audit — OFF by
+    default), in which case the refusal is skipped and normal sizing below
+    still runs; the bypass is logged either way so it's auditable.
 
     Never raises — a failure (sizing OR the cap check above) falls back to
     the executor's static config risk (returns None), same fail-open posture
     as every other entry-sizing gate in this file."""
     try:
         realized, pnls = _lane_realized_today(mcp, label_filter=_active_label_family())
-        cfg = _get_governor().config
+        governor = _get_governor()
+        cfg = governor.config
         floating = 0.0
         if state is not None:
             floating_by_symbol = (state.get("governor") or {}).get("floating_by_symbol") or {}
             floating = sum(_f(v, 0.0) for v in floating_by_symbol.values())
         effective = realized + floating
+        candidate_score = float(getattr(decision, "leader_score", 0.0) or 0.0)
         if effective <= -abs(cfg.daily_loss_usd):
-            log_line(
-                f"{utc_now_iso()} {decision.symbol} governor_loss_stop_pre_entry "
-                f"effective={effective:.2f} cap=-{abs(cfg.daily_loss_usd):.2f} (entry refused)"
-            )
-            return {
-                "allow": False,
-                "reason": "governor_loss_stop_pre_entry",
-                "effective_pnl": round(effective, 4),
-            }
-        governor = _get_governor()
+            if governor.bypass_allowed(candidate_score):
+                log_line(
+                    f"{utc_now_iso()} {decision.symbol} governor_bypass_pre_entry "
+                    f"effective={effective:.2f} cap=-{abs(cfg.daily_loss_usd):.2f} "
+                    f"score={candidate_score:.3f} >= min={cfg.bypass_min_score:.3f} (entry allowed)"
+                )
+            else:
+                log_line(
+                    f"{utc_now_iso()} {decision.symbol} governor_loss_stop_pre_entry "
+                    f"effective={effective:.2f} cap=-{abs(cfg.daily_loss_usd):.2f} "
+                    f"score={candidate_score:.3f} (entry refused)"
+                )
+                return {
+                    "allow": False,
+                    "reason": "governor_loss_stop_pre_entry",
+                    "effective_pnl": round(effective, 4),
+                }
         session = str(((decision.features or {}).get("session_context") or {}).get("value") or "unknown")
         streak = governor.win_streak_from_closes(pnls)
         info = governor.risk_for_entry(session, streak)
