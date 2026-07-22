@@ -124,6 +124,18 @@ Environment=DEXTER3_ENTRY_CONFIRM=m1
 # trades were that price, now stated in numbers).
 Environment=DEXTER3_CONFIRM_PREM_CAP=0.25
 Environment=DEXTER3_HUNT_NO_TRADE_UTC=20:45-22:15
+# 2026-07-22 owner audit ("good/positive opportunities must bypass every
+# block"): a dayreversal_structure_flip candidate -- a rare capitulation-
+# reversal setup its own producer journals as "Rare by construction" -- was
+# refused live by LOSS_STOPPED on 2026-07-21 with zero exception path. This
+# is fable-only: it's the only lane with a real numeric leader_score today
+# (vp/daytrend/scalp hardcode leader_score=0.0, so the bypass is a no-op
+# there until they get a real conviction metric). Threshold = market_lens's
+# existing LEADER_STRONG_SCORE band (0.74), not a new number invented here.
+# Scope: entry-gate only, never the close-all sweep that protects capital on
+# already-open positions, and no other gate (range caps, no-trade windows,
+# cross-lane dedup) is exempted by this.
+Environment=DEXTER3_GOVERNOR_BYPASS_MIN_SCORE=0.74
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
 [Install]
