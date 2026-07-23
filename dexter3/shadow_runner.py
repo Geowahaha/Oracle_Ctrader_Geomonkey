@@ -3986,7 +3986,8 @@ def _ensure_dpull_cs_backstop(
     log_line(
         f"{utc_now_iso()} {symbol} dpull_cs_backstop_ensure pid={pid} "
         f"cur_sl={cur_sl:.5f} -> backstop={backstop:.5f} "
-        f"result={res.get('action') or res.get('status')} reason={res.get('reason', '-')}"
+        f"result={res.get('action') or res.get('status')} reason={res.get('reason', '-')} "
+        f"err={str(res.get('error', '-'))[:160]}"
     )
 
 
