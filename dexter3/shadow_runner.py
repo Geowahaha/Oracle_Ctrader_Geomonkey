@@ -78,7 +78,7 @@ from dexter3 import vp_lane
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
-from dexter3.executor import Dexter3Executor, ExecutorConfig, label_matches_family
+from dexter3.executor import Dexter3Executor, ExecutorConfig, label_matches_family, position_id_of
 from dexter3.mcp_client import Dexter3McpClient, McpClientError, McpZombieError
 from dexter3.opening_manager import OMConfig, OpeningManager
 from dexter3.transport import make_client
@@ -2538,31 +2538,13 @@ def _service_vp_limit_intent(
             "atr_pts": _f(intent.get("atr_pts"), 0.0),
             "stop_pts": soft_stop_pts,
         }
-        # dpull-cs (2026-07-23, env-gated): the order was SIZED to the soft SL
-        # (so a soft-stop hit is -1R, matching the replay); now widen the
-        # BROKER SL to a far backstop so intrabar noise wicks do not fill it
-        # and the OM's convex_close_stop owns the -1R level. Sizing is
-        # unchanged (volume already set); this only moves the safety net.
-        # Never raises -- a failed amend just leaves the broker SL at the soft
-        # level (degrades to base-dpull behavior, safe).
-        if vp_lane.convex_close_stop_enabled() and soft_stop_pts > 0:
-            try:
-                pid = int(exec_result.get("position_id") or 0)
-                entry_px = _f(decision.entry)
-                bmult = vp_lane.convex_close_stop_backstop_mult()
-                if str(decision.side).lower().startswith("buy"):
-                    backstop = entry_px - soft_stop_pts * (1.0 + bmult)
-                else:
-                    backstop = entry_px + soft_stop_pts * (1.0 + bmult)
-                if pid > 0:
-                    res = executor.amend_lane_sl_tp(pid, sl=round(backstop, 5), tp=_f(decision.tp) or None)
-                    log_line(
-                        f"{utc_now_iso()} {symbol} dpull_cs_backstop_amend pid={pid} "
-                        f"soft_sl={_f(decision.sl):.5f} backstop={backstop:.5f} "
-                        f"result={res.get('action') or res.get('status')}"
-                    )
-            except Exception as exc:  # noqa: BLE001 - amend must never break the entry
-                log_line(f"{utc_now_iso()} {symbol} dpull_cs_backstop_amend_failed: {exc}")
+        # dpull-cs (2026-07-23): the order was SIZED to the soft SL (soft-stop
+        # = -1R, matching the replay). The BROKER SL is widened to a far
+        # backstop by _ensure_dpull_cs_backstop on the OM fast tick, NOT here
+        # -- an entry-time amend fires ~1s after the fill, before get_positions
+        # propagates the new position, and was refused (position_not_found)
+        # every time, leaving dpull-cs a clone of base dpull. The OM tick reads
+        # fresh positions and self-heals (retries until it sticks).
     log_line(
         f"{utc_now_iso()} {symbol} vp_limit_intent_{exec_result.get('action', 'unknown')} "
         f"level={intent.get('level')} touch_px={touch_px:.5f} "
@@ -3961,6 +3943,53 @@ def _run_repair_harvest_tick(
     )
 
 
+def _ensure_dpull_cs_backstop(
+    executor: Dexter3Executor | None, state: dict[str, Any],
+    lane: list[dict[str, Any]] | None, symbol: str,
+) -> None:
+    """dpull-cs (2026-07-23 fix): SELF-HEALING broker-SL backstop widen.
+
+    The old entry-time amend (fired ~1s after the fill) was refused every
+    time because get_positions had not yet propagated the new position
+    (position_not_found race) — so the broker SL stayed at the SOFT -1R level,
+    fired on wicks (broker_side_close), and the OM software close-stop never
+    engaged (convex_close_stop=0). Result: dpull-cs was a byte-for-byte clone
+    of base dpull and the whole forward A/B was measuring nothing.
+
+    This runs on EVERY OM fast tick with a FRESH position read, so it retries
+    until the broker sees the position and the amend sticks. Idempotent: once
+    the broker SL is at/near the backstop, the distance check skips it — no
+    repeated amends. Only touches close-stop lanes (env-gated); a failed amend
+    just leaves the SL tighter (degrades to base-dpull, safe) and retries next
+    tick."""
+    if (executor is None or not vp_lane.convex_close_stop_enabled()
+            or not lane or len(lane) != 1):
+        return
+    cvx = state.get("vp_convex") or {}
+    stop_pts = _f(cvx.get("stop_pts"), 0.0)
+    if stop_pts <= 0:
+        return
+    pos = lane[0]
+    entry = _f(pos.get("entryPrice") or pos.get("entry_price"), 0.0)
+    cur_sl = _f(pos.get("stopLoss") or pos.get("stop_loss"), 0.0)
+    side = str(pos.get("tradeSide") or pos.get("side") or "").lower()
+    if entry <= 0 or cur_sl <= 0:
+        return
+    backstop_dist = stop_pts * (1.0 + vp_lane.convex_close_stop_backstop_mult())
+    # already at/near the backstop (within 2%)? -> nothing to do (idempotent)
+    if abs(entry - cur_sl) >= backstop_dist * 0.98:
+        return
+    backstop = entry - backstop_dist if side.startswith("buy") else entry + backstop_dist
+    pid = int(position_id_of(pos))
+    tp = _f(pos.get("takeProfit") or pos.get("take_profit"), 0.0) or None
+    res = executor.amend_lane_sl_tp(pid, sl=round(backstop, 5), tp=tp)
+    log_line(
+        f"{utc_now_iso()} {symbol} dpull_cs_backstop_ensure pid={pid} "
+        f"cur_sl={cur_sl:.5f} -> backstop={backstop:.5f} "
+        f"result={res.get('action') or res.get('status')} reason={res.get('reason', '-')}"
+    )
+
+
 def run_om_tick(
     mcp: Dexter3McpClient,
     journal: DecisionJournal,
@@ -4005,6 +4034,11 @@ def run_om_tick(
         return "om_lane_read_failed"
 
     _note_mcp_error(state, ok=True)
+
+    try:
+        _ensure_dpull_cs_backstop(executor, state, lane, symbol)
+    except Exception as exc:  # noqa: BLE001 - never crash the OM tick over a safety-net amend
+        log_line(f"{utc_now_iso()} {symbol} dpull_cs_backstop_ensure_failed: {exc}")
 
     try:
         _run_repair_harvest_tick(mcp, journal, state, symbol, executor, lane, positions)

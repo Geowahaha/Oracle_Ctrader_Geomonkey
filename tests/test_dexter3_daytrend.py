@@ -418,3 +418,78 @@ def test_scalp_mode_routing_and_bank_om(monkeypatch):
     act2 = om.evaluate("XAUUSD", pos, None, bars2, [], [], st)
     assert act2["action"] == "hold"
     assert act2["reason"] == "bank_hold"
+
+
+# -- dpull-cs self-healing broker-SL backstop (2026-07-23 amend-race fix) -----
+
+class _FakeExec:
+    def __init__(self):
+        self.amends = []
+    def amend_lane_sl_tp(self, pid, sl, tp):
+        self.amends.append({"pid": pid, "sl": sl, "tp": tp})
+        return {"action": "amended", "status": "ok"}
+
+
+def _cs_pos(pid, entry, sl, side="SELL", tp=0.0):
+    return {"positionId": pid, "entryPrice": entry, "stopLoss": sl,
+            "tradeSide": side, "takeProfit": tp, "symbolName": "XAUUSD"}
+
+
+def test_dpull_cs_backstop_self_heal_widens_soft_sl(monkeypatch):
+    """The core fix: on an OM tick, a broker SL still at the SOFT level is
+    widened to backstop = entry ± stop_pts*(1+bmult). SELL entry 4100, soft
+    stop_pts 5 (broker SL 4105), backstop mult 2.5 -> backstop 4100+5*3.5=4117.5."""
+    import dexter3.shadow_runner as sr
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP", "1")
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP", "2.5")
+    ex = _FakeExec()
+    state = {"vp_convex": {"stop_pts": 5.0, "atr_pts": 5.0}}
+    lane = [_cs_pos(42, 4100.0, 4105.0, side="SELL")]
+    sr._ensure_dpull_cs_backstop(ex, state, lane, "XAUUSD")
+    assert len(ex.amends) == 1
+    assert ex.amends[0]["pid"] == 42
+    assert ex.amends[0]["sl"] == pytest.approx(4117.5)
+
+
+def test_dpull_cs_backstop_self_heal_idempotent_when_already_wide(monkeypatch):
+    import dexter3.shadow_runner as sr
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP", "1")
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP", "2.5")
+    ex = _FakeExec()
+    state = {"vp_convex": {"stop_pts": 5.0, "atr_pts": 5.0}}
+    # broker SL already at the backstop (4117.5) -> no re-amend
+    lane = [_cs_pos(42, 4100.0, 4117.5, side="SELL")]
+    sr._ensure_dpull_cs_backstop(ex, state, lane, "XAUUSD")
+    assert ex.amends == []
+
+
+def test_dpull_cs_backstop_self_heal_buy_side(monkeypatch):
+    import dexter3.shadow_runner as sr
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP", "1")
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP", "2.5")
+    ex = _FakeExec()
+    state = {"vp_convex": {"stop_pts": 5.0, "atr_pts": 5.0}}
+    lane = [_cs_pos(7, 4100.0, 4095.0, side="BUY")]   # backstop = 4100 - 17.5 = 4082.5
+    sr._ensure_dpull_cs_backstop(ex, state, lane, "XAUUSD")
+    assert ex.amends[0]["sl"] == pytest.approx(4082.5)
+
+
+def test_dpull_cs_backstop_self_heal_disabled_no_amend(monkeypatch):
+    import dexter3.shadow_runner as sr
+    monkeypatch.delenv("DEXTER3_OM_CONVEX_CLOSE_STOP", raising=False)
+    ex = _FakeExec()
+    state = {"vp_convex": {"stop_pts": 5.0}}
+    lane = [_cs_pos(42, 4100.0, 4105.0)]
+    sr._ensure_dpull_cs_backstop(ex, state, lane, "XAUUSD")
+    assert ex.amends == []   # close-stop off -> base dpull/vp untouched
+
+
+def test_dpull_cs_backstop_self_heal_needs_single_position(monkeypatch):
+    import dexter3.shadow_runner as sr
+    monkeypatch.setenv("DEXTER3_OM_CONVEX_CLOSE_STOP", "1")
+    ex = _FakeExec()
+    state = {"vp_convex": {"stop_pts": 5.0}}
+    sr._ensure_dpull_cs_backstop(ex, state, [], "XAUUSD")           # empty
+    sr._ensure_dpull_cs_backstop(ex, state, [_cs_pos(1, 4100, 4105),
+                                            _cs_pos(2, 4100, 4105)], "XAUUSD")  # 2 legs
+    assert ex.amends == []
