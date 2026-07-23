@@ -131,6 +131,12 @@ DEFAULT_POLL_SEC = 20
 M5_BAR_SEC = 300
 MCP_ZOMBIE_SLEEP_SEC = 60
 MIN_M5_BARS = 60
+# dpull-cs broker-SL backstop: cap the self-heal amend retries per position.
+# The broker order IS replaced within a couple of attempts even though the
+# loop's stale position stream + uncertain amend response make it LOOK like it
+# keeps failing (2026-07-23 investigation) — so a small cap stops an infinite
+# every-8s re-amend without leaving a genuinely-failed one un-widened.
+_CS_BACKSTOP_MAX_TRIES = 3
 M15_BARS_NEEDED = 60
 H1_BARS_NEEDED = 60
 
@@ -3964,6 +3970,10 @@ def _ensure_dpull_cs_backstop(
     tick."""
     if (executor is None or not vp_lane.convex_close_stop_enabled()
             or not lane or len(lane) != 1):
+        # position closed / none open -> forget the per-pid retry counters so a
+        # later reused pid starts fresh (the map only ever holds the live lane's).
+        if state.get("dpull_cs_bs_tries"):
+            state["dpull_cs_bs_tries"] = {}
         return
     cvx = state.get("vp_convex") or {}
     stop_pts = _f(cvx.get("stop_pts"), 0.0)
@@ -3979,15 +3989,29 @@ def _ensure_dpull_cs_backstop(
     # already at/near the backstop (within 2%)? -> nothing to do (idempotent)
     if abs(entry - cur_sl) >= backstop_dist * 0.98:
         return
-    backstop = entry - backstop_dist if side.startswith("buy") else entry + backstop_dist
     pid = int(position_id_of(pos))
+    # BOUNDED retry (2026-07-23): the daemon's position STREAM the loop reads
+    # is stale after a mutation (a fresh get_positions confirms the amend DID
+    # apply on the broker, but the loop still sees the old SL), and the amend
+    # response is often classified McpClientError even when the broker
+    # replaced the order (a false-negative "amend_failed"). Without a cap the
+    # self-heal would re-amend every 8s forever. So: attempt at most
+    # _CS_BACKSTOP_MAX_TRIES times per pid (the broker order IS replaced by
+    # then), then stop; the per-pid counter is cleared when the position
+    # closes (lane empties) below.
+    tries = state.setdefault("dpull_cs_bs_tries", {})
+    n = int(tries.get(str(pid), 0))
+    if n >= _CS_BACKSTOP_MAX_TRIES:
+        return
+    backstop = entry - backstop_dist if side.startswith("buy") else entry + backstop_dist
     tp = _f(pos.get("takeProfit") or pos.get("take_profit"), 0.0) or None
     res = executor.amend_lane_sl_tp(pid, sl=round(backstop, 5), tp=tp)
+    tries[str(pid)] = n + 1
     log_line(
-        f"{utc_now_iso()} {symbol} dpull_cs_backstop_ensure pid={pid} "
+        f"{utc_now_iso()} {symbol} dpull_cs_backstop_ensure pid={pid} try={n + 1} "
         f"cur_sl={cur_sl:.5f} -> backstop={backstop:.5f} "
         f"result={res.get('action') or res.get('status')} reason={res.get('reason', '-')} "
-        f"err={str(res.get('error', '-'))[:160]}"
+        f"err={str(res.get('error', '-'))[:120]}"
     )
 
 
