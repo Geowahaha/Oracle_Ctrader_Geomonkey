@@ -106,6 +106,7 @@ VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
 SCALP_STATE_FILE = RUNTIME / "dexter3_scalp_shadow_state.json"
 DPULL_STATE_FILE = RUNTIME / "dexter3_dpull_shadow_state.json"
+DPULL_CS_STATE_FILE = RUNTIME / "dexter3_dpull_cs_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -116,12 +117,14 @@ VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
 DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
 SCALP_LOG_FILE = RUNTIME / "dexter3_scalp_shadow.log"
 DPULL_LOG_FILE = RUNTIME / "dexter3_dpull_shadow.log"
+DPULL_CS_LOG_FILE = RUNTIME / "dexter3_dpull_cs_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
 DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
 SCALP_LOCK_FILE = RUNTIME / "dexter3_scalp_shadow.lock"
 DPULL_LOCK_FILE = RUNTIME / "dexter3_dpull_shadow.lock"
+DPULL_CS_LOCK_FILE = RUNTIME / "dexter3_dpull_cs_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -198,15 +201,26 @@ def _dpull_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "dpull"
 
 
+def _dpull_cs_producer_enabled() -> bool:
+    """DPULL-CS lane (owner choice ค, 2026-07-23): same decide_daytrend
+    producer as dpull, run in parallel with the vol-gated close-stop OM exit
+    for a forward head-to-head. Evidence block by DPULL_CS_LABEL in
+    dexter3/daytrend.py."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "dpull-cs":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "dpull-cs"
+
+
 def _alt_producer_enabled() -> bool:
-    """Non-hunt producers (vp / daytrend / scalp / dpull) share the same
-    runner posture: v16 gate bypass (no hunt-committee features), hunt
+    """Non-hunt producers (vp / daytrend / scalp / dpull / dpull-cs) share the
+    same runner posture: v16 gate bypass (no hunt-committee features), hunt
     sizing-selector bypass (their proofs sized flat), the VP entry gate
     (day-open bias + no-trade window; trivially true for daytrend/dpull
     whose signals are with-bias by construction), and the deep 340-bar M5
     fetch."""
     return (_vp_producer_enabled() or _daytrend_producer_enabled()
-            or _scalp_producer_enabled() or _dpull_producer_enabled())
+            or _scalp_producer_enabled() or _dpull_producer_enabled()
+            or _dpull_cs_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -234,6 +248,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.daytrend import DPULL_LABEL
 
         return DPULL_LABEL
+    if current_mode == "dpull-cs":
+        from dexter3.daytrend import DPULL_CS_LABEL
+
+        return DPULL_CS_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -270,6 +288,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.daytrend import DPULL_LABEL_FAMILY
 
         return DPULL_LABEL_FAMILY
+    if current_mode == "dpull-cs":
+        from dexter3.daytrend import DPULL_CS_LABEL_FAMILY
+
+        return DPULL_CS_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -285,6 +307,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return SCALP_STATE_FILE
     if current_mode == "dpull":
         return DPULL_STATE_FILE
+    if current_mode == "dpull-cs":
+        return DPULL_CS_STATE_FILE
     return STATE_FILE
 
 
@@ -305,6 +329,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return SCALP_LOG_FILE
     if current_mode == "dpull":
         return DPULL_LOG_FILE
+    if current_mode == "dpull-cs":
+        return DPULL_CS_LOG_FILE
     return LOG_FILE
 
 
@@ -1390,6 +1416,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = SCALP_LOCK_FILE, "scalp-canary"
     elif mode == "dpull":
         lock_file, lock_name = DPULL_LOCK_FILE, "dpull-canary"
+    elif mode == "dpull-cs":
+        lock_file, lock_name = DPULL_CS_LOCK_FILE, "dpull-cs-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1418,6 +1446,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = SCALP_LOCK_FILE
     elif mode == "dpull":
         lock_file = DPULL_LOCK_FILE
+    elif mode == "dpull-cs":
+        lock_file = DPULL_CS_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1791,13 +1821,13 @@ def run_symbol_cycle(
 
             sc_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_sdzone_live(symbol, prefix, spread_abs, session=sc_session)
-        elif is_newest and _dpull_producer_enabled():
-            # DPULL lane (owner sign-off 2026-07-22): SAME decide_daytrend
-            # producer, but the unit's env runs it with cap12 + deep-pullback
-            # bypass 3xATR, and the geometry downstream is limit -0.5R
-            # (DEXTER3_HUNT_LIMIT_DIP_R) x convex a2.0 h24 (OM env) — the
-            # dtcap matrix winner. NO dayreversal/sdzone sub-producers here:
-            # pure continuation stream, exactly what the matrix measured.
+        elif is_newest and (_dpull_producer_enabled() or _dpull_cs_producer_enabled()):
+            # DPULL lane (owner sign-off 2026-07-22) + DPULL-CS parallel lane
+            # (owner choice ค 2026-07-23): SAME decide_daytrend producer, cap12
+            # + deep-pullback bypass 3xATR + limit -0.5R x convex a2.0 h24. The
+            # ONLY difference between the two is the OM exit env: dpull uses
+            # the intrabar convex stop, dpull-cs adds the vol-gated close-stop
+            # (DEXTER3_OM_CONVEX_CLOSE_STOP=1). Identical decision path here.
             from dexter3 import daytrend as _daytrend
             from dexter3 import market_lens as _ml
 
@@ -2503,10 +2533,36 @@ def _service_vp_limit_intent(
         # signal time, stop distance of the FILLED geometry — the confirm
         # close for reversal-confirmed fills, the level for touch fills).
         # Inert for ladder lanes — only read when DEXTER3_OM_TRAIL_MODE=convex.
+        soft_stop_pts = abs(_f(decision.entry) - _f(decision.sl)) or _f(intent.get("stop_pts"), 0.0)
         state["vp_convex"] = {
             "atr_pts": _f(intent.get("atr_pts"), 0.0),
-            "stop_pts": abs(_f(decision.entry) - _f(decision.sl)) or _f(intent.get("stop_pts"), 0.0),
+            "stop_pts": soft_stop_pts,
         }
+        # dpull-cs (2026-07-23, env-gated): the order was SIZED to the soft SL
+        # (so a soft-stop hit is -1R, matching the replay); now widen the
+        # BROKER SL to a far backstop so intrabar noise wicks do not fill it
+        # and the OM's convex_close_stop owns the -1R level. Sizing is
+        # unchanged (volume already set); this only moves the safety net.
+        # Never raises -- a failed amend just leaves the broker SL at the soft
+        # level (degrades to base-dpull behavior, safe).
+        if vp_lane.convex_close_stop_enabled() and soft_stop_pts > 0:
+            try:
+                pid = int(exec_result.get("position_id") or 0)
+                entry_px = _f(decision.entry)
+                bmult = vp_lane.convex_close_stop_backstop_mult()
+                if str(decision.side).lower().startswith("buy"):
+                    backstop = entry_px - soft_stop_pts * (1.0 + bmult)
+                else:
+                    backstop = entry_px + soft_stop_pts * (1.0 + bmult)
+                if pid > 0:
+                    res = executor.amend_lane_sl_tp(pid, sl=round(backstop, 5), tp=_f(decision.tp) or None)
+                    log_line(
+                        f"{utc_now_iso()} {symbol} dpull_cs_backstop_amend pid={pid} "
+                        f"soft_sl={_f(decision.sl):.5f} backstop={backstop:.5f} "
+                        f"result={res.get('action') or res.get('status')}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - amend must never break the entry
+                log_line(f"{utc_now_iso()} {symbol} dpull_cs_backstop_amend_failed: {exc}")
     log_line(
         f"{utc_now_iso()} {symbol} vp_limit_intent_{exec_result.get('action', 'unknown')} "
         f"level={intent.get('level')} touch_px={touch_px:.5f} "
@@ -4397,6 +4453,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_daytrend = mode == "daytrend"
     is_scalp = mode == "scalp"
     is_dpull = mode == "dpull"
+    is_dpull_cs = mode == "dpull-cs"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -4434,6 +4491,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _DP_LABEL
         print(f"[DPULL] Forced executor LABEL to {_DP_LABEL}", flush=True)
 
+    if is_dpull_cs:
+        from dexter3.daytrend import DPULL_CS_LABEL as _DPC_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DPC_LABEL
+        print(f"[DPULL-CS] Forced executor LABEL to {_DPC_LABEL}", flush=True)
+
     if is_grok and GROK_LABEL:
         active_label = GROK_LABEL
     elif is_vp:
@@ -4452,6 +4516,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.daytrend import DPULL_LABEL as _DP_LABEL
 
         active_label = _DP_LABEL
+    elif is_dpull_cs:
+        from dexter3.daytrend import DPULL_CS_LABEL as _DPC_LABEL
+
+        active_label = _DPC_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
@@ -4611,6 +4679,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _DP_LABEL
         print(f"[DPULL] Forced executor LABEL to {_DP_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "dpull-cs":
+        from dexter3.daytrend import DPULL_CS_LABEL as _DPC_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _DPC_LABEL
+        print(f"[DPULL-CS] Forced executor LABEL to {_DPC_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

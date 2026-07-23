@@ -196,6 +196,38 @@ def test_dpull_producer_flag_via_producer_env(monkeypatch):
     assert not _dpull_producer_enabled()
 
 
+def test_dpull_cs_mode_routing_is_isolated_from_dpull(monkeypatch):
+    """DPULL-CS (owner choice ค) must be a fully separate lane from dpull —
+    own label/family/state/log/lock — so the forward head-to-head never
+    cross-contaminates positions or PnL."""
+    from dexter3.shadow_runner import (
+        DPULL_CS_LOCK_FILE,
+        DPULL_CS_LOG_FILE,
+        DPULL_CS_STATE_FILE,
+        DPULL_LOCK_FILE,
+        _active_label_family,
+        _active_log_file,
+        _active_order_label,
+        _active_state_file,
+        _alt_producer_enabled,
+        _dpull_cs_producer_enabled,
+        _dpull_producer_enabled,
+    )
+
+    monkeypatch.setenv("DEXTER3_MODE", "dpull-cs")
+    monkeypatch.delenv("DEXTER3_PRODUCER", raising=False)
+    assert _dpull_cs_producer_enabled()
+    assert _alt_producer_enabled()               # gets the vp gate/bypass posture
+    assert not _dpull_producer_enabled()         # distinct from the base dpull lane
+    assert _active_order_label() == "dexter3:dpull-cs:canary"
+    assert _active_label_family() == "dexter3:dpull-cs"
+    assert _active_state_file() == DPULL_CS_STATE_FILE
+    assert _active_log_file() == DPULL_CS_LOG_FILE
+    # separate lock from base dpull -> both lanes can run at once
+    assert DPULL_CS_LOCK_FILE != DPULL_LOCK_FILE
+    assert "dpull_cs" in DPULL_CS_STATE_FILE.name
+
+
 def test_dpull_limit_intent_uses_far_tp_not_signal_tp(monkeypatch):
     """The correctness crux: dpull's exit is the convex trail, so its limit
     intent must carry a FAR protective TP (like the VP lane), NOT the

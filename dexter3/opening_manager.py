@@ -490,6 +490,29 @@ class OpeningManager:
 
             if vp_lane.convex_trail_enabled():
                 cvx = st.get("vp_convex") or {}
+                # dpull-cs vol-gated close-based hard stop (2026-07-23,
+                # env-gated default off — no effect on the base dpull/vp
+                # convex lanes): evaluated on the LATEST CLOSED M5 bar BEFORE
+                # the profit trail, so the pre-arm -1R stop is close-based
+                # (wick-immune) unless the breaching bar is a crash bar. The
+                # broker SL sits at a far backstop (set at entry) so this
+                # software stop owns the -1R level.
+                if (vp_lane.convex_close_stop_enabled() and m5_bars
+                        and len(positions) == 1):
+                    _pos = positions[0]
+                    _entry = _f(_pos.get("entryPrice") or _pos.get("entry_price"), 0.0)
+                    _side = str(_pos.get("tradeSide") or _pos.get("side") or "")
+                    if vp_lane.convex_close_stop_hit(
+                        _side, _entry, _f(cvx.get("stop_pts"), 0.0),
+                        _f(cvx.get("atr_pts"), 0.0), m5_bars[-1],
+                    ):
+                        return {
+                            "action": "close_all",
+                            "reason": "convex_close_stop",
+                            "peak_r": round(peak_r, 4),
+                            "live_r": round(live_r, 4),
+                            "basket_runtime": basket_runtime,
+                        }
                 floor_cvx = vp_lane.convex_floor_r(
                     peak_r, _f(cvx.get("atr_pts"), 0.0), _f(cvx.get("stop_pts"), 0.0)
                 )

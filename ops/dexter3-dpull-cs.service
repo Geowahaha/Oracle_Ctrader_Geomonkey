@@ -1,0 +1,101 @@
+# Dexter3 DPULL-CS lane — the vol-gated CLOSE-STOP twin of dpull, run in
+# PARALLEL for a forward head-to-head (owner choice ค, 2026-07-23:
+# "รันเป็น lane คู่ขนาน dpull-base vs dpull-cs เทียบ forward ตรงๆ").
+#
+# WHY: the vol-gated close-stop passed the both-segments/all-windows bar
+# in-sample (VG1.2: derive +44.7/+4.0/+22.6, validate +72/+245/+196 vs base
+# +57/+117/+95) BUT on a narrow, threshold-fragile plateau (only VG 1.15-1.2
+# positive on the 10k derive) and the 3 replay windows are nested (share most
+# data). What is ROBUST in-sample: validate ~2-3x base at every gate. What is
+# FRAGILE: the derive/crash fix. Replay cannot settle it (no older data for a
+# truly independent window). So this lane gathers the honest arbiter: FORWARD
+# out-of-sample realized PnL, side-by-side with the base dpull lane on the
+# SAME signals. Promote/kill on the forward numbers, not the in-sample fit.
+#
+# IDENTICAL to dexter3-dpull.service EXCEPT the OM exit:
+#   * DEXTER3_OM_CONVEX_CLOSE_STOP=1  — the initial hard stop is CLOSE-based
+#     (holds through intrabar noise wicks) instead of the broker intrabar SL.
+#   * DEXTER3_OM_CONVEX_CLOSE_STOP_VOL_GATE=1.2 — a breaching M5 bar whose
+#     range > 1.2xATR is a crash bar and reverts to the intrabar -1R cut.
+#   * DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP=2.5 — the ENTRY sizes to the soft
+#     SL (soft-stop = -1R, matching the replay), then amends the BROKER SL to
+#     2.5x-risk beyond it as a gap/spike safety net the software stop owns.
+# LIVE-vs-REPLAY caveat: the replay idealises a crash-bar cut at exactly -1R;
+# live cuts at the volatile bar's M5 close (may be worse than -1R). Direction
+# is faithful (cut fast on volatile); exact R differs — which is precisely why
+# a real forward test beats trusting the replay.
+#
+# Isolation: DEXTER3_MODE=dpull-cs -> own label (dexter3:dpull-cs:canary),
+# state file, lock, log. dpull/vp/daytrend/scalp/fable never touch its
+# positions. Same-signal overlap with base dpull is softened by the standing
+# CROSS_LANE_DEDUP=downsize (so the head-to-head A/B sample stays valid).
+#
+# ACTIVATION:
+#   sudo cp ops/dexter3-dpull-cs.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-dpull-cs
+[Unit]
+Description=Dexter3 DPULL-CS lane LIVE canary (vol-gated close-stop twin of dpull, forward A/B)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=dpull-cs
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
+# canary risk (same tier as dpull)
+Environment=DEXTER3_DAILY_TARGET_USD=15
+Environment=DEXTER3_DAILY_LOSS_USD=8
+Environment=DEXTER3_BASE_RISK_FRAC=0.004
+Environment=DEXTER3_MAX_RISK_FRAC=0.008
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# --- producer: daytrend continuation with the deep-pullback bypass ON (= dpull)
+Environment=DEXTER3_DAYTREND_PULL_ATR=0.8
+Environment=DEXTER3_DAYTREND_SWING_BARS=6
+Environment=DEXTER3_DAYTREND_BUFFER_ATR=0.1
+Environment=DEXTER3_DAYTREND_MIN_HOURS=1
+Environment=DEXTER3_DAYTREND_MAX_RISK_ATR=2.0
+Environment=DEXTER3_DAYTREND_RANGE_CAP_ATR=12
+Environment=DEXTER3_DAYTREND_CAP_PULLBACK_BYPASS_ATR=3
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+# --- entry geometry: discount LIMIT -0.5R, TTL 30min (= dpull)
+Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.5
+Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
+Environment=DEXTER3_VP_FAR_TP_R=12
+# --- exit geometry: CONVEX arm 2.0R / giveback 3.0xATR / 120min (= dpull) ...
+Environment=DEXTER3_OM_TRAIL_MODE=convex
+Environment=DEXTER3_OM_CONVEX_ARM_R=2.0
+Environment=DEXTER3_OM_CONVEX_GIVEBACK_ATR=3.0
+Environment=DEXTER3_OM_CONVEX_MAX_AGE_MIN=120
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=130
+# --- THE ONLY DIFFERENCE FROM dpull: vol-gated close-based hard stop --------
+Environment=DEXTER3_OM_CONVEX_CLOSE_STOP=1
+Environment=DEXTER3_OM_CONVEX_CLOSE_STOP_VOL_GATE=1.2
+Environment=DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP=2.5
+# --- lane hygiene (mirrors dpull) ------------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=1
+Environment=DEXTER3_VP_BIAS_ANCHOR_HOUR=0
+Environment=DEXTER3_VP_BIAS_MIN_HOURS=1
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target

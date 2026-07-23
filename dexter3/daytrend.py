@@ -53,6 +53,15 @@ DAYTREND_LABEL_FAMILY = "dexter3:dtr"
 DPULL_LABEL = "dexter3:dpull:canary"
 DPULL_LABEL_FAMILY = "dexter3:dpull"
 
+# DPULL-CS lane (owner choice ค, 2026-07-23): IDENTICAL producer/entry/convex
+# to dpull, but the OM runs the vol-gated CLOSE-STOP exit
+# (DEXTER3_OM_CONVEX_CLOSE_STOP=1 + _VOL_GATE=1.2, set in the unit). Runs in
+# parallel with base dpull on the same signals so their forward realized PnL
+# is a clean head-to-head test of the close-stop edge (which passed in-sample
+# but on a narrow/nested-window plateau -> forward is the honest arbiter).
+DPULL_CS_LABEL = "dexter3:dpull-cs:canary"
+DPULL_CS_LABEL_FAMILY = "dexter3:dpull-cs"
+
 ENV_PULL_ATR = "DEXTER3_DAYTREND_PULL_ATR"           # default 0.8 (proven)
 ENV_SWING_BARS = "DEXTER3_DAYTREND_SWING_BARS"       # default 6
 ENV_BUFFER_ATR = "DEXTER3_DAYTREND_BUFFER_ATR"       # default 0.1

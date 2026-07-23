@@ -388,3 +388,72 @@ def test_confirm_premium_cap(monkeypatch):
     close_bar = _bar("2026-07-17T08:02:00Z", 1999.2, 1999.5, 1999.15, 1999.45)
     v, px = vp_lane.advance_confirm_intent(intent, [close_bar])
     assert v == "fill" and px == pytest.approx(1999.45)
+
+
+# -- dpull-cs vol-gated close-based hard stop (2026-07-23) --------------------
+
+def test_convex_close_stop_wick_immunity_calm_bar(monkeypatch):
+    """A CALM bar (range <= vg*ATR) that only WICKS past the soft SL but
+    closes back above must NOT stop -- this is the wick-immunity that captured
+    the ranging runners. entry 4100, stop_pts 5 -> soft SL 4095."""
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, "1.2")
+    atr = 5.0
+    # range 6 <= 1.2*5=6? -> 6 is NOT > 6, so calm; low 4094 wicks below 4095,
+    # close 4098 back above -> hold
+    bar = _bar("t", 4099.0, 4100.0, 4094.0, 4098.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, atr, bar) is False
+
+
+def test_convex_close_stop_close_below_soft_sl_cuts(monkeypatch):
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, "1.2")
+    # calm bar but CLOSES below soft SL 4095 -> cut (close-stop)
+    bar = _bar("t", 4099.0, 4100.0, 4093.0, 4094.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, 5.0, bar) is True
+
+
+def test_convex_close_stop_volatile_bar_intrabar_cut(monkeypatch):
+    """A VOLATILE bar (range > vg*ATR) that breaches the soft SL intrabar is
+    cut even though it might close back above -- the crash-bar path."""
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, "1.2")
+    # range 10 > 1.2*5=6 -> volatile; low 4094 <= soft SL 4095 -> cut
+    # (close 4099 back above would have held a calm bar, but this is volatile)
+    bar = _bar("t", 4100.0, 4102.0, 4092.0, 4099.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, 5.0, bar) is True
+
+
+def test_convex_close_stop_volatile_but_no_breach_holds(monkeypatch):
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, "1.2")
+    # volatile (range 10>6) but low 4096 stays ABOVE soft SL 4095, close above -> hold
+    bar = _bar("t", 4100.0, 4106.0, 4096.0, 4101.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, 5.0, bar) is False
+
+
+def test_convex_close_stop_vol_gate_off_is_pure_close_based(monkeypatch):
+    monkeypatch.delenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, raising=False)
+    # gate off: a wick below soft SL that closes back above -> hold (no vol cut)
+    wick = _bar("t", 4099.0, 4100.0, 4090.0, 4098.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, 5.0, wick) is False
+    # only a close below cuts
+    closed = _bar("t", 4099.0, 4100.0, 4090.0, 4094.0)
+    assert vp_lane.convex_close_stop_hit("BUY", 4100.0, 5.0, 5.0, closed) is True
+
+
+def test_convex_close_stop_sell_side_mirror(monkeypatch):
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_VOL_GATE, "1.2")
+    # sell entry 4100, stop_pts 5 -> soft SL 4105; calm wick to 4106 closes 4102 -> hold
+    hold = _bar("t", 4101.0, 4106.0, 4100.0, 4102.0)
+    assert vp_lane.convex_close_stop_hit("SELL", 4100.0, 5.0, 5.0, hold) is False
+    # close above soft SL -> cut
+    cut = _bar("t", 4101.0, 4107.0, 4100.0, 4106.0)
+    assert vp_lane.convex_close_stop_hit("SELL", 4100.0, 5.0, 5.0, cut) is True
+
+
+def test_convex_close_stop_enabled_and_backstop_env(monkeypatch):
+    monkeypatch.delenv(vp_lane.ENV_CONVEX_CLOSE_STOP, raising=False)
+    assert vp_lane.convex_close_stop_enabled() is False
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP, "1")
+    assert vp_lane.convex_close_stop_enabled() is True
+    monkeypatch.delenv(vp_lane.ENV_CONVEX_CLOSE_STOP_BACKSTOP, raising=False)
+    assert vp_lane.convex_close_stop_backstop_mult() == pytest.approx(2.5)
+    monkeypatch.setenv(vp_lane.ENV_CONVEX_CLOSE_STOP_BACKSTOP, "2.0")
+    assert vp_lane.convex_close_stop_backstop_mult() == pytest.approx(2.0)

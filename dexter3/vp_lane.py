@@ -46,6 +46,14 @@ ENV_CONVEX_ARM_R = "DEXTER3_OM_CONVEX_ARM_R"           # default 1.0
 ENV_CONVEX_GIVEBACK_ATR = "DEXTER3_OM_CONVEX_GIVEBACK_ATR"  # default 3.0
 ENV_CONVEX_MAX_AGE_MIN = "DEXTER3_OM_CONVEX_MAX_AGE_MIN"    # default 240
 ENV_CONVEX_ATR_PTS_DEFAULT = "DEXTER3_OM_CONVEX_ATR_PTS_DEFAULT"  # default 5.0
+# dpull-cs vol-gated close-stop (2026-07-23 investigation): the initial hard
+# stop is CLOSE-based (holds through intrabar noise wicks) unless the
+# breaching M5 bar's range exceeds VOL_GATE x ATR (a crash bar -> cut now).
+# The entry places the broker SL at BACKSTOP x soft-risk beyond the soft SL
+# so a gap/spike is still bounded while the OM software owns the -1R stop.
+ENV_CONVEX_CLOSE_STOP = "DEXTER3_OM_CONVEX_CLOSE_STOP"          # "1" -> enable
+ENV_CONVEX_CLOSE_STOP_VOL_GATE = "DEXTER3_OM_CONVEX_CLOSE_STOP_VOL_GATE"  # ATR mult, 0=off
+ENV_CONVEX_CLOSE_STOP_BACKSTOP = "DEXTER3_OM_CONVEX_CLOSE_STOP_BACKSTOP"  # broker-SL widen mult (default 2.5)
 ENV_BANK_R = "DEXTER3_OM_BANK_R"                       # bank mode: close-based take (default 0.4)
 ENV_CONFIRM_PREM_CAP = "DEXTER3_CONFIRM_PREM_CAP"     # reject confirms paying > cap x stop above the level (0=off)
 
@@ -402,6 +410,45 @@ def convex_floor_r(peak_r: float, atr_pts: float, stop_pts: float) -> float | No
     atr = atr_pts if atr_pts > 0 else _env_float(ENV_CONVEX_ATR_PTS_DEFAULT, 5.0)
     giveback_r = _env_float(ENV_CONVEX_GIVEBACK_ATR, 3.0) * atr / stop_pts
     return peak_r - giveback_r
+
+
+def convex_close_stop_enabled() -> bool:
+    return os.environ.get(ENV_CONVEX_CLOSE_STOP, "0").strip() == "1"
+
+
+def convex_close_stop_vol_gate() -> float:
+    return _env_float(ENV_CONVEX_CLOSE_STOP_VOL_GATE, 0.0)
+
+
+def convex_close_stop_backstop_mult() -> float:
+    return _env_float(ENV_CONVEX_CLOSE_STOP_BACKSTOP, 2.5)
+
+
+def convex_close_stop_hit(side: str, entry: float, stop_pts: float, atr_pts: float,
+                          last_bar: dict) -> bool:
+    """dpull-cs vol-gated close-based hard stop, evaluated on the LATEST CLOSED
+    M5 bar (mirror of scripts/dexter3_convex_exit_replay._simulate_convex's
+    close_stop + vol_gate legs). The soft SL is ``entry ∓ stop_pts`` (the
+    structural -1R level; the broker SL sits further out as a backstop):
+      * a VOLATILE bar (range > vol_gate x ATR) that BREACHES the soft SL
+        intrabar -> cut now (crash bar, matches the replay's intrabar -1R cut);
+      * else a bar that CLOSES beyond the soft SL -> cut now (close-stop);
+      * else (a calm bar that only WICKED past the soft SL and closed back) ->
+        hold (the wick-immunity that captured the ranging runners).
+    Pure: no I/O, no env reads beyond the two gate getters passed as values by
+    the caller."""
+    hi = _f(last_bar.get("high"), 0.0)
+    lo = _f(last_bar.get("low"), 0.0)
+    cl = _f(last_bar.get("close"), 0.0)
+    if stop_pts <= 0 or entry <= 0 or cl <= 0:
+        return False
+    vg = convex_close_stop_vol_gate()
+    volatile = vg > 0.0 and atr_pts > 0.0 and (hi - lo) > vg * atr_pts
+    if str(side).lower().startswith("buy"):
+        soft_sl = entry - stop_pts
+        return (volatile and lo <= soft_sl) or (cl <= soft_sl)
+    soft_sl = entry + stop_pts
+    return (volatile and hi >= soft_sl) or (cl >= soft_sl)
 
 
 def convex_age_exceeded(oldest_open_ts: str | None, now_iso: str | None) -> bool:
