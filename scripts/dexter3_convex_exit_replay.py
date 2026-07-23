@@ -174,7 +174,9 @@ def _simulate_ladder(side: str, entry: float, sl: float, future: list,
 
 
 def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r: float,
-                      giveback_atr: float, atr: float, max_hold: int) -> tuple[str, float, int]:
+                      giveback_atr: float, atr: float, max_hold: int,
+                      close_stop: bool = False,
+                      close_stop_hard_mult: float = 0.0) -> tuple[str, float, int]:
     """NO TP. The trail does not exist at all until the best-ever favorable
     excursion (``peak_r``, same tracking as ``_simulate_ladder``) reaches
     ``arm_at_r``. Once armed (permanently -- it never un-arms even if peak_r
@@ -182,7 +184,20 @@ def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r:
     line ``peak_r - (giveback_atr * atr / risk)`` -- unlike the ladder's
     discrete steps, this never widens in jumps, so a fast runner keeps far
     more of its move than a stepped floor that lags behind price. SL-first
-    conservative on the same bar; times out at ``max_hold`` -> last close."""
+    conservative on the same bar; times out at ``max_hold`` -> last close.
+
+    ``close_stop`` (2026-07-23, dpull wick-out investigation): when True, the
+    HARD stop triggers only on a bar that CLOSES beyond ``sl`` (not an
+    intrabar wick), and the loss is measured at that close (so a bar closing
+    well past the stop costs > 1R -- the honest price of holding through
+    noise). Motivated by two facts: (1) live dpull trade pid 655111580 was
+    wicked out (M5 low 4143.28 < sl 4144.14) on a bar that CLOSED 4144.34
+    ABOVE the stop then recovered; (2) the convex-replay's own MAE study --
+    tail runners' worst adverse move is p90 0.86R, never > 1R -- means a
+    ~0.5R stop (what a limit -0.5R entry creates) wicks out ~37.5% of the
+    3R+ runners. A close-based stop keeps the 0.5R nominal risk but grants
+    wick-immunity, so a runner that only dips intrabar survives. The arm and
+    trail legs stay intrabar (favorable/profit-protection, unaffected)."""
     risk = abs(entry - sl)
     if risk <= 0:
         return "skip", 0.0, 0
@@ -192,13 +207,24 @@ def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r:
     for held, bar in enumerate(future[:max_hold]):
         hi = float(bar.get("high", 0.0))
         lo = float(bar.get("low", 0.0))
+        cl = float(bar.get("close", 0.0))
         if side == "buy":
-            if lo <= sl:
-                return "loss", -1.0, held
+            # crash cap (2026-07-23): plain close-stop bled the derive/crash
+            # segment because a bar can CLOSE far past the stop. A hard
+            # intrabar backstop hard_mult*risk beyond sl caps that at
+            # -(1+hard_mult)R while normal wick-immunity is preserved.
+            if close_stop and close_stop_hard_mult > 0.0 and lo <= sl - close_stop_hard_mult * risk:
+                return "loss", -(1.0 + close_stop_hard_mult), held
+            stopped = (cl <= sl) if close_stop else (lo <= sl)
+            if stopped:
+                return "loss", ((cl - entry) / risk if close_stop else -1.0), held
             bar_peak_r = (hi - entry) / risk
         else:
-            if hi >= sl:
-                return "loss", -1.0, held
+            if close_stop and close_stop_hard_mult > 0.0 and hi >= sl + close_stop_hard_mult * risk:
+                return "loss", -(1.0 + close_stop_hard_mult), held
+            stopped = (cl >= sl) if close_stop else (hi >= sl)
+            if stopped:
+                return "loss", ((entry - cl) / risk if close_stop else -1.0), held
             bar_peak_r = (entry - lo) / risk
         if bar_peak_r > peak_r:
             peak_r = bar_peak_r

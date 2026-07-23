@@ -473,7 +473,9 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
     else:  # "convex"
         _outcome, r, held = _simulate_convex(side, sim_entry, sim_sl, sim_future,
                                              exit_params["arm_at"], exit_params["giveback_atr"],
-                                             atr, max_hold)
+                                             atr, max_hold,
+                                             close_stop=exit_params.get("close_stop", False),
+                                             close_stop_hard_mult=exit_params.get("close_stop_hard_mult", 0.0))
     return "taken", r - cost, base_idx + max(0, int(held))
 
 
@@ -921,6 +923,15 @@ def main() -> int:
                          "when the pullback off the day extreme >= this x ATR, the "
                          "range cap does not skip (entry-after-retrace anatomy, not "
                          "capitulation-chasing). 0=off")
+    ap.add_argument("--convex-close-stop", action="store_true",
+                    help="dpull wick-out investigation (2026-07-23): add a CLOSE-STOP "
+                         "convex row per combo -- the hard stop triggers on an M5 CLOSE "
+                         "beyond SL, not an intrabar wick (holds runners through noise; "
+                         "loss measured at the breaching close, so >1R is possible)")
+    ap.add_argument("--convex-close-stop-cap", default="",
+                    help="comma list of hard-backstop multiples (e.g. 0.5,1.0): add a "
+                         "CLOSE-STOP-CAP row per combo where an intrabar move cap*risk "
+                         "beyond sl hard-exits at -(1+cap)R -- wick-immune but crash-capped")
     ap.add_argument("--no-overlap", action="store_true",
                     help="model a SINGLE-POSITION lane: a signal is skipped while a prior "
                          "trade is still open -- the lane-realistic number (overlapping "
@@ -1116,6 +1127,19 @@ def main() -> int:
         for arm, gb, mh in convex_combos:
             exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh}", "convex",
                           {"arm_at": arm, "giveback_atr": gb}, mh))
+            if args.convex_close_stop:
+                # 2026-07-23 dpull wick-out investigation: same convex combo
+                # but the HARD stop is close-based (holds through intrabar
+                # wicks). Additive row -- the intrabar row above is unchanged.
+                exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh} CLOSE-STOP", "convex",
+                              {"arm_at": arm, "giveback_atr": gb, "close_stop": True}, mh))
+            for cap in (float(x) for x in args.convex_close_stop_cap.split(",") if x.strip()):
+                # close-stop WITH a crash cap: wick-immune, but a hard intrabar
+                # backstop cap*risk beyond sl bounds the loss at -(1+cap)R so
+                # the crash/derive segment does not blow out.
+                exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh} CLOSE-STOP-CAP{cap:g}", "convex",
+                              {"arm_at": arm, "giveback_atr": gb, "close_stop": True,
+                               "close_stop_hard_mult": cap}, mh))
     entries: list[tuple[str, str, float, int]] = [("market", "market", 0.0, 0)]
     for dip, win in limit_variants:
         entries.append((f"limit -{dip:.1f}R w{win}", "limit", dip, win))
