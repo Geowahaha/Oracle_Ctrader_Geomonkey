@@ -38,11 +38,16 @@ Bar = dict[str, Any]
 # committee member weights (module constants — auditable/tunable in one place)
 # ---------------------------------------------------------------------------
 
-WEIGHT_CLOSE_LOCATION_PRESSURE = 1.0
-WEIGHT_SWING_STRUCTURE = 1.2
-WEIGHT_DAY_RANGE_TILT = 1.0
-WEIGHT_DISPLACEMENT = 0.8
-WEIGHT_COMPRESSION_RELEASE = 0.8
+# All committee weights are env-tunable (2026-07-24 weight-vs-edge audit): the
+# isolated per-voter backtest measured each voter's edge (enter vote dir, 1atr
+# SL/1.5R) -- weight was INVERSELY correlated with it (best voter h1_context
+# lowest weight; -edge fade-sweep highest). Defaults preserve prior behaviour;
+# fable's unit sets the evidence-aligned values (up for +edge, down for -edge).
+WEIGHT_CLOSE_LOCATION_PRESSURE = _env_f("DEXTER3_HUNT_W_CLP", 1.0)   # audit +0.03
+WEIGHT_SWING_STRUCTURE = _env_f("DEXTER3_HUNT_W_SWING", 1.2)         # +0.03 raw (gated live)
+WEIGHT_DAY_RANGE_TILT = _env_f("DEXTER3_HUNT_W_TILT", 1.0)           # +0.11 UNDER
+WEIGHT_DISPLACEMENT = _env_f("DEXTER3_HUNT_W_DISP", 0.8)             # -0.06 NEG
+WEIGHT_COMPRESSION_RELEASE = _env_f("DEXTER3_HUNT_W_COMP", 0.8)      # -0.07 NEG
 # FIX 3 (2026-07-07): rebalanced 1.0->1.3. Diagnosis: the committee shorted
 # INTO strength (28 of 34 shorts clustered at range tops per the 2026-05-20
 # adversarial-awareness audit; the 2026-07-06/07 real-fill review showed the
@@ -52,8 +57,8 @@ WEIGHT_COMPRESSION_RELEASE = 0.8
 # (see _run_committee/_committee_side_and_conviction), on top of the new
 # trend_agreement conviction-penalty step below (_apply_trend_agreement_guard)
 # which additionally reshapes side/size when the two are in direct conflict.
-WEIGHT_M15_DRIFT = 1.3
-WEIGHT_SWEEP_RECLAIM_OVERRIDE = 1.5
+WEIGHT_M15_DRIFT = _env_f("DEXTER3_HUNT_W_M15", 1.3)                # audit +0.16 (good)
+WEIGHT_SWEEP_RECLAIM_OVERRIDE = _env_f("DEXTER3_HUNT_W_SWEEP", 1.5)  # raw fade ~0 -> OVER
 # FIX 3: rebalanced 0.6->0.9 — H1 context is the higher-timeframe trend voice,
 # under-weighted enough that day_range_tilt (mean-reversion) could dominate it.
 # 2026-07-24: isolated backtests show h1_context is fable's BEST-edge voter

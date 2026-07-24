@@ -142,6 +142,21 @@ Environment=DEXTER3_HUNT_SWING_MIN_EXT=0.4
 # risk than the isolated fixes (rebalances the committee) so MODEST + forward-
 # monitored; revert = drop this line (back to 0.9).
 Environment=DEXTER3_HUNT_W_H1=1.4
+# committee weight-vs-edge AUDIT re-weighting (2026-07-24): isolated per-voter
+# backtest (6000 bars, enter vote dir, 1atr SL/1.5R) measured each voter's edge
+# -- weight was inversely correlated with it. Align weights to measured edge:
+#   day_range_tilt  +0.107 expR, w1.0  -> 1.3  (under-weighted +edge)
+#   displacement    -0.059 expR, w0.8  -> 0.4  (negative edge, halve)
+#   compression     -0.070 expR, w0.8  -> 0.4  (negative edge, halve)
+#   sweep_reclaim   raw fade ~0 @ w1.5 -> 1.0  (over-weighted; the FOLLOW
+#                   selectivity now carries it, the 1.5 "override" was for fade)
+# (h1_context already 1.4 above; m15_drift +0.16 keeps 1.3; clp/swing keep.)
+# Higher-risk than isolated fixes (rebalances the committee) -> forward-
+# monitored; revert = drop these 4 lines.
+Environment=DEXTER3_HUNT_W_TILT=1.3
+Environment=DEXTER3_HUNT_W_DISP=0.4
+Environment=DEXTER3_HUNT_W_COMP=0.4
+Environment=DEXTER3_HUNT_W_SWEEP=1.0
 # owner 2026-07-16: reversal-confirm entries ONLY (no knife catching)
 Environment=DEXTER3_ENTRY_CONFIRM=m1
 # 2026-07-17 full surgery (owner: 'เจาะละเอียดทุกไม้แล้วผ่าตัด'): buys paid
