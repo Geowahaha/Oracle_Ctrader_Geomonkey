@@ -114,6 +114,19 @@ Environment=DEXTER3_HUNT_BIAS_MIN_HOURS=1
 Environment=DEXTER3_HUNT_BIAS_DOWNSIZE_MULT=0.25
 Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.4
 Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
+# sweep_reclaim FADE->FOLLOW flip (2026-07-24, owner "fade→follow ยาที่ลึกกว่า"):
+# the isolated 3-window backtest proved the legacy FADE is fable's single
+# biggest bleeder (-$92 @ 22% WR) -- the tight wick-SL turns a coin-flip signal
+# into a loser -- while FOLLOWING a STRONG liquidity grab (wick>=1xATR + volume
+# >=avg) is a robust +edge (expR +0.07/+0.22/+0.10 across 9k/5k/14k bars). A
+# real grab is a pause that fuels the next leg, not a reversal. Selective (only
+# strong grabs, not the 1189 noise pokes) + ATR geometry (SL 1xATR, TP 1.5R).
+# Forward = the arbiter; revert = set DEXTER3_HUNT_SWEEP_FOLLOW=0.
+Environment=DEXTER3_HUNT_SWEEP_FOLLOW=1
+Environment=DEXTER3_HUNT_SWEEP_MIN_WICK_ATR=1.0
+Environment=DEXTER3_HUNT_SWEEP_MIN_VOL=1.0
+Environment=DEXTER3_HUNT_SWEEP_SL_ATR=1.0
+Environment=DEXTER3_HUNT_SWEEP_TP_RR=1.5
 # owner 2026-07-16: reversal-confirm entries ONLY (no knife catching)
 Environment=DEXTER3_ENTRY_CONFIRM=m1
 # 2026-07-17 full surgery (owner: 'เจาะละเอียดทุกไม้แล้วผ่าตัด'): buys paid

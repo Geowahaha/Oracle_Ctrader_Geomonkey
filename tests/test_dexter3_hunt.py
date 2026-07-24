@@ -568,3 +568,52 @@ def test_decide_hunt_ignores_immature_empirical_stats() -> None:
     unchanged = hunt_mode.decide_hunt("XAUUSD", m5, m15, h1, None, _spread_for(32), journal_stats=stats)
     assert unchanged.p_win_est == baseline.p_win_est
     assert unchanged.features["empirical_p_win"]["applied"] is False
+
+
+# -- sweep_reclaim FADE->FOLLOW flip (2026-07-24, owner fade->follow) ----------
+
+def _sweep_lens(side: str) -> dict:
+    return {
+        "liquidity_sweep": {"value": True, "side": side, "level": 100.0,
+                            "evidence": "test"},
+        "swing_structure": {"last_swing_high": {"price": 105.0},
+                            "last_swing_low": {"price": 95.0}},
+    }
+
+
+def _sweep_bars(strong: bool) -> list[dict]:
+    # 30 calm ~1.0-range bars, then a sell-side sweep bar: big UPPER wick
+    # (poke high, close back). strong=big wick + high volume.
+    bars = [{"ts": f"2026-07-24T00:{i:02d}:00Z", "open": 100.0, "high": 100.6,
+             "low": 99.4, "close": 100.0, "volume": 100.0} for i in range(30)]
+    if strong:
+        bars.append({"ts": "2026-07-24T00:30:00Z", "open": 100.0, "high": 104.0,
+                     "low": 99.8, "close": 100.2, "volume": 500.0})  # 3.8 wick, 5x vol
+    else:
+        bars.append({"ts": "2026-07-24T00:30:00Z", "open": 100.0, "high": 100.7,
+                     "low": 99.8, "close": 100.2, "volume": 100.0})  # tiny wick
+    return bars
+
+
+def test_sweep_default_is_legacy_fade(monkeypatch):
+    monkeypatch.delenv("DEXTER3_HUNT_SWEEP_FOLLOW", raising=False)
+    from dexter3.hunter_brain import _try_sweep_reclaim_setup
+    setup, side, *_ = _try_sweep_reclaim_setup(_sweep_bars(True), _sweep_lens("sell"))
+    assert setup == "sweep_reclaim" and side == "sell"   # fade the poke
+
+
+def test_sweep_follow_flips_strong_grab(monkeypatch):
+    monkeypatch.setenv("DEXTER3_HUNT_SWEEP_FOLLOW", "1")
+    from dexter3.hunter_brain import _try_sweep_reclaim_setup
+    setup, side, entry, sl, tp, reasons = _try_sweep_reclaim_setup(
+        _sweep_bars(True), _sweep_lens("sell"))
+    assert setup == "sweep_reclaim" and side == "buy"    # FOLLOW the grab up
+    assert sl < entry < tp                                # long geometry
+    assert "follow" in reasons[0]
+
+
+def test_sweep_follow_skips_weak_grab(monkeypatch):
+    monkeypatch.setenv("DEXTER3_HUNT_SWEEP_FOLLOW", "1")
+    from dexter3.hunter_brain import _try_sweep_reclaim_setup
+    out = _try_sweep_reclaim_setup(_sweep_bars(False), _sweep_lens("sell"))
+    assert out[0] is None                                 # weak wick -> skip

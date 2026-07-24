@@ -25,12 +25,20 @@ skip with the RR shortfall stated).
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
 from dexter3 import empirical_stats, market_lens
+
+
+def _env_f(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _ROOT / "scripts"
@@ -269,7 +277,46 @@ def _try_sweep_reclaim_setup(
 
     last = m5_bars[-1]
     close = float(last.get("close") or 0.0)
-    side = sweep["side"]  # "buy" or "sell" — direction of the reversal trade
+    fade_side = sweep["side"]  # the FADE direction the detector proposes
+
+    # FOLLOW mode (2026-07-24 owner "fade→follow flip"): the isolated
+    # backtest (3 independent windows) proved the FADE is a coin-flip that the
+    # tight wick-SL turns into fable's 22%-WR / -$92 bleeder, while FOLLOWING
+    # the grab on STRONG sweeps (wick>=1xATR + volume>=avg) is a robust +edge
+    # (expR +0.07/+0.22/+0.10). A real liquidity grab is a pause that fuels the
+    # NEXT leg, not a reversal. Off by default -> the legacy fade is preserved.
+    if os.environ.get("DEXTER3_HUNT_SWEEP_FOLLOW", "0").strip() == "1":
+        min_wick_atr = _env_f("DEXTER3_HUNT_SWEEP_MIN_WICK_ATR", 1.0)
+        min_vol_x = _env_f("DEXTER3_HUNT_SWEEP_MIN_VOL", 1.0)
+        tp_rr = _env_f("DEXTER3_HUNT_SWEEP_TP_RR", 1.5)
+        sl_atr = _env_f("DEXTER3_HUNT_SWEEP_SL_ATR", 1.0)
+        trs = market_lens.true_ranges(m5_bars[-30:])
+        atr = (sum(trs) / len(trs)) if trs else 0.0
+        if atr <= 0:
+            return empty
+        o_ = float(last.get("open") or 0.0)
+        hi = float(last.get("high") or 0.0)
+        lo = float(last.get("low") or 0.0)
+        wick = (hi - max(o_, close)) if fade_side == "sell" else (min(o_, close) - lo)
+        if wick < min_wick_atr * atr:                 # not a strong grab -> skip
+            return empty
+        vol = float(last.get("volume") or 0.0)
+        vols = [float(b.get("volume") or 0.0) for b in m5_bars[-21:-1]]
+        vavg = (sum(vols) / len(vols)) if vols else 0.0
+        if min_vol_x > 0 and vavg > 0 and vol < min_vol_x * vavg:
+            return empty
+        side = "buy" if fade_side == "sell" else "sell"   # FOLLOW the grab
+        risk = sl_atr * atr
+        if side == "buy":
+            sl, tp = close - risk, close + tp_rr * risk
+        else:
+            sl, tp = close + risk, close - tp_rr * risk
+        reasons = [f"sweep_FOLLOW grab wick={wick:.2f}>={min_wick_atr:g}xATR "
+                   f"vol={vol:.0f}>={min_vol_x:g}xavg -> follow {side} (was fade {fade_side})"]
+        return "sweep_reclaim", side, close, sl, tp, reasons
+
+    # -- legacy FADE (default, unchanged) --------------------------------------
+    side = fade_side
     if side == "buy":
         # swept below prior low, closed back above it -> long
         sl = float(last.get("low") or 0.0)
