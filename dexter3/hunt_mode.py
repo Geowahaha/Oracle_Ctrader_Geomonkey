@@ -207,7 +207,19 @@ def _vote_swing_structure(lens: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         vote = -1.0
     else:
         vote = 0.0
-    return vote, {"classification": classification}
+    # EXTENSION gate (2026-07-24, own-terms fable fix): swing_structure is a
+    # MOMENTUM signal -- deep-pullback trend-follows lose consistently across 3
+    # windows (the OPPOSITE of dtr's pullback edge; hence NOT a clone). When
+    # DEXTER3_HUNT_SWING_MIN_EXT>0, skip a trend-follow whose price has pulled
+    # back below that extension (structure weakening) so noise pullbacks no
+    # longer vote. Off by default -> legacy behaviour preserved.
+    min_ext = _env_f("DEXTER3_HUNT_SWING_MIN_EXT", 0.0)
+    if vote != 0.0 and min_ext > 0.0:
+        ext = float(swing.get("extension") or 0.5)
+        if ext < min_ext:
+            return 0.0, {"classification": classification, "extension": ext,
+                         "skipped": "deep_pullback_weak_momentum"}
+    return vote, {"classification": classification, "extension": swing.get("extension")}
 
 
 def _vote_day_range_tilt(lens: dict[str, Any], m15_bars: list[Bar]) -> tuple[float, dict[str, Any]]:

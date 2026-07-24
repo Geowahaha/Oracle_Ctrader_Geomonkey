@@ -158,10 +158,24 @@ def swing_structure(bars: list[Bar], lookback: int = 20, pivot_span: int = 2) ->
     elif high_trend in ("HH", "LH") or low_trend in ("HL", "LL"):
         classification = "transition"
 
+    # EXTENSION (2026-07-24): how far price sits IN the trend direction within
+    # the recent range -- 0 = deep pullback (structure weakening), 1 = extended
+    # (powering through). swing_structure is a MOMENTUM signal: the isolated
+    # 3-window backtest showed deep-pullback trend-follows lose consistently
+    # (expR -0.05..-0.12) while extended ones win -- the OPPOSITE of a
+    # pullback-continuation edge. Consumers gate on it to skip the weakening
+    # deep pullbacks.
+    r_hi = max(_f(b.get("high")) for b in sample)
+    r_lo = min(_f(b.get("low")) for b in sample)
+    rng = r_hi - r_lo
+    pos = ((_f(sample[-1].get("close")) - r_lo) / rng) if rng > 0 else 0.5
+    extension = pos if classification != "downtrend" else (1.0 - pos)
+
     return {
         "value": classification,
         "high_trend": high_trend,
         "low_trend": low_trend,
+        "extension": round(extension, 3),
         "last_swing_high": swing_highs[-1] if swing_highs else None,
         "last_swing_low": swing_lows[-1] if swing_lows else None,
         "swing_highs": swing_highs[-4:],

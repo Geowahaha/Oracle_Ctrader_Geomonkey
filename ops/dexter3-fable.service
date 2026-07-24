@@ -127,6 +127,13 @@ Environment=DEXTER3_HUNT_SWEEP_MIN_WICK_ATR=1.0
 Environment=DEXTER3_HUNT_SWEEP_MIN_VOL=1.0
 Environment=DEXTER3_HUNT_SWEEP_SL_ATR=1.0
 Environment=DEXTER3_HUNT_SWEEP_TP_RR=1.5
+# swing_structure EXTENSION gate (2026-07-24, own-terms — NOT the dtr clone):
+# swing_structure is a MOMENTUM vote; the isolated 3-window backtest showed
+# deep-pullback trend-follows lose consistently (expR -0.05..-0.12 all windows,
+# the WORST bucket) while extended ones win -- the OPPOSITE of dtr's pullback
+# edge. Skip trend-follow votes whose price pulled back below 0.4 extension
+# (structure weakening). Forward = arbiter; revert = set to 0.
+Environment=DEXTER3_HUNT_SWING_MIN_EXT=0.4
 # owner 2026-07-16: reversal-confirm entries ONLY (no knife catching)
 Environment=DEXTER3_ENTRY_CONFIRM=m1
 # 2026-07-17 full surgery (owner: 'เจาะละเอียดทุกไม้แล้วผ่าตัด'): buys paid

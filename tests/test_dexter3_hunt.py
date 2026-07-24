@@ -656,3 +656,29 @@ def test_liquidity_sweep_reports_strength():
     sw = market_lens.liquidity_sweep(bars)
     assert sw["value"] and sw["side"] == "sell"
     assert sw["wick_atr"] > 1.0 and sw["vol_ratio"] > 1.0
+
+
+def test_vote_swing_extension_gate(monkeypatch):
+    from dexter3.hunt_mode import _vote_swing_structure
+    up_ext = {"swing_structure": {"value": "uptrend", "extension": 0.85}}
+    up_pull = {"swing_structure": {"value": "uptrend", "extension": 0.25}}
+    # default off: both vote +1
+    monkeypatch.delenv("DEXTER3_HUNT_SWING_MIN_EXT", raising=False)
+    assert _vote_swing_structure(up_ext)[0] == 1.0
+    assert _vote_swing_structure(up_pull)[0] == 1.0
+    # gate on: extended keeps its vote, deep pullback is skipped (momentum weak)
+    monkeypatch.setenv("DEXTER3_HUNT_SWING_MIN_EXT", "0.4")
+    assert _vote_swing_structure(up_ext)[0] == 1.0
+    assert _vote_swing_structure(up_pull)[0] == 0.0
+
+
+def test_swing_structure_reports_extension():
+    from dexter3 import market_lens
+    # rising structure, price near the top of the range = high extension
+    bars = []
+    for i in range(24):
+        base = 100 + i * 0.5
+        bars.append({"ts": f"t{i}", "open": base, "high": base + 0.6,
+                     "low": base - 0.6, "close": base + 0.4, "volume": 100})
+    sw = market_lens.swing_structure(bars)
+    assert "extension" in sw and 0.0 <= sw["extension"] <= 1.0
