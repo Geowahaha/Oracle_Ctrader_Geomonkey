@@ -4560,6 +4560,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_scalp = mode == "scalp"
     is_dpull = mode == "dpull"
     is_dpull_cs = mode == "dpull-cs"
+    is_channelfade = mode == "channelfade"
 
     # Force Grok label early for order creation (live entries)
     if is_grok and GROK_LABEL:
@@ -4604,6 +4605,15 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _DPC_LABEL
         print(f"[DPULL-CS] Forced executor LABEL to {_DPC_LABEL}", flush=True)
 
+    # CHANNELFADE canary lane (Edge A, 2026-07-24): own broker label so no
+    # other lane (esp. fable) ever touches its positions and vice versa.
+    if is_channelfade:
+        from dexter3.channelfade import CHF_LABEL as _CHF_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _CHF_LABEL
+        print(f"[CHANNELFADE] Forced executor LABEL to {_CHF_LABEL}", flush=True)
+
     if is_grok and GROK_LABEL:
         active_label = GROK_LABEL
     elif is_vp:
@@ -4626,6 +4636,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.daytrend import DPULL_CS_LABEL as _DPC_LABEL
 
         active_label = _DPC_LABEL
+    elif is_channelfade:
+        from dexter3.channelfade import CHF_LABEL as _CHF_LABEL
+
+        active_label = _CHF_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "grok-v1.0" if is_grok else "dexter3"
@@ -4792,6 +4806,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _DPC_LABEL
         print(f"[DPULL-CS] Forced executor LABEL to {_DPC_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "channelfade":
+        from dexter3.channelfade import CHF_LABEL as _CHF_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _CHF_LABEL
+        print(f"[CHANNELFADE] Forced executor LABEL to {_CHF_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

@@ -217,3 +217,19 @@ def test_label_constants_are_isolated():
     assert chf.CHF_LABEL == "dexter3:chf:canary"
     assert chf.CHF_LABEL_FAMILY == "dexter3:chf"
     assert chf.CHF_LABEL.startswith(chf.CHF_LABEL_FAMILY)
+
+
+def test_shadow_runner_resolvers_isolate_channelfade():
+    """Regression guard (2026-07-24 deploy): the runner must resolve
+    channelfade mode to its OWN label/family/state/log — NOT fable's. This
+    pins the wiring whose gap first shipped the lane pointing at fable's
+    broker label (caught live by the startup banner before any order)."""
+    from dexter3 import shadow_runner as sr
+
+    assert sr._active_order_label("channelfade") == chf.CHF_LABEL
+    assert sr._active_label_family("channelfade") == chf.CHF_LABEL_FAMILY
+    assert sr._active_state_file("channelfade") == sr.CHF_STATE_FILE
+    assert sr._active_log_file("channelfade") == sr.CHF_LOG_FILE
+    # and it must NOT collide with the fable default
+    assert sr._active_order_label("channelfade") != sr._active_order_label("v16")
+    assert sr._channelfade_producer_enabled() is False  # off unless env set
