@@ -54,10 +54,14 @@ WEIGHT_COMPRESSION_RELEASE = 0.8
 # which additionally reshapes side/size when the two are in direct conflict.
 WEIGHT_M15_DRIFT = 1.3
 WEIGHT_SWEEP_RECLAIM_OVERRIDE = 1.5
-# FIX 3: rebalanced 0.6->0.9 — same rationale as WEIGHT_M15_DRIFT above; H1
-# context is the higher-timeframe trend voice and was under-weighted enough
-# that day_range_tilt (a pure mean-reversion vote) could dominate it 1:0.6.
-WEIGHT_H1_CONTEXT = 0.9
+# FIX 3: rebalanced 0.6->0.9 — H1 context is the higher-timeframe trend voice,
+# under-weighted enough that day_range_tilt (mean-reversion) could dominate it.
+# 2026-07-24: isolated backtests show h1_context is fable's BEST-edge voter
+# (with-H1-trend expR +0.14..+0.22, robust 2 windows) yet it still carries the
+# LOWEST committee weight while the -edge fade-sweep carried the HIGHEST (1.5
+# override) — weight was INVERSELY correlated with edge. Env-tunable so the
+# best signal can be leaned into; default 0.9 preserves prior behaviour.
+WEIGHT_H1_CONTEXT = _env_f("DEXTER3_HUNT_W_H1", 0.9)
 
 TOTAL_COMMITTEE_WEIGHT = (
     WEIGHT_CLOSE_LOCATION_PRESSURE

@@ -134,6 +134,14 @@ Environment=DEXTER3_HUNT_SWEEP_TP_RR=1.5
 # edge. Skip trend-follow votes whose price pulled back below 0.4 extension
 # (structure weakening). Forward = arbiter; revert = set to 0.
 Environment=DEXTER3_HUNT_SWING_MIN_EXT=0.4
+# h1_context weight bump (2026-07-24, own-terms — AMPLIFY the good, not gate it):
+# isolated backtests show h1_context (with-H1-trend) is fable's BEST-edge voter
+# (expR +0.14..+0.22, robust 2 windows), yet it carried the LOWEST committee
+# weight (0.9) while the -edge fade-sweep carried the HIGHEST (1.5) — weight was
+# INVERSELY correlated with edge. Lean into the best signal: 0.9 -> 1.4. Higher
+# risk than the isolated fixes (rebalances the committee) so MODEST + forward-
+# monitored; revert = drop this line (back to 0.9).
+Environment=DEXTER3_HUNT_W_H1=1.4
 # owner 2026-07-16: reversal-confirm entries ONLY (no knife catching)
 Environment=DEXTER3_ENTRY_CONFIRM=m1
 # 2026-07-17 full surgery (owner: 'เจาะละเอียดทุกไม้แล้วผ่าตัด'): buys paid
