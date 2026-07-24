@@ -39,13 +39,26 @@ Environment=DEXTER3_CAPITAL_USD=1000
 Environment=DEXTER3_MAX_VOLUME_UNITS=10
 Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=12
-# canary risk (same tier as the VP lane)
-Environment=DEXTER3_DAILY_TARGET_USD=15
-Environment=DEXTER3_DAILY_LOSS_USD=8
+# canary risk. 2026-07-24 GOVERNOR-CAP UNLOCK (owner "ปลดล็อคเลยเอากำไรคืนมา"):
+# measured the live -12.51 gap vs the replay +31R validate winner — it is NOT
+# a strategy-design flaw (tested let-winners-run exits AND deeper-pullback
+# entries in replay, both LOSE vs the shipped knobs; the geometry is at its
+# optimum). The strangler is the DAILY CAP truncating the edge's distribution:
+# at base risk $4/trade, DAILY_LOSS_USD=8 stopped the whole day after ~2 losers
+# and TARGET=15 locked-and-stopped the winning days early — a 35%-WR / PF1.30
+# trend edge (losing streaks common, money made on the fat winning-day tail)
+# cannot express inside a 2-trade box. Governor floating was NEGATIVE at every
+# cut (it was NOT amputating winners — that hypothesis was measured false), so
+# the fix is ROOM, not removing protection. ASYMMETRIC loosen (tilt to the
+# hunter payoff — let winners run, keep downside bounded), isolated to dtr,
+# reversible, forward-measured (replay can't model the per-day governor, so
+# forward realized PnL is the arbiter; revert if dtr's forward cum worsens).
+Environment=DEXTER3_DAILY_TARGET_USD=30
+Environment=DEXTER3_DAILY_LOSS_USD=16
 Environment=DEXTER3_BASE_RISK_FRAC=0.004
 Environment=DEXTER3_MAX_RISK_FRAC=0.008
 Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
-Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+Environment=DEXTER3_DAILY_LOSS_BASKETS=5
 # exits: broker SL/TP only + 240min time stop (= the replay's h48)
 Environment=DEXTER3_OM_TRAIL_MODE=plain
 Environment=DEXTER3_BASKET_TIME_STOP_MIN=240
