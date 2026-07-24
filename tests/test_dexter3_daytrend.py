@@ -493,3 +493,32 @@ def test_dpull_cs_backstop_self_heal_needs_single_position(monkeypatch):
     sr._ensure_dpull_cs_backstop(ex, state, [_cs_pos(1, 4100, 4105),
                                             _cs_pos(2, 4100, 4105)], "XAUUSD")  # 2 legs
     assert ex.amends == []
+
+
+def test_resume_aggression_skips_weak_body(monkeypatch):
+    """Order-flow entry (2026-07-24): with the resume-body floor on, a weak/
+    doji resume (buyers/sellers NOT in control through the bar) is skipped even
+    when the pullback geometry is valid -- the enter-on-flow-not-location fix.
+    The default sell-day fixture's resume bar has body ~0.36 (weak)."""
+    monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
+    prefix = _sell_day_prefix()
+    # baseline (floor off) enters
+    assert daytrend.decide_daytrend("XAUUSD", prefix, 0.12, session="asian").action == "enter"
+    # floor on -> the weak-body resume is refused
+    monkeypatch.setenv(daytrend.ENV_RESUME_BODY, "0.6")
+    d = daytrend.decide_daytrend("XAUUSD", prefix, 0.12, session="asian")
+    assert d.action == "skip"
+    assert "weak_resume_body" in d.reasons[0]
+
+
+def test_resume_aggression_admits_strong_trend_bar(monkeypatch):
+    """A strong trend-bar resume (large body, close toward the extreme = in
+    control) is TAKEN even at the extreme -- flow is advantageous."""
+    monkeypatch.setenv(daytrend.ENV_SWING_BARS, "3")
+    monkeypatch.setenv(daytrend.ENV_RESUME_BODY, "0.5")
+    monkeypatch.setenv(daytrend.ENV_RESUME_CLV, "0.6")
+    prefix = _sell_day_prefix()[:-1]
+    # replace the resume bar with a strong red trend bar closing near its low
+    prefix.append(_bar("2026-07-16T03:05:00Z", 4001.0, 4001.2, 3998.6, 3998.8))
+    d = daytrend.decide_daytrend("XAUUSD", prefix, 0.12, session="asian")
+    assert d.action == "enter" and d.side == "sell"

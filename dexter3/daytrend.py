@@ -67,6 +67,18 @@ ENV_SWING_BARS = "DEXTER3_DAYTREND_SWING_BARS"       # default 6
 ENV_BUFFER_ATR = "DEXTER3_DAYTREND_BUFFER_ATR"       # default 0.1
 ENV_MIN_HOURS = "DEXTER3_DAYTREND_MIN_HOURS"         # default 1.0
 ENV_MAX_RISK_ATR = "DEXTER3_DAYTREND_MAX_RISK_ATR"   # default 2.0
+# RESUME-BAR AGGRESSION (2026-07-24 order-flow entry, owner "เข้าที่ยอดได้ถ้า
+# เงื่อนไข positive ได้เปรียบ ... อย่ายึดติด lagging indicators"): condition the
+# continuation on WHO won the resume bar (leading, read from bar anatomy — NOT
+# a lagging indicator), so an entry even at the extreme is TAKEN when buyers/
+# sellers are genuinely in control and SKIPPED on a weak/doji resume right off
+# a rejection (live pid655570325). Replay (2 independent windows, market x
+# plain, cap12): body>=0.5 + clv>=0.6 lifts PF 1.28->1.45-1.50, WR 35->39%,
+# and flips a derive segment positive. Default 0 = OFF (additive; dpull leaves
+# it off unless separately proven). Only gates FLOW, never location/RR.
+ENV_RESUME_BODY = "DEXTER3_DAYTREND_RESUME_BODY"     # min |c-o|/range, 0=off
+ENV_RESUME_CLV = "DEXTER3_DAYTREND_RESUME_CLV"       # buy: close>=this in range; sell: <=1-this. 0=off
+ENV_RESUME_VOL = "DEXTER3_DAYTREND_RESUME_VOL"       # resume vol >= this x trailing-20 avg, 0=off
 ENV_ANCHOR_HOUR = "DEXTER3_DAYTREND_ANCHOR_HOUR"     # default 0 (00Z)
 # G1 capitulation guard (owner 2026-07-16, after the first live day: two
 # continuation sells died to the DZ rebound at ~14x ATR day range): once the
@@ -138,9 +150,20 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
     pull_atr = _env(ENV_PULL_ATR, 0.8)
     buffer_atr = _env(ENV_BUFFER_ATR, 0.1)
     max_risk_atr = _env(ENV_MAX_RISK_ATR, 2.0)
+    resume_body = _env(ENV_RESUME_BODY, 0.0)
+    resume_clv = _env(ENV_RESUME_CLV, 0.0)
+    resume_vol = _env(ENV_RESUME_VOL, 0.0)
     last = m5_prefix[-1]
     o = _f(last.get("open"), 0.0)
     c = _f(last.get("close"), 0.0)
+    # resume-bar aggression (order-flow read from anatomy; see ENV_RESUME_*)
+    h_last, l_last = _f(last.get("high"), 0.0), _f(last.get("low"), 0.0)
+    rng_last = h_last - l_last
+    body_last = abs(c - o) / rng_last if rng_last > 0 else 0.0
+    clv_last = (c - l_last) / rng_last if rng_last > 0 else 0.5   # 0=at low, 1=at high
+    vol_last = _f(last.get("volume"), 0.0)
+    vol_avg = (sum(_f(b.get("volume"), 0.0) for b in m5_prefix[-21:-1]) / 20.0
+               ) if len(m5_prefix) >= 21 else 0.0
     day_bars = min(len(m5_prefix), max(swing_bars + 2, int(hours * 12) + 1))
     day = m5_prefix[-day_bars:]
     # G1 capitulation guard: beyond the cap the extreme is a DZ/SZ, not a
@@ -171,6 +194,12 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
         if not (pullback >= pull_atr * atr and c < o):
             return _skip(ts_close, symbol, session,
                          f"no_setup (pull={pullback:.2f} need>={pull_atr * atr:.2f} red={c < o})")
+        if resume_body > 0 and body_last < resume_body:
+            return _skip(ts_close, symbol, session, f"weak_resume_body ({body_last:.2f}<{resume_body:g})")
+        if resume_clv > 0 and clv_last > (1.0 - resume_clv):   # sell: want close near LOW
+            return _skip(ts_close, symbol, session, f"resume_clv_high ({clv_last:.2f}, sellers not in control)")
+        if resume_vol > 0 and vol_avg > 0 and vol_last < resume_vol * vol_avg:
+            return _skip(ts_close, symbol, session, f"resume_low_vol ({vol_last:.0f}<{resume_vol:g}xavg)")
         swing_hi = max(_f(b.get("high"), 0.0) for b in m5_prefix[-swing_bars:])
         sl = swing_hi + buffer_atr * atr
         risk = sl - c
@@ -190,6 +219,12 @@ def decide_daytrend(symbol: str, m5_prefix: list, spread_abs: float,
     if not (pullback >= pull_atr * atr and c > o):
         return _skip(ts_close, symbol, session,
                      f"no_setup (pull={pullback:.2f} need>={pull_atr * atr:.2f} green={c > o})")
+    if resume_body > 0 and body_last < resume_body:
+        return _skip(ts_close, symbol, session, f"weak_resume_body ({body_last:.2f}<{resume_body:g})")
+    if resume_clv > 0 and clv_last < resume_clv:               # buy: want close near HIGH
+        return _skip(ts_close, symbol, session, f"resume_clv_low ({clv_last:.2f}, buyers not in control)")
+    if resume_vol > 0 and vol_avg > 0 and vol_last < resume_vol * vol_avg:
+        return _skip(ts_close, symbol, session, f"resume_low_vol ({vol_last:.0f}<{resume_vol:g}xavg)")
     swing_lo = min(_f(b.get("low"), 0.0) for b in m5_prefix[-swing_bars:])
     sl = swing_lo - buffer_atr * atr
     risk = c - sl

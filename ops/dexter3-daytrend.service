@@ -68,6 +68,17 @@ Environment=DEXTER3_DAYTREND_SWING_BARS=6
 Environment=DEXTER3_DAYTREND_BUFFER_ATR=0.1
 Environment=DEXTER3_DAYTREND_MIN_HOURS=1
 Environment=DEXTER3_DAYTREND_MAX_RISK_ATR=2.0
+# ORDER-FLOW entry (2026-07-24, owner "เข้าที่ยอดได้ถ้า flow ได้เปรียบ, อย่ายึด
+# lagging indicators"): only take the continuation when the RESUME BAR shows
+# real aggression -- a trend bar (body>=0.5) closing toward the extreme
+# (clv>=0.6) = buyers/sellers in control THROUGH the bar; skip weak/doji
+# resumes right off a rejection (the pid655570325 top-buy). Reads bar anatomy
+# (leading), gates FLOW not location -- a top entry with strong flow is TAKEN.
+# 2-window replay (market x plain, cap12): PF 1.28->1.45-1.50, WR 35->39%,
+# derive flipped positive in window B. Forward = the arbiter (higher WR/PF
+# should also realize better live under the governor). Revert = set both to 0.
+Environment=DEXTER3_DAYTREND_RESUME_BODY=0.5
+Environment=DEXTER3_DAYTREND_RESUME_CLV=0.6
 # 2026-07-16 owner orders (after day-1: two continuation sells died to the
 # DZ rebound; "ไม่ต้องการ shadow เพราะโอกาสแบบนี้หายาก เปิดเลย"):
 # the capitulation handoff — beyond 12xATR day range the continuation STOPS
