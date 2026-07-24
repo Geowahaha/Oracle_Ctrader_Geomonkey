@@ -75,6 +75,7 @@ from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.weekly_risk import weekly_close_policy
 from dexter3 import vp_lane
+from dexter3 import channelfade
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
@@ -107,6 +108,7 @@ DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
 SCALP_STATE_FILE = RUNTIME / "dexter3_scalp_shadow_state.json"
 DPULL_STATE_FILE = RUNTIME / "dexter3_dpull_shadow_state.json"
 DPULL_CS_STATE_FILE = RUNTIME / "dexter3_dpull_cs_shadow_state.json"
+CHF_STATE_FILE = RUNTIME / "dexter3_chf_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -118,6 +120,7 @@ DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
 SCALP_LOG_FILE = RUNTIME / "dexter3_scalp_shadow.log"
 DPULL_LOG_FILE = RUNTIME / "dexter3_dpull_shadow.log"
 DPULL_CS_LOG_FILE = RUNTIME / "dexter3_dpull_cs_shadow.log"
+CHF_LOG_FILE = RUNTIME / "dexter3_chf_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 GROK_LOCK_FILE = RUNTIME / "dexter3_grok_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
@@ -125,6 +128,7 @@ DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
 SCALP_LOCK_FILE = RUNTIME / "dexter3_scalp_shadow.lock"
 DPULL_LOCK_FILE = RUNTIME / "dexter3_dpull_shadow.lock"
 DPULL_CS_LOCK_FILE = RUNTIME / "dexter3_dpull_cs_shadow.lock"
+CHF_LOCK_FILE = RUNTIME / "dexter3_chf_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -217,16 +221,32 @@ def _dpull_cs_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "dpull-cs"
 
 
+def _channelfade_producer_enabled() -> bool:
+    """CHANNELFADE lane (Edge A, owner 2026-07-24 "สร้าง อย่าตัด"): the
+    range-phase edge-fade producer (dexter3/channelfade.py), forward-A/B
+    canary — DEFAULT OFF (owner sign-off required). Two ways in:
+    DEXTER3_PRODUCER=channelfade (producer-only override) or
+    DEXTER3_MODE=channelfade (the full canary lane: own label
+    dexter3:chf:canary + own state file + own lock, same isolation pattern as
+    the vp/dpull lanes). replay UNDER-RATES range edges (vp is replay-marginal
+    yet live +23.58) so this lane's promotion is judged on FORWARD realized
+    PnL, not the in-sample fit."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "channelfade":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "channelfade"
+
+
 def _alt_producer_enabled() -> bool:
-    """Non-hunt producers (vp / daytrend / scalp / dpull / dpull-cs) share the
-    same runner posture: v16 gate bypass (no hunt-committee features), hunt
-    sizing-selector bypass (their proofs sized flat), the VP entry gate
-    (day-open bias + no-trade window; trivially true for daytrend/dpull
-    whose signals are with-bias by construction), and the deep 340-bar M5
+    """Non-hunt producers (vp / daytrend / scalp / dpull / dpull-cs /
+    channelfade) share the same runner posture: v16 gate bypass (no
+    hunt-committee features), hunt sizing-selector bypass (their proofs sized
+    flat), the VP entry gate (day-open bias + no-trade window; trivially true
+    for daytrend/dpull whose signals are with-bias by construction, and
+    bias-neutral for the channelfade range lane), and the deep 340-bar M5
     fetch."""
     return (_vp_producer_enabled() or _daytrend_producer_enabled()
             or _scalp_producer_enabled() or _dpull_producer_enabled()
-            or _dpull_cs_producer_enabled())
+            or _dpull_cs_producer_enabled() or _channelfade_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -258,6 +278,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.daytrend import DPULL_CS_LABEL
 
         return DPULL_CS_LABEL
+    if current_mode == "channelfade":
+        from dexter3.channelfade import CHF_LABEL
+
+        return CHF_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -298,6 +322,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.daytrend import DPULL_CS_LABEL_FAMILY
 
         return DPULL_CS_LABEL_FAMILY
+    if current_mode == "channelfade":
+        from dexter3.channelfade import CHF_LABEL_FAMILY
+
+        return CHF_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -315,6 +343,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return DPULL_STATE_FILE
     if current_mode == "dpull-cs":
         return DPULL_CS_STATE_FILE
+    if current_mode == "channelfade":
+        return CHF_STATE_FILE
     return STATE_FILE
 
 
@@ -337,6 +367,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return DPULL_LOG_FILE
     if current_mode == "dpull-cs":
         return DPULL_CS_LOG_FILE
+    if current_mode == "channelfade":
+        return CHF_LOG_FILE
     return LOG_FILE
 
 
@@ -1424,6 +1456,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = DPULL_LOCK_FILE, "dpull-canary"
     elif mode == "dpull-cs":
         lock_file, lock_name = DPULL_CS_LOCK_FILE, "dpull-cs-canary"
+    elif mode == "channelfade":
+        lock_file, lock_name = CHF_LOCK_FILE, "channelfade-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1454,6 +1488,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = DPULL_LOCK_FILE
     elif mode == "dpull-cs":
         lock_file = DPULL_CS_LOCK_FILE
+    elif mode == "channelfade":
+        lock_file = CHF_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1839,6 +1875,17 @@ def run_symbol_cycle(
 
             dp_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dp_session)
+        elif is_newest and _channelfade_producer_enabled():
+            # CHANNELFADE lane (Edge A, owner 2026-07-24): the range-phase
+            # edge-fade producer — fade the box edges toward the vp POC. Exit
+            # is PLAIN (DEXTER3_OM_TRAIL_MODE=plain: a fade has a fixed target
+            # and must NOT ride). Off-by-default; forward-A/B canary — replay
+            # under-rates range edges (vp replay-marginal yet live +23.58) so
+            # the honest arbiter is forward realized PnL.
+            from dexter3 import market_lens as _ml
+
+            chf_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = channelfade.decide_channelfade(symbol, prefix, spread_abs, session=chf_session)
         elif is_newest and _daytrend_producer_enabled():
             # DAYTREND lane (owner deploy 2026-07-16) — with-the-day pullback
             # continuation; evidence + parity notes in dexter3/daytrend.py.
