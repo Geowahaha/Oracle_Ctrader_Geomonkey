@@ -617,3 +617,42 @@ def test_sweep_follow_skips_weak_grab(monkeypatch):
     from dexter3.hunter_brain import _try_sweep_reclaim_setup
     out = _try_sweep_reclaim_setup(_sweep_bars(False), _sweep_lens("sell"))
     assert out[0] is None                                 # weak wick -> skip
+
+
+# -- LIVE committee vote flip (2026-07-24): _vote_sweep_reclaim is the path the
+#    live decide_hunt committee uses (NOT hunter_brain._try_sweep_reclaim_setup)
+
+def _sweep_vote_lens(side, wick_atr, vol_ratio):
+    return {"liquidity_sweep": {"value": True, "side": side, "wick_atr": wick_atr,
+                                "vol_ratio": vol_ratio, "evidence": "x"}}
+
+
+def test_vote_sweep_default_fades(monkeypatch):
+    monkeypatch.delenv("DEXTER3_HUNT_SWEEP_FOLLOW", raising=False)
+    from dexter3.hunt_mode import _vote_sweep_reclaim
+    assert _vote_sweep_reclaim(_sweep_vote_lens("sell", 1.4, 1.3))[0] == -1.0  # sell/fade
+    assert _vote_sweep_reclaim(_sweep_vote_lens("buy", 1.4, 1.3))[0] == +1.0
+
+
+def test_vote_sweep_follow_flips_strong(monkeypatch):
+    monkeypatch.setenv("DEXTER3_HUNT_SWEEP_FOLLOW", "1")
+    from dexter3.hunt_mode import _vote_sweep_reclaim
+    assert _vote_sweep_reclaim(_sweep_vote_lens("sell", 1.4, 1.3))[0] == +1.0  # follow -> buy
+    assert _vote_sweep_reclaim(_sweep_vote_lens("buy", 1.4, 1.3))[0] == -1.0
+
+
+def test_vote_sweep_follow_skips_weak(monkeypatch):
+    monkeypatch.setenv("DEXTER3_HUNT_SWEEP_FOLLOW", "1")
+    from dexter3.hunt_mode import _vote_sweep_reclaim
+    assert _vote_sweep_reclaim(_sweep_vote_lens("sell", 0.4, 0.8))[0] == 0.0   # weak -> no vote
+
+
+def test_liquidity_sweep_reports_strength():
+    from dexter3 import market_lens
+    bars = [{"ts": f"t{i}", "open": 100, "high": 100.5, "low": 99.5, "close": 100, "volume": 100}
+            for i in range(12)]
+    # strong sell grab: big upper wick, high volume
+    bars.append({"ts": "t12", "open": 100, "high": 104, "low": 99.8, "close": 100.1, "volume": 400})
+    sw = market_lens.liquidity_sweep(bars)
+    assert sw["value"] and sw["side"] == "sell"
+    assert sw["wick_atr"] > 1.0 and sw["vol_ratio"] > 1.0

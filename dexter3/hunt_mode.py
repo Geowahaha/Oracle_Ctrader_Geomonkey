@@ -18,11 +18,19 @@ every other ``dexter3/`` module (see docs/DEXTER3_M5_HUNTER_BLUEPRINT.md).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 from dexter3 import empirical_stats, market_lens
 from dexter3.hunter_brain import Decision, _bar_close_ts
+
+
+def _env_f(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 Bar = dict[str, Any]
 
@@ -264,10 +272,28 @@ def _vote_sweep_reclaim(lens: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         return 0.0, {"fired": False}
     # market_lens.liquidity_sweep() only reports value=True when the bar
     # already closed back inside the swept level (its own detection IS the
-    # reclaim confirmation — see market_lens.liquidity_sweep docstring and
-    # hunter_brain._try_sweep_reclaim_setup, which relies on the same fact).
+    # reclaim confirmation).
     side = sweep.get("side")
     sign = 1.0 if side == "buy" else (-1.0 if side == "sell" else 0.0)
+    # FADE→FOLLOW flip (2026-07-24, owner "fade→follow ยาที่ลึกกว่า"): the legacy
+    # vote FADES the grab (sell a high-poke) — fable's -$92 @ 22% WR bleeder.
+    # Isolated 3-window backtest: FADE is a coin-flip the tight geometry loses;
+    # FOLLOWING a STRONG grab (wick>=1xATR + volume>=avg) is a robust +edge. So
+    # when enabled: require grab strength, then FLIP the sign to follow. Weak
+    # grabs vote 0 (don't let noise pokes dominate the committee). Off by
+    # default -> legacy fade preserved.
+    if os.environ.get("DEXTER3_HUNT_SWEEP_FOLLOW", "0").strip() == "1":
+        wick_atr = float(sweep.get("wick_atr") or 0.0)
+        vol_ratio = float(sweep.get("vol_ratio") or 0.0)
+        min_wick = _env_f("DEXTER3_HUNT_SWEEP_MIN_WICK_ATR", 1.0)
+        min_vol = _env_f("DEXTER3_HUNT_SWEEP_MIN_VOL", 1.0)
+        if wick_atr < min_wick or (min_vol > 0 and vol_ratio < min_vol):
+            return 0.0, {"fired": True, "skipped": "weak_grab",
+                         "wick_atr": wick_atr, "vol_ratio": vol_ratio}
+        sign = -sign  # FOLLOW the grab (a real grab fuels the next leg)
+        return sign * 1.0, {"fired": True, "follow": True, "side_follow": ("buy" if sign > 0 else "sell"),
+                            "wick_atr": wick_atr, "vol_ratio": vol_ratio,
+                            "evidence": sweep.get("evidence")}
     vote = sign * 1.0
     return vote, {"fired": True, "side": side, "evidence": sweep.get("evidence")}
 

@@ -193,6 +193,20 @@ def liquidity_sweep(bars: list[Bar], lookback: int = 10) -> dict[str, Any]:
     close = _f(last.get("close"))
     high = _f(last.get("high"))
     low = _f(last.get("low"))
+    open_ = _f(last.get("open"))
+
+    # STRENGTH metrics (2026-07-24): a REAL liquidity grab is a big wick on
+    # participation; a minor poke is noise. wick_atr = grab wick / recent ATR;
+    # vol_ratio = bar volume / trailing-20 avg. Reported so consumers can gate
+    # on grab strength (the fade→follow edge lives on STRONG grabs only).
+    trs = true_ranges(prior)
+    atr = (sum(trs) / len(trs)) if trs else 0.0
+    vols = [_f(b.get("volume")) for b in prior]
+    vavg = (sum(vols) / len(vols)) if vols else 0.0
+    vol_last = _f(last.get("volume"))
+    vol_ratio = (vol_last / vavg) if vavg > 0 else 0.0
+    upper_wick = high - max(open_, close)
+    lower_wick = min(open_, close) - low
 
     # sell-side sweep: wick pokes above prior high, closes back below it
     if high > prior_high and close < prior_high and upper_wick_ratio(last) >= 0.25:
@@ -200,6 +214,8 @@ def liquidity_sweep(bars: list[Bar], lookback: int = 10) -> dict[str, Any]:
             "value": True,
             "side": "sell",
             "level": round(prior_high, 5),
+            "wick_atr": round(upper_wick / atr, 3) if atr > 0 else 0.0,
+            "vol_ratio": round(vol_ratio, 3),
             "evidence": f"wick_high={high:.5f}>prior_high={prior_high:.5f},close={close:.5f} back inside",
         }
     # buy-side sweep: wick pokes below prior low, closes back above it
@@ -208,6 +224,8 @@ def liquidity_sweep(bars: list[Bar], lookback: int = 10) -> dict[str, Any]:
             "value": True,
             "side": "buy",
             "level": round(prior_low, 5),
+            "wick_atr": round(lower_wick / atr, 3) if atr > 0 else 0.0,
+            "vol_ratio": round(vol_ratio, 3),
             "evidence": f"wick_low={low:.5f}<prior_low={prior_low:.5f},close={close:.5f} back inside",
         }
     return {"value": False, "side": None, "level": None, "evidence": "no_sweep"}
