@@ -391,12 +391,25 @@ def is_our_position(position: dict[str, Any]) -> bool:
 
 
 def verify_entry_snapshot(
-    position: dict[str, Any] | None, side: str, entry: float, volume: float
+    position: dict[str, Any] | None, side: str, entry: float, volume: float,
+    expect_sl: float | None = None, expect_tp: float | None = None,
+    price_tol: float = 0.05,
 ) -> tuple[bool, dict[str, Any]]:
     """Geometry/side/volume check on a freshly-opened position.
 
     Mirrors ``scripts/btc_scalp_monitor.py::verify_position_snapshot``
     exactly (side_ok / volume_ok / geometry_ok, volume tolerance 0.1%).
+
+    ``expect_sl``/``expect_tp`` (2026-07-25 audit fix): the base check only
+    proves the stop is on the CORRECT SIDE of entry — not that it is where the
+    caller asked for. An amend whose request the broker REFUSED therefore came
+    back ``verified=True`` because the OLD stop was still on the right side, so
+    the caller logged success and moved on. That is how the dpull-cs backstop
+    could report "amended" while the position silently kept its tight soft stop
+    (three retries burned, then given up on permanently) — reinstating the exact
+    wick-stop-out the backstop exists to prevent. When an expected price is
+    supplied, it must MATCH within ``price_tol``. Optional so entry-time callers
+    that legitimately have no target price keep the previous behaviour.
     """
     if not position:
         return False, {"reason": "position_not_found"}
@@ -409,6 +422,21 @@ def verify_entry_snapshot(
         geometry_ok = sl > 0 and tp > 0 and sl < entry < tp
     else:
         geometry_ok = sl > 0 and tp > 0 and tp < entry < sl
+
+    sl_matches: bool | None = None
+    tp_matches: bool | None = None
+    if expect_sl is not None:
+        try:
+            sl_matches = abs(float(sl) - float(expect_sl)) <= float(price_tol)
+        except (TypeError, ValueError):
+            sl_matches = False
+        geometry_ok = bool(geometry_ok) and bool(sl_matches)
+    if expect_tp is not None:
+        try:
+            tp_matches = abs(float(tp) - float(expect_tp)) <= float(price_tol)
+        except (TypeError, ValueError):
+            tp_matches = False
+        geometry_ok = bool(geometry_ok) and bool(tp_matches)
     meta = {
         "side_ok": side_ok,
         "volume_ok": volume_ok,
@@ -418,6 +446,12 @@ def verify_entry_snapshot(
         "take_profit": tp,
         "geometry_ok": geometry_ok,
     }
+    if expect_sl is not None:
+        meta["sl_expected"] = expect_sl
+        meta["sl_matches"] = sl_matches
+    if expect_tp is not None:
+        meta["tp_expected"] = expect_tp
+        meta["tp_matches"] = tp_matches
     return bool(side_ok and volume_ok and geometry_ok), meta
 
 
@@ -1275,11 +1309,30 @@ class Dexter3Executor:
                 payload={"reason": "no_position_id_to_repair"},
             )
             return {"verified": False, "verification": {"reason": "no_position_id_to_repair"}}
+        uncertain_note = ""
         try:
-            self.client.amend_position(position_id, stop_loss=sl, take_profit=tp)
+            try:
+                self.client.amend_position(position_id, stop_loss=sl, take_profit=tp)
+            except McpMutationUncertain as exc:
+                # 2026-07-25 audit fix: McpMutationUncertain SUBCLASSES
+                # McpClientError, so the broad handler below used to swallow it
+                # and fall straight through to close_position — MARKET-CLOSING A
+                # HEALTHY POSITION whenever the amend had actually reached the
+                # broker and applied but its HTTP response outran the daemon
+                # timeout. That false-negative is live-observed on this account
+                # (27 amend_failed lines in 3 days, with fresh reads confirming
+                # the SL really did move). The sibling amend_lane_sl_tp already
+                # handles the identical signal correctly; this mirrors it —
+                # settle, then let the authoritative re-read below decide.
+                uncertain_note = str(exc)
+                time.sleep(2.0)
             positions = self._safe_get_positions()
             pos = next((p for p in positions if position_id_of(p) == position_id), None)
-            verified, verification = verify_entry_snapshot(pos, side, entry, volume)
+            verified, verification = verify_entry_snapshot(
+                pos, side, entry, volume, expect_sl=sl, expect_tp=tp
+            )
+            if uncertain_note:
+                verification["amend_uncertain"] = uncertain_note
             self._journal(
                 symbol,
                 "naked_position_repaired_via_amend",
@@ -1519,7 +1572,15 @@ class Dexter3Executor:
             return self._refuse(symbol, "amend_failed", position_id=position_id, error=str(exc))
         post_positions = self._safe_get_positions()
         post_pos = next((p for p in post_positions if position_id_of(p) == int(position_id)), None)
-        verified, verification = verify_entry_snapshot(post_pos, side, entry, volume)
+        # 2026-07-25 audit fix: pass the REQUESTED prices so a broker-refused
+        # amend can no longer report verified=True merely because the OLD stop
+        # is still on the correct side of entry. Only the values actually asked
+        # for are checked (sl/tp may be None = "leave unchanged").
+        verified, verification = verify_entry_snapshot(
+            post_pos, side, entry, volume,
+            expect_sl=sl if sl is not None else None,
+            expect_tp=tp if tp is not None else None,
+        )
         self._journal(
             symbol,
             "lane_position_amended",

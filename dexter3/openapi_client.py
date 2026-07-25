@@ -919,6 +919,9 @@ class Dexter3OpenApiClient:
         if not positions:
             return
         spot_cache: dict[str, dict[str, float] | None] = {}
+        # per-symbol reason a spot read failed, so the blindness is stamped on
+        # the position instead of vanishing (2026-07-25 audit fix)
+        spot_err_cache: dict[str, str] = {}
         for pos in positions:
             symbol = str(pos.get("symbol") or "").strip().upper()
             point_value = _USD_POINT_VALUE_PER_UNIT.get(symbol)
@@ -927,13 +930,27 @@ class Dexter3OpenApiClient:
             if symbol not in spot_cache:
                 try:
                     spot_cache[symbol] = self.get_spot_price(symbol)
-                except Exception:  # noqa: BLE001 - enrichment is best-effort; ANY
+                except Exception as exc:  # noqa: BLE001 - enrichment is best-effort; ANY
                     # spot failure (market closed, stale quote, transport) must
                     # leave the position blind → basket unreliable → HOLD, never
                     # break get_positions itself.
                     spot_cache[symbol] = None
+                    # 2026-07-25 audit fix: this failure used to be COMPLETELY
+                    # silent — no marker, no log. It is not merely lost
+                    # observability: with no netProfit the basket degrades to
+                    # unreliable and the OM HOLDS, so the convex trail, the
+                    # close-stop, the time stop and close-all-in-profit are ALL
+                    # disabled for that tick. A persistent outage was therefore
+                    # an hour of exit-blindness indistinguishable from an
+                    # unknown symbol. The sibling staleness path 20 lines below
+                    # already stamps its rejection; this one now does too.
+                    spot_err_cache[symbol] = str(exc)[:200]
             spot = spot_cache.get(symbol)
             if not spot:
+                err = spot_err_cache.get(symbol)
+                if err is not None:
+                    pos["pnl_source"] = "spot_unavailable"
+                    pos["pnl_spot_error"] = err
                 continue
             # -- independent client-side staleness gate (2026-07-15
             # OM-blindspot fix #1) — see CLIENT_SPOT_MAX_AGE_ENV_VAR's
