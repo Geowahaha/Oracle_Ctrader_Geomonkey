@@ -2199,29 +2199,60 @@ def run_symbol_cycle(
                                 decision, prefix, float(risk_usd_override)
                             )
                             prev_intent = state.get("vp_limit_intent")
-                            replaced = bool(prev_intent)
-                            # vp-funnel instrumentation (2026-07-25): carry the
-                            # journal row id so the intent's final fate can be
-                            # stamped back on the decision that produced it,
-                            # and record the REPLACED fate of the intent this
-                            # one evicts (a signal every M5 close can evict a
-                            # pending intent before it ever fills — the
-                            # suspected 72-for-0 mechanism on vp_poc_reversion).
-                            intent["decision_row_id"] = decision_row_id
-                            if replaced:
-                                _stamp_intent_fate(
-                                    journal, prev_intent, "replaced",
-                                    {"by_row_id": decision_row_id, "at": utc_now_iso()},
-                                )
-                            state["vp_limit_intent"] = intent
-                            log_line(
-                                f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
-                                f"level={intent['level']} sl={intent['sl']} ttl_min="
-                                f"{(intent['deadline_epoch'] - intent['created_epoch']) / 60:.0f} "
-                                f"replaced={replaced}"
+                            # 2026-07-25: the REPLAY THIS LAYER WAS PROVEN ON
+                            # (scripts/dexter3_entry_position_replay.py::_limit_fill)
+                            # evaluates every signal INDEPENDENTLY — each one gets
+                            # its own limit that lives the full window_bars (w6 =
+                            # 30 min = the deployed TTL). The live loop instead
+                            # keeps ONE global slot and lets each new M5 signal
+                            # DESTROY the pending one, so with a signal every 5
+                            # minutes an intent rarely survives a sixth of the TTL
+                            # it was measured with. The 16/16-cell proof therefore
+                            # describes a system we do not run — a single-variable
+                            # implementation shortcut, never itself measured, and
+                            # the leading explanation for vp_poc_reversion's 72
+                            # enter decisions against 0 fills.
+                            # Env-gated (default 0 = legacy clobber) because it
+                            # materially raises fill frequency: enable only on a
+                            # lane that is NOT inside a frozen measurement.
+                            keep_unexpired = (
+                                _env_bool("DEXTER3_LANE_INTENT_KEEP_UNEXPIRED", False)
+                                and isinstance(prev_intent, dict)
+                                and str(prev_intent.get("symbol")) == symbol
+                                and _iso_to_epoch(utc_now_iso()) <= _f(prev_intent.get("deadline_epoch"), 0.0)
                             )
-                            status += ":vp_limit_intent_set"
-                            exec_result = {"action": "limit_intent_set"}
+                            if keep_unexpired:
+                                log_line(
+                                    f"{utc_now_iso()} {symbol} vp_limit_intent_kept "
+                                    f"(unexpired {prev_intent.get('side')} @ {prev_intent.get('level')} "
+                                    f"survives; new {intent['side']} @ {intent['level']} dropped)"
+                                )
+                                status += ":vp_limit_intent_kept_prev"
+                                exec_result = {"action": "limit_intent_kept_prev"}
+                            else:
+                                replaced = bool(prev_intent)
+                                # vp-funnel instrumentation (2026-07-25): carry the
+                                # journal row id so the intent's final fate can be
+                                # stamped back on the decision that produced it,
+                                # and record the REPLACED fate of the intent this
+                                # one evicts (a signal every M5 close can evict a
+                                # pending intent before it ever fills — the
+                                # suspected 72-for-0 mechanism on vp_poc_reversion).
+                                intent["decision_row_id"] = decision_row_id
+                                if replaced:
+                                    _stamp_intent_fate(
+                                        journal, prev_intent, "replaced",
+                                        {"by_row_id": decision_row_id, "at": utc_now_iso()},
+                                    )
+                                state["vp_limit_intent"] = intent
+                                log_line(
+                                    f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
+                                    f"level={intent['level']} sl={intent['sl']} ttl_min="
+                                    f"{(intent['deadline_epoch'] - intent['created_epoch']) / 60:.0f} "
+                                    f"replaced={replaced}"
+                                )
+                                status += ":vp_limit_intent_set"
+                                exec_result = {"action": "limit_intent_set"}
                         else:
                             exec_result = _execute_live_entry(
                                 executor,
@@ -2362,6 +2393,10 @@ def _classify_entry_outcome(status: str) -> tuple[str, str]:
         return "filled", "entered"
     if ":vp_limit_intent_set" in s:
         return "limit_intent", "intent_set"
+    # an older, still-unexpired intent was kept instead of being clobbered
+    # (DEXTER3_LANE_INTENT_KEEP_UNEXPIRED) — this signal produced no intent
+    if ":vp_limit_intent_kept_prev" in s:
+        return "no_exec", "intent_kept_prev"
     for marker, outcome in (
         (":live_blocked_", "blocked"),
         (":governor_", "blocked"),
