@@ -68,6 +68,35 @@ def _position_label(position: Position) -> str:
     return str(position.get("label") or position.get("comment") or "").strip()
 
 
+def _label_in_family(label: str, family: str) -> bool:
+    """True when ``label`` belongs to the ``family`` root.
+
+    Duplicated (not imported) from ``dexter3.executor.label_matches_family``
+    per this module's own "no cross-imports, duplicate small pure logic"
+    convention — the two MUST stay in agreement.
+
+    2026-07-25 audit fix: this was a bare ``label.startswith(family)``, which
+    made the family root "dexter3:dpull" match "dexter3:dpull-cs:canary" — a
+    DIFFERENT LANE, not a version of dpull — so the dpull lane scanned
+    dpull-cs's open positions into its own basket. A ':' segment is the normal
+    boundary; a '-' is honoured only when a version token (``v`` + digit)
+    follows it, which keeps Grok's legacy "dexter3:grok-v1.0:scalper" matching
+    "dexter3:grok" while rejecting "-cs:canary".
+    """
+    label_s = str(label or "")
+    family_s = str(family or "")
+    if not family_s:
+        return False
+    if label_s == family_s:
+        return True
+    if not label_s.startswith(family_s):
+        return False
+    rest = label_s[len(family_s):]
+    if rest[0] == ":":
+        return True
+    return len(rest) >= 3 and rest[0] == "-" and rest[1] == "v" and rest[2].isdigit()
+
+
 def _position_symbol(position: Position) -> str:
     return str(position.get("symbolName") or position.get("symbol") or "").strip().upper()
 
@@ -193,7 +222,7 @@ def lane_positions(
             label = _position_label(position)
         except Exception:  # noqa: BLE001 - never let one malformed row crash the lane scan
             continue
-        if not label.startswith(label_prefix):
+        if not _label_in_family(label, label_prefix):
             continue
         if exclude_label_suffix and _has_label_suffix(label, exclude_label_suffix):
             continue

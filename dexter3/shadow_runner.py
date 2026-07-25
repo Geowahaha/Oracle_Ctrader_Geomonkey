@@ -1807,7 +1807,14 @@ def run_symbol_cycle(
     # no_new_m5_close. weekly_close_policy stays as the time-based backstop.
     if _env_bool("DEXTER3_MARKET_STATE_GATE", False):
         _meta = _cached_symbol_meta(mcp, symbol)
-        _newest_epoch = _iso_to_epoch(str(m5_bars[-1].get("ts") or "")) + M5_BAR_SEC
+        # 2026-07-25 audit fix (fail-OPEN, self-inflicted): _iso_to_epoch
+        # returns the sentinel 0.0 for a missing/unparseable bar timestamp, and
+        # feeding 0.0 + M5_BAR_SEC = 300 to the gate made bar_age ~1.7e9s, i.e.
+        # a bogus "stale_feed" that HALTS entries on every lane running this
+        # gate — inverting market_state's documented fail-OPEN contract. Pass
+        # None (unknown age) instead so the verdict degrades to open.
+        _newest_raw = _iso_to_epoch(str(m5_bars[-1].get("ts") or ""))
+        _newest_epoch = (_newest_raw + M5_BAR_SEC) if _newest_raw > 0 else None
         _ms = market_state.evaluate_market_state(
             now_ts=datetime.now(timezone.utc).timestamp(),
             newest_bar_epoch=_newest_epoch,
@@ -2725,7 +2732,15 @@ def _lane_make_limit_intent(
     # signal TP would cap the +100R convex ride the dtcap matrix measured for
     # "limit -0.5R x convex a2.0 h24" at the day extreme. Hunt lanes (limit x
     # ladder, TP is structural) keep prefer_signal_tp=True unchanged.
-    prefer_signal_tp = not _dpull_producer_enabled()
+    # 2026-07-25 audit fix: this omitted _dpull_cs_producer_enabled(), so the
+    # dpull-cs lane kept decide_daytrend's SIGNAL tp (the day extreme) instead
+    # of the far protective cap its own DEXTER3_VP_FAR_TP_R=12 configures —
+    # truncating the convex ride the lane exists to capture, and making the
+    # dpull vs dpull-cs A/B differ in TP PLACEMENT as well as the close-stop it
+    # was designed to isolate. The producer dispatch already pairs both
+    # predicates; this line was the missed second wiring site (the same defect
+    # class as the chf label bug).
+    prefer_signal_tp = not (_dpull_producer_enabled() or _dpull_cs_producer_enabled())
     return vp_lane.make_limit_intent(
         decision, prefix, risk_usd, utc_now_iso(),
         dip_r=_env_float("DEXTER3_HUNT_LIMIT_DIP_R", 0.4),

@@ -129,7 +129,31 @@ def label_matches_family(label: Any, family: Any) -> bool:
     family_s = str(family or "")
     if not family_s:
         return False
-    return label_s == family_s or label_s.startswith(family_s)
+    if label_s == family_s:
+        return True
+    rest = label_s[len(family_s):] if label_s.startswith(family_s) else ""
+    if not rest:
+        return False
+    # Normal case: the family root is followed by a ':' separated segment
+    # ("dexter3:fable" -> "dexter3:fable:v1.8-size-the-edge").
+    if rest[0] == ":":
+        return True
+    # LEGACY hyphen-versioned labels: Grok separates its VERSION with a hyphen
+    # ("dexter3:grok" -> "dexter3:grok-v1.0:scalper"), so a strictly
+    # colon-bounded rule would stop matching Grok against its own label.
+    #
+    # 2026-07-25 audit fix: the old rule was a bare ``startswith(family)``,
+    # which also made "dexter3:dpull" match "dexter3:dpull-cs:canary" — a
+    # DIFFERENT LANE, not a version of dpull. That let the dpull lane read
+    # dpull-cs's deals and positions as its own (premature LOSS_STOPPED on a
+    # peer's losses, foreign legs dragging its basket aggregate) and it
+    # contaminated the very forward A/B those two lanes existed to run. The
+    # hyphen is therefore honoured ONLY when what follows is a version token
+    # (``v`` + digit), which admits "-v1.0..." and rejects "-cs:canary"
+    # without hardcoding any lane name.
+    if len(rest) >= 3 and rest[0] == "-" and rest[1] == "v" and rest[2].isdigit():
+        return True
+    return False
 
 
 # Known family roots this module can recognize on an arbitrary CURRENT
