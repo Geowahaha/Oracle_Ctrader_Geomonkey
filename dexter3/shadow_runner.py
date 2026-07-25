@@ -75,6 +75,7 @@ from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.weekly_risk import weekly_close_policy
 from dexter3 import market_state
+from dexter3 import stop_floor
 from dexter3 import vp_lane
 from dexter3 import channelfade
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
@@ -1983,6 +1984,12 @@ def run_symbol_cycle(
                 symbol, None, prefix, m15_ctx, h1_ctx, journal_stats=journal_stats if is_newest else None
             )
         if decision.action == "enter":
+            # Volatility-normalized SL floor (2026-07-25 whole-project audit —
+            # the #1 measured edge: SL<1.2xTR = -0.398R vs SL>=1.2xTR = +0.116R,
+            # 4/4 refutation controls passed). Runs FIRST so every downstream
+            # reader (pa_eye, gates, sizing, executor) and the journal row below
+            # all see the FINAL geometry. Off by default; see _apply_sl_floor.
+            _apply_sl_floor(decision, prefix)
             # Price Action Eye Phase A shadow (2026-07-15, additive): MUST
             # run before insert_decision just below so the journaled
             # features_json snapshot captures pa_eye automatically (see
@@ -2234,6 +2241,82 @@ def run_symbol_cycle(
             status += f":late{int(late_sec)}s"
         statuses.append(status)
     return ";".join(statuses)
+
+
+def _apply_sl_floor(decision: hunter_brain.Decision, prefix: list[dict[str, Any]]) -> None:
+    """Widen a too-tight stop to a volatility-normalized floor, preserving RR.
+
+    THE #1 finding of the 2026-07-25 whole-project audit and the only pre-trade
+    discriminator that survived refutation (4/4 controls): trades entered with
+    ``SL < 1.2 x true range`` averaged **-0.398R** (N=30) while ``SL >= 1.2x``
+    averaged **+0.116R** (N=25). The mechanism is measured, not fitted — the
+    tight cohort reached its take-profit only 6-8% of the time vs 27-29% for
+    the wide cohort *at comparable planned RR*, the opposite of what a random
+    walk implies, i.e. the tight stops were being taken out by noise before the
+    thesis could resolve (38 of 105 trades died inside 15 minutes at -1.110R
+    with a median peak MFE of just 0.23R).
+
+    This is ONE root cause the project previously fixed four separate times as
+    four per-lane diseases (dpull intrabar stop, fable sweep wick-SL, dpull-cs
+    close-stop, the 07-25 -9.56 h1_context loss). It is therefore implemented
+    in ONE central place on the shared run loop rather than in each of the four
+    producers — deliberately avoiding the "wiring lives in N places, one was
+    missed" defect class that has bitten this repo repeatedly.
+
+    Env (default OFF => byte-identical behaviour):
+      DEXTER3_SL_FLOOR_TR_MULT   floor = mult x median true range (0 = off)
+      DEXTER3_SL_FLOOR_MAX_ABS   hard ceiling on the widened stop distance.
+                                 At the XAU 1-ounce volume floor dollar risk ==
+                                 stop distance, and the executor REFUSES when
+                                 that exceeds DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD
+                                 (9-12 on the live units) — so this bound keeps
+                                 a volatile bar widening the stop as far as is
+                                 affordable instead of silently converting the
+                                 trade into a refusal, which would confound
+                                 "better stops" with "fewer trades" in the
+                                 forward measurement.
+      DEXTER3_SL_FLOOR_LOOKBACK  bars for the median TR (default 14)
+
+    Always stamps ``features["sl_floor"]`` — including when it does nothing —
+    so the journal can PROVE the path executed on live data (the audit's #1
+    defect class was flags that were set but never actually ran). Never raises.
+    """
+    try:
+        mult = _env_float("DEXTER3_SL_FLOOR_TR_MULT", 0.0)
+        if mult <= 0.0:
+            return
+        if not isinstance(getattr(decision, "features", None), dict):
+            return
+        lookback = int(_env_float("DEXTER3_SL_FLOOR_LOOKBACK", 14.0))
+        tr = stop_floor.median_true_range(prefix, lookback=lookback)
+        out = stop_floor.apply_floor(
+            side=str(getattr(decision, "side", "") or ""),
+            entry=_f(getattr(decision, "entry", 0.0)),
+            sl=_f(getattr(decision, "sl", 0.0)),
+            tp=_f(getattr(decision, "tp", 0.0)),
+            tr=tr,
+            mult=mult,
+            max_sl_abs=_env_float("DEXTER3_SL_FLOOR_MAX_ABS", 0.0),
+        )
+        if out is None:
+            decision.features["sl_floor"] = {"applied": False, "tr": round(tr, 5), "mult": mult}
+            return
+        before_sl, before_tp = decision.sl, decision.tp
+        decision.sl = out["sl"]
+        decision.tp = out["tp"]
+        decision.features["sl_floor"] = out["meta"]
+        decision.reasons = list(getattr(decision, "reasons", []) or []) + [
+            f"sl_floor: {out['meta']['sl_dist_before']:.2f}->{out['meta']['sl_dist_after']:.2f} "
+            f"({out['meta']['sl_over_tr_before']:.2f}->{out['meta']['sl_over_tr_after']:.2f} xTR), RR preserved"
+        ]
+        log_line(
+            f"{utc_now_iso()} {decision.symbol} sl_floor_applied side={decision.side} "
+            f"tr={tr:.3f} sl {before_sl}->{decision.sl} tp {before_tp}->{decision.tp} "
+            f"dist {out['meta']['sl_dist_before']:.2f}->{out['meta']['sl_dist_after']:.2f} "
+            f"capped={out['meta']['capped_by_max_abs']}"
+        )
+    except Exception as exc:  # noqa: BLE001 - geometry tuning must never kill a cycle
+        log_line(f"{utc_now_iso()} sl_floor_failed (decision left unchanged): {exc}")
 
 
 def _classify_entry_outcome(status: str) -> tuple[str, str]:
