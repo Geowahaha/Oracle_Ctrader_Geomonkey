@@ -67,6 +67,7 @@ sign-off + a second independent window.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from bisect import bisect_left
 from pathlib import Path
@@ -90,6 +91,36 @@ from scripts.dexter3_convex_exit_replay import (  # noqa: E402
 )
 from scripts.dexter3_geometry_optimizer import _equity  # noqa: E402
 from dexter3 import hunt_mode, market_lens, volume_profile  # noqa: E402
+
+
+def _load_unit_env(unit_path: str) -> dict[str, str]:
+    """Import ``Environment=K=V`` lines from a systemd unit into os.environ.
+
+    2026-07-26 replay-vs-live audit: this harness imports ``hunt_mode`` in a
+    shell that exports none of the DEXTER3_HUNT_W_* committee weights, so every
+    offline proof scored the DEFAULT committee (total 8.5) while the deployed
+    lane runs a re-weighted one (total 8.0) — and conviction (= leader_score,
+    the number every gate threshold is expressed in) is |sum| / TOTAL. Feeding
+    the real unit in makes the run measure the committee that is actually
+    deployed. Only DEXTER3_* keys are imported, and only ones not already set,
+    so an explicit shell export still wins.
+    """
+    applied: dict[str, str] = {}
+    with open(unit_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line.startswith("Environment="):
+                continue
+            kv = line[len("Environment="):].strip().strip('"')
+            if "=" not in kv:
+                continue
+            key, _, val = kv.partition("=")
+            key, val = key.strip(), val.strip()
+            if not key.startswith("DEXTER3_") or key in os.environ:
+                continue
+            os.environ[key] = val
+            applied[key] = val
+    return applied
 from dexter3.sd_zones import SDZoneEngine, decide_sdzone  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
 
@@ -97,6 +128,11 @@ from dexter3.transport import make_client  # noqa: E402
 _ZONE_PREM_CAP = [0.0]   # set from --zone-prem-cap in main()
 _CONFIRM_QUALITY = [""]  # ""|wick|engulf|wick-or-engulf -- --confirm-quality
 _CONFIRM_WICK_K = [0.33]  # rejection wick >= K x bar range -- --confirm-wick-k
+# "hybrid" entry model (2026-07-24): a limit that MISSES enters at MARKET at
+# the expiry bar's close (the strong trend ran away without offering the
+# -dip_r discount) instead of forgoing the runner -- the +188R miss_cf hunt.
+# Driven per-entry via the "hybrid" model (not a global), so a single run can
+# score limit-only vs hybrid side by side.
 _CONFIRM_VOL_K = [0.0]   # confirm bar volume >= K x volMA20 (0=off) -- --confirm-vol
 
 
@@ -410,19 +446,36 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
     base_idx = 0
     if entry_model == "market":
         sim_entry, sim_sl, sim_future = entry, sl, future
-    elif entry_model == "limit":
+    elif entry_model in ("limit", "hybrid"):
         status, fill_price, fill_idx = _limit_fill(side, entry, sl, future, dip_r, window_bars)
         if status == "miss":
-            return "miss_no_touch", None, None
-        sim_entry, sim_sl = float(fill_price), sl
-        new_risk = abs(sim_entry - sim_sl)
-        if new_risk <= 0:
-            return "skip", None, None
-        cost = spread_abs / new_risk + commission_r
-        if status == "filled_stopped":
-            return "taken", -1.0 - cost, fill_idx
-        base_idx = fill_idx + 1
-        sim_future = future[base_idx:]
+            if entry_model != "hybrid":
+                return "miss_no_touch", None, None
+            # HYBRID (2026-07-24, the +188R miss_cf hunt): the -dip_r limit never
+            # filled -> a strong continuation ran away without offering the
+            # discount, exactly the biggest winners. Enter at MARKET at the
+            # EXPIRY bar's close (honest: the real price after the TTL wait, NOT
+            # the optimistic signal-close counterfactual). SL unchanged. On a
+            # miss the price never crossed the limit, so it never crossed the SL
+            # beyond it either -> sim_entry is always on the correct side of sl.
+            exp_idx = min(window_bars - 1, len(future) - 1)
+            if exp_idx < 0:
+                return "miss_no_touch", None, None
+            sim_entry, sim_sl = float(future[exp_idx].get("close", entry)), sl
+            if abs(sim_entry - sim_sl) <= 0:
+                return "skip", None, None
+            base_idx = exp_idx + 1
+            sim_future = future[base_idx:]
+        else:
+            sim_entry, sim_sl = float(fill_price), sl
+            new_risk = abs(sim_entry - sim_sl)
+            if new_risk <= 0:
+                return "skip", None, None
+            cost = spread_abs / new_risk + commission_r
+            if status == "filled_stopped":
+                return "taken", -1.0 - cost, fill_idx
+            base_idx = fill_idx + 1
+            sim_future = future[base_idx:]
     elif entry_model == "zone":  # touch + real-break check + reversal confirmation
         status, fill_price, fill_idx = _zone_confirm_entry(side, entry, sl, future,
                                                            dip_r, window_bars,
@@ -475,7 +528,8 @@ def _trade_r(trade: dict, entry_model: str, dip_r: float, window_bars: int,
                                              exit_params["arm_at"], exit_params["giveback_atr"],
                                              atr, max_hold,
                                              close_stop=exit_params.get("close_stop", False),
-                                             close_stop_hard_mult=exit_params.get("close_stop_hard_mult", 0.0))
+                                             close_stop_hard_mult=exit_params.get("close_stop_hard_mult", 0.0),
+                                             close_stop_vol_gate=exit_params.get("close_stop_vol_gate", 0.0))
     return "taken", r - cost, base_idx + max(0, int(held))
 
 
@@ -532,7 +586,9 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
                     buffer_atr: float = 0.1, min_hours: float = 1.0,
                     max_risk_atr: float = 2.0, range_cap_atr: float = 0.0,
                     last_entry_hour: float = 0.0,
-                    cap_pullback_bypass_atr: float = 0.0) -> dict | None:
+                    cap_pullback_bypass_atr: float = 0.0,
+                    min_rr: float = 0.0, resume_body: float = 0.0,
+                    resume_clv: float = 0.0, resume_vol: float = 0.0) -> dict | None:
     """WITH-BIAS continuation producer (owner live lesson 2026-07-16: a
     40-pt sell-only day where every counter-trend producer was correctly
     bias-blocked and every with-trend hunt signal was gate-blocked — the
@@ -561,6 +617,19 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
         return None
     last = m5_prefix[-1]
     o, c = float(last.get("open", 0.0)), float(last.get("close", 0.0))
+    # RESUME-BAR AGGRESSION (2026-07-24 order-flow hunt): read WHO won the
+    # resume bar from its anatomy (leading, not a lagging indicator) -- a real
+    # continuation resume is a trend bar (strong body) that closes toward the
+    # bias extreme (close-location) on participation (volume), i.e. buyers are
+    # in control THROUGH the bar; a weak/doji resume right off a rejection is
+    # not. Lets an entry at the extreme be TAKEN when flow is advantageous.
+    h_last, l_last = float(last.get("high", 0.0)), float(last.get("low", 0.0))
+    rng_last = h_last - l_last
+    body_last = abs(c - o) / rng_last if rng_last > 0 else 0.0
+    clv_last = (c - l_last) / rng_last if rng_last > 0 else 0.5  # 0=at low, 1=at high
+    vol_last = float(last.get("volume", 0.0) or 0.0)
+    vol_avg = (sum(float(b.get("volume", 0.0) or 0.0) for b in m5_prefix[-21:-1]) / 20.0
+               ) if len(m5_prefix) >= 21 else 0.0
     # bars since the day anchor (approx: use trailing window of the day so
     # far — the bias hours tell us how deep to look)
     day_bars = min(len(m5_prefix), max(swing_bars + 2, int(hrs * 12) + 1))
@@ -586,10 +655,18 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
         resumes = c < o                       # red close = resuming down
         if not (pullback >= pull_atr * atr and resumes):
             return None
+        if resume_body > 0 and body_last < resume_body:
+            return None
+        if resume_clv > 0 and clv_last > (1.0 - resume_clv):   # sell: close near LOW
+            return None
+        if resume_vol > 0 and vol_avg > 0 and vol_last < resume_vol * vol_avg:
+            return None
         swing_hi = max(float(b.get("high", 0.0)) for b in m5_prefix[-swing_bars:])
         sl = swing_hi + buffer_atr * atr
         risk = sl - c
         if risk <= 0 or risk > max_risk_atr * atr:
+            return None
+        if min_rr > 0 and pullback < min_rr * risk:   # reward(=pullback) to extreme too small
             return None
         return {"side": "sell", "entry": c, "sl": sl, "tp": extreme}
     extreme = max(float(b.get("high", 0.0)) for b in day)
@@ -597,10 +674,18 @@ def decide_daytrend(m5_prefix: list, bias_row: dict, atr: float,
     resumes = c > o
     if not (pullback >= pull_atr * atr and resumes):
         return None
+    if resume_body > 0 and body_last < resume_body:
+        return None
+    if resume_clv > 0 and clv_last < resume_clv:               # buy: close near HIGH
+        return None
+    if resume_vol > 0 and vol_avg > 0 and vol_last < resume_vol * vol_avg:
+        return None
     swing_lo = min(float(b.get("low", 0.0)) for b in m5_prefix[-swing_bars:])
     sl = swing_lo - buffer_atr * atr
     risk = c - sl
     if risk <= 0 or risk > max_risk_atr * atr:
+        return None
+    if min_rr > 0 and pullback < min_rr * risk:   # reward(=pullback) to extreme too small
         return None
     return {"side": "buy", "entry": c, "sl": sl, "tp": extreme}
 
@@ -850,6 +935,10 @@ def _print_row(dir_mode: str, label: str, d: dict | None, v: dict | None, v_days
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="XAUUSD")
+    ap.add_argument("--unit", default="",
+                    help="systemd unit to import DEXTER3_* env from BEFORE scoring "
+                         "(semantic parity: makes the run use the committee weights / "
+                         "flags the lane actually deploys). e.g. ops/dexter3-fable.service")
     ap.add_argument("--count", type=int, default=6000)
     ap.add_argument("--split", type=float, default=0.6)
     ap.add_argument("--spread-abs", type=float, default=0.12)
@@ -910,8 +999,38 @@ def main() -> int:
     ap.add_argument("--chf-tp-frac", type=float, default=0.5,
                     help="channelfade TP as fraction of box height from the faded edge "
                          "(0.5=mid primary, 0.85=near opposite edge secondary)")
+    ap.add_argument("--chf-window", type=int, default=36,
+                    help="channelfade: trailing M5 bars defining the box")
+    ap.add_argument("--chf-max-eff", type=float, default=0.35,
+                    help="channelfade selectivity: max directional efficiency "
+                         "|drift|/H (lower = stricter sideways-only; the range-regime gate)")
+    ap.add_argument("--chf-min-touches", type=int, default=2,
+                    help="channelfade selectivity: min bar-touches of EACH edge band")
+    ap.add_argument("--chf-min-h-atr", type=float, default=1.5,
+                    help="channelfade: min box height in ATR (too tight = spread noise)")
+    ap.add_argument("--chf-max-h-atr", type=float, default=4.0,
+                    help="channelfade: max box height in ATR (too wide = trending)")
     ap.add_argument("--drev-arm-atr", type=float, default=12.0,
                     help="dayreversal: capitulation arming threshold (day range in ATR)")
+    ap.add_argument("--dt-min-rr", type=float, default=0.0,
+                    help="daytrend RR floor (2026-07-24 blind-spot fix): skip a "
+                         "continuation whose reward to the day-extreme TP < this x "
+                         "risk (near the extreme = buying the top under resistance). "
+                         "0 = off")
+    ap.add_argument("--dt-resume-body", type=float, default=0.0,
+                    help="daytrend resume-bar aggression: min body_ratio (|c-o|/range) "
+                         "of the resume bar -- a trend bar = buyers/sellers in control; "
+                         "a doji = no conviction. 0 = off (order-flow entry hunt)")
+    ap.add_argument("--dt-resume-clv", type=float, default=0.0,
+                    help="daytrend resume close-location: buy needs close >= this in "
+                         "the bar range (near high), sell <= 1-this (near low). 0 = off")
+    ap.add_argument("--dt-resume-vol", type=float, default=0.0,
+                    help="daytrend resume participation: resume-bar volume >= this x the "
+                         "trailing 20-bar avg. 0 = off")
+    ap.add_argument("--dt-pull", type=float, default=0.8,
+                    help="daytrend: min pullback off the day extreme in ATR "
+                         "to arm a continuation entry (0.8 = live default; "
+                         "higher = sharper/deeper-only setups)")
     ap.add_argument("--dt-range-cap-atr", type=float, default=0.0,
                     help="daytrend G1: skip entries once the day's high-low range "
                          "exceeds this x ATR (0=off) -- capitulation exhaustion guard")
@@ -932,13 +1051,39 @@ def main() -> int:
                     help="comma list of hard-backstop multiples (e.g. 0.5,1.0): add a "
                          "CLOSE-STOP-CAP row per combo where an intrabar move cap*risk "
                          "beyond sl hard-exits at -(1+cap)R -- wick-immune but crash-capped")
+    ap.add_argument("--convex-close-stop-vol-gate", default="",
+                    help="comma list of ATR multiples (e.g. 1.5,2.0,2.5): add a "
+                         "CLOSE-STOP-VG row per combo where the breaching bar reverts to "
+                         "the intrabar -1R cut when its range > vg*ATR (crash bar), else "
+                         "keeps close-stop wick-immunity (calm/ranging bar)")
     ap.add_argument("--no-overlap", action="store_true",
                     help="model a SINGLE-POSITION lane: a signal is skipped while a prior "
                          "trade is still open -- the lane-realistic number (overlapping "
                          "signals otherwise overstate one lane capture)")
+    ap.add_argument("--hybrid-variants", default="",
+                    help="dip_r:window_bars HYBRID-entry variants (2026-07-24): a "
+                         "limit at -dip_r that MISSES within the window enters at "
+                         "MARKET at the expiry bar's close instead of forgoing the "
+                         "runaway trend -- captures the +188R the limit misses")
     ap.add_argument("--base-risk-usd", type=float, default=12.0)
     ap.add_argument("--min-derive-trades", type=int, default=60)
     args = ap.parse_args()
+    if args.unit:
+        applied = _load_unit_env(args.unit)
+        weights = hunt_mode.reload_weights()
+        print(f"[unit-env] {args.unit}: imported {len(applied)} DEXTER3_* keys")
+        print(f"[unit-env] committee TOTAL_WEIGHT={weights['TOTAL_COMMITTEE_WEIGHT']:.2f} "
+              + " ".join(f"{k.replace('WEIGHT_','')}={v:g}"
+                         for k, v in weights.items() if k != "TOTAL_COMMITTEE_WEIGHT"))
+        for k in ("DEXTER3_HUNT_SWEEP_FOLLOW", "DEXTER3_HUNT_SWING_MIN_EXT",
+                  "DEXTER3_HUNT_SWEEP_SL_ATR", "DEXTER3_HUNT_SWEEP_TP_RR",
+                  "DEXTER3_SL_FLOOR_TR_MULT"):
+            if os.environ.get(k):
+                print(f"[unit-env]   {k}={os.environ[k]}")
+    else:
+        print("[unit-env] NOT USED — scoring the DEFAULT committee "
+              f"(TOTAL_WEIGHT={hunt_mode.TOTAL_COMMITTEE_WEIGHT:.2f}); "
+              "pass --unit ops/dexter3-<lane>.service for semantic parity with live")
 
     _ZONE_PREM_CAP[0] = args.zone_prem_cap
     _CONFIRM_QUALITY[0] = args.confirm_quality
@@ -1041,14 +1186,23 @@ def main() -> int:
         if args.producer in ("daytrend", "dayreversal", "channelfade"):
             if args.producer == "daytrend":
                 sig = decide_daytrend(prefix, bias_rows[i], atr,
+                                      pull_atr=args.dt_pull,
                                       range_cap_atr=args.dt_range_cap_atr,
                                       last_entry_hour=args.dt_last_hour,
-                                      cap_pullback_bypass_atr=args.dt_cap_bypass_atr)
+                                      cap_pullback_bypass_atr=args.dt_cap_bypass_atr,
+                                      min_rr=args.dt_min_rr,
+                                      resume_body=args.dt_resume_body,
+                                      resume_clv=args.dt_resume_clv,
+                                      resume_vol=args.dt_resume_vol)
             elif args.producer == "dayreversal":
                 sig = decide_dayreversal(prefix, bias_rows[i], atr,
                                          range_arm_atr=args.drev_arm_atr)
             else:
-                sig = decide_channelfade(prefix, atr, tp_frac=args.chf_tp_frac)
+                sig = decide_channelfade(prefix, atr, tp_frac=args.chf_tp_frac,
+                                         window=args.chf_window, max_eff=args.chf_max_eff,
+                                         min_touches=args.chf_min_touches,
+                                         min_h_atr=args.chf_min_h_atr,
+                                         max_h_atr=args.chf_max_h_atr)
             if sig is None:
                 continue
             from types import SimpleNamespace
@@ -1090,6 +1244,12 @@ def main() -> int:
             continue
         dip_s, win_s = part.strip().split(":")
         zone_variants.append((float(dip_s), int(win_s)))
+    hybrid_variants = []
+    for part in args.hybrid_variants.split(","):
+        if not part.strip():
+            continue
+        dip_s, win_s = part.strip().split(":")
+        hybrid_variants.append((float(dip_s), int(win_s)))
     zone_m1_variants = []
     for part in args.zone_m1_variants.split(","):
         if not part.strip():
@@ -1140,11 +1300,20 @@ def main() -> int:
                 exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh} CLOSE-STOP-CAP{cap:g}", "convex",
                               {"arm_at": arm, "giveback_atr": gb, "close_stop": True,
                                "close_stop_hard_mult": cap}, mh))
+            for vg in (float(x) for x in args.convex_close_stop_vol_gate.split(",") if x.strip()):
+                # close-stop gated by the breaching bar's range vs ATR: a bar
+                # bigger than vg*ATR reverts to the intrabar -1R cut (crash),
+                # calm bars keep close-stop wick-immunity (ranging).
+                exits.append((f"convex a{arm:.1f} gb{gb:.1f} h{mh} CLOSE-STOP-VG{vg:g}", "convex",
+                              {"arm_at": arm, "giveback_atr": gb, "close_stop": True,
+                               "close_stop_vol_gate": vg}, mh))
     entries: list[tuple[str, str, float, int]] = [("market", "market", 0.0, 0)]
     for dip, win in limit_variants:
         entries.append((f"limit -{dip:.1f}R w{win}", "limit", dip, win))
     for dip, win in zone_variants:
         entries.append((f"zone -{dip:.1f}R w{win}", "zone", dip, win))
+    for dip, win in hybrid_variants:
+        entries.append((f"hybrid -{dip:.1f}R w{win}", "hybrid", dip, win))
     for dip, win in zone_m1_variants:
         entries.append((f"zoneM1 -{dip:.1f}R w{win}", "zone_m1", dip, win))
 

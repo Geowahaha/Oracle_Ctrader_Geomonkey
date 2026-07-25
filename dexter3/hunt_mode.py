@@ -79,6 +79,48 @@ TOTAL_COMMITTEE_WEIGHT = (
     + WEIGHT_H1_CONTEXT
 )
 
+_WEIGHT_ENV = (
+    ("WEIGHT_CLOSE_LOCATION_PRESSURE", "DEXTER3_HUNT_W_CLP", 1.0),
+    ("WEIGHT_SWING_STRUCTURE", "DEXTER3_HUNT_W_SWING", 1.2),
+    ("WEIGHT_DAY_RANGE_TILT", "DEXTER3_HUNT_W_TILT", 1.0),
+    ("WEIGHT_DISPLACEMENT", "DEXTER3_HUNT_W_DISP", 0.8),
+    ("WEIGHT_COMPRESSION_RELEASE", "DEXTER3_HUNT_W_COMP", 0.8),
+    ("WEIGHT_M15_DRIFT", "DEXTER3_HUNT_W_M15", 1.3),
+    ("WEIGHT_SWEEP_RECLAIM_OVERRIDE", "DEXTER3_HUNT_W_SWEEP", 1.5),
+    ("WEIGHT_H1_CONTEXT", "DEXTER3_HUNT_W_H1", 0.9),
+)
+
+
+def reload_weights() -> dict[str, float]:
+    """Re-read every ``DEXTER3_HUNT_W_*`` from the CURRENT environment.
+
+    2026-07-26 replay-vs-live audit: these weights are bound at IMPORT time,
+    and the replay harness imports this module in a shell that exports none of
+    them — so every offline proof scored the DEFAULT committee (total 8.5)
+    while the deployed fable lane runs a re-weighted one (total 8.0, TILT 1.3 /
+    DISP 0.4 / COMP 0.4 / SWEEP 1.0 / H1 1.4). ``conviction`` is
+    ``|weighted_sum| / TOTAL_COMMITTEE_WEIGHT`` and conviction IS
+    ``leader_score``, the number every gate threshold (min_leader_score 0.18,
+    B-tier 0.15, A+ bands, governor bypass 0.74) is expressed in — so the two
+    were not merely differently tuned, they scored different distributions.
+
+    Calling this after setting the env (see the replay's ``--unit``) makes an
+    offline run measure the committee that is actually deployed. Returns the
+    effective weights so a caller can print/assert them. Live behaviour is
+    unchanged: the module still self-initialises at import.
+    """
+    total = 0.0
+    out: dict[str, float] = {}
+    g = globals()
+    for name, env, default in _WEIGHT_ENV:
+        val = _env_f(env, default)
+        g[name] = val
+        out[name] = val
+        total += val
+    g["TOTAL_COMMITTEE_WEIGHT"] = total
+    out["TOTAL_COMMITTEE_WEIGHT"] = total
+    return out
+
 # ---------------------------------------------------------------------------
 # FIX 3 (2026-07-07) — trend-agreement conviction guard constants
 # ---------------------------------------------------------------------------
@@ -554,6 +596,62 @@ def _nearest_opposing_swing(
     return None
 
 
+def _sweep_follow_enabled() -> bool:
+    """FOLLOW-mode sweep voting (2026-07-24 flip). Mirrors _vote_sweep_reclaim."""
+    return str(os.environ.get("DEXTER3_HUNT_SWEEP_FOLLOW", "")).strip().lower() not in (
+        "", "0", "false", "no", "off"
+    )
+
+
+def _apply_sweep_follow_geometry(
+    side: str, entry: float, sl: float, tp: float,
+    m5_bars: list[Bar], spread_abs: float,
+) -> tuple[float, float, dict[str, Any]]:
+    """Apply the geometry the sweep-FOLLOW edge was actually measured with.
+
+    The 3-window isolated backtest that justified flipping sweep_reclaim from
+    FADE to FOLLOW entered with **SL = sl_atr x ATR** and **TP = tp_rr x R**
+    (expR +0.067/+0.224/+0.096 across windows). Those two knobs shipped on the
+    fable unit but were only ever read by ``hunter_brain`` -- the offline path
+    -- so live kept the generic swing-clamped SL and the 1.2 RR floor and was
+    trading a different geometry than the one that was proven.
+
+    Both knobs default to 0 = OFF, so this is inert unless deployed. The SL is
+    never tightened below the spread-cost floor, and TP is never brought closer
+    than the module's own RR floor.
+    """
+    sl_atr = _env_f("DEXTER3_HUNT_SWEEP_SL_ATR", 0.0)
+    tp_rr = _env_f("DEXTER3_HUNT_SWEEP_TP_RR", 0.0)
+    if sl_atr <= 0.0 and tp_rr <= 0.0:
+        return sl, tp, {}
+    tr_q50, _tr_q90 = _tr_quantiles(m5_bars)
+    detail: dict[str, Any] = {"applied": True, "tr_q50": tr_q50}
+
+    new_sl = sl
+    if sl_atr > 0.0 and tr_q50 > 0.0:
+        dist = max(sl_atr * tr_q50, MIN_SL_SPREAD_MULT * spread_abs)
+        new_sl = entry - dist if side == "buy" else entry + dist
+        detail["sl_atr"] = sl_atr
+        detail["sl_distance"] = dist
+
+    new_tp = tp
+    if tp_rr > 0.0:
+        risk = abs(entry - new_sl)
+        if risk > 0.0:
+            rr = max(tp_rr, MIN_REWARD_RISK)
+            tp_dist = rr * risk * (1.0 + _RR_ROUNDING_SAFETY_MARGIN)
+            new_tp = entry + tp_dist if side == "buy" else entry - tp_dist
+            detail["tp_rr"] = rr
+            detail["tp_distance"] = tp_dist
+
+    # never return inverted geometry
+    if side == "buy" and not (new_sl < entry < new_tp):
+        return sl, tp, {}
+    if side == "sell" and not (new_tp < entry < new_sl):
+        return sl, tp, {}
+    return new_sl, new_tp, detail
+
+
 def _compute_sl(
     side: str, entry: float, lens: dict[str, Any], m5_bars: list[Bar], spread_abs: float
 ) -> tuple[float, dict[str, Any]]:
@@ -804,6 +902,22 @@ def decide_hunt(
     entry = _f(m5_bars[-1].get("close"))
     sl, sl_detail = _compute_sl(side, entry, lens_computed, m5_bars, spread_abs)
     tp, tp_detail = _compute_tp(side, entry, sl, lens_computed, spread_abs)
+    # 2026-07-26 replay-vs-live audit: DEXTER3_HUNT_SWEEP_SL_ATR /
+    # DEXTER3_HUNT_SWEEP_TP_RR were deployed on the fable unit but read ONLY in
+    # hunter_brain.py -- the OFFLINE path -- so they were dead here, a verbatim
+    # repeat of the 2026-07-24 _try_sweep_reclaim_setup incident. The sweep
+    # FADE->FOLLOW edge was MEASURED with SL = 1x ATR and TP = 1.5R; live was
+    # trading it on the generic swing-clamped SL and the 1.2 RR floor, i.e.
+    # the proven edge was not the deployed edge. Applies only when the sweep
+    # voter actually won the committee AND follow-mode is on; both envs unset
+    # => unchanged behaviour.
+    if dominant == "sweep_reclaim" and _sweep_follow_enabled():
+        sl, tp, sweep_geo = _apply_sweep_follow_geometry(
+            side, entry, sl, tp, m5_bars, spread_abs
+        )
+        if sweep_geo:
+            sl_detail = {**sl_detail, "sweep_follow": sweep_geo}
+            tp_detail = {**tp_detail, "sweep_follow": sweep_geo}
 
     size_class = "small" if conviction >= CONVICTION_SMALL_FLOOR else "scout"
     base_p_win_est = round(_clip(P_WIN_BASE + P_WIN_CONVICTION_SLOPE * conviction, 0.0, 1.0), 4)

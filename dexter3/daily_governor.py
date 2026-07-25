@@ -68,6 +68,13 @@ class GovernorConfig:
     # Effective PnL falling to/below -daily_loss_usd -> LOSS_STOPPED: close
     # everything, protect capital, no more entries until next UTC day.
     daily_loss_usd: float = 50.0
+    # 2026-07-26 replay-vs-live audit: when True the TARGET lock reads REALIZED
+    # PnL only, so an open runner is not liquidated the moment its UNREALIZED
+    # profit touches the daily target. Intended for trail/convex lanes, whose
+    # entire measured edge lives in the >=3R tail that a floating-basis lock
+    # amputates (see status()'s comment for the numbers). The LOSS cap keeps
+    # counting floating either way. Default False = prior behaviour.
+    target_ignores_floating: bool = False
     # Base risk per entry = capital_usd * base_risk_frac (~$12 at defaults).
     base_risk_frac: float = 0.012
     # Absolute per-entry risk ceiling regardless of streak/session multipliers
@@ -120,10 +127,29 @@ class DailyGovernor:
         """
         cfg = self.config
         effective = float(day_pnl_usd) + float(floating_pnl_usd)
-        if effective >= cfg.daily_target_usd:
+        # 2026-07-26 replay-vs-live audit — TARGET side only:
+        # counting FLOATING toward the TARGET amputates the exact distribution
+        # a convex/trail lane exists to harvest. Measured: canary lanes run
+        # 1R ~ $4 with daily_target_usd=15, so TARGET_LOCKED fires at ~+3.75R
+        # of UNREALIZED profit and closes every position at market — while the
+        # convex trail only arms at 2.0R and its floor does not turn positive
+        # until peak ~3R, and the convex proof's whole net comes from the 16.2%
+        # of trades that reach >=3R (mean MFE 6.11R, max 20.64R). Worse, once
+        # the day has realized profit the lock fires even lower (with $10
+        # realized: +1.25R floating, BELOW the arm threshold) so the trail
+        # becomes mathematically unreachable and the lane silently runs a tiny
+        # fixed take-profit. Live ledger agrees: governor_target_lock is 14.7%
+        # of all gross profit while om_convex_time_stop fired twice.
+        # ``target_ignores_floating`` lets a trail lane bank the TARGET only on
+        # REALIZED money, so open runners are managed by the trail they were
+        # proven with. The LOSS side deliberately still counts floating — a
+        # day must never bleed past the cap because "it hasn't closed yet".
+        target_basis = float(day_pnl_usd) if cfg.target_ignores_floating else effective
+        if target_basis >= cfg.daily_target_usd:
             state = STATE_TARGET_LOCKED
             reason = (
-                f"effective_pnl {effective:.2f} >= daily_target {cfg.daily_target_usd:.2f} "
+                f"{'realized' if cfg.target_ignores_floating else 'effective'}_pnl "
+                f"{target_basis:.2f} >= daily_target {cfg.daily_target_usd:.2f} "
                 "-> mission complete, locking profit"
             )
         elif effective <= -cfg.daily_loss_usd:

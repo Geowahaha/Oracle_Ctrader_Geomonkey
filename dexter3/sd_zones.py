@@ -163,11 +163,57 @@ def rolling_indicators(bars: list) -> tuple[list, list]:
     return atr14, volma
 
 
-def zones_from_prefix(bars: list) -> tuple["SDZoneEngine", float]:
-    """Run the engine over an entire (live) prefix and return it with the
-    newest ATR14 — the stateless live entry point."""
-    eng = SDZoneEngine()
+_PERSISTENT_ENGINE: dict[str, "SDZoneEngine"] = {}
+_PERSISTENT_LAST_TS: dict[str, str] = {}
+
+
+def zones_from_prefix(bars: list, persist_key: str = "") -> tuple["SDZoneEngine", float]:
+    """Run the engine over a (live) prefix and return it with the newest ATR14.
+
+    2026-07-26 replay-vs-live audit — THE sdzone divergence. The proof
+    (``scripts/dexter3_entry_position_replay.py``) advances ONE ``SDZoneEngine``
+    continuously across the whole 6k-14k-bar series, so a zone can live for a
+    measured median of ~415 bars (p95 ~1460). Live called this function fresh
+    every M5 close over a 340-bar prefix, throwing the engine away each time —
+    hard-capping zone age at ~313 bars and yielding roughly half the zone
+    density. Measured on identical bars: **36 replay signals vs 29 live, 7
+    replay-only, 0 live-only** — i.e. ~19% of the proven trade population is
+    structurally unreachable in production, and the surviving subset is not a
+    random sample (the ``_overlaps``/spacing accept pattern differs too).
+
+    ``persist_key`` (usually the symbol) opts into the proven semantics: the
+    engine is kept between calls and only advanced over bars it has not seen,
+    so zone lifetime is bounded by the engine's own eviction rules rather than
+    by the caller's window. Empty key = the previous stateless behaviour.
+    Never raises: any inconsistency falls back to a clean rebuild.
+    """
     atr14, volma = rolling_indicators(bars)
+    last_ts = str(bars[-1].get("ts") or "") if bars else ""
+
+    if persist_key:
+        eng = _PERSISTENT_ENGINE.get(persist_key)
+        prev_ts = _PERSISTENT_LAST_TS.get(persist_key)
+        if eng is not None and prev_ts:
+            # Advance only over bars newer than the last one this engine saw.
+            start = None
+            for k in range(len(bars) - 1, 14, -1):
+                if str(bars[k].get("ts") or "") == prev_ts:
+                    start = k + 1
+                    break
+            if start is not None:
+                for k in range(start, len(bars)):
+                    eng.update(k, bars, atr14[k], volma[k])
+                _PERSISTENT_LAST_TS[persist_key] = last_ts
+                return eng, (atr14[-1] if atr14 else 0.0)
+            # prefix does not overlap what we saw (gap/restart) -> rebuild
+        eng = SDZoneEngine()
+        for k in range(15, len(bars)):
+            eng.update(k, bars, atr14[k], volma[k])
+        _PERSISTENT_ENGINE[persist_key] = eng
+        _PERSISTENT_LAST_TS[persist_key] = last_ts
+        return eng, (atr14[-1] if atr14 else 0.0)
+
+    eng = SDZoneEngine()
     for k in range(15, len(bars)):
         eng.update(k, bars, atr14[k], volma[k])
     return eng, (atr14[-1] if atr14 else 0.0)

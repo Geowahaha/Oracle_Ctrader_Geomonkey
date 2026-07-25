@@ -117,6 +117,11 @@ def _env(key: str, default: float) -> float:
     return _f(os.environ.get(key), default)
 
 
+def _env_flag(key: str) -> bool:
+    """Truthy env flag (unset/0/false/no/off = False)."""
+    return str(os.environ.get(key, "")).strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def _skip(ts_close: str, symbol: str, session: str, reason: str) -> Decision:
     return Decision(
         ts_close=ts_close, symbol=symbol, action="skip", side=None,
@@ -374,7 +379,12 @@ def decide_sdzone_live(symbol: str, m5_prefix: list, spread_abs: float,
     ts_close = str(m5_prefix[-1].get("ts") or "") if m5_prefix else ""
     if len(m5_prefix) < 40:
         return _skip(ts_close, symbol, session, "sdzone_bars_short")
-    engine, atr = zones_from_prefix(m5_prefix)
+    # 2026-07-26 audit: opt into the PROVEN zone semantics (one engine advanced
+    # continuously) instead of rebuilding from the 340-bar prefix every close,
+    # which capped zone age at ~313 bars and made ~19% of the proven signal
+    # population unreachable. Env-gated; unset = prior stateless behaviour.
+    _persist = symbol if _env_flag("DEXTER3_SDZONE_PERSIST_ENGINE") else ""
+    engine, atr = zones_from_prefix(m5_prefix, persist_key=_persist)
     if atr <= 0:
         return _skip(ts_close, symbol, session, "sdzone_no_atr")
     sig = decide_sdzone(m5_prefix, len(m5_prefix) - 1, engine, atr)

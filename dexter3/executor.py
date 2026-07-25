@@ -1096,13 +1096,35 @@ class Dexter3Executor:
             except ValueError:
                 abs_cap = 0.0
             est_floor_risk = float(volume_meta.get("estimated_min_volume_risk_usd", 0.0) or 0.0)
-            if abs_cap > 0 and est_floor_risk > abs_cap:
+            # 2026-07-26 replay-vs-live audit — a SELF-INFLICTED adverse filter.
+            # At the XAU 1-ounce floor real risk == stop distance, so this cap
+            # refuses precisely the WIDE-STOP trades, and live data says those
+            # are the winners: win rate by stop width runs 11% (<2pt) -> 33% ->
+            # 41% -> 47% -> **60% at >=5pt (+$50.17)**, holding within-lane 3/3.
+            # Replay counted those trades at full weight (flat $12/R), which is
+            # part of why replay looked profitable and live did not. Refusing
+            # them is therefore not prudence, it is deleting the best cohort.
+            # DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT scales the ceiling by the
+            # trade's own volatility (stop distance / reference), so a genuinely
+            # volatile setup is allowed proportionally more dollar risk while a
+            # runaway stop is still refused. Unset => the flat cap, unchanged.
+            eff_cap = abs_cap
+            cap_mult_meta: dict[str, Any] = {}
+            if abs_cap > 0:
+                try:
+                    cap_mult = float(os.environ.get("DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT", "0") or 0.0)
+                except ValueError:
+                    cap_mult = 0.0
+                if cap_mult > 1.0:
+                    eff_cap = abs_cap * cap_mult
+                    cap_mult_meta = {"abs_cap_base_usd": abs_cap, "abs_cap_mult": cap_mult}
+            if eff_cap > 0 and est_floor_risk > eff_cap:
                 return self._refuse(
                     symbol,
                     "min_volume_risk_exceeds_abs_cap",
                     estimated_min_volume_risk_usd=est_floor_risk,
-                    abs_cap_usd=abs_cap,
-                    volume_meta=volume_meta,
+                    abs_cap_usd=eff_cap,
+                    volume_meta={**volume_meta, **cap_mult_meta},
                 )
             self._journal(
                 symbol,

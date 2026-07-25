@@ -571,12 +571,18 @@ def _governor_config_from_env() -> GovernorConfig:
                 kw[field_name] = float(raw_val)
             except ValueError:
                 log_line(f"{utc_now_iso()} ignored invalid {env}={raw_val!r}")
+    # 2026-07-26 replay-vs-live audit: boolean, not float — the TARGET lock
+    # reads REALIZED PnL only when set, so a trail lane's open runner is not
+    # liquidated the instant its UNREALIZED profit touches the daily target.
+    if _env_bool("DEXTER3_GOVERNOR_TARGET_IGNORES_FLOATING", False):
+        kw["target_ignores_floating"] = True
     cfg = GovernorConfig(**kw)
     log_line(
         f"{utc_now_iso()} governor config: capital_usd={cfg.capital_usd} "
         f"daily_target_usd={cfg.daily_target_usd} daily_loss_usd={cfg.daily_loss_usd} "
         f"base_risk_frac={cfg.base_risk_frac} max_risk_frac={cfg.max_risk_frac} "
-        f"bypass_min_score={cfg.bypass_min_score}"
+        f"bypass_min_score={cfg.bypass_min_score} "
+        f"target_ignores_floating={cfg.target_ignores_floating}"
     )
     return cfg
 
