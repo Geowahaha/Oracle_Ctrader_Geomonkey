@@ -84,6 +84,7 @@ Environment=DEXTER3_V16_MAX_EDGE_MULT=3.0
 # VM-intentional (post-cutover): shadow observers + weekend safety
 Environment=DEXTER3_PA_EYE=shadow
 Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
 Environment=DEXTER3_REPAIR_HARVEST=shadow
 Environment=DEXTER3_REPAIR_HARVEST_BANK_TARGET_R=0.4
 Environment=DEXTER3_REPAIR_HARVEST_SCALP_SL_FRAC=0.5

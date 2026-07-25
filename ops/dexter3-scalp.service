@@ -52,6 +52,7 @@ Environment=DEXTER3_SMART_EXIT_ENABLED=0
 Environment=DEXTER3_REPAIR_HARVEST=off
 Environment=DEXTER3_PA_EYE=off
 Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
 Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
 ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
 
