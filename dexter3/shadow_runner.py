@@ -3030,7 +3030,9 @@ def _manage_lane_basket(
     lens = hunter_brain._run_lens(prefix, ts_close)
     daily = _daily_state(state)
 
-    agg = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, executor.config.risk_usd))
+    agg = basket_live.aggregate_lane(
+        lane, base_risk_usd=_lane_actual_risk_usd(lane, executor.config.risk_usd, _soft_stop_pts(state))
+    )
     agg["lens_liquidity_sweep"] = lens.get("liquidity_sweep")  # sweep-vs-break repair distinction
     sides = agg.get("sides", {}) or {}
     basket_side = "buy" if int(sides.get("buy", 0)) >= int(sides.get("sell", 0)) else "sell"
@@ -4263,7 +4265,8 @@ def _run_repair_harvest_tick(
         # which would need an extra get_deals() call this fast-tick path
         # deliberately avoids; documented as a best-effort field).
         parent_agg = basket_live.aggregate_lane(
-            parent_lane, base_risk_usd=_lane_actual_risk_usd(parent_lane, _om_base_risk_usd(executor))
+            parent_lane,
+            base_risk_usd=_lane_actual_risk_usd(parent_lane, _om_base_risk_usd(executor), _soft_stop_pts(state)),
         )
         if not bool(parent_agg.get("unreliable")):
             episode["parent_last_known_agg_r"] = parent_agg.get("aggregate_r")
