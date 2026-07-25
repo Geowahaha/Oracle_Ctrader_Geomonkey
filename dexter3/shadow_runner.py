@@ -74,6 +74,7 @@ from dexter3.daily_governor import DailyGovernor, GovernorConfig
 from dexter3.decision_journal import DecisionJournal
 from dexter3.edge_buckets import EdgeGateConfig, anti_chase_risk_mult
 from dexter3.weekly_risk import weekly_close_policy
+from dexter3 import market_state
 from dexter3 import vp_lane
 from dexter3 import channelfade
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
@@ -959,6 +960,30 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# --- broker market-state (2026-07-25, owner cTrader ‖-pause observation) -------
+_SYMBOL_META_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_SYMBOL_META_TTL_SEC = 3600.0  # schedule/tradingMode change ~never; refresh hourly
+
+
+def _cached_symbol_meta(mcp: Any, symbol: str) -> dict[str, Any] | None:
+    """Broker symbol spec (tradingMode/trading_enabled/schedule/...) with a long
+    TTL cache and FAIL-OPEN semantics: any error (no daemon, subprocess
+    transport, transport failure, unrecognised proto) -> None, so the
+    market-state gate degrades to feed-freshness only and never hard-blocks.
+    Never raises."""
+    now = datetime.now(timezone.utc).timestamp()
+    hit = _SYMBOL_META_CACHE.get(symbol)
+    if hit is not None and (now - hit[0]) < _SYMBOL_META_TTL_SEC:
+        return hit[1]
+    meta: dict[str, Any] | None = None
+    try:
+        meta = mcp.get_symbol_details(symbol)
+    except Exception:
+        meta = None
+    _SYMBOL_META_CACHE[symbol] = (now, meta)
+    return meta
+
+
 def _env_csv_set(name: str, default: set[str]) -> set[str]:
     raw = os.environ.get(name)
     if raw is None:
@@ -1771,6 +1796,32 @@ def run_symbol_cycle(
     m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _alt_producer_enabled() else MIN_M5_BARS)
     if len(m5_bars) < MIN_M5_BARS:
         return f"insufficient_m5_bars({len(m5_bars)})"
+
+    # --- broker market-state gate (2026-07-25, owner cTrader ‖-pause obs) ------
+    # Additive + env-gated (default off => fail-open, byte-identical behaviour).
+    # Reads the broker's OWN open/closed signal — feed freshness (newest M5 bar
+    # age) plus tradingMode when the daemon surfaces it — instead of relying
+    # only on the hardcoded weekly_close_policy time window, and turns "market
+    # closed" into an OBSERVABLE skip reason rather than a silent
+    # no_new_m5_close. weekly_close_policy stays as the time-based backstop.
+    if _env_bool("DEXTER3_MARKET_STATE_GATE", False):
+        _meta = _cached_symbol_meta(mcp, symbol)
+        _newest_epoch = _iso_to_epoch(str(m5_bars[-1].get("ts") or "")) + M5_BAR_SEC
+        _ms = market_state.evaluate_market_state(
+            now_ts=datetime.now(timezone.utc).timestamp(),
+            newest_bar_epoch=_newest_epoch,
+            trading_enabled=(_meta or {}).get("trading_enabled"),
+            schedule=(_meta or {}).get("schedule"),
+            stale_sec=_env_float("DEXTER3_MARKET_STALE_SEC", market_state.DEFAULT_STALE_SEC),
+        )
+        if not _ms["open"]:
+            log_line(
+                f"{utc_now_iso()} {symbol} market_closed_broker "
+                f"source={_ms['source']} reason={_ms['reason']} "
+                f"bar_age={_ms.get('bar_age_sec')}s trading_enabled={_ms.get('trading_enabled')} "
+                f"schedule_intervals={_ms.get('schedule_intervals')}"
+            )
+            return f"market_closed_broker:{_ms['source']}"
 
     pending = pending_m5_closes(state, symbol, m5_bars)
     if not pending:

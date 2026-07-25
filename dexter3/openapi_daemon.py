@@ -1652,6 +1652,30 @@ class OpenApiDaemon:
             defer.returnValue({"ok": False, "status": "symbol_details_empty", "message": f"no ProtoOASymbol for {sd_symbol_name}"})
             return
         meta = meta_list[0]
+        # Market-state telemetry (2026-07-25): surface the broker's OWN
+        # open/closed signals that ProtoOASymbol already carries but which
+        # this mode previously dropped. ALL defensive (getattr + try/except ->
+        # None) — this runs on the live daemon and must never raise on a proto
+        # field/enum-accessor shape it doesn't recognise; consumers fail-open.
+        trading_mode_raw = _safe_int(getattr(meta, "tradingMode", -1), -1)
+        trading_enabled: bool | None = None
+        try:
+            # Named enum lookup — never a hardcoded int (the lib is the source
+            # of truth for what ENABLED maps to).
+            enabled_val = model.ProtoOATradingMode.Value("ENABLED")
+            if trading_mode_raw >= 0:
+                trading_enabled = trading_mode_raw == int(enabled_val)
+        except Exception:
+            trading_enabled = None
+        schedule_out: list[dict[str, int]] = []
+        try:
+            for iv in list(getattr(meta, "schedule", []) or []):
+                schedule_out.append({
+                    "start": _safe_int(getattr(iv, "startSecond", 0), 0),
+                    "end": _safe_int(getattr(iv, "endSecond", 0), 0),
+                })
+        except Exception:
+            schedule_out = []
         defer.returnValue({
             "ok": True,
             "status": "symbol_details_loaded",
@@ -1662,6 +1686,9 @@ class OpenApiDaemon:
             "minVolume_raw": _safe_int(getattr(meta, "minVolume", 0), 0),
             "stepVolume_raw": _safe_int(getattr(meta, "stepVolume", 0), 0),
             "maxVolume_raw": _safe_int(getattr(meta, "maxVolume", 0), 0),
+            "tradingMode": trading_mode_raw if trading_mode_raw >= 0 else None,
+            "trading_enabled": trading_enabled,
+            "schedule": schedule_out,
         })
 
     @defer.inlineCallbacks

@@ -1069,6 +1069,12 @@ class Dexter3OpenApiClient:
             "lotSize": float(UNITS_TO_RAW_SCALE),
             "pipSize": pip_size,
             "digits": int(raw.get("digits", 0) or 0),
+            # Market-state telemetry (2026-07-25): pass through the broker's
+            # open/closed signals the daemon now surfaces. Absent (older daemon /
+            # unrecognised proto shape) -> None/[] so market_state fails open.
+            "tradingMode": raw.get("tradingMode"),
+            "trading_enabled": raw.get("trading_enabled"),
+            "schedule": list(raw.get("schedule") or []),
         }
 
     def get_pending_orders(self) -> list[dict[str, Any]]:
