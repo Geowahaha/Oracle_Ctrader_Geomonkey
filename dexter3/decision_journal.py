@@ -205,6 +205,38 @@ class DecisionJournal:
         )
         self._conn.commit()
 
+    def merge_decision_features(self, decision_id: int, patch: dict[str, Any]) -> None:
+        """Merge ``patch`` into an existing row's ``features_json`` (top-level
+        key update), preserving everything already stored.
+
+        2026-07-25 vp-funnel instrumentation: an entry decision's fate is
+        settled LATER and ELSEWHERE than the gate chain — a synthetic limit
+        intent is filled/expired/killed/replaced on the fast tick, which holds
+        no copy of the decision's features. ``update_decision_features``
+        rewrites the column wholesale, so a fast-tick stamp would DESTROY the
+        gate evidence the post-gate resync just wrote. This read-modify-write
+        is the safe path for those out-of-band stamps. Unparseable existing
+        JSON is treated as ``{}`` (the patch still lands); no-op on an unknown
+        id; never touches any other column.
+        """
+        row = self._conn.execute(
+            "SELECT features_json FROM decisions WHERE id = ?", (int(decision_id),)
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            current = json.loads(row[0] or "{}")
+            if not isinstance(current, dict):
+                current = {}
+        except (TypeError, ValueError):
+            current = {}
+        current.update(patch or {})
+        self._conn.execute(
+            "UPDATE decisions SET features_json = ? WHERE id = ?",
+            (json.dumps(current, ensure_ascii=False, default=str), int(decision_id)),
+        )
+        self._conn.commit()
+
     def recent_decisions(self, limit: int = 50, symbol: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM decisions"
         params: tuple[Any, ...] = ()

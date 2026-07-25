@@ -2161,7 +2161,21 @@ def run_symbol_cycle(
                             intent = _lane_make_limit_intent(
                                 decision, prefix, float(risk_usd_override)
                             )
-                            replaced = bool(state.get("vp_limit_intent"))
+                            prev_intent = state.get("vp_limit_intent")
+                            replaced = bool(prev_intent)
+                            # vp-funnel instrumentation (2026-07-25): carry the
+                            # journal row id so the intent's final fate can be
+                            # stamped back on the decision that produced it,
+                            # and record the REPLACED fate of the intent this
+                            # one evicts (a signal every M5 close can evict a
+                            # pending intent before it ever fills — the
+                            # suspected 72-for-0 mechanism on vp_poc_reversion).
+                            intent["decision_row_id"] = decision_row_id
+                            if replaced:
+                                _stamp_intent_fate(
+                                    journal, prev_intent, "replaced",
+                                    {"by_row_id": decision_row_id, "at": utc_now_iso()},
+                                )
                             state["vp_limit_intent"] = intent
                             log_line(
                                 f"{utc_now_iso()} {symbol} vp_limit_intent_set side={intent['side']} "
@@ -2201,6 +2215,14 @@ def run_symbol_cycle(
             # never carried any of it and the B-tier verdict was reduced to
             # journalctl greps. One re-sync after the whole chain; never
             # allowed to break the loop.
+            # 2026-07-25 vp-funnel instrumentation: the accumulated ``status``
+            # already names EVERY downstream branch this enter took (governor
+            # lock, lane unverified, risk-cap refusal, quality/vp gate block,
+            # limit-intent set, live fill) but it only ever reached the log
+            # line — so "155 enter decisions -> 6 broker fills" was not
+            # answerable from the DB. Stamp it on the row itself, in ONE place
+            # after the whole chain, so no branch can be missed.
+            _stamp_entry_outcome(decision, status)
             try:
                 journal.update_decision_features(decision_row_id, decision.features)
             except Exception as exc:  # noqa: BLE001 - observability must not kill the cycle
@@ -2212,6 +2234,83 @@ def run_symbol_cycle(
             status += f":late{int(late_sec)}s"
         statuses.append(status)
     return ";".join(statuses)
+
+
+def _classify_entry_outcome(status: str) -> tuple[str, str]:
+    """Map an accumulated cycle ``status`` string to (outcome, reason).
+
+    Outcomes: ``filled`` (a real order exists), ``limit_intent`` (pending —
+    its final fate is stamped later by the fast tick), ``blocked`` (a gate
+    refused it), ``no_exec`` (nothing downstream ran, e.g. shadow mode).
+    Pure/table-driven so the funnel query has stable buckets.
+    """
+    s = str(status or "")
+    if ":live_entered" in s:
+        return "filled", "entered"
+    if ":vp_limit_intent_set" in s:
+        return "limit_intent", "intent_set"
+    for marker, outcome in (
+        (":live_blocked_", "blocked"),
+        (":governor_", "blocked"),
+        (":live_skipped_", "blocked"),
+        (":live_", "no_exec"),
+    ):
+        idx = s.find(marker)
+        if idx >= 0:
+            reason = s[idx + len(marker):].split(":")[0] or marker.strip(":_")
+            if marker == ":governor_" and reason.endswith("_bypassed"):
+                continue  # bypassed = allowed through; a later marker decides
+            return outcome, reason
+    return "no_exec", "no_downstream_branch"
+
+
+def _stamp_entry_outcome(decision: hunter_brain.Decision, status: str) -> None:
+    """Record how an enter decision actually ended downstream (2026-07-25).
+
+    Pure observability — writes only into ``decision.features`` (which the
+    caller's post-gate resync persists); never changes sizing, gating or any
+    order. Wrapped by the caller's try/except at the journal boundary; kept
+    exception-safe here too so a malformed status can never kill a cycle."""
+    try:
+        if not isinstance(getattr(decision, "features", None), dict):
+            return
+        outcome, reason = _classify_entry_outcome(status)
+        decision.features["entry_outcome"] = {
+            "outcome": outcome,
+            "reason": reason,
+            "status": str(status or "")[:200],
+            "setup": str(getattr(decision, "setup", "") or ""),
+            "side": str(getattr(decision, "side", "") or ""),
+        }
+    except Exception:  # noqa: BLE001 - observability must never break the loop
+        return
+
+
+def _stamp_intent_fate(
+    journal: Any,
+    intent: dict[str, Any] | None,
+    fate: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Stamp a synthetic-limit intent's FINAL fate onto its originating
+    decision row (2026-07-25 vp-funnel instrumentation).
+
+    The fast tick settles an intent (fill/expire/kill) long after the decision
+    was journaled, and a newer signal can REPLACE a pending intent outright —
+    the suspected reason vp booked 72 ``vp_poc_reversion`` enter decisions and
+    0 broker fills. Uses ``merge_decision_features`` so the gate evidence
+    written by the post-gate resync is preserved. Fully exception-safe and a
+    no-op without a journal / row id: pure observability."""
+    try:
+        if journal is None or not isinstance(intent, dict):
+            return
+        row_id = intent.get("decision_row_id")
+        if row_id is None:
+            return
+        patch = {"intent_fate": {"fate": str(fate), **(extra or {})}}
+        journal.merge_decision_features(int(row_id), patch)
+    except Exception:  # noqa: BLE001 - observability must never break the loop
+        return
 
 
 def _stamp_skip_bias_fallback(decision: hunter_brain.Decision, prefix: list[dict[str, Any]]) -> None:
@@ -2557,6 +2656,7 @@ def _service_vp_limit_intent(
     state: dict[str, Any],
     symbol: str,
     executor: Dexter3Executor,
+    journal: Any | None = None,
 ) -> dict[str, Any] | None:
     """Fast-tick servicing of the VP lane's synthetic limit intent (owner
     deploy 2026-07-16). Fires a MARKET entry when the touch-side quote
@@ -2579,6 +2679,8 @@ def _service_vp_limit_intent(
             state.pop("vp_limit_intent", None)
             log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
                      f"side={intent.get('side')} confirm_tf={confirm_tf}")
+            _stamp_intent_fate(journal, intent, "expired",
+                               {"confirm_tf": confirm_tf, "at": utc_now_iso()})
             save_shadow_state(state)
             return None
         tf_sec = 60 if confirm_tf == "m1" else 300
@@ -2593,6 +2695,8 @@ def _service_vp_limit_intent(
             state.pop("vp_limit_intent", None)
             log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_killed_break level={intent.get('level')} "
                      f"sl={intent.get('sl')} side={intent.get('side')} confirm_tf={confirm_tf}")
+            _stamp_intent_fate(journal, intent, "killed_break",
+                               {"confirm_tf": confirm_tf, "at": utc_now_iso()})
             save_shadow_state(state)
             return None
         if verdict != "fill":
@@ -2612,6 +2716,7 @@ def _service_vp_limit_intent(
             state.pop("vp_limit_intent", None)
             log_line(f"{utc_now_iso()} {symbol} vp_limit_intent_expired level={intent.get('level')} "
                      f"side={intent.get('side')}")
+            _stamp_intent_fate(journal, intent, "expired", {"at": utc_now_iso()})
             save_shadow_state(state)
             return None
         if verdict != "fill":
@@ -2628,6 +2733,8 @@ def _service_vp_limit_intent(
         today_losing_count=int(daily.get("loss_baskets", 0)),
         risk_usd_override=_f(intent.get("risk_usd"), None),
     )
+    _stamp_intent_fate(journal, intent, str(exec_result.get("action") or "unknown"),
+                       {"at": utc_now_iso(), "fill_px": fill_px, "touch_px": touch_px})
     if exec_result.get("action") == "entered":
         daily["entries"] = int(daily.get("entries", 0)) + 1
         if not _is_grok_mode():
@@ -4738,7 +4845,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
                         if executor is not None:
                             # no-ops without a pending intent; serves VP and
                             # hunt lanes alike (owner 2026-07-16 layer port)
-                            _service_vp_limit_intent(mcp, state, symbol, executor)
+                            _service_vp_limit_intent(mcp, state, symbol, executor, journal=journal)
                         run_om_tick(mcp, journal, state, symbol, executor=executor)
                     except McpZombieError as exc:
                         log_line(f"{utc_now_iso()} {symbol} OM MCP_ZOMBIE: {exc}")
