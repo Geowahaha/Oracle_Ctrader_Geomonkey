@@ -27,33 +27,49 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY  # noqa: E402
+from dexter3.executor import label_matches_family  # noqa: E402
 from dexter3.transport import make_client  # noqa: E402
-
-try:
-    from dexter3.grok_v10 import GROK_LABEL_FAMILY  # noqa: E402
-except Exception:  # pragma: no cover - mirrors shadow_runner's own optional import
-    GROK_LABEL_FAMILY = "dexter3:grok"
 from dexter3.volume_profile import VP_LABEL_FAMILY  # noqa: E402
 
-# Family root -> short display name, checked in this order (2026-07-15
-# versioned-labels design — bucket by FAMILY, not "grok" substring vs
-# everything-else, so the VP canary lane gets its own bucket too instead of
-# being silently lumped into "fable").
+# Family root -> short display name (2026-07-15 versioned-labels design —
+# bucket by FAMILY so each lane gets its own bucket instead of being lumped
+# into "fable").
+#
+# 2026-07-25 audit fix: this listed ONLY grok/vp/fable, so dtr, dpull,
+# dpull-cs, scalp and chf — five of the live lanes — all fell into "other" in
+# the very tool this project calls "broker truth". A ledger that cannot name
+# its own live lanes is a structural cause of the cherry-picked PnL prose the
+# board later had to retract. Every current lane is now listed explicitly.
+# grok was RETIRED 2026-07-17 and its lane code is being removed; its historical
+# deals now bucket as "retired" rather than pretending it is a live lane.
+#
+# ORDER MATTERS for the longest-prefix cases: "dexter3:dpull-cs" must be tested
+# before "dexter3:dpull". label_matches_family is boundary-aware as of the
+# 2026-07-25 fix, but the explicit ordering keeps this correct even if a future
+# label re-introduces an ambiguous pair.
 _LANE_FAMILIES: tuple[tuple[str, str], ...] = (
-    (GROK_LABEL_FAMILY, "grok"),
+    ("dexter3:dpull-cs", "dpull-cs"),
+    ("dexter3:dpull", "dpull"),
+    ("dexter3:dtr", "dtr"),
+    ("dexter3:scalp", "scalp"),
+    ("dexter3:chf", "chf"),
     (VP_LABEL_FAMILY, "vp"),
     (FABLE_LABEL_FAMILY, "fable"),
+    ("dexter3:grok", "retired"),
 )
 
 
 def _lane_family(label: str) -> str:
-    """Short lane name for an exact broker label, by family-prefix match
-    (plain ``.startswith`` — see dexter3.executor.label_matches_family's
-    docstring for why this is not colon-bounded). Falls back to "other" for
-    a dexter3-prefixed label that matches none of the known families rather
-    than silently mis-bucketing it as fable."""
+    """Short lane name for an exact broker label.
+
+    Uses ``dexter3.executor.label_matches_family`` so the tally buckets exactly
+    the way the live lanes claim ownership — before 2026-07-25 this was a bare
+    ``.startswith()``, which bucketed "dexter3:dpull-cs:canary" as *dpull*.
+    Falls back to "other" for a dexter3-prefixed label matching no known family
+    rather than silently mis-bucketing it as fable.
+    """
     for family_root, name in _LANE_FAMILIES:
-        if label == family_root or label.startswith(family_root):
+        if label_matches_family(label, family_root):
             return name
     return "other"
 
