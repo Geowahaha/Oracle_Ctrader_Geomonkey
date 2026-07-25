@@ -1313,6 +1313,11 @@ def _apply_v16_house_money_status(gov_state: dict[str, Any], status: dict[str, A
 # _OM_BAR_CACHE below. Keyed by nothing (single account) — module-level like
 # every other cross-tick cache in this file.
 LANE_REALIZED_CACHE_SEC = 60
+# How often a PERSISTENT get_deals outage is re-logged (2026-07-25 audit fix).
+# The old code logged exactly once ever, so an all-day outage — during which
+# the daily loss cap is effectively disabled because the realized total can no
+# longer grow — produced a single line nobody would notice.
+LANE_REALIZED_FAILURE_RELOG_SEC = 300.0
 _LANE_REALIZED_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -1371,9 +1376,27 @@ def _lane_realized_today(mcp: Dexter3McpClient, label_filter: str = FABLE_LABEL_
         # remain the correctness backstop on that path.
         deals = mcp.get_deals(count=500, from_timestamp_ms=today_start_ms)
     except (McpClientError, McpZombieError) as exc:
-        if not cache.get("logged_failure"):
-            log_line(f"{utc_now_iso()} governor lane_realized_today get_deals_failed (using cached/zero): {exc}")
+        # 2026-07-25 audit fix: a persistent get_deals outage silently turned
+        # the daily loss cap OFF. The cached total cannot grow while closes
+        # keep landing, so `effective_pnl` freezes at its last good value and
+        # NEITHER the close-all trigger NOR the pre-entry refusal can ever
+        # fire — and the single `logged_failure` line meant an all-day outage
+        # produced exactly ONE log entry. The cache is still served (a stale
+        # total is better than a fabricated zero), but the failure is now
+        # re-logged on a bounded interval and, when there has NEVER been a
+        # successful read, it is escalated so "0.0 realized" is never mistaken
+        # for "no losses today".
+        first_ever = float(cache.get("epoch", 0.0) or 0.0) <= 0.0
+        last_warn = float(cache.get("last_failure_log_epoch", 0.0) or 0.0)
+        if not cache.get("logged_failure") or (now_epoch - last_warn) >= LANE_REALIZED_FAILURE_RELOG_SEC:
+            severity = "NO CACHE EVER — daily cap is BLIND" if first_ever else "serving stale cache"
+            log_line(
+                f"{utc_now_iso()} governor lane_realized_today get_deals_failed "
+                f"({severity}; label={label_filter} cached_sum={float(cache.get('sum', 0.0)):+.2f} "
+                f"age={int(now_epoch - float(cache.get('epoch', 0.0) or now_epoch))}s): {exc}"
+            )
             cache["logged_failure"] = True
+            cache["last_failure_log_epoch"] = now_epoch
         return float(cache.get("sum", 0.0)), list(cache.get("pnls", []))
 
     dated: list[tuple[str, float]] = []
@@ -4209,7 +4232,7 @@ def _run_repair_harvest_tick(
     m5_bars, _m15, _h1 = _om_bars_for(mcp, symbol)
 
     if episode is None:
-        base_risk_usd = _lane_actual_risk_usd(lane, _om_base_risk_usd(executor))
+        base_risk_usd = _lane_actual_risk_usd(lane, _om_base_risk_usd(executor), _soft_stop_pts(state))
         _maybe_open_repair_harvest_episode(journal, state, symbol, lane, cfg, base_risk_usd, governor_locked)
         episode = store.get(symbol)
         if episode is None:
@@ -4407,7 +4430,7 @@ def run_om_tick(
         runtime_key = "basket_runtime"
         regime_key = "smart_exit_regime"
 
-    agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, _om_base_risk_usd(executor)))
+    agg_probe = basket_live.aggregate_lane(lane, base_risk_usd=_lane_actual_risk_usd(lane, _om_base_risk_usd(executor), _soft_stop_pts(state)))
     # Daily Mission Governor (owner directive 2026-07-07): record this
     # symbol's floating PnL for the governor's account-wide floating
     # aggregate — reuses this same aggregate_lane read, no extra MCP calls.
@@ -4453,7 +4476,7 @@ def run_om_tick(
         "now_utc_iso": utc_now_iso(),
         "daily_state": {"daily_loss_baskets": int(_daily_state(state).get("loss_baskets", 0))},
         "basket_cfg": _basket_config_from_env(),
-        "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
+        "base_risk_usd": _lane_actual_risk_usd(lane, _om_base_risk_usd(executor), _soft_stop_pts(state)),
         "spread_abs": spread_abs,
         "smart_exit_regime": regime_map,
         # VP convex-exit inputs (stamped at intent fill — see
@@ -4568,7 +4591,7 @@ def run_om_tick(
                     executor.client,
                     state,
                     repair_decision,
-                    _lane_actual_risk_usd(lane, _om_base_risk_usd(executor)),
+                    _lane_actual_risk_usd(lane, _om_base_risk_usd(executor), _soft_stop_pts(state)),
                 ),
                 repair_context=repair_context,
             )
@@ -4688,12 +4711,39 @@ def run_governor_tick(
             effective_state = new_state
             newly_triggered = new_state in ("TARGET_LOCKED", "LOSS_STOPPED")
 
-        if newly_triggered:
+        # 2026-07-25 audit fix — the close-all was FIRE-ONCE: the latch is set
+        # before the close loop runs, so `newly_triggered` could never be true
+        # again that UTC day, while inside the loop a single get_positions
+        # failure only `continue`d and execute_close_all's
+        # "close_all_partial" result was journaled but never checked. One
+        # transient daemon hiccup at exactly the wrong moment therefore turned
+        # the daily loss cap into an ADVISORY: entries stayed blocked (correct)
+        # but the open basket kept running past the cap on broker SL alone.
+        # The latch still fires once (the mission is decided once, not
+        # re-litigated); only the CLOSE is retried, until it verifiably has
+        # nothing left to close.
+        retry_close_all = (
+            not newly_triggered
+            and effective_state in ("TARGET_LOCKED", "LOSS_STOPPED")
+            and not bool(gov_state.get("close_all_done"))
+        )
+        if retry_close_all:
+            log_line(
+                f"{utc_now_iso()} governor close_all RETRY state={effective_state} "
+                f"(previous attempt did not complete)"
+            )
+
+        if newly_triggered or retry_close_all:
             gov_state["state"] = effective_state
-            gov_state["locked_pnl"] = status["effective_pnl"]
-            gov_state["triggered_at"] = utc_now_iso()
+            if newly_triggered:
+                gov_state["locked_pnl"] = status["effective_pnl"]
+                gov_state["triggered_at"] = utc_now_iso()
 
             # Close every lane position across every symbol.
+            # ``close_all_ok`` tracks whether this pass verifiably finished:
+            # any read failure or non-clean close result leaves it False so the
+            # retry above fires on the next tick (2026-07-25 audit fix).
+            close_all_ok = True
             closed_summary: dict[str, Any] = {}
             if executor is not None:
                 # active_label stays the exact/full current label (needed
@@ -4708,6 +4758,7 @@ def run_governor_tick(
                         positions = executor.client.get_positions()
                     except (McpClientError, McpZombieError) as exc:
                         log_line(f"{utc_now_iso()} governor close_all read_failed {symbol}: {exc}")
+                        close_all_ok = False  # unknown broker state -> must retry
                         continue
                     lane = basket_live.lane_positions(positions, active_label_family)
                     lane = [p for p in lane if str(p.get("symbolName") or p.get("symbol") or "") in ("", symbol)]
@@ -4716,8 +4767,25 @@ def run_governor_tick(
                     ids = [int(p.get("positionId") or p.get("id") or 0) for p in lane]
                     ids = [x for x in ids if x > 0]
                     reason = "governor_target_lock" if effective_state == "TARGET_LOCKED" else "governor_loss_stop"
-                    closed_summary[symbol] = executor.execute_close_all(ids, reason=reason)
+                    result = executor.execute_close_all(ids, reason=reason)
+                    closed_summary[symbol] = result
+                    # execute_close_all returns "close_all_partial" when ANY leg
+                    # was refused. Previously that was journaled and ignored.
+                    if str((result or {}).get("action") or "") != "closed_all":
+                        close_all_ok = False
+                        log_line(
+                            f"{utc_now_iso()} governor close_all INCOMPLETE {symbol} "
+                            f"action={(result or {}).get('action')} ids={ids} — will retry"
+                        )
                     _clear_basket_runtime(state, symbol, grok=active_label == GROK_LABEL)
+
+            # Only mark the capital-protection close as COMPLETE when this pass
+            # verifiably closed everything (or found nothing to close). While
+            # False, the retry branch above re-attempts on every governor tick
+            # instead of the cap silently degrading to advisory.
+            gov_state["close_all_done"] = bool(close_all_ok)
+            if not close_all_ok:
+                log_line(f"{utc_now_iso()} governor close_all NOT COMPLETE — retrying next tick")
 
             if effective_state == "TARGET_LOCKED" and status.get("house_money_floor_triggered"):
                 log_line(
@@ -4754,14 +4822,41 @@ def run_governor_tick(
         return "governor_error"
 
 
-def _lane_actual_risk_usd(lane: list[dict[str, Any]] | None, fallback: float) -> float:
+def _soft_stop_pts(state: dict[str, Any] | None) -> float:
+    """The SOFT (entry-time) stop distance for a close-stop lane, else 0.0.
+
+    2026-07-25 audit fix, see ``_lane_actual_risk_usd``. Only meaningful while
+    ``DEXTER3_OM_CONVEX_CLOSE_STOP=1`` (dpull-cs), where the broker SL is
+    deliberately widened away from the risk the lane actually runs."""
+    try:
+        if not vp_lane.convex_close_stop_enabled():
+            return 0.0
+        return max(0.0, _f(((state or {}).get("vp_convex") or {}).get("stop_pts"), 0.0))
+    except Exception:  # noqa: BLE001 - never let the R-base lookup kill a tick
+        return 0.0
+
+
+def _lane_actual_risk_usd(lane: list[dict[str, Any]] | None, fallback: float,
+                          soft_stop_pts: float = 0.0) -> float:
     """ACTUAL dollar risk of the open lane legs: sum(|entry−SL| × volume).
 
     The R-base for aggregate_r/trail math. Using the static config risk was
     a live bug (2026-07-07): governor sized entries at ~$14.4 while the base
     stayed $0.50 → aggregate_r inflated ~29× → OM 'take' fired at +$0.60 and
-    banked 11 straight winners at ~0.09R of their true risk."""
+    banked 11 straight winners at ~0.09R of their true risk.
+
+    ``soft_stop_pts`` (2026-07-25 audit fix): on a CLOSE-STOP lane the broker
+    SL is intentionally amended out to a far backstop (2.5× by default) while
+    the software close-stop owns the real −1R. Deriving the R-base from that
+    widened broker SL inflated the denominator ~3.5×, so ``peak_r`` read 0.57
+    on a genuine +2.0R move and the convex trail could NEVER arm at
+    ``DEXTER3_OM_CONVEX_ARM_R=2.0`` — it would have needed a 7.0 soft-R move
+    inside the 120-minute cap. The deployed dpull-cs lane therefore had no
+    profit trail at all and every winner rode to the time stop. When the caller
+    supplies the soft distance, it is used as the per-unit risk instead.
+    """
     total = 0.0
+    soft = max(0.0, float(soft_stop_pts or 0.0))
     for p in lane or []:
         try:
             entry = float(p.get("entryPrice") or p.get("price") or 0.0)
@@ -4770,7 +4865,8 @@ def _lane_actual_risk_usd(lane: list[dict[str, Any]] | None, fallback: float) ->
         except (TypeError, ValueError):
             continue
         if entry > 0 and sl > 0 and vol > 0:
-            total += abs(entry - sl) * vol
+            dist = soft if soft > 0 else abs(entry - sl)
+            total += dist * vol
     return total if total > 0 else float(fallback)
 
 
