@@ -424,7 +424,17 @@ class OpeningManager:
         # profit (close-based, matching the replay's _simulate_bank; the
         # sdzone x bias x bank verdict: 5/6 cells positive, WR 81-87%).
         # Losses exit via broker SL; time cap via basket time_stop_min.
-        if vp_lane.trail_mode() == "bank" and m5_bars:
+        if vp_lane.trail_mode() == "bank":
+            # 2026-07-26 audit: this branch used to be guarded by `and m5_bars`,
+            # while the plain/convex branches below have no data guard — so an
+            # empty bar fetch (a restart before the daemon is up returns
+            # [], [], []) fell THROUGH to _hard_take/ladder_floor_r, silently
+            # swapping the lane's proven bank exit for the RETIRED dragon
+            # ladder with nothing in the log to say the exit curve changed.
+            # The dispatch is now exhaustive: no bars simply means hold.
+            if not m5_bars:
+                return {"action": "hold", "reason": "bank_no_bars",
+                        "basket_runtime": basket_runtime}
             bank_r = _f(__import__("os").environ.get(vp_lane.ENV_BANK_R), 0.4) or 0.4
             if len(positions) == 1:
                 pos = positions[0]
@@ -433,7 +443,12 @@ class OpeningManager:
                 p_side = str(pos.get("tradeSide") or pos.get("side") or "").lower()
                 risk_pts = abs(p_entry - p_sl)
                 last_close = _f(m5_bars[-1].get("close"), 0.0)
-                if risk_pts > 0 and p_entry > 0 and last_close > 0:
+                # 2026-07-26 audit: guarding on `risk_pts > 0` did not catch a
+                # MISSING stop — with stopLoss absent p_sl is 0.0, so risk_pts
+                # becomes the gold PRICE (~3300) and r_close is ~0.0 forever,
+                # meaning the lane never banks and only the 60-min cap resolves
+                # the position. Require a real stop instead.
+                if p_sl > 0 and risk_pts > 0 and p_entry > 0 and last_close > 0:
                     r_close = ((last_close - p_entry) / risk_pts
                                if p_side.startswith("buy")
                                else (p_entry - last_close) / risk_pts)

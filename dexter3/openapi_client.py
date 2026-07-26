@@ -1300,7 +1300,24 @@ class Dexter3OpenApiClient:
         from risk_usd — dexter3 already computed the exact size it wants.
         """
         sym = str(symbol or "").strip().upper()
-        pip_size = _PIP_SIZE_BY_SYMBOL.get(sym)
+        # 2026-07-26 audit: TWO independent pip sizes existed across the order
+        # boundary — the executor converts distance->pips with the BROKER-derived
+        # pipSize (10**-pipPosition from get_symbol_details) while this method
+        # converted pips->price with a HARDCODED table. get_symbol_details
+        # already logs a warning when they disagree and nobody gated on it, so a
+        # broker reporting pipPosition=1 would turn a 3.00 stop into 0.30 and
+        # stop every trade instantly. Prefer the live broker value and keep the
+        # table only as the fallback it was always documented to be.
+        pip_size = None
+        try:
+            details = self.get_symbol_details(sym)
+            derived = float((details or {}).get("pipSize") or 0.0)
+            if derived > 0.0:
+                pip_size = derived
+        except Exception:  # noqa: BLE001 - fall back to the known table below
+            pip_size = None
+        if pip_size is None:
+            pip_size = _PIP_SIZE_BY_SYMBOL.get(sym)
         if pip_size is None:
             raise McpClientError(
                 f"place_market_order: no known pip size for symbol={sym!r} "

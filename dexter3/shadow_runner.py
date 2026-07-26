@@ -94,6 +94,7 @@ from dexter3.v16_entry_quality import (
 
 RUNTIME = ROOT / "data" / "runtime"
 STATE_FILE = RUNTIME / "dexter3_shadow_state.json"
+PAPER_STATE_FILE = RUNTIME / "dexter3_fable_paper_shadow_state.json"
 VP_STATE_FILE = RUNTIME / "dexter3_vp_shadow_state.json"
 DAYTREND_STATE_FILE = RUNTIME / "dexter3_daytrend_shadow_state.json"
 SCALP_STATE_FILE = RUNTIME / "dexter3_scalp_shadow_state.json"
@@ -105,6 +106,7 @@ LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # path stays LOG_FILE unchanged (confirmed the only code reader,
 # ops/dexter3_telegram_watcher.py, hardcodes exactly this fable path — see
 # _active_log_file below), so keeping it as-is means zero breakage there.
+PAPER_LOG_FILE = RUNTIME / "dexter3_fable_paper_shadow.log"
 VP_LOG_FILE = RUNTIME / "dexter3_vp_shadow.log"
 DAYTREND_LOG_FILE = RUNTIME / "dexter3_daytrend_shadow.log"
 SCALP_LOG_FILE = RUNTIME / "dexter3_scalp_shadow.log"
@@ -112,6 +114,7 @@ DPULL_LOG_FILE = RUNTIME / "dexter3_dpull_shadow.log"
 DPULL_CS_LOG_FILE = RUNTIME / "dexter3_dpull_cs_shadow.log"
 CHF_LOG_FILE = RUNTIME / "dexter3_chf_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
+PAPER_LOCK_FILE = RUNTIME / "dexter3_fable_paper_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
 DAYTREND_LOCK_FILE = RUNTIME / "dexter3_daytrend_shadow.lock"
 SCALP_LOCK_FILE = RUNTIME / "dexter3_scalp_shadow.lock"
@@ -245,6 +248,8 @@ def _active_order_label(mode: str | None = None) -> str:
     The process mode selects exactly one label.
     """
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "fable-paper":
+        return f"{FABLE_LABEL_FAMILY}:paper"
     if current_mode == "vp":
         from dexter3.volume_profile import VP_LABEL
 
@@ -287,6 +292,8 @@ def _active_label_family(mode: str | None = None) -> str:
     versions.
     """
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "fable-paper":
+        return FABLE_LABEL_FAMILY
     if current_mode == "vp":
         from dexter3.volume_profile import VP_LABEL_FAMILY
 
@@ -316,6 +323,8 @@ def _active_label_family(mode: str | None = None) -> str:
 
 def _active_state_file(mode: str | None = None) -> Path:
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "fable-paper":
+        return PAPER_STATE_FILE
     if current_mode == "vp":
         return VP_STATE_FILE
     if current_mode == "daytrend":
@@ -338,6 +347,8 @@ def _active_log_file(mode: str | None = None) -> Path:
     is the only code that reads this path today and it only ever reads the
     fable path, so this default is a strict no-op for that reader."""
     current_mode = (mode or os.environ.get("DEXTER3_MODE", "v16")).lower().strip()
+    if current_mode == "fable-paper":
+        return PAPER_LOG_FILE
     if current_mode == "vp":
         return VP_LOG_FILE
     if current_mode == "daytrend":
@@ -1441,7 +1452,10 @@ def _pid_alive(pid: int) -> bool:
 
 def acquire_loop_lock(mode: str = "v16") -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    if mode == "vp":
+    if mode == "fable-paper":
+        lock_file, lock_name = PAPER_LOCK_FILE, "fable-paper"
+   
+    elif mode == "vp":
         lock_file, lock_name = VP_LOCK_FILE, "vp-canary"
     elif mode == "daytrend":
         lock_file, lock_name = DAYTREND_LOCK_FILE, "daytrend-canary"
@@ -1471,7 +1485,10 @@ def acquire_loop_lock(mode: str = "v16") -> None:
 
 
 def release_loop_lock(mode: str = "v16") -> None:
-    if mode == "vp":
+    if mode == "fable-paper":
+        lock_file = PAPER_LOCK_FILE
+   
+    elif mode == "vp":
         lock_file = VP_LOCK_FILE
     elif mode == "daytrend":
         lock_file = DAYTREND_LOCK_FILE

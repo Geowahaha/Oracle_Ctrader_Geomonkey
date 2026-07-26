@@ -350,10 +350,30 @@ def aggregate_lane(positions: list[Position], base_risk_usd: float) -> dict[str,
         # (which would read as "flat", not "unknown").
         unreliable = True
 
+    # 2026-07-26 audit: enforce_caps reads agg["base_risk_usd"] and
+    # agg["current_basket_risk_usd"], but aggregate_lane never emitted either —
+    # base_risk_usd was only ever a PARAMETER. So the max_basket_risk_mult cap
+    # evaluated `if 0.0 > 0` and could never fire; only the tests, which
+    # fabricated the keys, ever exercised it. Emitting them arms the guard.
+    # current_basket_risk_usd = the lane's worst case if every leg hits its
+    # stop, i.e. the same sum _lane_actual_risk_usd computes.
+    current_basket_risk_usd = 0.0
+    for position in positions or []:
+        try:
+            p_entry = float(position.get("entryPrice") or position.get("price") or 0.0)
+            p_sl = float(position.get("stopLoss") or position.get("stopLossPrice") or 0.0)
+            p_vol = float(position.get("volumeInUnits") or position.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if p_entry > 0 and p_sl > 0 and p_vol > 0:
+            current_basket_risk_usd += abs(p_entry - p_sl) * p_vol
+
     return {
         "legs": legs,
         "aggregate_pnl_usd": round(total_pnl, 4),
         "aggregate_r": round(aggregate_r, 4),
+        "base_risk_usd": round(float(base_risk_usd or 0.0), 4),
+        "current_basket_risk_usd": round(current_basket_risk_usd, 4),
         "sides": sides,
         "volume_net": round(volume_net, 8),
         "oldest_open_ts": oldest_open_ts,

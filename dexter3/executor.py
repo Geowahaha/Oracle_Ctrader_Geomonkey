@@ -84,6 +84,21 @@ MAX_LABEL_LEN = 60
 _VERSION_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _env_int(key: str, default: int) -> int:
+    """Int env with a safe fallback (2026-07-26 audit helpers)."""
+    try:
+        return int(str(os.environ.get(key, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float_local(key: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(key, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def sanitize_label_version(raw: Any) -> str:
     """Collapse invalid characters to '-'; empty/all-invalid input -> "unknown"
     rather than producing an empty/degenerate version segment."""
@@ -1295,10 +1310,28 @@ class Dexter3Executor:
         best-effort read (no sleep) keeps unit tests fast while the shape
         stays identical for a live client to layer retries on top of later.
         """
-        try:
-            positions = self.client.get_positions()
-        except (McpClientError, McpZombieError):
-            return 0
+        # 2026-07-26 audit: a single blind read meant that whenever
+        # get_positions had not yet propagated the fill, pid stayed 0 -> the
+        # naked-repair branch was SKIPPED entirely (voiding this module's
+        # "never leave naked" promise) and insert_exec_event wrote a NULL
+        # position_id, which vanish-reconcile can never resolve
+        # (`AND e.position_id > 0`), so the learner stayed permanently blind to
+        # that trade. Bounded retry: the propagation window is ~1s, and the
+        # docstring above always intended a live client to layer retries here.
+        attempts = max(1, int(_env_int("DEXTER3_RESOLVE_POSITION_TRIES", 3)))
+        delay = max(0.0, _env_float_local("DEXTER3_RESOLVE_POSITION_DELAY_SEC", 0.7))
+        positions: list[dict[str, Any]] = []
+        for attempt in range(attempts):
+            try:
+                positions = self.client.get_positions()
+            except (McpClientError, McpZombieError):
+                positions = []
+            if any(position_symbol_of(p) == symbol and is_our_position(p)
+                   and position_id_of(p) > 0 and position_id_of(p) not in known_ids
+                   for p in positions):
+                break
+            if attempt < attempts - 1 and delay > 0:
+                time.sleep(delay)
         for pos in positions:
             if position_symbol_of(pos) == symbol and is_our_position(pos):
                 pid = position_id_of(pos)

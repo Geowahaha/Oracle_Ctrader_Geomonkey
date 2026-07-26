@@ -18,6 +18,13 @@ MemoryMax=200M
 Restart=always
 RestartSec=15
 Environment=PYTHONUNBUFFERED=1
+# 2026-07-26 audit: without DEXTER3_MODE this unit resolved to mode "v16" —
+# the SAME state file, lock file, log file and journal label as the LIVE
+# fable lane. The lock made them mutually exclusive, so if paper won the
+# race the live money lane exited with SystemExit and never traded, while
+# they also shared governor day-state, daily entry counters and the
+# pending limit intent. Its own mode gives it its own everything.
+Environment=DEXTER3_MODE=fable-paper
 Environment=DEXTER3_TRANSPORT=openapi
 Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
 Environment=DEXTER3_FAST_TICK_SEC=8
