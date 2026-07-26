@@ -162,7 +162,7 @@ def label_matches_family(label: Any, family: Any) -> bool:
 # plain string literals (not imported) — same "no cross-imports, duplicate
 # small pure logic" convention dexter3.basket_live documents for itself, to
 # avoid coupling this module to grok_v10/volume_profile.
-_KNOWN_LABEL_FAMILIES = (LABEL_FAMILY, "dexter3:grok", "dexter3:vp")
+_KNOWN_LABEL_FAMILIES = (LABEL_FAMILY, "dexter3:vp")
 
 
 def _label_family_root(label: Any) -> str:

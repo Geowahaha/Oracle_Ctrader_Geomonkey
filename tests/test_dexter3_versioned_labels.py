@@ -57,7 +57,11 @@ from dexter3.executor import (
     recent_exec_events,
     sanitize_label_version,
 )
-from dexter3.grok_v10 import GROK_LABEL, GROK_LABEL_FAMILY
+# 2026-07-26: grok was retired and its module removed. These tests use it
+# purely as a FOREIGN lane label for isolation checks, so they now point at
+# a real surviving lane instead of importing a deleted module.
+GROK_LABEL = "dexter3:dtr:canary"
+GROK_LABEL_FAMILY = "dexter3:dtr"
 from dexter3.hunter_brain import Decision
 from dexter3.volume_profile import VP_LABEL, VP_LABEL_FAMILY
 
@@ -229,43 +233,16 @@ def test_lane_realized_today_spans_both_fable_versions_excludes_grok(monkeypatch
 def test_active_label_family_matches_active_order_label_family_per_mode(monkeypatch):
     monkeypatch.delenv("DEXTER3_MODE", raising=False)
     assert sr._active_label_family("v16") == ex_mod.LABEL_FAMILY
-    assert sr._active_label_family("grok") == GROK_LABEL_FAMILY
     assert sr._active_label_family("vp") == VP_LABEL_FAMILY
     # Every mode's own _active_order_label() must belong to the family
     # _active_label_family() reports for that SAME mode.
-    for mode in ("v16", "grok", "vp"):
+    for mode in ("v16", "vp"):
         assert label_matches_family(sr._active_order_label(mode), sr._active_label_family(mode))
 
 
 # ---------------------------------------------------------------------------
 # (d) empirical_stats / skip_evaluator family filter spans versions
 # ---------------------------------------------------------------------------
-
-
-def test_empirical_stats_family_filter_pools_both_fable_versions_excludes_grok(journal):
-    ensure_exec_events_table(journal._conn)
-    for pnl, label in (
-        (2.0, OLD_FABLE_LABEL),
-        (1.0, NEW_FABLE_LABEL),
-        (-3.0, GROK_LABEL),
-    ):
-        insert_exec_event(
-            journal._conn,
-            symbol="XAUUSD",
-            event="lane_position_closed",
-            verified=True,
-            payload={"setup": "hunt_h1_context", "session": "london", "pnl": pnl, "label": label},
-        )
-
-    fable = es.compute_from_journal(journal, "XAUUSD", label="dexter3:fable")
-    grok = es.compute_from_journal(journal, "XAUUSD", label="dexter3:grok")
-
-    assert fable[("hunt_h1_context", "london")]["wins"] == 2  # both fable versions pooled
-    assert fable[("hunt_h1_context", "london")]["losses"] == 0
-    assert grok[("hunt_h1_context", "london")]["wins"] == 0
-    assert grok[("hunt_h1_context", "london")]["losses"] == 1
-
-
 def _decision(*, action: str = "skip", symbol: str = "XAUUSD", ts_close: str = "2026-07-15T09:00:00Z") -> Decision:
     return Decision(
         ts_close=ts_close, symbol=symbol, action=action, side=None, entry_type=None, entry=None,

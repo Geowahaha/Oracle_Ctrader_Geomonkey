@@ -141,7 +141,6 @@ def journal(tmp_path: Path):
 def _isolate_shadow_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep runner-glue tests from touching the live lane's state or log."""
     monkeypatch.setattr(sr, "STATE_FILE", tmp_path / "dexter3_shadow_state.json")
-    monkeypatch.setattr(sr, "GROK_STATE_FILE", tmp_path / "dexter3_grok_shadow_state.json")
     monkeypatch.setattr(sr, "log_line", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sr, "log_error", lambda *_args, **_kwargs: None)
 

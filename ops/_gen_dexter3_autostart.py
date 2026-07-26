@@ -224,68 +224,6 @@ Write-Host "[dexter3-v16] started detached wrapper_pid=$($p.Id) (stdout=$StdoutL
 exit 0
 """
 
-GROK = r"""# Dexter3 Grok v1.0 live loop - XAUUSD only (label dexter3:grok-v1.0:scalper)
-# Lock: data/runtime/dexter3_grok_loop.lock
-# Peer lane: ops/dexter3_xau_v16_loop.ps1 (parallel, separate lock)
-param(
-    [switch]$Foreground
-)
-
-$ErrorActionPreference = "Continue"
-$Root = Split-Path -Parent $PSScriptRoot
-Set-Location $Root
-
-$Lock = Join-Path $Root "data\runtime\dexter3_grok_loop.lock"
-$StdoutLog = Join-Path $Root "data\runtime\dexter3_grok_stdout.log"
-$StderrLog = Join-Path $Root "data\runtime\dexter3_grok_stderr.log"
-$PythonExe = if (Test-Path "C:\Python312\python.exe") { "C:\Python312\python.exe" } else { "python" }
-
-function Test-LoopAlive {
-    if (-not (Test-Path $Lock)) { return $false }
-    $raw = (Get-Content $Lock -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if (-not $raw) { return $false }
-    $pidVal = 0
-    if (-not [int]::TryParse(([string]$raw).Trim(), [ref]$pidVal)) { return $false }
-    return [bool](Get-Process -Id $pidVal -ErrorAction SilentlyContinue)
-}
-
-if (Test-LoopAlive) {
-    $oldPid = (Get-Content $Lock -ErrorAction SilentlyContinue | Select-Object -First 1)
-    Write-Host "[dexter3-grok] already running pid=$oldPid - exit"
-    exit 0
-}
-
-if (Test-Path $Lock) {
-    Remove-Item $Lock -Force -ErrorAction SilentlyContinue
-}
-
-$env:PYTHONUTF8 = "1"
-$env:PYTHONIOENCODING = "utf-8"
-$env:DEXTER3_LIVE = "1"
-$env:DEXTER3_MODE = "grok"
-
-Write-Host "[dexter3-grok] MCP health check (auto-restart if down)..."
-& $PythonExe "$Root\scripts\ctrader_mcp_watchdog.py" --quiet --restart
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[dexter3-grok] WARNING: cTrader MCP still unhealthy after auto-restart"
-}
-
-Write-Host "[dexter3-grok] starting XAUUSD live at $(Get-Date -Format o)"
-if ($Foreground) {
-    & $PythonExe -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok
-    exit $LASTEXITCODE
-}
-
-$runtimeDir = Join-Path $Root "data\runtime"
-if (-not (Test-Path $runtimeDir)) {
-    New-Item -Path $runtimeDir -ItemType Directory -Force | Out-Null
-}
-
-$cmdLine = "`"$PythonExe`" -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live --grok >> `"$StdoutLog`" 2>> `"$StderrLog`""
-$p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $cmdLine) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
-Write-Host "[dexter3-grok] started detached wrapper_pid=$($p.Id) (stdout=$StdoutLog)"
-exit 0
-"""
 
 REGISTER = r"""# Install Windows Scheduled Tasks for parallel XAU Dexter3 lanes (V1.6 + Grok v1.0).
 #   Dexter3-XAU-Parallel-Autostart  - At logon (2 min delay best-effort)
@@ -457,7 +395,6 @@ def write_ps1(name: str, content: str) -> None:
 def main() -> None:
     write_ps1("dexter3_xau_parallel_watchdog.ps1", WATCHDOG)
     write_ps1("dexter3_xau_v16_loop.ps1", V16)
-    write_ps1("dexter3_xau_grok_loop.ps1", GROK)
     write_ps1("register_dexter3_xau_parallel_tasks.ps1", REGISTER)
 
 

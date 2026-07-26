@@ -47,7 +47,6 @@ REPORTS = ROOT / "data" / "reports"
 
 LANES = {
     "fable": {"family": "dexter3:fable", "log": "dexter3_shadow.log"},
-    "grok": {"family": "dexter3:grok", "log": "dexter3_grok_shadow.log"},
     "vp": {"family": "dexter3:vp", "log": "dexter3_vp_shadow.log"},
     "daytrend": {"family": "dexter3:dtr", "log": "dexter3_daytrend_shadow.log"},
     # scalp lane live 2026-07-17 (grok's successor) — added 2026-07-19 so the

@@ -455,13 +455,10 @@ def test_account_open_risk_cap_fails_open_on_malformed_position_data(journal, mo
 
 def test_active_log_file_selects_by_mode(monkeypatch):
     assert sr._active_log_file("v16").name == "dexter3_shadow.log"
-    assert sr._active_log_file("grok").name == "dexter3_grok_shadow.log"
     assert sr._active_log_file("vp").name == "dexter3_vp_shadow.log"
 
     monkeypatch.delenv("DEXTER3_MODE", raising=False)
     assert sr._active_log_file().name == "dexter3_shadow.log"
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    assert sr._active_log_file().name == "dexter3_grok_shadow.log"
     monkeypatch.setenv("DEXTER3_MODE", "vp")
     assert sr._active_log_file().name == "dexter3_vp_shadow.log"
 
@@ -481,7 +478,6 @@ def test_once_mode_vp_patches_executor_label(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sr, "DecisionJournal", lambda *a, **kw: DecisionJournal(tmp_path / "once_vp_journal.db"))
     monkeypatch.setattr(sr, "run_once", lambda *a, **kw: None)
     monkeypatch.setattr(sr, "LOCK_FILE", tmp_path / "dexter3_loop.lock")
-    monkeypatch.setattr(sr, "GROK_LOCK_FILE", tmp_path / "dexter3_grok_loop.lock")
     # dexter3.executor.LABEL is mutated by main() as a bare module-global
     # assignment (not via monkeypatch) -- pre-register a snapshot so pytest
     # restores the ORIGINAL value at teardown regardless of that mutation.
@@ -500,7 +496,6 @@ def test_once_mode_fable_default_leaves_executor_label_unchanged(tmp_path: Path,
     monkeypatch.setattr(sr, "DecisionJournal", lambda *a, **kw: DecisionJournal(tmp_path / "once_fable_journal.db"))
     monkeypatch.setattr(sr, "run_once", lambda *a, **kw: None)
     monkeypatch.setattr(sr, "LOCK_FILE", tmp_path / "dexter3_loop.lock")
-    monkeypatch.setattr(sr, "GROK_LOCK_FILE", tmp_path / "dexter3_grok_loop.lock")
     monkeypatch.setattr(ex_mod, "LABEL", FABLE_LABEL)
 
     rc = sr.main(["--once", "--symbols", "XAUUSD"])

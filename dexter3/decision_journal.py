@@ -148,7 +148,7 @@ class DecisionJournal:
 
         ``label`` (H2, 2026-07-15 cross-lane entanglement audit, optional):
         the ORDER label of the lane writing this row (e.g.
-        ``dexter3.executor.LABEL`` / ``GROK_LABEL`` / ``VP_LABEL`` —
+        ``dexter3.executor.LABEL`` / ``VP_LABEL`` —
         typically ``dexter3.shadow_runner._active_order_label()``). ``None``
         (the default) preserves the pre-fix behavior of an unlabeled row.
         The ``Decision`` dataclass itself has no ``label`` field, so this is

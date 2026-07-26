@@ -48,12 +48,6 @@ from typing import Any
 from dexter3 import basket_live, hunt_mode, vp_lane
 from dexter3.basket_manager import BasketConfig
 
-# Grok_v1.0 parallel micro-scalp lock (independent, optional)
-try:
-    from dexter3 import grok_v10 as _grok_v10
-except Exception:  # pragma: no cover
-    _grok_v10 = None  # type: ignore
-
 Bar = dict[str, Any]
 Position = dict[str, Any]
 
@@ -373,20 +367,6 @@ class OpeningManager:
         peak_r = _f(basket_runtime.get("peak_r"), live_r)
         floor_r = None  # may be set by V1.6 ladder; Grok path uses its own band
 
-        # Grok scalping mode must be explicit. Recomputing it here would make
-        # normal V1.6 lanes inherit Grok's broad "use on high score" default.
-        is_grok_scalp = bool(st.get("is_grok_scalp", False))
-        grok_cfg = None
-        if is_grok_scalp and _grok_v10 is not None:
-            try:
-                grok_cfg = _grok_v10.get_grok_v10_config_from_env()
-                grok_act = _grok_v10.grok_v10_close_action(peak_r, live_r, grok_cfg)
-                if grok_act:
-                    grok_act["basket_runtime"] = basket_runtime
-                    return grok_act
-            except Exception:
-                is_grok_scalp = False
-
         # ------------------------------------------------------------------
         # General monitoring (caps, smart loss, repair) applies to BOTH modes.
         # Profit exit logic below is mode-specific for independence.
@@ -430,190 +410,189 @@ class OpeningManager:
         # V1.6 profit exits (hard_take, ladder, stall, pyramid) are skipped for
         # Grok_v1.0 scalping entries so the two systems run independently.
         # Only Grok small-lock handles profit taking for scalps.
-        if not is_grok_scalp:
-            # -- CONVEX TRAIL mode (VP lane, owner deploy 2026-07-16;
-            # env-gated DEXTER3_OM_TRAIL_MODE=convex — fable/grok ladder
-            # lanes untouched). The 3-window replay proof's exit: no TP, no
-            # hard-take, no ladder, no stall, no pyramid/repair — a single
-            # trail that arms at peak_r >= arm and floors at
-            # peak - giveback_atr x ATR (floor MAY be negative; below the
-            # broker SL it simply never fires = the replay's SL-first
-            # semantics), plus a hard max-age stop (replay h48 = 240min).
-            # -- BANK mode (scalp lane, owner order 2026-07-17 "ถ้าผ่าน เปิด
-            # scalp lane เลย"): v1.0 bank-green — close the single-leg lane
-            # when the LATEST CLOSED M5 bar's close is >= bank_r x risk in
-            # profit (close-based, matching the replay's _simulate_bank; the
-            # sdzone x bias x bank verdict: 5/6 cells positive, WR 81-87%).
-            # Losses exit via broker SL; time cap via basket time_stop_min.
-            if vp_lane.trail_mode() == "bank" and m5_bars:
-                bank_r = _f(__import__("os").environ.get(vp_lane.ENV_BANK_R), 0.4) or 0.4
-                if len(positions) == 1:
-                    pos = positions[0]
-                    p_entry = _f(pos.get("entryPrice") or pos.get("entry_price"), 0.0)
-                    p_sl = _f(pos.get("stopLoss") or pos.get("stop_loss"), 0.0)
-                    p_side = str(pos.get("tradeSide") or pos.get("side") or "").lower()
-                    risk_pts = abs(p_entry - p_sl)
-                    last_close = _f(m5_bars[-1].get("close"), 0.0)
-                    if risk_pts > 0 and p_entry > 0 and last_close > 0:
-                        r_close = ((last_close - p_entry) / risk_pts
-                                   if p_side.startswith("buy")
-                                   else (p_entry - last_close) / risk_pts)
-                        if r_close >= bank_r:
-                            return {
-                                "action": "close_all",
-                                "reason": "bank_green",
-                                "peak_r": round(peak_r, 4),
-                                "live_r": round(live_r, 4),
-                                "basket_runtime": basket_runtime,
-                            }
-                return {
-                    "action": "hold",
-                    "reason": "bank_hold",
-                    "peak_r": round(peak_r, 4),
-                    "live_r": round(live_r, 4),
-                    "basket_runtime": basket_runtime,
-                }
-
-            # -- PLAIN mode (daytrend lane, owner deploy 2026-07-16): broker
-            # SL/TP + basket caps (incl. time stop) are the ENTIRE exit; the
-            # OM must not profit-exit at all — the daytrend proof's exit is
-            # the signal's own TP at the day extreme, and both the ladder
-            # and convex measurably destroy that producer.
-            if vp_lane.trail_mode() == "plain":
-                return {
-                    "action": "hold",
-                    "reason": "plain_hold",
-                    "peak_r": round(peak_r, 4),
-                    "live_r": round(live_r, 4),
-                    "basket_runtime": basket_runtime,
-                }
-
-            if vp_lane.convex_trail_enabled():
-                cvx = st.get("vp_convex") or {}
-                # dpull-cs vol-gated close-based hard stop (2026-07-23,
-                # env-gated default off — no effect on the base dpull/vp
-                # convex lanes): evaluated on the LATEST CLOSED M5 bar BEFORE
-                # the profit trail, so the pre-arm -1R stop is close-based
-                # (wick-immune) unless the breaching bar is a crash bar. The
-                # broker SL sits at a far backstop (set at entry) so this
-                # software stop owns the -1R level.
-                if (vp_lane.convex_close_stop_enabled() and m5_bars
-                        and len(positions) == 1):
-                    _pos = positions[0]
-                    _entry = _f(_pos.get("entryPrice") or _pos.get("entry_price"), 0.0)
-                    _side = str(_pos.get("tradeSide") or _pos.get("side") or "")
-                    if vp_lane.convex_close_stop_hit(
-                        _side, _entry, _f(cvx.get("stop_pts"), 0.0),
-                        _f(cvx.get("atr_pts"), 0.0), m5_bars[-1],
-                    ):
+        # -- CONVEX TRAIL mode (VP lane, owner deploy 2026-07-16;
+        # env-gated DEXTER3_OM_TRAIL_MODE=convex — fable/grok ladder
+        # lanes untouched). The 3-window replay proof's exit: no TP, no
+        # hard-take, no ladder, no stall, no pyramid/repair — a single
+        # trail that arms at peak_r >= arm and floors at
+        # peak - giveback_atr x ATR (floor MAY be negative; below the
+        # broker SL it simply never fires = the replay's SL-first
+        # semantics), plus a hard max-age stop (replay h48 = 240min).
+        # -- BANK mode (scalp lane, owner order 2026-07-17 "ถ้าผ่าน เปิด
+        # scalp lane เลย"): v1.0 bank-green — close the single-leg lane
+        # when the LATEST CLOSED M5 bar's close is >= bank_r x risk in
+        # profit (close-based, matching the replay's _simulate_bank; the
+        # sdzone x bias x bank verdict: 5/6 cells positive, WR 81-87%).
+        # Losses exit via broker SL; time cap via basket time_stop_min.
+        if vp_lane.trail_mode() == "bank" and m5_bars:
+            bank_r = _f(__import__("os").environ.get(vp_lane.ENV_BANK_R), 0.4) or 0.4
+            if len(positions) == 1:
+                pos = positions[0]
+                p_entry = _f(pos.get("entryPrice") or pos.get("entry_price"), 0.0)
+                p_sl = _f(pos.get("stopLoss") or pos.get("stop_loss"), 0.0)
+                p_side = str(pos.get("tradeSide") or pos.get("side") or "").lower()
+                risk_pts = abs(p_entry - p_sl)
+                last_close = _f(m5_bars[-1].get("close"), 0.0)
+                if risk_pts > 0 and p_entry > 0 and last_close > 0:
+                    r_close = ((last_close - p_entry) / risk_pts
+                               if p_side.startswith("buy")
+                               else (p_entry - last_close) / risk_pts)
+                    if r_close >= bank_r:
                         return {
                             "action": "close_all",
-                            "reason": "convex_close_stop",
+                            "reason": "bank_green",
                             "peak_r": round(peak_r, 4),
                             "live_r": round(live_r, 4),
                             "basket_runtime": basket_runtime,
                         }
-                floor_cvx = vp_lane.convex_floor_r(
-                    peak_r, _f(cvx.get("atr_pts"), 0.0), _f(cvx.get("stop_pts"), 0.0)
-                )
-                if vp_lane.convex_age_exceeded(
-                    str(oldest_open_ts) if oldest_open_ts else None, now_utc_iso or None
+            return {
+                "action": "hold",
+                "reason": "bank_hold",
+                "peak_r": round(peak_r, 4),
+                "live_r": round(live_r, 4),
+                "basket_runtime": basket_runtime,
+            }
+
+        # -- PLAIN mode (daytrend lane, owner deploy 2026-07-16): broker
+        # SL/TP + basket caps (incl. time stop) are the ENTIRE exit; the
+        # OM must not profit-exit at all — the daytrend proof's exit is
+        # the signal's own TP at the day extreme, and both the ladder
+        # and convex measurably destroy that producer.
+        if vp_lane.trail_mode() == "plain":
+            return {
+                "action": "hold",
+                "reason": "plain_hold",
+                "peak_r": round(peak_r, 4),
+                "live_r": round(live_r, 4),
+                "basket_runtime": basket_runtime,
+            }
+
+        if vp_lane.convex_trail_enabled():
+            cvx = st.get("vp_convex") or {}
+            # dpull-cs vol-gated close-based hard stop (2026-07-23,
+            # env-gated default off — no effect on the base dpull/vp
+            # convex lanes): evaluated on the LATEST CLOSED M5 bar BEFORE
+            # the profit trail, so the pre-arm -1R stop is close-based
+            # (wick-immune) unless the breaching bar is a crash bar. The
+            # broker SL sits at a far backstop (set at entry) so this
+            # software stop owns the -1R level.
+            if (vp_lane.convex_close_stop_enabled() and m5_bars
+                    and len(positions) == 1):
+                _pos = positions[0]
+                _entry = _f(_pos.get("entryPrice") or _pos.get("entry_price"), 0.0)
+                _side = str(_pos.get("tradeSide") or _pos.get("side") or "")
+                if vp_lane.convex_close_stop_hit(
+                    _side, _entry, _f(cvx.get("stop_pts"), 0.0),
+                    _f(cvx.get("atr_pts"), 0.0), m5_bars[-1],
                 ):
                     return {
                         "action": "close_all",
-                        "reason": "convex_time_stop",
+                        "reason": "convex_close_stop",
                         "peak_r": round(peak_r, 4),
-                        "floor_r": round(floor_cvx, 4) if floor_cvx is not None else None,
                         "live_r": round(live_r, 4),
                         "basket_runtime": basket_runtime,
                     }
-                if floor_cvx is not None and live_r <= floor_cvx:
-                    return {
-                        "action": "close_all",
-                        "reason": "convex_trail",
-                        "peak_r": round(peak_r, 4),
-                        "floor_r": round(floor_cvx, 4),
-                        "live_r": round(live_r, 4),
-                        "basket_runtime": basket_runtime,
-                    }
+            floor_cvx = vp_lane.convex_floor_r(
+                peak_r, _f(cvx.get("atr_pts"), 0.0), _f(cvx.get("stop_pts"), 0.0)
+            )
+            if vp_lane.convex_age_exceeded(
+                str(oldest_open_ts) if oldest_open_ts else None, now_utc_iso or None
+            ):
                 return {
-                    "action": "hold",
-                    "reason": "convex_hold",
+                    "action": "close_all",
+                    "reason": "convex_time_stop",
                     "peak_r": round(peak_r, 4),
                     "floor_r": round(floor_cvx, 4) if floor_cvx is not None else None,
                     "live_r": round(live_r, 4),
                     "basket_runtime": basket_runtime,
                 }
-
-            # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
-            # ceiling captures — never wait on giveback math once the move is
-            # this big) ------------------------------------------------------
-            hard_take_action = self._hard_take(live_r, peak_r, cfg)
-            if hard_take_action is not None:
-                hard_take_action["basket_runtime"] = basket_runtime
-                return hard_take_action
-
-            # -- step c2: DRAGON LADDER floor close (the new default profit
-            # exit — see ``ladder_floor_r``) -----------------------------------
-            floor_r = ladder_floor_r(peak_r, cfg)
-            if floor_r is not None and live_r <= floor_r:
+            if floor_cvx is not None and live_r <= floor_cvx:
                 return {
                     "action": "close_all",
-                    "reason": "ladder_floor",
+                    "reason": "convex_trail",
                     "peak_r": round(peak_r, 4),
-                    "floor_r": round(floor_r, 4),
+                    "floor_r": round(floor_cvx, 4),
                     "live_r": round(live_r, 4),
                     "basket_runtime": basket_runtime,
                 }
+            return {
+                "action": "hold",
+                "reason": "convex_hold",
+                "peak_r": round(peak_r, 4),
+                "floor_r": round(floor_cvx, 4) if floor_cvx is not None else None,
+                "live_r": round(live_r, 4),
+                "basket_runtime": basket_runtime,
+            }
 
-            # -- step c3: stall-take (hungry scalp) — a small winner that has
-            # stopped making new peaks and is decaying back toward the (much
-            # looser) ladder floor gets banked now instead of waiting. Only
-            # applies below ``stall_max_peak_r`` — above that tier the ladder
-            # itself is already tight enough to ride.
-            # Pro-pack: also require min peak (noise floor) + min hold ticks.
-            if cfg.stall_min_peak_r <= peak_r < cfg.stall_max_peak_r:
-                ticks_since_peak = int(_f(basket_runtime.get("ticks_since_peak"), 0))
-                ticks_open = int(_f(basket_runtime.get("ticks_open"), 0))
-                min_hold = max(0, int(cfg.stall_min_hold_ticks))
-                if (
-                    ticks_open >= min_hold
-                    and ticks_since_peak >= cfg.stall_ticks
-                    and live_r <= peak_r * cfg.stall_decay_frac
-                ):
-                    return {
-                        "action": "close_all",
-                        "reason": "stall_take",
-                        "peak_r": round(peak_r, 4),
-                        "floor_r": floor_r if floor_r is None else round(floor_r, 4),
-                        "live_r": round(live_r, 4),
-                        "ticks_since_peak": ticks_since_peak,
-                        "ticks_open": ticks_open,
-                        "basket_runtime": basket_runtime,
-                    }
+        # -- step c: spike / hard-take (fire ABOVE the ladder, unconditional
+        # ceiling captures — never wait on giveback math once the move is
+        # this big) ------------------------------------------------------
+        hard_take_action = self._hard_take(live_r, peak_r, cfg)
+        if hard_take_action is not None:
+            hard_take_action["basket_runtime"] = basket_runtime
+            return hard_take_action
 
-            # -- step c4: opportunity add — pyramid the dragon (winners-only,
-            # capped, one add per peak-tier crossed) -----------------------------
-            if cfg.pyramid_enabled:
-                pyramid_action = self._pyramid_add(
-                    symbol,
-                    agg,
-                    live_r,
-                    peak_r,
-                    floor_r,
-                    basket_runtime,
-                    m5_bars,
-                    m15_bars,
-                    h1_bars,
-                    basket_cfg,
-                    cfg,
-                    now_utc_iso,
-                    daily_state,
-                    _f(st.get("spread_abs"), 0.0),
-                )
-                if pyramid_action is not None:
-                    pyramid_action["basket_runtime"] = basket_runtime
-                    return pyramid_action
+        # -- step c2: DRAGON LADDER floor close (the new default profit
+        # exit — see ``ladder_floor_r``) -----------------------------------
+        floor_r = ladder_floor_r(peak_r, cfg)
+        if floor_r is not None and live_r <= floor_r:
+            return {
+                "action": "close_all",
+                "reason": "ladder_floor",
+                "peak_r": round(peak_r, 4),
+                "floor_r": round(floor_r, 4),
+                "live_r": round(live_r, 4),
+                "basket_runtime": basket_runtime,
+            }
+
+        # -- step c3: stall-take (hungry scalp) — a small winner that has
+        # stopped making new peaks and is decaying back toward the (much
+        # looser) ladder floor gets banked now instead of waiting. Only
+        # applies below ``stall_max_peak_r`` — above that tier the ladder
+        # itself is already tight enough to ride.
+        # Pro-pack: also require min peak (noise floor) + min hold ticks.
+        if cfg.stall_min_peak_r <= peak_r < cfg.stall_max_peak_r:
+            ticks_since_peak = int(_f(basket_runtime.get("ticks_since_peak"), 0))
+            ticks_open = int(_f(basket_runtime.get("ticks_open"), 0))
+            min_hold = max(0, int(cfg.stall_min_hold_ticks))
+            if (
+                ticks_open >= min_hold
+                and ticks_since_peak >= cfg.stall_ticks
+                and live_r <= peak_r * cfg.stall_decay_frac
+            ):
+                return {
+                    "action": "close_all",
+                    "reason": "stall_take",
+                    "peak_r": round(peak_r, 4),
+                    "floor_r": floor_r if floor_r is None else round(floor_r, 4),
+                    "live_r": round(live_r, 4),
+                    "ticks_since_peak": ticks_since_peak,
+                    "ticks_open": ticks_open,
+                    "basket_runtime": basket_runtime,
+                }
+
+        # -- step c4: opportunity add — pyramid the dragon (winners-only,
+        # capped, one add per peak-tier crossed) -----------------------------
+        if cfg.pyramid_enabled:
+            pyramid_action = self._pyramid_add(
+                symbol,
+                agg,
+                live_r,
+                peak_r,
+                floor_r,
+                basket_runtime,
+                m5_bars,
+                m15_bars,
+                h1_bars,
+                basket_cfg,
+                cfg,
+                now_utc_iso,
+                daily_state,
+                _f(st.get("spread_abs"), 0.0),
+            )
+            if pyramid_action is not None:
+                pyramid_action["basket_runtime"] = basket_runtime
+                return pyramid_action
 
         # -- step d: Basket Doctor (edge-measured repair) --------------------
         if live_r <= cfg.repair_trigger_r:

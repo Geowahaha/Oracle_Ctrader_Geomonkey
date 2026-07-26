@@ -36,7 +36,11 @@ from dexter3.executor import (
     position_id_of,
     recent_exec_events,
 )
-from dexter3.grok_v10 import GROK_LABEL
+# 2026-07-26: grok was retired and its module removed. These tests use it
+# purely as a FOREIGN lane label for isolation checks, so they now point at
+# a real surviving lane instead of importing a deleted module.
+GROK_LABEL = "dexter3:dtr:canary"
+GROK_LABEL_FAMILY = "dexter3:dtr"
 
 
 # ---------------------------------------------------------------------------
@@ -522,44 +526,6 @@ def test_stamp_skip_bias_fallback_respects_anchor_hour_env(monkeypatch):
 # ---------------------------------------------------------------------------
 # 5. _apply_v16_entry_quality_gate — grok minimum leader_score floor
 # ---------------------------------------------------------------------------
-
-
-def test_grok_min_leader_score_floor_blocks_low_score_by_default(monkeypatch):
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    monkeypatch.delenv("DEXTER3_GROK_MIN_LEADER_SCORE", raising=False)
-    d = FakeDecision(leader_score=0.056, features={})
-    result = sr._apply_v16_entry_quality_gate({}, d)
-    assert result["allow"] is False
-    assert result["reason"] == "grok_min_leader_score"
-
-
-def test_grok_min_leader_score_floor_allows_above_default(monkeypatch):
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    monkeypatch.delenv("DEXTER3_GROK_MIN_LEADER_SCORE", raising=False)
-    d = FakeDecision(leader_score=0.25, features={})
-    result = sr._apply_v16_entry_quality_gate({}, d)
-    assert result["allow"] is True
-    assert result["reason"] == "grok_bypass"
-
-
-def test_grok_min_leader_score_floor_disabled_by_non_positive_env(monkeypatch):
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    monkeypatch.setenv("DEXTER3_GROK_MIN_LEADER_SCORE", "0")
-    d = FakeDecision(leader_score=0.056, features={})
-    result = sr._apply_v16_entry_quality_gate({}, d)
-    assert result["allow"] is True
-    assert result["reason"] == "grok_bypass"
-
-
-def test_grok_min_leader_score_floor_handles_missing_leader_score_as_zero(monkeypatch):
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    monkeypatch.delenv("DEXTER3_GROK_MIN_LEADER_SCORE", raising=False)
-    d = SimpleNamespace(symbol="XAUUSD", setup="s", features={})  # no leader_score attr at all
-    result = sr._apply_v16_entry_quality_gate({}, d)
-    assert result["allow"] is False
-    assert result["reason"] == "grok_min_leader_score"
-
-
 def test_fable_mode_is_unaffected_by_the_grok_leader_score_floor(monkeypatch):
     monkeypatch.setenv("DEXTER3_MODE", "v16")
     d = FakeDecision(

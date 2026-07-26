@@ -94,7 +94,6 @@ def journal(tmp_path: Path):
 def _isolate_shadow_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep runner-glue tests from touching the live lane's state or log."""
     monkeypatch.setattr(sr, "STATE_FILE", tmp_path / "dexter3_shadow_state.json")
-    monkeypatch.setattr(sr, "GROK_STATE_FILE", tmp_path / "dexter3_grok_shadow_state.json")
     monkeypatch.setattr(sr, "log_line", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sr, "log_error", lambda *_args, **_kwargs: None)
 
@@ -524,31 +523,6 @@ def test_run_om_tick_no_lane_clears_runtime_and_is_noop(journal, monkeypatch, tm
     status = sr.run_om_tick(mcp, journal, state, "BTCUSD", executor=None)
     assert status == "om_no_lane"
     assert "BTCUSD" not in state.get("basket_runtime", {})
-
-
-def test_active_order_label_selects_v16_or_grok_label():
-    from dexter3.grok_v10 import GROK_LABEL
-
-    assert sr._active_order_label("v16") == LABEL
-    assert sr._active_order_label("grok") == GROK_LABEL
-
-
-def test_active_state_file_selects_separate_v16_and_grok_files():
-    assert sr._active_state_file("v16").name == "dexter3_shadow_state.json"
-    assert sr._active_state_file("grok").name == "dexter3_grok_shadow_state.json"
-    assert sr._active_state_file("v16") != sr._active_state_file("grok")
-
-
-def test_grok_runtime_clear_does_not_touch_v16_runtime():
-    state = {
-        "basket_runtime": {"XAUUSD": {"peak_r": 1.2}},
-        "grok_v10_basket_runtime": {"XAUUSD": {"peak_r": 0.4}},
-    }
-    sr._clear_basket_runtime(state, "XAUUSD", grok=True)
-    assert state["basket_runtime"]["XAUUSD"]["peak_r"] == pytest.approx(1.2)
-    assert "XAUUSD" not in state["grok_v10_basket_runtime"]
-
-
 # ---------------------------------------------------------------------------
 # V1.6 profit controls (2026-07-09) — green-day scaling + weak-bucket scout
 # ---------------------------------------------------------------------------
@@ -596,17 +570,6 @@ def test_v16_profit_controls_house_money_scale_after_cushion(monkeypatch):
     risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
     assert risk == pytest.approx(36.0)
     assert d.features["v16_profit_control"]["reason"] == "house_money_winner_scale"
-
-
-def test_v16_profit_controls_skip_grok_mode(monkeypatch):
-    monkeypatch.setenv("DEXTER3_MODE", "grok")
-    monkeypatch.setattr(sr, "_lane_realized_today", lambda mcp, label_filter: (100.0, []))
-    d = _profit_control_decision("hunt_m15_drift")
-    risk = sr._apply_v16_profit_controls(FakeMcp(), {"governor": {"floating_by_symbol": {}}}, d, 12.0)
-    assert risk == pytest.approx(12.0)
-    assert "v16_profit_control" not in d.features
-
-
 def test_v16_house_money_arms_then_locks_floor(monkeypatch):
     monkeypatch.setenv("DEXTER3_MODE", "v16")
     monkeypatch.setenv("DEXTER3_V16_HOUSE_THRESHOLD_USD", "30")
