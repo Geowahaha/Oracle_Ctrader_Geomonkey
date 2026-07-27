@@ -525,6 +525,18 @@ def planned_volume_units(
         rounded = min_volume
         meta["rounded_units"] = rounded
         meta["min_volume_clamped_up"] = True
+        # 2026-07-27 live audit: at the XAU 1-ounce floor the ACTUAL dollar risk
+        # is stop_distance x minVolume, which can be a large multiple of what
+        # the governor asked for — measured live on dtr: intended $1.60 ->
+        # actual $7.16 (4.5x), $1.60 -> $3.40, $3.20 -> $6.55. Every governor
+        # downsize multiplier (session, ladder, anti-chase, bias) therefore does
+        # not merely fail to shrink the position, it makes the OVERRUN worse:
+        # the smaller the requested risk, the larger the multiple. That silently
+        # burns the daily loss budget several times faster than the governor
+        # plans. Stamped so it is queryable per fill instead of having to be
+        # rediscovered by hand.
+        if float(risk_usd) > 0:
+            meta["risk_overrun_mult"] = round(estimated_min_volume_risk_usd / float(risk_usd), 3)
         # DEXTER3_MIN_VOLUME_RISK_RATIO_CAP (default 0 = off, byte-identical
         # legacy accept): when the min-volume floor inflates actual risk beyond
         # ratio_cap x the designed risk_usd, REFUSE instead of silently

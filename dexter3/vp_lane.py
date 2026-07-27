@@ -396,12 +396,33 @@ def convex_trail_enabled() -> bool:
     return trail_mode() == "convex"
 
 
+ENV_CONVEX_GIVEBACK_MAX_PEAK_FRAC = "DEXTER3_OM_CONVEX_GIVEBACK_MAX_PEAK_FRAC"
+
+
 def convex_floor_r(peak_r: float, atr_pts: float, stop_pts: float) -> float | None:
     """None until ``peak_r`` reaches the arm threshold; then a single
     continuous line ``peak_r - (giveback_atr * atr_pts / stop_pts)``. The
     floor MAY be negative by design (unlike the ladder's >=0 guarantee) —
     below the broker SL it simply never fires, which is exactly the replay's
-    SL-first semantics."""
+    SL-first semantics.
+
+    2026-07-27 LIVE DEFECT (journal, vp_lvn_rejection 07-27T02:38): because
+    ``giveback_r`` is ATR divided by STOP DISTANCE, a tight stop makes the
+    giveback enormous in R terms. That trade ran to ``peak_r 3.2674`` with a
+    2.88-pt stop against a ~3.8-pt ATR, giving ``giveback_r = 3.98R`` and a
+    floor of ``-0.7138`` — the floor was BELOW BREAKEVEN for the entire life of
+    the position, so the trail held a +3.27R winner all the way down and closed
+    it at -0.74R, handing back 4.0R. A trail whose floor can never rise above
+    breakeven is strictly worse than no trail at all.
+
+    ``DEXTER3_OM_CONVEX_GIVEBACK_MAX_PEAK_FRAC`` caps the giveback at a
+    FRACTION OF PEAK, which is the one exit rule the 2026-07-25 causal
+    path-simulation found beat doing nothing ("trail 50% of peak, arm 1.5R",
+    the only positive row of 32 tested). At 0.5 the example above floors at
+    +1.63R instead of -0.71R. Default 0 = OFF = prior behaviour, because the
+    same study showed every EARLIER-locking rule loses money — this caps the
+    give-back, it does not tighten the arm.
+    """
     arm_r = _env_float(ENV_CONVEX_ARM_R, 1.0)
     if peak_r < arm_r:
         return None
@@ -409,6 +430,9 @@ def convex_floor_r(peak_r: float, atr_pts: float, stop_pts: float) -> float | No
         return None
     atr = atr_pts if atr_pts > 0 else _env_float(ENV_CONVEX_ATR_PTS_DEFAULT, 5.0)
     giveback_r = _env_float(ENV_CONVEX_GIVEBACK_ATR, 3.0) * atr / stop_pts
+    max_frac = _env_float(ENV_CONVEX_GIVEBACK_MAX_PEAK_FRAC, 0.0)
+    if max_frac > 0.0:
+        giveback_r = min(giveback_r, max_frac * peak_r)
     return peak_r - giveback_r
 
 
