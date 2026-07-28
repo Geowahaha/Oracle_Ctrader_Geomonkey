@@ -176,7 +176,8 @@ def _simulate_ladder(side: str, entry: float, sl: float, future: list,
 def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r: float,
                       giveback_atr: float, atr: float, max_hold: int,
                       close_stop: bool = False,
-                      close_stop_hard_mult: float = 0.0) -> tuple[str, float, int]:
+                      close_stop_hard_mult: float = 0.0,
+                      close_stop_vol_gate: float = 0.0) -> tuple[str, float, int]:
     """NO TP. The trail does not exist at all until the best-ever favorable
     excursion (``peak_r``, same tracking as ``_simulate_ladder``) reaches
     ``arm_at_r``. Once armed (permanently -- it never un-arms even if peak_r
@@ -208,13 +209,20 @@ def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r:
         hi = float(bar.get("high", 0.0))
         lo = float(bar.get("low", 0.0))
         cl = float(bar.get("close", 0.0))
+        # vol gate (2026-07-23): the crash/derive damage comes from holding a
+        # close-stop through BIG volatile bars (a real move continuing). The
+        # breaching bar's OWN range vs entry ATR is a lookahead-free
+        # regime-at-the-bar signal: range > gate*ATR = a crash bar -> revert
+        # to the intrabar -1R stop (cut fast, no extra loss); a calm bar with
+        # a wick (range <= gate*ATR) keeps the close-stop wick-immunity that
+        # saved the ranging/validate runners. Separates "noise wick" from
+        # "crash-start wick" without forecasting the regime.
+        volatile_bar = close_stop and close_stop_vol_gate > 0.0 and (hi - lo) > close_stop_vol_gate * atr
         if side == "buy":
-            # crash cap (2026-07-23): plain close-stop bled the derive/crash
-            # segment because a bar can CLOSE far past the stop. A hard
-            # intrabar backstop hard_mult*risk beyond sl caps that at
-            # -(1+hard_mult)R while normal wick-immunity is preserved.
             if close_stop and close_stop_hard_mult > 0.0 and lo <= sl - close_stop_hard_mult * risk:
                 return "loss", -(1.0 + close_stop_hard_mult), held
+            if volatile_bar and lo <= sl:
+                return "loss", -1.0, held          # crash bar: cut intrabar
             stopped = (cl <= sl) if close_stop else (lo <= sl)
             if stopped:
                 return "loss", ((cl - entry) / risk if close_stop else -1.0), held
@@ -222,6 +230,8 @@ def _simulate_convex(side: str, entry: float, sl: float, future: list, arm_at_r:
         else:
             if close_stop and close_stop_hard_mult > 0.0 and hi >= sl + close_stop_hard_mult * risk:
                 return "loss", -(1.0 + close_stop_hard_mult), held
+            if volatile_bar and hi >= sl:
+                return "loss", -1.0, held
             stopped = (cl >= sl) if close_stop else (hi >= sl)
             if stopped:
                 return "loss", ((entry - cl) / risk if close_stop else -1.0), held
