@@ -265,3 +265,14 @@ def test_shadow_runner_resolvers_isolate_sniper(monkeypatch):
     assert sr._alt_producer_enabled() is True
     monkeypatch.setenv("DEXTER3_MODE", "v16")
     assert sr._sniper_producer_enabled() is False
+
+
+def test_index_symbols_have_usd_point_value():
+    """Without a table entry `_enrich_positions_with_live_pnl` skips the
+    symbol -> no netProfit -> basket unreliable -> OM holds forever (observed
+    live on the first US30 sniper position, 2026-07-29). Pin the index
+    entries so a refactor can never silently blind the index lanes again."""
+    from dexter3.openapi_client import _USD_POINT_VALUE_PER_UNIT as tbl
+
+    for sym in ("XAUUSD", "USTEC", "US30", "US500"):
+        assert tbl.get(sym) == 1.0, sym

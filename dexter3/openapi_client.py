@@ -233,6 +233,20 @@ _PIP_SIZE_BY_SYMBOL = {
 # number. Add a symbol only with its confirmed contract point value.
 _USD_POINT_VALUE_PER_UNIT = {
     "XAUUSD": 1.0,
+    # 2026-07-29 sniper index lanes: without a table entry the enrichment
+    # SKIPS the symbol entirely -> no netProfit -> basket "unreliable" -> OM
+    # HOLDs forever (observed live on the first US30 position, pnl_sources
+    # {"unavailable": 1} every tick while get_spot_price(US30) was healthy).
+    # 1.0 = $1 per 1.0 index point per volume UNIT — the same convention the
+    # executor's sizing math (planned_volume_units: units = risk/sl_distance)
+    # already assumes for EVERY symbol, and these three share XAUUSD's exact
+    # broker normalization (lotSize=100, pipSize=0.1; probed 2026-07-29 on
+    # demo 9922808). Any drift from broker truth will surface as an
+    # OM-vs-deal-netProfit mismatch at the first close — the ledger itself
+    # stays broker-supplied either way.
+    "USTEC": 1.0,
+    "US30": 1.0,
+    "US500": 1.0,
 }
 
 # Entry-vs-target field-confusion sanity guard (2026-07-15, P0 live-PnL
