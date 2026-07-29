@@ -1,0 +1,93 @@
+# Dexter3 SNIPER lane — XAUUSD unit (owner directive 2026-07-30: the
+# SHADOWCODES [PRO SNIPER] Pine v6 script, translated to dexter3/sniper.py,
+# live-tested as a forward canary on XAUUSD and USTEC).
+#
+# WHAT: supply/demand zones (base bar + impulse + direction flip, mitigated
+# by close-through) + two entry mechanisms on the M5 close:
+#   ST2 = dominant wick rejection printed INSIDE a zone (wick > 2.5x body,
+#         > 2x the opposite wick) -> market entry with the zone at the back;
+#   QM  = 20-bar liquidity sweep reclaimed with displacement (the exact
+#         family of the owner's own reviewed NASDAQ trades).
+# SL = signal-bar extreme -/+ 0.5 x ATR (script), then the audit-proven SL
+# floor (1.3 x median TR — the ONE measured edge, +0.51R swing) may widen it.
+# TP = PLAIN broker TP at 2R (the script's TP1; multi-TP partials are
+# impossible at the 1-oz floor, and fixed broker TP = 66.5% of live gross
+# profit per the 2026-07-25 audit). Exits must NOT trail — plain only.
+#
+# VALIDATION: replay sanity-checked pre-deploy (parity by construction — the
+# harness calls dexter3/sniper.py itself, zones are a pure function of the
+# bar window); the honest arbiter is FORWARD realized PnL at canary size,
+# same stance as chf/dpull-cs. Judge at N>=30; do not scale before then.
+#
+# Isolation: DEXTER3_MODE=sniper -> own label (dexter3:sniper:canary), state,
+# lock, log. The USTEC sibling runs a SEPARATE process + SEPARATE label
+# family (dexter3:sniper-ustec via DEXTER3_SNIPER_SUFFIX) so the two
+# governors never read each other's deals.
+#
+# OFF BY DEFAULT — not installed until deploy sign-off. ACTIVATION:
+#   sudo cp ops/dexter3-sniper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-sniper
+[Unit]
+Description=Dexter3 SNIPER lane LIVE canary XAUUSD (SHADOWCODES S/D zones + ST2 wick rejection + QM sweep)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=sniper
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
+# --- canary risk (same tier as the other new-lane canaries) ----------------
+Environment=DEXTER3_DAILY_TARGET_USD=15
+Environment=DEXTER3_DAILY_LOSS_USD=8
+Environment=DEXTER3_BASE_RISK_FRAC=0.004
+Environment=DEXTER3_MAX_RISK_FRAC=0.008
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# --- the audit-proven SL floor (only ever WIDENS the script's stop) ---------
+Environment=DEXTER3_SL_FLOOR_TR_MULT=1.3
+Environment=DEXTER3_SL_FLOOR_MAX_ABS=10
+# --- producer knobs (dexter3/sniper.py; defaults = the script's own inputs) -
+Environment=DEXTER3_SNIPER_ATR_LEN=14
+Environment=DEXTER3_SNIPER_BASE_BODY_FRAC=0.3
+Environment=DEXTER3_SNIPER_IMPULSE_BODY_FRAC=0.6
+Environment=DEXTER3_SNIPER_ZONE_MAX_AGE=100
+Environment=DEXTER3_SNIPER_ST2_RATIO=2.5
+Environment=DEXTER3_SNIPER_WICK_DOM=2.0
+Environment=DEXTER3_SNIPER_SWEEP_LOOKBACK=20
+Environment=DEXTER3_SNIPER_SL_ATR_BUF=0.5
+Environment=DEXTER3_SNIPER_TP_R=2.0
+Environment=DEXTER3_SNIPER_MAX_RISK_ATR=3.0
+Environment=DEXTER3_SNIPER_SCAN_WINDOW=300
+# --- entry: MARKET at the signal close (the script's own convention) --------
+Environment=DEXTER3_ENTRY_CONFIRM=off
+# --- exit: PLAIN (fixed 2R broker TP IS the strategy; never trail past it) --
+Environment=DEXTER3_OM_TRAIL_MODE=plain
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=130
+# --- lane hygiene ------------------------------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=0
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target

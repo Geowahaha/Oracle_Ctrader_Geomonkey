@@ -91,6 +91,7 @@ from scripts.dexter3_convex_exit_replay import (  # noqa: E402
 )
 from scripts.dexter3_geometry_optimizer import _equity  # noqa: E402
 from dexter3 import hunt_mode, market_lens, volume_profile  # noqa: E402
+from dexter3 import sniper as dexter3_sniper  # noqa: E402
 
 
 def _load_unit_env(unit_path: str) -> dict[str, str]:
@@ -960,7 +961,7 @@ def main() -> int:
                     help="dip_r:window_bars zone variants confirmed on M1 bars (M5 green "
                          "light, M1 best-entry trigger) -- owner idea 2026-07-16. NOTE: "
                          "daemon M1 history is ~14 days; rows outside it report miss_no_m1")
-    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend", "dayreversal", "channelfade", "sdzone"), default="hunt",
+    ap.add_argument("--producer", choices=("hunt", "vp", "daytrend", "dayreversal", "channelfade", "sdzone", "sniper"), default="hunt",
                     help="signal producer: hunt = live decide_hunt committee; vp = "
                          "volume_profile.decide_vp (the only gate-passer in repo history); "
                          "daytrend = with-bias pullback-continuation (owner live lesson "
@@ -1142,6 +1143,19 @@ def main() -> int:
                 tsign = _h1_trend_sign(h1c)
             decisions.append((i, d, tsign))
             continue
+        if args.producer == "sniper":
+            # SNIPER (SHADOWCODES, 2026-07-30): calls THE LIVE MODULE itself
+            # (dexter3/sniper.py) on the bar prefix — zones are a pure
+            # function of the trailing window, so replay and live share the
+            # exact state model by construction (no prototype fork to drift).
+            try:
+                d = dexter3_sniper.decide_sniper(args.symbol, prefix, args.spread_abs)
+            except Exception:
+                continue
+            if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
+                continue
+            decisions.append((i, d, 0))
+            continue
         if args.producer == "sdzone":
             _sd_engine.update(i, m5, _atr14[i], _volma[i])
             sig = decide_sdzone(m5, i, _sd_engine, _atr14[i], rr=args.sdz_rr)
@@ -1224,7 +1238,7 @@ def main() -> int:
     print(f"decisions: {len(decisions)} enter candidates (producer={args.producer})")
 
     gate_modes = [g.strip() for g in args.gates.split(",") if g.strip()]
-    if args.producer in ("vp", "daytrend", "dayreversal", "channelfade", "sdzone") and gate_modes != ["none"]:
+    if args.producer in ("vp", "daytrend", "dayreversal", "channelfade", "sdzone", "sniper") and gate_modes != ["none"]:
         print(f"producer={args.producer}: forcing gates=none")
         gate_modes = ["none"]
     rungs = _parse_ladder_csv(args.ladder_csv)
