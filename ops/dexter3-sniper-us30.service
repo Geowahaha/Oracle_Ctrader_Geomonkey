@@ -1,0 +1,86 @@
+# Dexter3 SNIPER lane — US30 unit (owner extension 2026-07-30: "ทดสอบใน US30
+# US100 ด้วย"; US100 on this broker IS the already-live USTEC symbol — probed
+# 2026-07-29, get_symbol_details("US100") = symbol_not_found — so US30 is the
+# one NEW symbol this order adds). Same producer + posture as
+# ops/dexter3-sniper.service (read that header first); this file documents
+# only what differs for the Dow.
+#
+# RISK TIER (measured 2026-07-29 on demo 9922808): US30 minVolume = 1 unit
+# ~= $1 per index point at ~51,950; MEASURED M5 mean TR = 29.45 pts
+# (replay 2026-07-29) ~= USTEC's 32.7 despite ~2x the price, so the floor
+# risk band is the SAME (~$15-50/trade) and this unit copies the USTEC tier
+# exactly: intended ~= actual floor (BASE_RISK_FRAC 0.03 -> ~$30), overrun
+# ~1 by design, DAILY_LOSS 60 ~= 2 floor-risk losses, TARGET 120, abs-cap
+# 45x1.6 = $72. DEMO — the point is forward evidence at honest sizes.
+#
+# ISOLATION: DEXTER3_SNIPER_SUFFIX=us30 -> label family "dexter3:sniper-us30",
+# own state/lock/log — shares NOTHING with the XAU/USTEC sniper processes.
+#
+# OFF BY DEFAULT — ACTIVATION:
+#   sudo cp ops/dexter3-sniper-us30.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-sniper-us30
+[Unit]
+Description=Dexter3 SNIPER lane LIVE canary US30 (SHADOWCODES S/D zones + ST2 wick rejection + QM sweep)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=sniper
+Environment=DEXTER3_SNIPER_SUFFIX=us30
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=45
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
+# --- risk tier sized to US30's 1-unit floor (see header math) ---------------
+Environment=DEXTER3_DAILY_TARGET_USD=120
+Environment=DEXTER3_DAILY_LOSS_USD=60
+Environment=DEXTER3_BASE_RISK_FRAC=0.03
+Environment=DEXTER3_MAX_RISK_FRAC=0.06
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# --- the audit-proven SL floor (MAX_ABS in POINTS; Dow TR measured ~29) -----
+Environment=DEXTER3_SL_FLOOR_TR_MULT=1.3
+Environment=DEXTER3_SL_FLOOR_MAX_ABS=80
+# --- producer knobs (identical across all sniper units — one strategy) ------
+Environment=DEXTER3_SNIPER_ATR_LEN=14
+Environment=DEXTER3_SNIPER_BASE_BODY_FRAC=0.3
+Environment=DEXTER3_SNIPER_IMPULSE_BODY_FRAC=0.6
+Environment=DEXTER3_SNIPER_ZONE_MAX_AGE=100
+Environment=DEXTER3_SNIPER_ST2_RATIO=2.5
+Environment=DEXTER3_SNIPER_WICK_DOM=2.0
+Environment=DEXTER3_SNIPER_SWEEP_LOOKBACK=20
+Environment=DEXTER3_SNIPER_SL_ATR_BUF=0.5
+Environment=DEXTER3_SNIPER_TP_R=2.0
+Environment=DEXTER3_SNIPER_MAX_RISK_ATR=3.0
+Environment=DEXTER3_SNIPER_SCAN_WINDOW=300
+# --- entry: MARKET at the signal close --------------------------------------
+Environment=DEXTER3_ENTRY_CONFIRM=off
+# --- exit: PLAIN (fixed 2R broker TP IS the strategy) ------------------------
+Environment=DEXTER3_OM_TRAIL_MODE=plain
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=130
+# --- lane hygiene ------------------------------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=0
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols US30 --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target
