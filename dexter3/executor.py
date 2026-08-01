@@ -1629,6 +1629,24 @@ class Dexter3Executor:
         side = position_side_of(pos)
         entry = float(pos.get("entryPrice") or pos.get("price") or 0.0)
         volume = position_volume_of(pos)
+        # 2026-08-01 dpull-cs backstop forensics: the ENTRY path sends SL/TP as
+        # integer PIPS (_to_pips) so raw float arithmetic never reaches the
+        # broker — but THIS amend path sends ABSOLUTE prices, and cTrader
+        # rejects any price with more decimals than the symbol allows
+        # ("Order protection = 4079.85828 has more digits than symbol allows.
+        # Allowed 2 digits"). Every dpull-cs backstop widen since the lane's
+        # first day (136 rejects, 2026-07-23→31) died on this, silently
+        # reinstating the tight soft SL — the exact wick-out the backstop
+        # exists to prevent. Round HERE, at the one chokepoint every amend
+        # caller goes through; fail-open to the raw price if details are
+        # unavailable (the broker then decides, same as before this fix).
+        try:
+            _digits = int((self.client.get_symbol_details(symbol) or {}).get("digits") or 0)
+        except Exception:  # noqa: BLE001 - rounding is best-effort, never block the amend
+            _digits = 0
+        if _digits > 0:
+            sl = round(float(sl), _digits) if sl is not None else None
+            tp = round(float(tp), _digits) if tp is not None else None
         try:
             self.client.amend_position(int(position_id), stop_loss=sl, take_profit=tp)
         except McpMutationUncertain as exc:

@@ -276,3 +276,54 @@ def test_index_symbols_have_usd_point_value():
 
     for sym in ("XAUUSD", "USTEC", "US30", "US500"):
         assert tbl.get(sym) == 1.0, sym
+
+
+# -- Phase-3 lever: zone-to-zone TP (DEXTER3_SNIPER_TP_MODE) --------------------
+
+
+def _st2_with_supply_overhead() -> list[dict]:
+    """demand zone at [4000,4002] + a SUPPLY zone overhead at [4006,4008]
+    (green flip -> base at 4006-4008 -> red impulse), then the ST2 buy signal
+    bar. The buy's zone target must be the supply BOTTOM (4006.0)."""
+    bars = _quiet(20) + _demand_triplet(20)
+    bars.append(_bar(_ts(23), 4004.0, 4006.0, 4003.8, 4005.8))          # green flip
+    bars.append(_bar(_ts(24), 4007.0, 4008.0, 4006.0, 4006.8))          # base (supply zone)
+    bars.append(_bar(_ts(25), 4006.6, 4006.8, 4002.2, 4002.4))          # red impulse
+    bars += _drift_above(3, start=26, base=4004.0)
+    bars.append(_bar(_ts(29), 4004.5, 4004.6, 4001.5, 4004.4))          # ST2 buy signal
+    return bars
+
+
+def test_tp_mode_default_rr_unchanged(monkeypatch):
+    monkeypatch.delenv(sn.ENV_TP_MODE, raising=False)
+    d = sn.decide_sniper("XAUUSD", _st2_with_supply_overhead(), spread_abs=0.2)
+    assert d.action == "enter"
+    risk = d.entry - d.sl
+    assert d.tp == pytest.approx(d.entry + 2.0 * risk, abs=1e-4)
+
+
+def test_tp_mode_zone_targets_opposing_zone(monkeypatch):
+    monkeypatch.setenv(sn.ENV_TP_MODE, "zone")
+    d = sn.decide_sniper("XAUUSD", _st2_with_supply_overhead(), spread_abs=0.2)
+    assert d.action == "enter"
+    assert d.tp == pytest.approx(4006.0)          # the supply zone's bottom
+    assert any("zone target" in r for r in d.reasons)
+
+
+def test_tp_mode_zone_falls_back_to_rr_without_opposing_zone(monkeypatch):
+    monkeypatch.setenv(sn.ENV_TP_MODE, "zone")
+    d = sn.decide_sniper("XAUUSD", _st2_setup(), spread_abs=0.2)  # no supply zone
+    assert d.action == "enter"
+    risk = d.entry - d.sl
+    assert d.tp == pytest.approx(d.entry + 2.0 * risk, abs=1e-4)
+
+
+def test_tp_mode_zone_minrr1_skips_thin_target(monkeypatch):
+    """Zone target closer than 1R -> the framework says no trade."""
+    monkeypatch.setenv(sn.ENV_TP_MODE, "zone-minrr1")
+    bars = _st2_with_supply_overhead()
+    # signal bar with a DEEP low -> risk ~3+ pts while the zone target is
+    # ~1.6 pts away -> < 1R -> skip
+    bars[-1] = _bar(_ts(29), 4004.5, 4004.6, 4000.2, 4004.4)
+    d = sn.decide_sniper("XAUUSD", bars, spread_abs=0.2)
+    assert d.action == "skip"

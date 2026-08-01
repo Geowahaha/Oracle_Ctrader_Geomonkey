@@ -81,6 +81,15 @@ ENV_SL_ATR_BUF = "DEXTER3_SNIPER_SL_ATR_BUF"          # SL buffer beyond the ext
 ENV_TP_R = "DEXTER3_SNIPER_TP_R"                      # fixed TP in R (2.0 = script TP1)
 ENV_MAX_RISK_ATR = "DEXTER3_SNIPER_MAX_RISK_ATR"      # reject risk > this x ATR (3.0)
 ENV_SCAN_WINDOW = "DEXTER3_SNIPER_SCAN_WINDOW"        # trailing bars for the zone rebuild (300)
+# Phase-3 lever (owner framework 2026-07-19 "ตั้ง Take Profit ที่ Zone ถัดไป",
+# re-ordered into the sniper roadmap 2026-08-01): where the fixed target sits.
+#   rr          (default) entry +/- tp_r x risk — the script's TP1, byte-
+#               identical to the deployed behaviour when this env is absent;
+#   zone        the nearest OPPOSING zone edge beyond entry (a buy exits where
+#               supply begins), falling back to rr when no such zone exists;
+#   zone-minrr1 same, but SKIP the signal entirely when the zone target pays
+#               < 1R (the framework's own "poor RR to target = no trade").
+ENV_TP_MODE = "DEXTER3_SNIPER_TP_MODE"
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -202,17 +211,43 @@ def _skip(ts_close: str, symbol: str, reason: str) -> Decision:
     )
 
 
+def _zone_target(zones: list[dict[str, Any]], side: str, entry: float) -> float | None:
+    """Nearest OPPOSING zone edge beyond ``entry`` (a buy exits where the
+    next supply zone begins; a sell where the next demand zone begins), or
+    None when no opposing zone sits on the profit side."""
+    if side == "buy":
+        cands = [_f(z.get("bottom")) for z in zones
+                 if z.get("side") == "supply" and _f(z.get("bottom")) > entry]
+        return min(cands) if cands else None
+    cands = [_f(z.get("top")) for z in zones
+             if z.get("side") == "demand" and _f(z.get("top")) < entry]
+    return max(cands) if cands else None
+
+
 def _enter(ts_close: str, symbol: str, side: str, entry: float, sl: float,
            setup: str, session: str, reasons: list[str],
-           features: dict[str, Any]) -> Decision | None:
-    """Geometry guard + the script's fixed-R target (TP1 by default). A
-    zero/inverted risk is no trade — returns None so the caller reports a
-    clean skip instead of shipping a broken order."""
+           features: dict[str, Any],
+           zones: list[dict[str, Any]] | None = None) -> Decision | None:
+    """Geometry guard + the target (script TP1 fixed-R by default; the
+    zone-to-zone target when ENV_TP_MODE selects it). A zero/inverted risk is
+    no trade — returns None so the caller reports a clean skip instead of
+    shipping a broken order."""
     tp_r = _env_float(ENV_TP_R, 2.0)
+    tp_mode = os.environ.get(ENV_TP_MODE, "rr").strip().lower()
     risk = abs(entry - sl)
     if risk <= 0 or tp_r <= 0:
         return None
     tp = entry + tp_r * risk if side == "buy" else entry - tp_r * risk
+    if tp_mode in ("zone", "zone-minrr1") and zones is not None:
+        zt = _zone_target(zones, side, entry)
+        if zt is not None:
+            if abs(zt - entry) < risk and tp_mode == "zone-minrr1":
+                return None  # zone target pays <1R -> the framework says no trade
+            tp = zt
+            reasons = reasons + [f"tp_mode={tp_mode}: zone target {zt:.2f}"]
+        elif tp_mode == "zone-minrr1":
+            # no opposing zone to aim at -> fall back to rr (same as 'zone')
+            reasons = reasons + [f"tp_mode={tp_mode}: no opposing zone, rr fallback"]
     if side == "buy" and not (sl < entry < tp):
         return None
     if side == "sell" and not (tp < entry < sl):
@@ -297,10 +332,12 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
             d = _enter(ts_close, symbol, side, c, sl, "sniper_qm_sweep", session,
                        [f"QM {side}: swept {sweep_lb}-bar extreme {swept:.2f}, "
                         f"reclaimed + displaced past prev bar"],
-                       {**feat, "sniper_swept_level": round(swept, 5)})
+                       {**feat, "sniper_swept_level": round(swept, 5)}, zones=zones)
             if d:
                 return d
-        return _skip(ts_close, symbol, f"qm_risk {risk:.2f} outside (0, {max_risk_atr}xATR]")
+        if not (0 < risk <= max_risk_atr * a):
+            return _skip(ts_close, symbol, f"qm_risk {risk:.2f} outside (0, {max_risk_atr}xATR]")
+        return _skip(ts_close, symbol, "qm_geometry_rejected (inverted/zero RR or zone target <1R)")
 
     # -- ST2 wick rejection inside a zone ------------------------------------
     st2_buy = in_demand and dn_wick > body * st2_ratio and dn_wick > up_wick * wick_dom
@@ -316,9 +353,11 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
                        [f"ST2 {side}: wick rejection in "
                         f"{'demand' if st2_buy else 'supply'} zone "
                         f"(wick/body={(dn_wick if st2_buy else up_wick) / max(body, 1e-9):.1f})"],
-                       feat)
+                       feat, zones=zones)
             if d:
                 return d
-        return _skip(ts_close, symbol, f"st2_risk {risk:.2f} outside (0, {max_risk_atr}xATR]")
+        if not (0 < risk <= max_risk_atr * a):
+            return _skip(ts_close, symbol, f"st2_risk {risk:.2f} outside (0, {max_risk_atr}xATR]")
+        return _skip(ts_close, symbol, "st2_geometry_rejected (inverted/zero RR or zone target <1R)")
 
     return _skip(ts_close, symbol, "no_setup")

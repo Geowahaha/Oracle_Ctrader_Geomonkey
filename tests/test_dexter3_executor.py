@@ -1070,3 +1070,35 @@ def test_vanish_reconcile_unknown_lane_is_noop(journal_conn):
     ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
     _entered(ex, mcp, 905)
     assert ex.reconcile_vanished_lane_positions("BTCUSD", None) == []  # unknown broker state
+
+
+def test_amend_lane_sl_tp_rounds_prices_to_symbol_digits(journal_conn):
+    """2026-08-01 dpull-cs backstop forensics: the amend path sends ABSOLUTE
+    prices and cTrader rejects any price with more decimals than the symbol
+    allows ('4079.85828 ... Allowed 2 digits') — every backstop widen since
+    the lane's first day (136 rejects) died on this. The chokepoint must
+    round to the symbol's own digits before calling amend_position."""
+    ours = _filled_position(position_id=11, stop_loss=61900.0, take_profit=62150.0)
+    mcp = FakeMcp(positions=[ours], symbol_details={
+        "minVolume": 0.01, "maxVolume": 10.0, "volumeStep": 0.01,
+        "lotSize": 1.0, "pipSize": 0.01, "digits": 2,
+    })
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    ex.amend_lane_sl_tp(11, sl=61879.85828, tp=62233.1234567)
+    amends = [c for c in mcp.calls if c[0] == "amend_position"]
+    assert amends, "amend_position was never called"
+    args = amends[-1][1]
+    assert args.get("stop_loss") == pytest.approx(61879.86)
+    assert args.get("take_profit") == pytest.approx(62233.12)
+
+
+def test_amend_lane_sl_tp_survives_missing_symbol_details(journal_conn):
+    """Details lookup failing must not block the amend (fail-open: raw price
+    goes through and the broker decides — the pre-fix behaviour)."""
+    ours = _filled_position(position_id=12, stop_loss=61900.0, take_profit=62150.0)
+    mcp = FakeMcp(positions=[ours], raise_on={"get_symbol_details": McpClientError("boom")})
+    ex = Dexter3Executor(mcp, journal_conn, ExecutorConfig())
+    res = ex.amend_lane_sl_tp(12, sl=61879.85828, tp=None)
+    amends = [c for c in mcp.calls if c[0] == "amend_position"]
+    assert amends and amends[-1][1].get("stop_loss") == pytest.approx(61879.85828)
+    assert res["action"] == "amended"
