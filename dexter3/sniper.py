@@ -303,8 +303,10 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
     up_wick = hi - max(o, c)
     dn_wick = min(o, c) - lo
 
-    in_demand = any(z["bottom"] <= lo <= z["top"] for z in demand)
-    in_supply = any(z["bottom"] <= hi <= z["top"] for z in supply)
+    touched_demand = next((z for z in demand if z["bottom"] <= lo <= z["top"]), None)
+    touched_supply = next((z for z in supply if z["bottom"] <= hi <= z["top"]), None)
+    in_demand = touched_demand is not None
+    in_supply = touched_supply is not None
 
     feat: dict[str, Any] = {
         "sniper_atr": round(a, 5),
@@ -327,12 +329,25 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
         side = "buy" if qm_buy else "sell"
         sl = (lo - sl_buf * a) if qm_buy else (hi + sl_buf * a)
         risk = abs(c - sl)
+        # Journal-only quality score (catalog philosophy: journaled POWERLESS,
+        # promoted later by outcome evidence — gates nothing today). QM
+        # quality = how deep the raid went past the prior extreme (a deeper
+        # sweep takes more liquidity) + how hard the reclaim displaced.
+        sweep_depth = ((lo_prev - lo) if qm_buy else (hi - hi_prev)) / a
+        displacement = (abs(c - (_f(prev_bar.get("high")) if qm_buy
+                                 else _f(prev_bar.get("low"))))) / a
+        quality = round(min(0.9, 0.4 + 0.2 * min(1.0, sweep_depth / 0.5)
+                            + 0.2 * min(1.0, displacement / 1.0)), 3)
         if 0 < risk <= max_risk_atr * a:
             swept = lo_prev if qm_buy else hi_prev
             d = _enter(ts_close, symbol, side, c, sl, "sniper_qm_sweep", session,
                        [f"QM {side}: swept {sweep_lb}-bar extreme {swept:.2f}, "
                         f"reclaimed + displaced past prev bar"],
-                       {**feat, "sniper_swept_level": round(swept, 5)}, zones=zones)
+                       {**feat, "sniper_swept_level": round(swept, 5),
+                        "sniper_quality": quality,
+                        "sniper_q_sweep_depth_atr": round(sweep_depth, 3),
+                        "sniper_q_displacement_atr": round(displacement, 3)},
+                       zones=zones)
             if d:
                 return d
         if not (0 < risk <= max_risk_atr * a):
@@ -348,6 +363,20 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
         side = "buy" if st2_buy else "sell"
         sl = (lo - sl_buf * a) if st2_buy else (hi + sl_buf * a)
         risk = abs(c - sl)
+        # Journal-only quality score (see the QM twin above). ST2 quality =
+        # wick dominance beyond the trigger thresholds + zone freshness (a
+        # first-touch zone holds better than a many-times-used one).
+        wick = dn_wick if st2_buy else up_wick
+        opp = up_wick if st2_buy else dn_wick
+        zone = touched_demand if st2_buy else touched_supply
+        zone_age = int(zone.get("age", 999)) if zone else 999
+        quality = round(min(0.9, 0.35
+                            + 0.15 * min(1.0, (wick / max(body, 1e-9) - st2_ratio) / 5.0)
+                            + 0.15 * min(1.0, (wick / max(opp, 1e-9) - wick_dom) / 4.0)
+                            + 0.2 * (1.0 if zone_age <= 30 else 0.0)), 3)
+        feat = {**feat, "sniper_quality": quality,
+                "sniper_q_zone_age": zone_age,
+                "sniper_q_wick_body": round(wick / max(body, 1e-9), 2)}
         if 0 < risk <= max_risk_atr * a:
             d = _enter(ts_close, symbol, side, c, sl, "sniper_st2_zone", session,
                        [f"ST2 {side}: wick rejection in "

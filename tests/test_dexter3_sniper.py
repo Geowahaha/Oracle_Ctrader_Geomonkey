@@ -327,3 +327,29 @@ def test_tp_mode_zone_minrr1_skips_thin_target(monkeypatch):
     bars[-1] = _bar(_ts(29), 4004.5, 4004.6, 4000.2, 4004.4)
     d = sn.decide_sniper("XAUUSD", bars, spread_abs=0.2)
     assert d.action == "skip"
+
+
+# -- journal-only quality score (catalog philosophy: powerless until promoted) --
+
+
+def test_st2_carries_quality_features():
+    d = sn.decide_sniper("XAUUSD", _st2_setup(), spread_abs=0.2)
+    assert d.action == "enter"
+    q = d.features.get("sniper_quality")
+    assert q is not None and 0.0 < q <= 0.9
+    assert "sniper_q_zone_age" in d.features
+    assert "sniper_q_wick_body" in d.features
+    assert d.leader_score == 0.5  # quality is JOURNAL-ONLY — gates nothing
+
+
+def test_qm_carries_quality_features():
+    bars = _quiet(24)
+    hi_prev = max(b["high"] for b in bars)
+    bars.append(_bar(_ts(24), 4004.6, 4005.0, 4003.9, 4004.2))
+    bars.append(_bar(_ts(25), 4004.8, hi_prev + 1.2, 4003.2, 4003.5))
+    d = sn.decide_sniper("USTEC", bars, spread_abs=0.5)
+    assert d.action == "enter"
+    q = d.features.get("sniper_quality")
+    assert q is not None and 0.0 < q <= 0.9
+    assert "sniper_q_sweep_depth_atr" in d.features
+    assert "sniper_q_displacement_atr" in d.features
