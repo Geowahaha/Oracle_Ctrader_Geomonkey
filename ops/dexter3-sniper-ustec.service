@@ -77,6 +77,11 @@ Environment=DEXTER3_SNIPER_SL_ATR_BUF=0.5
 Environment=DEXTER3_SNIPER_TP_R=2.0
 Environment=DEXTER3_SNIPER_MAX_RISK_ATR=3.0
 Environment=DEXTER3_SNIPER_SCAN_WINDOW=300
+# --- TP = next opposing zone, skip <1R targets (owner phase-3 order 2026-08-01).
+# Replay: 6k BOTH segments + (+7.34/+8.78R PF 1.46) vs 2R-TP's -12.83/+25.35;
+# 12k validate +22.80 PF 1.42 ~= 2R's +23.71 with June-era still negative —
+# more regime-robust, equal upside. Forward N>=30 remains the arbiter.
+Environment=DEXTER3_SNIPER_TP_MODE=zone-minrr1
 # --- entry: MARKET at the signal close --------------------------------------
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- exit: PLAIN (fixed 2R broker TP IS the strategy) ------------------------

@@ -64,6 +64,11 @@ Environment=DEXTER3_SNIPER_SL_ATR_BUF=0.5
 Environment=DEXTER3_SNIPER_TP_R=2.0
 Environment=DEXTER3_SNIPER_MAX_RISK_ATR=3.0
 Environment=DEXTER3_SNIPER_SCAN_WINDOW=300
+# --- TP = next opposing zone, skip <1R targets (owner phase-3 order 2026-08-01).
+# Replay: 6k BOTH segments + (+3.80/+2.47R) vs 2R-TP's +0.32/-6.17; 12k
+# validate +7.83 PF 1.17 vs 2R's -3.90. Live 2R-TP record was 0W/7L -$126.80
+# in 2 days — this lever is the measured best response. Forward N>=30 arbiter.
+Environment=DEXTER3_SNIPER_TP_MODE=zone-minrr1
 # --- entry: MARKET at the signal close --------------------------------------
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- exit: PLAIN (fixed 2R broker TP IS the strategy) ------------------------
