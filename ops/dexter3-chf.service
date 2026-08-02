@@ -50,6 +50,15 @@ Environment=DEXTER3_MODE=channelfade
 Environment=DEXTER3_FAST_TICK_SEC=8
 Environment=DEXTER3_CAPITAL_USD=1000
 Environment=DEXTER3_MAX_VOLUME_UNITS=10
+# --- account-wide open-risk cap recalibrated to the 9-lane book (2026-08-02
+# deep scan): the $40 default was sized for the XAU-only era and NEVER fired
+# before the index sniper lanes existed (1 event ever, 2026-07-30, caused by
+# a $57 US30 position eating the whole cap and refusing a peer's $3.7 entry).
+# One healthy index position (risk $40-88 at the 1-unit floor) > $40, so the
+# default would block EVERY other lane's entries whenever an index position
+# is open — changing the frozen lanes' machine mid-experiment. 300 ~= the
+# 9-lane worst-case book; the gate still catches true runaway stacking.
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=300
 Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
 # --- canary risk (same tier as the other new-lane canaries) ----------------

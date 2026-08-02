@@ -46,6 +46,15 @@ Environment=DEXTER3_MODE=sniper
 Environment=DEXTER3_FAST_TICK_SEC=8
 Environment=DEXTER3_CAPITAL_USD=1000
 Environment=DEXTER3_MAX_VOLUME_UNITS=10
+# --- account-wide open-risk cap recalibrated to the 9-lane book (2026-08-02
+# deep scan): the $40 default was sized for the XAU-only era and NEVER fired
+# before the index sniper lanes existed (1 event ever, 2026-07-30, caused by
+# a $57 US30 position eating the whole cap and refusing a peer's $3.7 entry).
+# One healthy index position (risk $40-88 at the 1-unit floor) > $40, so the
+# default would block EVERY other lane's entries whenever an index position
+# is open — changing the frozen lanes' machine mid-experiment. 300 ~= the
+# 9-lane worst-case book; the gate still catches true runaway stacking.
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=300
 Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
@@ -82,7 +91,9 @@ Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- exit: PLAIN (fixed 2R broker TP IS the strategy; never trail past it) --
 Environment=DEXTER3_OM_TRAIL_MODE=plain
-Environment=DEXTER3_BASKET_TIME_STOP_MIN=130
+# 240 min = the replay's h48 (48 M5 bars) max-hold — the 130 copied from chf
+# was never what the sniper proof measured (deployed machine = measured machine).
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=240
 # --- lane hygiene ------------------------------------------------------------
 Environment=DEXTER3_VP_DAYOPEN_BIAS=0
 Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
