@@ -76,6 +76,13 @@ Environment=DEXTER3_SNIPER_SCAN_WINDOW=300
 # validate +7.83 PF 1.17 vs 2R's -3.90. Live 2R-TP record was 0W/7L -$126.80
 # in 2 days — this lever is the measured best response. Forward N>=30 arbiter.
 Environment=DEXTER3_SNIPER_TP_MODE=zone-minrr1
+# --- house-money OFF (2026-08-02 USTEC autopsy): the $30/$20 house-money
+# defaults are XAU-canary-scaled dollars; on an index lane 1R ~= $40-88 so it
+# armed at +0.5R and TARGET_LOCKED the whole day on a wobble — proven 07-30:
+# pos 657265559 cut 5 min after entry at +$28, then 7 signals blocked all day.
+# The replay proof contains NO house-money manager; deployed machine must
+# equal measured machine (plain SL/TP + day caps own everything).
+Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
 # --- entry: MARKET at the signal close --------------------------------------
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- exit: PLAIN (fixed 2R broker TP IS the strategy) ------------------------
