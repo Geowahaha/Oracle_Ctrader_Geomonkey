@@ -43,8 +43,15 @@ Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=45
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
 # --- risk tier sized to US30's 1-unit floor (see header math) ---------------
-Environment=DEXTER3_DAILY_TARGET_USD=120
-Environment=DEXTER3_DAILY_LOSS_USD=60
+Environment=DEXTER3_DAILY_TARGET_USD=240
+# 2026-08-01 US30 autopsy: LOSS was set 60 assuming ~$30/trade floor risk,
+# but MEASURED live risks run $40-57 (SL floor x elevated TR) -> the cap
+# was really ~1.2 trades, and after one full loss the NEXT trade's normal
+# -0.3R breathing tripped the close-all. PROVEN twice in 2 days on US30:
+# pos 657270510 cut 01:47 at -0.5R, price hit the 2R TP at 06:10 (+$113
+# forgone); pos 657965700 cut 3 min after entry, then +1.5R. Recalibrated
+# to the ORIGINAL intent: 2 full measured losses + breathing = 120.
+Environment=DEXTER3_DAILY_LOSS_USD=120
 Environment=DEXTER3_BASE_RISK_FRAC=0.03
 Environment=DEXTER3_MAX_RISK_FRAC=0.06
 Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
