@@ -90,6 +90,15 @@ ENV_SCAN_WINDOW = "DEXTER3_SNIPER_SCAN_WINDOW"        # trailing bars for the zo
 #   zone-minrr1 same, but SKIP the signal entirely when the zone target pays
 #               < 1R (the framework's own "poor RR to target = no trade").
 ENV_TP_MODE = "DEXTER3_SNIPER_TP_MODE"
+# Counter-trend filter (2026-08-03 US30 forensics: every real SL loss on the
+# index lanes was a COUNTER-trend entry — e.g. the 08-03 QM sell fired into a
+# 71%-efficiency 3h uptrend — while the with-trend fills were the winners).
+# "1" -> skip a signal fired AGAINST the trailing ~6h net drift (the same
+# 6-completed-H1-closes sign the replay harness's --dir-modes nocounter
+# uses, computed here from the M5 prefix so replay and live stay one
+# machine). Flat drift (sign 0) allows. Default OFF = byte-identical.
+ENV_NOCOUNTER = "DEXTER3_SNIPER_NOCOUNTER"
+ENV_TREND_BARS = "DEXTER3_SNIPER_TREND_BARS"          # M5 bars for the drift sign (72 = 6h)
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -308,7 +317,16 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
     in_demand = touched_demand is not None
     in_supply = touched_supply is not None
 
+    # trailing ~6h drift sign (see ENV_NOCOUNTER above); journaled on every
+    # entry either way so the counter-trend cost stays measurable at N>=30
+    trend_bars = max(2, _env_int(ENV_TREND_BARS, 72))
+    tseg = window[-trend_bars:]
+    tnet = _f(tseg[-1].get("close")) - _f(tseg[0].get("close"))
+    tsign = 1 if tnet > 0 else (-1 if tnet < 0 else 0)
+    nocounter = os.environ.get(ENV_NOCOUNTER, "").strip() == "1"
+
     feat: dict[str, Any] = {
+        "sniper_trend_sign": tsign,
         "sniper_atr": round(a, 5),
         "sniper_zones_demand": len(demand), "sniper_zones_supply": len(supply),
         "sniper_in_demand": in_demand, "sniper_in_supply": in_supply,
@@ -327,6 +345,8 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
     qm_buy = sweep_l and c > _f(prev_bar.get("high"))
     if qm_buy or qm_sell:
         side = "buy" if qm_buy else "sell"
+        if nocounter and ((side == "buy" and tsign == -1) or (side == "sell" and tsign == 1)):
+            return _skip(ts_close, symbol, f"qm_counter_trend (side={side} vs 6h drift {tsign:+d})")
         sl = (lo - sl_buf * a) if qm_buy else (hi + sl_buf * a)
         risk = abs(c - sl)
         # Journal-only quality score (catalog philosophy: journaled POWERLESS,
@@ -361,6 +381,8 @@ def decide_sniper(symbol: str, m5_bars: list[Bar], spread_abs: float,
         return _skip(ts_close, symbol, "st2_both_sides (doji in overlapping zones)")
     if st2_buy or st2_sell:
         side = "buy" if st2_buy else "sell"
+        if nocounter and ((side == "buy" and tsign == -1) or (side == "sell" and tsign == 1)):
+            return _skip(ts_close, symbol, f"st2_counter_trend (side={side} vs 6h drift {tsign:+d})")
         sl = (lo - sl_buf * a) if st2_buy else (hi + sl_buf * a)
         risk = abs(c - sl)
         # Journal-only quality score (see the QM twin above). ST2 quality =

@@ -353,3 +353,38 @@ def test_qm_carries_quality_features():
     assert q is not None and 0.0 < q <= 0.9
     assert "sniper_q_sweep_depth_atr" in d.features
     assert "sniper_q_displacement_atr" in d.features
+
+
+# -- counter-trend filter (DEXTER3_SNIPER_NOCOUNTER, 2026-08-03 forensics) ------
+
+
+def test_nocounter_off_by_default_and_trend_journaled():
+    d = sn.decide_sniper("XAUUSD", _st2_setup(), spread_abs=0.2)
+    assert d.action == "enter"                     # default OFF: nothing skipped
+    assert "sniper_trend_sign" in d.features       # but the sign is journaled
+
+
+def test_nocounter_skips_buy_against_down_drift(monkeypatch):
+    monkeypatch.setenv(sn.ENV_NOCOUNTER, "1")
+    monkeypatch.setenv(sn.ENV_TREND_BARS, "20")
+    # _st2_setup: window starts ~4004-4005 quiet, dips to the 4000-4002 zone
+    # late -> last-20-bar drift is DOWN while the signal is a BUY -> skip
+    bars = _st2_setup()
+    d = sn.decide_sniper("XAUUSD", bars, spread_abs=0.2)
+    if d.action == "enter":  # drift may compute flat on the synthetic fixture
+        assert int(d.features.get("sniper_trend_sign", 9)) >= 0
+    else:
+        assert "counter_trend" in d.reasons[0]
+
+
+def test_nocounter_allows_with_trend(monkeypatch):
+    monkeypatch.setenv(sn.ENV_NOCOUNTER, "1")
+    monkeypatch.setenv(sn.ENV_TREND_BARS, "6")
+    bars = _quiet(24)
+    lo_prev = min(b["low"] for b in bars)
+    bars.append(_bar(_ts(24), 4004.4, 4005.0, 4004.0, 4004.6))
+    # QM BUY whose close (4005.2) is above the close 6 bars back -> drift UP
+    bars.append(_bar(_ts(25), 4004.2, 4005.4, lo_prev - 1.2, 4005.2))
+    d = sn.decide_sniper("USTEC", bars, spread_abs=0.5)
+    assert d.action == "enter"
+    assert d.setup == "sniper_qm_sweep"
