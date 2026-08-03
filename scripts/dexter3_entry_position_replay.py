@@ -1154,7 +1154,14 @@ def main() -> int:
                 continue
             if d.action != "enter" or d.side is None or d.sl is None or d.tp is None:
                 continue
-            decisions.append((i, d, 0))
+            # 2026-08-03 US30 counter-trend forensics: stamp the H1 trend sign
+            # so --dir-modes nocounter is a REAL lever here (it was silently a
+            # no-op — tsign was hardcoded 0, so the filter never skipped).
+            tsign = 0
+            if needs_h1_sign:
+                h1c = [b for b in h1 if _completed_by(str(b.get("ts") or ""), close_epoch, 60)]
+                tsign = _h1_trend_sign(h1c)
+            decisions.append((i, d, tsign))
             continue
         if args.producer == "sdzone":
             _sd_engine.update(i, m5, _atr14[i], _volma[i])
