@@ -105,22 +105,16 @@ Environment=DEXTER3_SNIPER_TP_MODE=zone-minrr1
 # The replay proof contains NO house-money manager; deployed machine must
 # equal measured machine (plain SL/TP + day caps own everything).
 Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
-# --- entry: LIMIT at a -0.5R dip (2026-08-03, two-window proven on USTEC) ---
-# The owner's own reviewed principle ("ไม่ไล่ราคา — รอให้ราคาดีขึ้น") measured
-# on this exact lane config (zone-minrr1 TP): 6k derive/validate +15.71/+30.29
-# (PF 2.82) and 12k -10.54/+38.17 (PF 1.86) vs market's -27.66/+23.87 — the
-# limit portfolio beats market in EVERY window measured (whole-12k: +27.6R vs
-# -3.8R) even after paying the missed-runner cost (miss_cf +31.76 visible in
-# the funnel). Uses the generic producer-agnostic intent layer (same as
-# dpull-cs): dip 0.5R, TTL 30 min = the replay's w6; prefer_signal_tp=True
-# keeps the sniper decision's own zone/2R TP; ENTRY_CONFIRM=off = bare-touch
-# fill, matching the replay's fill model. KEEP_UNEXPIRED preserves the first
-# unexpired intent (the replay's per-signal semantics, as close as the
-# one-slot machinery allows — proven on vp/dpull-cs). US30/XAU stay MARKET
-# (limit rows were mixed/negative there — no evidence, no change).
-Environment=DEXTER3_HUNT_LIMIT_DIP_R=0.5
-Environment=DEXTER3_HUNT_LIMIT_TTL_MIN=30
-Environment=DEXTER3_LANE_INTENT_KEEP_UNEXPIRED=1
+# --- entry: MARKET (limit-dip REVERTED 2026-08-04 after owner challenge) ----
+# The limit deploy was based on the harness's own-risk R units, which divide
+# by the HALVED stop distance and so credit ~2x R per point. At this lane's
+# 1-unit volume floor real money = POINTS, and an independent fixed-volume
+# sim (spread-charged, SL-first, one-position) measured: market derive
+# +$1313 / limit +$786 (validate -$136 vs -$135) — the limit entry FORFEITS
+# ~40% of the profitable segment in account dollars. The R-unit trick only
+# bites when an entry lever CHANGES the stop distance; zone-minrr1 (same
+# entry/SL both arms) is unit-consistent and stands. LAW: for volume-floored
+# lanes judge replay POINTS, never own-risk R-sums.
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- exit: PLAIN (fixed 2R broker TP IS the strategy) ------------------------
 Environment=DEXTER3_OM_TRAIL_MODE=plain
