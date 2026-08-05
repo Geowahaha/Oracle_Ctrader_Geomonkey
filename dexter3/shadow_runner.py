@@ -79,6 +79,7 @@ from dexter3 import stop_floor
 from dexter3 import vp_lane
 from dexter3 import channelfade
 from dexter3 import sniper
+from dexter3 import mscalp
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
@@ -109,6 +110,7 @@ CHF_STATE_FILE = RUNTIME / "dexter3_chf_shadow_state.json"
 _SNIPER_SUFFIX_RAW = os.environ.get("DEXTER3_SNIPER_SUFFIX", "").strip().lower()
 _SNIPER_SUFFIX = f"_{_SNIPER_SUFFIX_RAW}" if _SNIPER_SUFFIX_RAW else ""
 SNIPER_STATE_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow_state.json"
+MSCALP_STATE_FILE = RUNTIME / "dexter3_mscalp_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -122,6 +124,7 @@ DPULL_LOG_FILE = RUNTIME / "dexter3_dpull_shadow.log"
 DPULL_CS_LOG_FILE = RUNTIME / "dexter3_dpull_cs_shadow.log"
 CHF_LOG_FILE = RUNTIME / "dexter3_chf_shadow.log"
 SNIPER_LOG_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.log"
+MSCALP_LOG_FILE = RUNTIME / "dexter3_mscalp_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 PAPER_LOCK_FILE = RUNTIME / "dexter3_fable_paper_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
@@ -131,6 +134,7 @@ DPULL_LOCK_FILE = RUNTIME / "dexter3_dpull_shadow.lock"
 DPULL_CS_LOCK_FILE = RUNTIME / "dexter3_dpull_cs_shadow.lock"
 CHF_LOCK_FILE = RUNTIME / "dexter3_chf_shadow.lock"
 SNIPER_LOCK_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.lock"
+MSCALP_LOCK_FILE = RUNTIME / "dexter3_mscalp_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -250,6 +254,15 @@ def _sniper_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "sniper"
 
 
+def _mscalp_producer_enabled() -> bool:
+    """MSCALP lane (owner order 2026-08-05): the 5-minute close-based
+    impulse-continuation scalper (dexter3/mscalp.py) — bank/time/SL exits via
+    existing OM machinery. DEFAULT OFF."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "mscalp":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp"
+
+
 def _alt_producer_enabled() -> bool:
     """Non-hunt producers (vp / daytrend / scalp / dpull / dpull-cs /
     channelfade) share the same runner posture: v16 gate bypass (no
@@ -261,7 +274,7 @@ def _alt_producer_enabled() -> bool:
     return (_vp_producer_enabled() or _daytrend_producer_enabled()
             or _scalp_producer_enabled() or _dpull_producer_enabled()
             or _dpull_cs_producer_enabled() or _channelfade_producer_enabled()
-            or _sniper_producer_enabled())
+            or _sniper_producer_enabled() or _mscalp_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -301,6 +314,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.sniper import SNIPER_LABEL
 
         return SNIPER_LABEL
+    if current_mode == "mscalp":
+        from dexter3.mscalp import MSCALP_LABEL
+
+        return MSCALP_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -349,6 +366,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.sniper import SNIPER_LABEL_FAMILY
 
         return SNIPER_LABEL_FAMILY
+    if current_mode == "mscalp":
+        from dexter3.mscalp import MSCALP_LABEL_FAMILY
+
+        return MSCALP_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -370,6 +391,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return CHF_STATE_FILE
     if current_mode == "sniper":
         return SNIPER_STATE_FILE
+    if current_mode == "mscalp":
+        return MSCALP_STATE_FILE
     return STATE_FILE
 
 
@@ -396,6 +419,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return CHF_LOG_FILE
     if current_mode == "sniper":
         return SNIPER_LOG_FILE
+    if current_mode == "mscalp":
+        return MSCALP_LOG_FILE
     return LOG_FILE
 
 
@@ -1504,6 +1529,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = CHF_LOCK_FILE, "channelfade-canary"
     elif mode == "sniper":
         lock_file, lock_name = SNIPER_LOCK_FILE, f"sniper{_SNIPER_SUFFIX}-canary"
+    elif mode == "mscalp":
+        lock_file, lock_name = MSCALP_LOCK_FILE, "mscalp-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1539,6 +1566,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = CHF_LOCK_FILE
     elif mode == "sniper":
         lock_file = SNIPER_LOCK_FILE
+    elif mode == "mscalp":
+        lock_file = MSCALP_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1956,6 +1985,13 @@ def run_symbol_cycle(
 
             dp_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dp_session)
+        elif is_newest and _mscalp_producer_enabled():
+            # MSCALP lane (owner order 2026-08-05): impulse-continuation
+            # 5-min scalp; exits = OM bank mode + time stop + broker SL.
+            from dexter3 import market_lens as _ml
+
+            ms_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = mscalp.decide_mscalp(symbol, prefix, spread_abs, session=ms_session)
         elif is_newest and _sniper_producer_enabled():
             # SNIPER lane (owner directive 2026-07-30): SHADOWCODES S/D zones
             # + ST2 wick rejection + QM sweep reclaim (dexter3/sniper.py).
@@ -4919,6 +4955,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_dpull_cs = mode == "dpull-cs"
     is_channelfade = mode == "channelfade"
     is_sniper = mode == "sniper"
+    is_mscalp = mode == "mscalp"
 
     # VP canary lane (2026-07-11): same isolation pattern as grok — its own
     # broker label so fable/grok loops never touch VP positions and vice versa.
@@ -4976,6 +5013,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _SN_LABEL
         print(f"[SNIPER] Forced executor LABEL to {_SN_LABEL}", flush=True)
 
+    if is_mscalp:
+        from dexter3.mscalp import MSCALP_LABEL as _MS_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _MS_LABEL
+        print(f"[MSCALP] Forced executor LABEL to {_MS_LABEL}", flush=True)
+
     if is_vp:
         from dexter3.volume_profile import VP_LABEL as _VP_LABEL
 
@@ -5004,6 +5048,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.sniper import SNIPER_LABEL as _SN_LABEL
 
         active_label = _SN_LABEL
+    elif is_mscalp:
+        from dexter3.mscalp import MSCALP_LABEL as _MS_LABEL
+
+        active_label = _MS_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "dexter3"
@@ -5167,6 +5215,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _SN_LABEL
         print(f"[SNIPER] Forced executor LABEL to {_SN_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "mscalp":
+        from dexter3.mscalp import MSCALP_LABEL as _MS_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _MS_LABEL
+        print(f"[MSCALP] Forced executor LABEL to {_MS_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.
