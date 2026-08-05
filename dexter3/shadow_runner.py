@@ -80,6 +80,7 @@ from dexter3 import vp_lane
 from dexter3 import channelfade
 from dexter3 import sniper
 from dexter3 import mscalp
+from dexter3 import h3fade
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
@@ -111,6 +112,7 @@ _SNIPER_SUFFIX_RAW = os.environ.get("DEXTER3_SNIPER_SUFFIX", "").strip().lower()
 _SNIPER_SUFFIX = f"_{_SNIPER_SUFFIX_RAW}" if _SNIPER_SUFFIX_RAW else ""
 SNIPER_STATE_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow_state.json"
 MSCALP_STATE_FILE = RUNTIME / "dexter3_mscalp_shadow_state.json"
+H3FADE_STATE_FILE = RUNTIME / "dexter3_h3fade_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -125,6 +127,7 @@ DPULL_CS_LOG_FILE = RUNTIME / "dexter3_dpull_cs_shadow.log"
 CHF_LOG_FILE = RUNTIME / "dexter3_chf_shadow.log"
 SNIPER_LOG_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.log"
 MSCALP_LOG_FILE = RUNTIME / "dexter3_mscalp_shadow.log"
+H3FADE_LOG_FILE = RUNTIME / "dexter3_h3fade_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 PAPER_LOCK_FILE = RUNTIME / "dexter3_fable_paper_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
@@ -135,6 +138,7 @@ DPULL_CS_LOCK_FILE = RUNTIME / "dexter3_dpull_cs_shadow.lock"
 CHF_LOCK_FILE = RUNTIME / "dexter3_chf_shadow.lock"
 SNIPER_LOCK_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.lock"
 MSCALP_LOCK_FILE = RUNTIME / "dexter3_mscalp_shadow.lock"
+H3FADE_LOCK_FILE = RUNTIME / "dexter3_h3fade_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -263,6 +267,17 @@ def _mscalp_producer_enabled() -> bool:
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp"
 
 
+def _h3fade_producer_enabled() -> bool:
+    """H3FADE lane (pre-registered spec 2026-08-05, docs/handoff/
+    H3_BUILD_BRIEF.md): M1 streak-fade on XAUUSD 13-16Z — dexter3/h3fade.py
+    carries the evidence block. The ONLY M1-cadence lane: run_symbol_cycle
+    swaps its decision bars to M1 and _run_h3fade_exit_tick owns the
+    M1-close bank / 4-min time exits. DEFAULT OFF."""
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "h3fade":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "h3fade"
+
+
 def _alt_producer_enabled() -> bool:
     """Non-hunt producers (vp / daytrend / scalp / dpull / dpull-cs /
     channelfade) share the same runner posture: v16 gate bypass (no
@@ -270,11 +285,13 @@ def _alt_producer_enabled() -> bool:
     flat), the VP entry gate (day-open bias + no-trade window; trivially true
     for daytrend/dpull whose signals are with-bias by construction, and
     bias-neutral for the channelfade range lane), and the deep 340-bar M5
-    fetch."""
+    fetch (h3fade excepted: its decision bars are the M1 fetch in
+    run_symbol_cycle, not the deep M5 window)."""
     return (_vp_producer_enabled() or _daytrend_producer_enabled()
             or _scalp_producer_enabled() or _dpull_producer_enabled()
             or _dpull_cs_producer_enabled() or _channelfade_producer_enabled()
-            or _sniper_producer_enabled() or _mscalp_producer_enabled())
+            or _sniper_producer_enabled() or _mscalp_producer_enabled()
+            or _h3fade_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -318,6 +335,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.mscalp import MSCALP_LABEL
 
         return MSCALP_LABEL
+    if current_mode == "h3fade":
+        from dexter3.h3fade import H3FADE_LABEL
+
+        return H3FADE_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -370,6 +391,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.mscalp import MSCALP_LABEL_FAMILY
 
         return MSCALP_LABEL_FAMILY
+    if current_mode == "h3fade":
+        from dexter3.h3fade import H3FADE_LABEL_FAMILY
+
+        return H3FADE_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -393,6 +418,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return SNIPER_STATE_FILE
     if current_mode == "mscalp":
         return MSCALP_STATE_FILE
+    if current_mode == "h3fade":
+        return H3FADE_STATE_FILE
     return STATE_FILE
 
 
@@ -421,6 +448,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return SNIPER_LOG_FILE
     if current_mode == "mscalp":
         return MSCALP_LOG_FILE
+    if current_mode == "h3fade":
+        return H3FADE_LOG_FILE
     return LOG_FILE
 
 
@@ -1531,6 +1560,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = SNIPER_LOCK_FILE, f"sniper{_SNIPER_SUFFIX}-canary"
     elif mode == "mscalp":
         lock_file, lock_name = MSCALP_LOCK_FILE, "mscalp-canary"
+    elif mode == "h3fade":
+        lock_file, lock_name = H3FADE_LOCK_FILE, "h3fade-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1568,6 +1599,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = SNIPER_LOCK_FILE
     elif mode == "mscalp":
         lock_file = MSCALP_LOCK_FILE
+    elif mode == "h3fade":
+        lock_file = H3FADE_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -1692,6 +1725,31 @@ def fetch_fresh_m5(mcp: Dexter3McpClient, symbol: str, count: int = MIN_M5_BARS)
     if bars:
         log_line(
             f"{utc_now_iso()} {symbol} data_stale newest_m5={bars[-1].get('ts')} "
+            f"(expected newer bar; will catch up on a later poll)"
+        )
+    return bars[-count:] if len(bars) > count else bars
+
+
+def fetch_fresh_m1(mcp: Dexter3McpClient, symbol: str, count: int = h3fade.M1_FETCH_BARS) -> list[dict[str, Any]]:
+    """M1 counterpart of ``fetch_fresh_m5`` for the h3fade lane (the only
+    M1-cadence lane — pre-registered spec 2026-08-05). Same stale-snapshot
+    retry posture, M1 bar period; additive, fetch_fresh_m5 untouched."""
+    bars = mcp.get_trendbars(symbol, "m1", count)
+    for attempt in range(1, FRESHNESS_RETRIES + 1):
+        if not bars:
+            return bars
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        expected_open = (
+            int(now_epoch - FRESHNESS_GRACE_SEC) // h3fade.M1_BAR_SEC * h3fade.M1_BAR_SEC
+        ) - h3fade.M1_BAR_SEC
+        gap = expected_open - _iso_to_epoch(str(bars[-1].get("ts") or ""))
+        if gap <= 0 or gap > FRESHNESS_MAX_GAP_SEC:
+            return bars
+        time.sleep(FRESHNESS_RETRY_SLEEP_SEC)
+        bars = mcp.get_trendbars(symbol, "m1", count + attempt)
+    if bars:
+        log_line(
+            f"{utc_now_iso()} {symbol} data_stale newest_m1={bars[-1].get('ts')} "
             f"(expected newer bar; will catch up on a later poll)"
         )
     return bars[-count:] if len(bars) > count else bars
@@ -1840,14 +1898,25 @@ def run_symbol_cycle(
         if bool(weekly["block_entries"]):
             return f"weekly_entry_blocked:{weekly['reason']}"
 
-    # VP mode needs a much deeper prefix than hunt: decide_vp's profile
-    # window is 288 bars (+3 context = MIN_BARS 291, else it skips every
-    # bar with "bars<291" — the exact latent gap that surfaced at first
-    # enable 2026-07-16), and the day-open bias must see back to the 00Z
-    # anchor bar (worst case 288 bars; 340 covers ~28h, > any anchor age).
-    m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _alt_producer_enabled() else MIN_M5_BARS)
-    if len(m5_bars) < MIN_M5_BARS:
-        return f"insufficient_m5_bars({len(m5_bars)})"
+    # H3FADE (pre-registered spec 2026-08-05): the ONLY M1-cadence lane —
+    # its decision bars ARE the M1 fetch (~40 bars/poll) and new-close
+    # detection runs on M1 ts in the lane's OWN state file. Every other
+    # lane keeps the M5 path below byte-for-byte.
+    is_h3fade = _h3fade_producer_enabled()
+    decision_bar_sec = h3fade.M1_BAR_SEC if is_h3fade else M5_BAR_SEC
+    if is_h3fade:
+        m5_bars = fetch_fresh_m1(mcp, symbol)
+        if len(m5_bars) < h3fade.min_m1_bars():
+            return f"insufficient_m1_bars({len(m5_bars)})"
+    else:
+        # VP mode needs a much deeper prefix than hunt: decide_vp's profile
+        # window is 288 bars (+3 context = MIN_BARS 291, else it skips every
+        # bar with "bars<291" — the exact latent gap that surfaced at first
+        # enable 2026-07-16), and the day-open bias must see back to the 00Z
+        # anchor bar (worst case 288 bars; 340 covers ~28h, > any anchor age).
+        m5_bars = fetch_fresh_m5(mcp, symbol, count=340 if _alt_producer_enabled() else MIN_M5_BARS)
+        if len(m5_bars) < MIN_M5_BARS:
+            return f"insufficient_m5_bars({len(m5_bars)})"
 
     # --- broker market-state gate (2026-07-25, owner cTrader ‖-pause obs) ------
     # Additive + env-gated (default off => fail-open, byte-identical behaviour).
@@ -1865,7 +1934,7 @@ def run_symbol_cycle(
         # gate — inverting market_state's documented fail-OPEN contract. Pass
         # None (unknown age) instead so the verdict degrades to open.
         _newest_raw = _iso_to_epoch(str(m5_bars[-1].get("ts") or ""))
-        _newest_epoch = (_newest_raw + M5_BAR_SEC) if _newest_raw > 0 else None
+        _newest_epoch = (_newest_raw + decision_bar_sec) if _newest_raw > 0 else None
         _ms = market_state.evaluate_market_state(
             now_ts=datetime.now(timezone.utc).timestamp(),
             newest_bar_epoch=_newest_epoch,
@@ -1892,7 +1961,7 @@ def run_symbol_cycle(
     statuses: list[str] = []
     for i in pending:
         bar_ts = str(m5_bars[i].get("ts") or "")
-        close_epoch = _iso_to_epoch(bar_ts) + M5_BAR_SEC
+        close_epoch = _iso_to_epoch(bar_ts) + decision_bar_sec
         late_sec = max(0.0, datetime.now(timezone.utc).timestamp() - close_epoch)
         prefix = m5_bars[: i + 1]
         m15_ctx = [b for b in m15_bars if _completed_by(str(b.get("ts") or ""), close_epoch, 15)]
@@ -1992,6 +2061,16 @@ def run_symbol_cycle(
 
             ms_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = mscalp.decide_mscalp(symbol, prefix, spread_abs, session=ms_session)
+        elif is_newest and _h3fade_producer_enabled():
+            # H3FADE lane (pre-registered 2026-08-05): M1 streak-fade —
+            # ``prefix`` IS the M1 window in this mode (see the fetch swap at
+            # the top of this function). Exits = the M1-close bank + 4-min
+            # time stop in _run_h3fade_exit_tick + broker SL; the far 3R TP
+            # is a backstop only (touch-TP measured to kill the edge).
+            from dexter3 import market_lens as _ml
+
+            h3_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = h3fade.decide_h3fade(symbol, prefix, spread_abs, session=h3_session)
         elif is_newest and _sniper_producer_enabled():
             # SNIPER lane (owner directive 2026-07-30): SHADOWCODES S/D zones
             # + ST2 wick rejection + QM sweep reclaim (dexter3/sniper.py).
@@ -4397,6 +4476,62 @@ def _ensure_dpull_cs_backstop(
     )
 
 
+def _h3fade_exit_enabled() -> bool:
+    """DEXTER3_H3FADE_EXIT=1 arms the M1-close bank/time exit branch in
+    run_om_tick — DEFAULT OFF so every lane (h3fade included) is
+    byte-identical with the env absent."""
+    return os.environ.get("DEXTER3_H3FADE_EXIT") == "1"
+
+
+def _run_h3fade_exit_tick(
+    mcp: Dexter3McpClient,
+    state: dict[str, Any],
+    symbol: str,
+    executor: Dexter3Executor | None,
+    lane: list[dict[str, Any]],
+) -> str | None:
+    """H3FADE fast-tick exit (pre-registered spec 2026-08-05): (1) first M1
+    CLOSE >= +0.5R -> close at market (``h3_bank`` — close-based, NEVER a
+    broker touch-TP: touch-TP measured explore +11.4 -> -5.5); (2) position
+    age >= 4 min -> close (``h3_time``). Returns a status string when the
+    lane was closed this tick (caller returns early, skipping the normal OM
+    evaluation on a lane that no longer exists); None -> fall through to the
+    unchanged OM path. Never raises. Shadow mode (executor None) closes
+    nothing, identical to every other live-mutation gate in this file.
+    """
+    if executor is None or not lane:
+        return None
+    try:
+        m1_bars = mcp.get_trendbars(symbol, "m1", 3)
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} h3fade_exit_m1_read_failed (no exit action this tick): {exc}")
+        m1_bars = []
+    try:
+        verdict = h3fade.h3fade_exit_decision(
+            lane, m1_bars, now_epoch=datetime.now(timezone.utc).timestamp()
+        )
+    except Exception as exc:  # noqa: BLE001 - exit decision must never crash the fast loop
+        log_error(f"h3fade_exit_decision({symbol})", exc)
+        return None
+    if verdict is None:
+        return None
+    reason, info = verdict
+    ids = [position_id_of(p) for p in lane if position_id_of(p) > 0]
+    if not ids:
+        return None
+    try:
+        executed = executor.execute_close_all(ids, reason=reason)
+    except Exception as exc:  # noqa: BLE001 - a failed close falls back to the OM/broker SL paths
+        log_error(f"h3fade_exit_close({symbol})", exc)
+        return None
+    log_line(
+        f"{utc_now_iso()} {symbol} h3fade_exit {reason} ids={ids} info={info} "
+        f"result={executed.get('action') if isinstance(executed, dict) else executed}"
+    )
+    _clear_basket_runtime(state, symbol)
+    return f"h3fade_{reason}"
+
+
 def run_om_tick(
     mcp: Dexter3McpClient,
     journal: DecisionJournal,
@@ -4461,6 +4596,15 @@ def run_om_tick(
         _update_position_peak_ledger(state, symbol, [], None, None)
         state.setdefault("governor", {}).setdefault("floating_by_symbol", {})[symbol] = 0.0
         return "om_no_lane"
+
+    # H3FADE M1-close bank/time exit (pre-registered spec 2026-08-05):
+    # mode-gated AND env-gated (DEXTER3_H3FADE_EXIT=1, default off) — every
+    # other lane, and h3fade itself with the env absent, falls through to
+    # the unchanged OM evaluation below byte-for-byte.
+    if _h3fade_producer_enabled() and _h3fade_exit_enabled():
+        h3_status = _run_h3fade_exit_tick(mcp, state, symbol, executor, lane)
+        if h3_status is not None:
+            return h3_status
 
     m5_bars, m15_bars, h1_bars = _om_bars_for(mcp, symbol)
 
@@ -4956,6 +5100,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_channelfade = mode == "channelfade"
     is_sniper = mode == "sniper"
     is_mscalp = mode == "mscalp"
+    is_h3fade = mode == "h3fade"
 
     # VP canary lane (2026-07-11): same isolation pattern as grok — its own
     # broker label so fable/grok loops never touch VP positions and vice versa.
@@ -5020,6 +5165,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _MS_LABEL
         print(f"[MSCALP] Forced executor LABEL to {_MS_LABEL}", flush=True)
 
+    if is_h3fade:
+        from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _H3_LABEL
+        print(f"[H3FADE] Forced executor LABEL to {_H3_LABEL}", flush=True)
+
     if is_vp:
         from dexter3.volume_profile import VP_LABEL as _VP_LABEL
 
@@ -5052,6 +5204,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.mscalp import MSCALP_LABEL as _MS_LABEL
 
         active_label = _MS_LABEL
+    elif is_h3fade:
+        from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
+
+        active_label = _H3_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "dexter3"
@@ -5222,6 +5378,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _MS_LABEL
         print(f"[MSCALP] Forced executor LABEL to {_MS_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "h3fade":
+        from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _H3_LABEL
+        print(f"[H3FADE] Forced executor LABEL to {_H3_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

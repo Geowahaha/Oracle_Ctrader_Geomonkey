@@ -1,0 +1,85 @@
+# Dexter3 H3FADE lane — XAUUSD M1 streak-fade canary (pre-registered spec
+# 2026-08-05, docs/handoff/H3_BUILD_BRIEF.md — execute VERBATIM, no re-tune).
+#
+# WHAT: 5 consecutive same-direction M1 CLOSES totalling >= 2.0 x ATR1
+# (RMA-14 of M1 TR), UTC 13:00-16:59 ONLY -> FADE the streak, MARKET at that
+# M1 close. SL 2.0 x ATR1 (~$3.3 at the 1-oz floor). Exits in priority:
+# (1) first M1 CLOSE >= +0.5R -> bank at market (h3_bank — CLOSE-BASED,
+# touch-TP measured to kill the edge: explore +11.4 -> -5.5); (2) 4-min time
+# stop (h3_time); (3) broker SL. Broker TP = far 3R backstop only. One
+# position (open lane -> basket_hold, no new entries).
+#
+# EVIDENCE (filter, NOT proof — [[feedback_live_wins_only]]): sole survivor
+# of the 28-cell XAU scalp campaign on 14k real M1 bars: explore +$11.4
+# (N=33, WR 55%) / confirm +$18.8 (N=20) / days+ 6/10. N=53 is SMALL; 1-2
+# false survivors were expected across 28 cells. JUDGE: N>=30 broker deals
+# in DOLLARS; negative -> kill without ceremony, no tuning.
+#
+# ACTIVATION (start ONLY this unit — never restart dexter3-fable/daytrend,
+# frozen SL-floor experiment):
+#   sudo cp ops/dexter3-h3fade.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-h3fade
+[Unit]
+Description=Dexter3 H3FADE lane LIVE canary XAUUSD (M1 streak-fade 13-16Z, M1-close bank/4-min/SL exits)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=h3fade
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=300
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=9
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
+# --- canary risk tier (the brief's tier, same as the other XAU canaries) ----
+Environment=DEXTER3_DAILY_TARGET_USD=15
+Environment=DEXTER3_DAILY_LOSS_USD=8
+Environment=DEXTER3_BASE_RISK_FRAC=0.004
+Environment=DEXTER3_MAX_RISK_FRAC=0.008
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=20
+Environment=DEXTER3_DAILY_LOSS_BASKETS=3
+# --- producer owns the stop; generic SL floor OFF (would double-widen) ------
+Environment=DEXTER3_SL_FLOOR_TR_MULT=0
+# --- producer knobs (the pre-registered cell; dexter3/h3fade.py) ------------
+Environment=DEXTER3_H3FADE_ATR_LEN=14
+Environment=DEXTER3_H3FADE_STREAK=5
+Environment=DEXTER3_H3FADE_MOVE_ATR=2.0
+Environment=DEXTER3_H3FADE_SL_ATR=2.0
+Environment=DEXTER3_H3FADE_TP_BACKSTOP_R=3.0
+Environment=DEXTER3_H3FADE_HOUR_START=13
+Environment=DEXTER3_H3FADE_HOUR_END=16
+# --- exits: the M1-close bank/time branch (h3_bank 0.5R / h3_time 240s);
+#     OM itself holds plain (broker SL + basket caps as the fail-safe only) --
+Environment=DEXTER3_H3FADE_EXIT=1
+Environment=DEXTER3_H3FADE_BANK_R=0.5
+Environment=DEXTER3_H3FADE_TIME_STOP_SEC=240
+Environment=DEXTER3_OM_TRAIL_MODE=plain
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=6
+Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
+Environment=DEXTER3_ENTRY_CONFIRM=off
+# --- lane hygiene ------------------------------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=0
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target
