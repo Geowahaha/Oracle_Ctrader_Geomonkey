@@ -46,6 +46,22 @@ Bar = dict[str, Any]
 MSCALP_LABEL_FAMILY = "dexter3:mscalp"
 MSCALP_LABEL = MSCALP_LABEL_FAMILY + ":canary"
 
+# -- MSCALP2 (owner order 2026-08-06 "clone ทำ parallel lane ... กำไร >5/10 USD
+# ให้ปิดเลย และใช้ exit แบบเดียวกับต้นแบบ"): the forward-A/B twin. SAME
+# producer, SAME entries, SAME bank/time/SL exits — the ONLY difference is
+# the fast-tick dollar-take below (close the position the first tick its
+# REAL broker floating PnL >= take_usd). Measures bank-the-tail-vs-take-fast
+# on live money, the dpull/dpull-cs pattern.
+#
+# EVIDENCE (filter, NOT proof — day-1 mscalp autopsy 2026-08-06, N=12 real
+# positions replayed against M1 MFE): $5-take ~= +$29.7 (11W/1L) vs actual
+# +$50.90; $10-take ~= -$2.7 (caps the +101.4 tail, misses three losers'
+# $6.7-9.5 MFE). $5 chosen as the default; judged at N>=30 broker deals.
+MSCALP2_LABEL_FAMILY = "dexter3:mscalp2"
+MSCALP2_LABEL = MSCALP2_LABEL_FAMILY + ":canary"
+
+ENV_MSCALP2_TAKE_USD = "DEXTER3_MSCALP2_TAKE_USD"      # dollar take; <=0 = off
+
 ENV_ATR_LEN = "DEXTER3_MSCALP_ATR_LEN"                # ATR length (14)
 ENV_BODY_FRAC = "DEXTER3_MSCALP_IMPULSE_BODY_FRAC"    # impulse body > frac x range (0.6)
 ENV_RANGE_ATR = "DEXTER3_MSCALP_RANGE_ATR"            # impulse range > k x ATR (1.0)
@@ -76,6 +92,27 @@ def mscalp_mode_enabled() -> bool:
     if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "mscalp":
         return True
     return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp"
+
+
+def mscalp2_mode_enabled() -> bool:
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "mscalp2":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp2"
+
+
+def mscalp2_take_usd() -> float:
+    """Dollar-take threshold for the mscalp2 twin; <= 0 disables the branch
+    (byte-identical to the mscalp original, so a mis-set env can never arm
+    it silently on another lane)."""
+    return _env_float(ENV_MSCALP2_TAKE_USD, 0.0)
+
+
+def mscalp2_take_decision(agg_pnl_usd: float, take_usd: float) -> bool:
+    """Pure: should the mscalp2 lane close NOW? True the first evaluation
+    where the lane's REAL broker floating PnL has reached the dollar take.
+    The caller feeds broker-valued aggregate PnL (spread/commission already
+    inside), so `>= take_usd` means the owner's "กำไร >$X จริง" in hand."""
+    return take_usd > 0 and agg_pnl_usd >= take_usd
 
 
 def _atr(bars: list[Bar], length: int) -> float:
