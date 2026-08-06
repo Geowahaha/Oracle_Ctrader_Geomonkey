@@ -38,17 +38,17 @@ Environment=DEXTER3_MODE=mscalp-be
 Environment=DEXTER3_FAST_TICK_SEC=8
 Environment=DEXTER3_CAPITAL_USD=1000
 Environment=DEXTER3_MAX_VOLUME_UNITS=10
-Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=300
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=100000
 Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
-Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=45
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=0
 Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
 # --- risk tier IDENTICAL to dexter3-mscalp/mscalp2 (clean 3-way A/B) --------
-Environment=DEXTER3_DAILY_TARGET_USD=240
-Environment=DEXTER3_DAILY_LOSS_USD=120
+Environment=DEXTER3_DAILY_TARGET_USD=100000
+Environment=DEXTER3_DAILY_LOSS_USD=100000
 Environment=DEXTER3_BASE_RISK_FRAC=0.03
 Environment=DEXTER3_MAX_RISK_FRAC=0.06
-Environment=DEXTER3_MAX_ENTRIES_PER_DAY=30
-Environment=DEXTER3_DAILY_LOSS_BASKETS=5
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=999
+Environment=DEXTER3_DAILY_LOSS_BASKETS=999
 # --- producer owns the stop; generic SL floor OFF ---------------------------
 Environment=DEXTER3_SL_FLOOR_TR_MULT=0
 # --- producer knobs IDENTICAL to dexter3-mscalp (same signals by construction)
@@ -68,7 +68,9 @@ Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
 Environment=DEXTER3_ENTRY_CONFIRM=off
 # --- lane hygiene (identical to the twins) -----------------------------------
 Environment=DEXTER3_VP_DAYOPEN_BIAS=0
-Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_VP_NO_TRADE_UTC=
+Environment=DEXTER3_MAX_SPREAD_BPS=10000
+Environment=DEXTER3_V16_ENTRY_QUALITY_ENABLED=0
 Environment=DEXTER3_DAYREVERSAL=0
 Environment=DEXTER3_SDZONE=0
 Environment=DEXTER3_SMART_EXIT_ENABLED=0
