@@ -1730,6 +1730,32 @@ def fetch_fresh_m5(mcp: Dexter3McpClient, symbol: str, count: int = MIN_M5_BARS)
     return bars[-count:] if len(bars) > count else bars
 
 
+_H3_CTX_CACHE: dict[str, dict[str, Any]] = {}  # symbol -> {"epoch":, "m15":, "h1":}
+H3_CTX_REFRESH_SEC = 300  # m15/h1 context at the M5 lanes' own cadence
+
+
+def _h3fade_ctx_bars(mcp: Dexter3McpClient, symbol: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cached m15/h1 context for h3fade's M1 cycles — refreshed at most every
+    ``H3_CTX_REFRESH_SEC`` and NEVER raising (a failed refresh serves the
+    stale copy, or empty lists on the very first cycle). h3fade's producer
+    does not read these bars; they only feed journal-metadata paths, so a
+    <=5-min-old copy is informationally identical (h1 changes hourly)."""
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    cached = _H3_CTX_CACHE.get(symbol)
+    if cached is not None and (now_epoch - cached.get("epoch", 0.0)) < H3_CTX_REFRESH_SEC:
+        return cached["m15"], cached["h1"]
+    try:
+        m15 = mcp.get_trendbars(symbol, "m15", M15_BARS_NEEDED)
+        h1 = mcp.get_trendbars(symbol, "h1", H1_BARS_NEEDED)
+        _H3_CTX_CACHE[symbol] = {"epoch": now_epoch, "m15": m15, "h1": h1}
+        return m15, h1
+    except (McpClientError, McpZombieError) as exc:
+        log_line(f"{utc_now_iso()} {symbol} h3fade_ctx_refresh_failed (serving stale copy): {exc}")
+        if cached is not None:
+            return cached["m15"], cached["h1"]
+        return [], []
+
+
 def fetch_fresh_m1(mcp: Dexter3McpClient, symbol: str, count: int = h3fade.M1_FETCH_BARS) -> list[dict[str, Any]]:
     """M1 counterpart of ``fetch_fresh_m5`` for the h3fade lane (the only
     M1-cadence lane — pre-registered spec 2026-08-05). Same stale-snapshot
@@ -1955,8 +1981,19 @@ def run_symbol_cycle(
     if not pending:
         return "no_new_m5_close"
 
-    m15_bars = mcp.get_trendbars(symbol, "m15", M15_BARS_NEEDED)
-    h1_bars = mcp.get_trendbars(symbol, "h1", H1_BARS_NEEDED)
+    if is_h3fade:
+        # 2026-08-06 day-1 bug fix (load, NOT tuning — the h3fade producer
+        # never reads m15/h1): fetching both EVERY M1 close (every minute)
+        # tripped the broker rate limiter twice IN-WINDOW on day 1 (13:15Z /
+        # 14:15Z), and the uncaught McpClientError aborted those decision
+        # minutes — a silent lost-signal hazard for the N>=30 trial. Cache at
+        # the M5 lanes' own 5-min cadence and fail SOFT to the stale copy so
+        # a context-fetch hiccup can never kill an M1 decision again. The
+        # decision inputs themselves (M1 bars) are untouched.
+        m15_bars, h1_bars = _h3fade_ctx_bars(mcp, symbol)
+    else:
+        m15_bars = mcp.get_trendbars(symbol, "m15", M15_BARS_NEEDED)
+        h1_bars = mcp.get_trendbars(symbol, "h1", H1_BARS_NEEDED)
 
     statuses: list[str] = []
     for i in pending:

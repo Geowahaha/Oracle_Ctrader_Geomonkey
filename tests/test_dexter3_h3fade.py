@@ -237,3 +237,35 @@ def test_exit_empty_lane_or_no_bars_is_none():
     assert h3.h3fade_exit_decision([], [_m1("2026-08-05T13:11:00Z", 98.0)], 0.0) is None
     lane = [_pos()]
     assert h3.h3fade_exit_decision(lane, [], now_epoch=_epoch("2026-08-05T13:11:00Z")) is None
+
+
+def test_h3fade_ctx_cache_ttl_and_fail_soft():
+    # 2026-08-06 day-1 bug fix: a rate-limited m15/h1 context fetch must
+    # never abort an M1 decision minute — cache 5 min, serve stale on error.
+    import dexter3.shadow_runner as sr
+
+    class Stub:
+        def __init__(self):
+            self.calls = 0
+            self.fail = False
+
+        def get_trendbars(self, symbol, tf, n):
+            self.calls += 1
+            if self.fail:
+                raise sr.McpClientError("You are being rate limited")
+            return [{"ts": f"{tf}-{self.calls}"}]
+
+    stub = Stub()
+    sr._H3_CTX_CACHE.clear()
+    m15, h1 = sr._h3fade_ctx_bars(stub, "XAUUSD")
+    assert stub.calls == 2 and m15 and h1
+    m15b, _h1b = sr._h3fade_ctx_bars(stub, "XAUUSD")
+    assert stub.calls == 2 and m15b == m15  # within TTL -> cache, no calls
+    sr._H3_CTX_CACHE["XAUUSD"]["epoch"] = 0.0  # expire
+    stub.fail = True
+    m15c, h1c = sr._h3fade_ctx_bars(stub, "XAUUSD")
+    assert m15c == m15 and h1c == h1  # stale copy served, no raise
+    sr._H3_CTX_CACHE.clear()
+    e15, e1 = sr._h3fade_ctx_bars(stub, "XAUUSD")
+    assert e15 == [] and e1 == []  # first-cycle failure -> empty, no raise
+    sr._H3_CTX_CACHE.clear()
