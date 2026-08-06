@@ -62,6 +62,23 @@ MSCALP2_LABEL = MSCALP2_LABEL_FAMILY + ":canary"
 
 ENV_MSCALP2_TAKE_USD = "DEXTER3_MSCALP2_TAKE_USD"      # dollar take; <=0 = off
 
+# -- MSCALP-BE (owner order 2026-08-06 "ทำ twin ตัวที่สาม mscalp-be"): the
+# BE-at-deadline twin. SAME producer/entries; at deadline_sec the position's
+# broker SL is AMENDED to breakeven instead of being flattened — bank 0.5R
+# and the 3R TP keep working, so "ถือถ้ากำไรยังไปต่อ" holds literally: the
+# clock only decides when the trade must become FREE, never when to exit.
+#
+# EVIDENCE (filter, NOT proof — 2026-08-06 time-stop sweep, 9000 real USTEC
+# M5 bars / 711 signals / spread 1.5 charged / 60-40 split): BE15 was the
+# ONLY cell positive in BOTH segments — derive +236 / validate +1277 PF 1.58,
+# thrown runners 0 — vs the deployed T15's derive -1252 / validate +536 with
+# 61 of 257 time stops discarding a >=1R continuation. Judged at N>=30
+# broker deals vs mscalp/mscalp2 on the same signals.
+MSCALP_BE_LABEL_FAMILY = "dexter3:mscalp-be"   # '-be' is NOT a "-v<d>" token,
+MSCALP_BE_LABEL = MSCALP_BE_LABEL_FAMILY + ":canary"  # so no family overlap
+
+ENV_MSCALP_BE_SEC = "DEXTER3_MSCALP_BE_SEC"    # BE deadline seconds; <=0 = off
+
 ENV_ATR_LEN = "DEXTER3_MSCALP_ATR_LEN"                # ATR length (14)
 ENV_BODY_FRAC = "DEXTER3_MSCALP_IMPULSE_BODY_FRAC"    # impulse body > frac x range (0.6)
 ENV_RANGE_ATR = "DEXTER3_MSCALP_RANGE_ATR"            # impulse range > k x ATR (1.0)
@@ -113,6 +130,70 @@ def mscalp2_take_decision(agg_pnl_usd: float, take_usd: float) -> bool:
     The caller feeds broker-valued aggregate PnL (spread/commission already
     inside), so `>= take_usd` means the owner's "กำไร >$X จริง" in hand."""
     return take_usd > 0 and agg_pnl_usd >= take_usd
+
+
+def mscalp_be_mode_enabled() -> bool:
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "mscalp-be":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp-be"
+
+
+def mscalp_be_deadline_sec() -> float:
+    """BE deadline for the mscalp-be twin; <= 0 disables the branch."""
+    return _env_float(ENV_MSCALP_BE_SEC, 0.0)
+
+
+def _position_open_epoch(position: dict[str, Any]) -> float:
+    """Open epoch of a broker position dict (0.0 unknown) — same field
+    fallbacks as basket_live._position_open_ts."""
+    raw = str(
+        position.get("openTimestamp")
+        or position.get("open_ts")
+        or position.get("createTimestamp")
+        or position.get("utcLastUpdateTimestamp")
+        or ""
+    )
+    if not raw:
+        return 0.0
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        val = _f(raw, 0.0)
+        if val > 1e12:
+            return val / 1000.0
+        return val if val > 1e9 else 0.0
+
+
+def mscalp_be_amend_needed(position: dict[str, Any], now_epoch: float,
+                           deadline_sec: float) -> float | None:
+    """Pure: the breakeven SL price when this position must be amended NOW
+    (age >= deadline and its stop is not yet at/beyond entry), else None.
+
+    Idempotent by construction — once the broker SL sits at breakeven or
+    better the check returns None forever, so the caller can re-evaluate
+    every fast tick without re-amending. A missing/zero SL still amends (BE
+    is strictly safer than naked)."""
+    if deadline_sec <= 0:
+        return None
+    opened = _position_open_epoch(position)
+    if opened <= 0 or (now_epoch - opened) < deadline_sec:
+        return None
+    entry = _f(position.get("entryPrice") or position.get("entry_price"), 0.0)
+    sl = _f(position.get("stopLoss") or position.get("stop_loss"), 0.0)
+    side = str(position.get("tradeSide") or position.get("side") or "").lower()
+    if entry <= 0:
+        return None
+    if side.startswith("buy"):
+        if sl >= entry:
+            return None
+    elif side.startswith("sell"):
+        if 0 < sl <= entry:
+            return None
+    else:
+        return None
+    return entry
 
 
 def _atr(bars: list[Bar], length: int) -> float:

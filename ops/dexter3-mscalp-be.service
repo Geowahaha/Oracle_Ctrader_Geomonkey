@@ -1,0 +1,83 @@
+# Dexter3 MSCALP-BE lane — twin #3: BE-at-deadline (owner order 2026-08-06
+# "ทำ twin ตัวที่สาม mscalp-be — entry เดิมเป๊ะ + BE15 exit — deploy live เลย").
+#
+# WHAT: identical entries to dexter3-mscalp/mscalp2 (same producer, same
+# knobs). The exit difference: NO 15-min flatten — at DEXTER3_MSCALP_BE_SEC
+# (900s) the broker SL is AMENDED to breakeven and the position holds until
+# bank 0.5R (closed bar), the 3R TP, or the BE stop. "ถือถ้ากำไรยังไปต่อ"
+# implemented literally: the clock decides when the trade becomes FREE,
+# never when to exit. Basket time stop stays only as a 240-min fail-safe.
+#
+# WHY (filter, NOT proof — 2026-08-06 time-stop sweep on 9000 real USTEC M5
+# bars, 711 signals, spread 1.5 charged, 60/40 split): BE15 was the ONLY
+# cell positive in BOTH segments — derive +236 / validate +1277 PF 1.58,
+# thrown runners 0 — while the deployed T15 sat at derive -1252 / validate
+# +536 and discarded a >=1R continuation in 61 of its 257 time stops.
+# JUDGE: N>=30 broker deals in DOLLARS vs mscalp (T15) and mscalp2 ($5-take)
+# on the same signals; no tuning mid-trial.
+#
+# ACTIVATION (start ONLY this unit):
+#   sudo cp ops/dexter3-mscalp-be.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-mscalp-be
+[Unit]
+Description=Dexter3 MSCALP-BE lane LIVE canary USTEC (mscalp twin #3, breakeven-at-15min instead of flatten)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=mscalp-be
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=300
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=45
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
+# --- risk tier IDENTICAL to dexter3-mscalp/mscalp2 (clean 3-way A/B) --------
+Environment=DEXTER3_DAILY_TARGET_USD=240
+Environment=DEXTER3_DAILY_LOSS_USD=120
+Environment=DEXTER3_BASE_RISK_FRAC=0.03
+Environment=DEXTER3_MAX_RISK_FRAC=0.06
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=30
+Environment=DEXTER3_DAILY_LOSS_BASKETS=5
+# --- producer owns the stop; generic SL floor OFF ---------------------------
+Environment=DEXTER3_SL_FLOOR_TR_MULT=0
+# --- producer knobs IDENTICAL to dexter3-mscalp (same signals by construction)
+Environment=DEXTER3_MSCALP_ATR_LEN=14
+Environment=DEXTER3_MSCALP_IMPULSE_BODY_FRAC=0.6
+Environment=DEXTER3_MSCALP_RANGE_ATR=1.0
+Environment=DEXTER3_MSCALP_DRIFT_BARS=72
+Environment=DEXTER3_MSCALP_DRIFT_MIN_ATR=3.0
+Environment=DEXTER3_MSCALP_SL_ATR=1.3
+Environment=DEXTER3_MSCALP_TP_BACKSTOP_R=3.0
+# --- THE twin-#3 exit: BE amend at 15 min; NO flatten (240m = fail-safe only)
+Environment=DEXTER3_MSCALP_BE_SEC=900
+Environment=DEXTER3_OM_TRAIL_MODE=bank
+Environment=DEXTER3_OM_BANK_R=0.5
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=240
+Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
+Environment=DEXTER3_ENTRY_CONFIRM=off
+# --- lane hygiene (identical to the twins) -----------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=0
+Environment=DEXTER3_VP_NO_TRADE_UTC=20:45-22:15
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols USTEC --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target
