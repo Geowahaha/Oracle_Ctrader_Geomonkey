@@ -4677,15 +4677,18 @@ def _run_mscalp_be_tick(
     symbol: str,
     executor: Dexter3Executor | None,
     lane: list[dict[str, Any]],
-) -> None:
-    """MSCALP-BE deadline (owner order 2026-08-06): once a position's age
-    reaches ``DEXTER3_MSCALP_BE_SEC``, AMEND its broker SL to breakeven —
-    never flatten. Bank 0.5R / TP 3R keep working underneath ("ถือถ้ากำไร
-    ยังไปต่อ"); the clock only makes the trade free. Idempotent via
-    ``mscalp_be_amend_needed`` (already-BE positions return None), retries
-    capped per position, never raises, shadow mode amends nothing."""
+) -> str | None:
+    """MSCALP-BE deadline (owner order 2026-08-06, semantics corrected same
+    day off the live broker rejection): at ``DEXTER3_MSCALP_BE_SEC``, a
+    position AT/ABOVE breakeven gets its SL AMENDED to entry and rides on
+    (bank/TP/BE — "ถือถ้ากำไรยังไปต่อ"); an UNDERWATER position is CLOSED at
+    market (reason ``be_time``) — an entry-level stop on the losing side is
+    a broker-rejected fiction (an armed stop there would fill instantly at
+    market anyway). Returns a status string when it closed the lane this
+    tick, else None. Amend retries capped per position; never raises;
+    shadow mode mutates nothing."""
     if executor is None or not lane:
-        return
+        return None
     deadline = mscalp.mscalp_be_deadline_sec()
     now_epoch = datetime.now(timezone.utc).timestamp()
     tries: dict[str, Any] = state.setdefault("mscalp_be_tries", {})
@@ -4696,21 +4699,36 @@ def _run_mscalp_be_tick(
         pid = position_id_of(pos)
         if pid <= 0:
             continue
-        be_price = mscalp.mscalp_be_amend_needed(pos, now_epoch, deadline)
-        if be_price is None:
+        verdict = mscalp.mscalp_be_action(pos, now_epoch, deadline)
+        if verdict is None:
             continue
+        action, value = verdict
+        if action == "close":
+            try:
+                executed = executor.execute_close_all([pid], reason="be_time")
+            except Exception as exc:  # noqa: BLE001 - a failed close falls back to bank/TP/SL
+                log_error(f"mscalp_be_time_close({symbol})", exc)
+                continue
+            log_line(
+                f"{utc_now_iso()} {symbol} mscalp_be_time_closed position_id={pid} "
+                f"floating={value:.2f} "
+                f"result={executed.get('action') if isinstance(executed, dict) else executed}"
+            )
+            _clear_basket_runtime(state, symbol)
+            return "mscalp_be_time"
         if int(tries.get(str(pid), 0)) >= _MSCALP_BE_MAX_TRIES:
             continue
         tries[str(pid)] = int(tries.get(str(pid), 0)) + 1
         try:
-            executor.client.amend_position(pid, stop_loss=be_price)
+            executor.client.amend_position(pid, stop_loss=value)
             log_line(
                 f"{utc_now_iso()} {symbol} mscalp_be_amended position_id={pid} "
-                f"sl->breakeven={be_price} try={tries[str(pid)]}"
+                f"sl->breakeven={value} try={tries[str(pid)]}"
             )
         except Exception as exc:  # noqa: BLE001 - a failed amend keeps the original SL; bank/TP/SL still resolve
             log_line(f"{utc_now_iso()} {symbol} mscalp_be_amend_failed position_id={pid} "
                      f"try={tries[str(pid)]}: {exc}")
+    return None
 
 
 def run_om_tick(
@@ -4796,10 +4814,13 @@ def run_om_tick(
             return take_status
 
     # MSCALP-BE deadline (owner order 2026-08-06): mode+env double gate;
-    # amends SL to breakeven (does NOT close), then falls through to the
-    # unchanged OM evaluation — every other lane byte-identical.
+    # winners get SL->breakeven (falls through to the unchanged OM), an
+    # underwater position at the deadline is closed (early return) — every
+    # other lane byte-identical.
     if _mscalp_be_producer_enabled() and mscalp.mscalp_be_deadline_sec() > 0:
-        _run_mscalp_be_tick(state, symbol, executor, lane)
+        be_status = _run_mscalp_be_tick(state, symbol, executor, lane)
+        if be_status is not None:
+            return be_status
 
     m5_bars, m15_bars, h1_bars = _om_bars_for(mcp, symbol)
 

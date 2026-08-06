@@ -7,9 +7,10 @@ from __future__ import annotations
 from dexter3 import mscalp as ms
 
 
-def _pos(side="BUY", entry=29800.0, sl=29760.0, open_ts="2026-08-06T01:00:00Z", pid=9):
+def _pos(side="BUY", entry=29800.0, sl=29760.0, open_ts="2026-08-06T01:00:00Z",
+         pid=9, floating=4.0):
     return {"positionId": pid, "tradeSide": side, "entryPrice": entry,
-            "stopLoss": sl, "openTimestamp": open_ts}
+            "stopLoss": sl, "openTimestamp": open_ts, "netProfit": floating}
 
 
 def _epoch(ts: str) -> float:
@@ -69,34 +70,47 @@ def test_lane_tally_family_split():
     assert _lane_family("dexter3:mscalp2:canary") == "mscalp2"
 
 
-def test_be_amend_waits_for_deadline():
+def test_be_action_waits_for_deadline():
     pos = _pos()
-    before = ms.mscalp_be_amend_needed(pos, _epoch("2026-08-06T01:14:59Z"), 900.0)
-    assert before is None
-    at = ms.mscalp_be_amend_needed(pos, _epoch("2026-08-06T01:15:00Z"), 900.0)
-    assert at == 29800.0  # amend SL -> entry
+    assert ms.mscalp_be_action(pos, _epoch("2026-08-06T01:14:59Z"), 900.0) is None
+    assert ms.mscalp_be_action(pos, _epoch("2026-08-06T01:15:00Z"), 900.0) == ("amend", 29800.0)
 
 
-def test_be_amend_idempotent_once_at_breakeven():
-    # buy already BE (or better) -> no re-amend, ever
-    assert ms.mscalp_be_amend_needed(_pos(sl=29800.0), _epoch("2026-08-06T01:30:00Z"), 900.0) is None
-    assert ms.mscalp_be_amend_needed(_pos(sl=29810.0), _epoch("2026-08-06T01:30:00Z"), 900.0) is None
+def test_be_action_underwater_closes_instead_of_amending():
+    # measured live 2026-08-06 01:39Z: the broker REJECTS an entry-level SL
+    # on the losing side — the honest deadline action for a loser is the
+    # market close (the corrected sweep's BEW cell).
+    loser = _pos(floating=-12.1)
+    assert ms.mscalp_be_action(loser, _epoch("2026-08-06T01:30:00Z"), 900.0) == ("close", -12.1)
+    # epoch-millis openTimestamp (the broker's real payload shape) parses too
+    millis = _pos(floating=-3.0)
+    millis["openTimestamp"] = 1785979437172  # 2026-08-06T01:23:57Z
+    assert ms.mscalp_be_action(millis, 1785979437.172 + 900.0, 900.0) == ("close", -3.0)
+
+
+def test_be_action_idempotent_once_at_breakeven():
+    # buy already BE (or better) -> None forever
+    assert ms.mscalp_be_action(_pos(sl=29800.0), _epoch("2026-08-06T01:30:00Z"), 900.0) is None
+    assert ms.mscalp_be_action(_pos(sl=29810.0), _epoch("2026-08-06T01:30:00Z"), 900.0) is None
     # sell: BE means sl <= entry
     sell = _pos(side="SELL", entry=29800.0, sl=29840.0)
-    assert ms.mscalp_be_amend_needed(sell, _epoch("2026-08-06T01:30:00Z"), 900.0) == 29800.0
+    assert ms.mscalp_be_action(sell, _epoch("2026-08-06T01:30:00Z"), 900.0) == ("amend", 29800.0)
     sell_be = _pos(side="SELL", entry=29800.0, sl=29800.0)
-    assert ms.mscalp_be_amend_needed(sell_be, _epoch("2026-08-06T01:30:00Z"), 900.0) is None
+    assert ms.mscalp_be_action(sell_be, _epoch("2026-08-06T01:30:00Z"), 900.0) is None
 
 
-def test_be_amend_guards():
-    # disabled deadline / unknown open time / missing entry / unknown side
-    assert ms.mscalp_be_amend_needed(_pos(), _epoch("2026-08-06T02:00:00Z"), 0.0) is None
+def test_be_action_guards():
+    # disabled deadline / unknown open time / missing entry / unknown side /
+    # unreadable PnL -> never act blind
+    assert ms.mscalp_be_action(_pos(), _epoch("2026-08-06T02:00:00Z"), 0.0) is None
     no_ts = _pos(); no_ts["openTimestamp"] = ""
-    assert ms.mscalp_be_amend_needed(no_ts, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
+    assert ms.mscalp_be_action(no_ts, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
     no_entry = _pos(entry=0.0)
-    assert ms.mscalp_be_amend_needed(no_entry, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
+    assert ms.mscalp_be_action(no_entry, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
     odd = _pos(); odd["tradeSide"] = ""
-    assert ms.mscalp_be_amend_needed(odd, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
-    # missing SL (0.0) after deadline still amends -> BE is safer than naked
+    assert ms.mscalp_be_action(odd, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
+    blind = _pos(); blind.pop("netProfit")
+    assert ms.mscalp_be_action(blind, _epoch("2026-08-06T02:00:00Z"), 900.0) is None
+    # missing SL (0.0) on a WINNER after deadline still amends -> BE beats naked
     naked = _pos(sl=0.0)
-    assert ms.mscalp_be_amend_needed(naked, _epoch("2026-08-06T02:00:00Z"), 900.0) == 29800.0
+    assert ms.mscalp_be_action(naked, _epoch("2026-08-06T02:00:00Z"), 900.0) == ("amend", 29800.0)

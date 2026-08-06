@@ -166,15 +166,32 @@ def _position_open_epoch(position: dict[str, Any]) -> float:
         return val if val > 1e9 else 0.0
 
 
-def mscalp_be_amend_needed(position: dict[str, Any], now_epoch: float,
-                           deadline_sec: float) -> float | None:
-    """Pure: the breakeven SL price when this position must be amended NOW
-    (age >= deadline and its stop is not yet at/beyond entry), else None.
+def position_floating_usd(position: dict[str, Any]) -> float | None:
+    """Broker floating PnL of one position dict (None when absent) — same
+    field fallbacks basket_live's aggregate uses."""
+    for key in ("netProfit", "profit", "grossProfit", "pnl"):
+        if position.get(key) is not None:
+            return _f(position.get(key), 0.0)
+    return None
 
-    Idempotent by construction — once the broker SL sits at breakeven or
-    better the check returns None forever, so the caller can re-evaluate
-    every fast tick without re-amending. A missing/zero SL still amends (BE
-    is strictly safer than naked)."""
+
+def mscalp_be_action(position: dict[str, Any], now_epoch: float,
+                     deadline_sec: float) -> tuple[str, float] | None:
+    """Pure: what the BE deadline demands for this position NOW.
+
+    Returns ('amend', breakeven_price) for a position AT/ABOVE breakeven —
+    the broker accepts an SL at entry only from the profitable side; or
+    ('close', floating_usd) for an UNDERWATER position — an entry-level stop
+    on the losing side would fill instantly at market anyway (and the broker
+    rejects the amend outright: measured live 2026-08-06 01:39Z,
+    `amend_rejected: New SL for SELL position should be >= current ASK`), so
+    the honest deadline action for a loser IS the market close, exactly the
+    BEW cell the corrected sweep measured (T15 −1214/+535 vs BEW0 −1133/+661
+    PF 1.23, both segments better). None = nothing due (young position,
+    already at BE-or-better, or unreadable).
+
+    Idempotent: once the SL sits at breakeven or better the check returns
+    None forever. A missing SL on a winner still amends (BE beats naked)."""
     if deadline_sec <= 0:
         return None
     opened = _position_open_epoch(position)
@@ -183,17 +200,18 @@ def mscalp_be_amend_needed(position: dict[str, Any], now_epoch: float,
     entry = _f(position.get("entryPrice") or position.get("entry_price"), 0.0)
     sl = _f(position.get("stopLoss") or position.get("stop_loss"), 0.0)
     side = str(position.get("tradeSide") or position.get("side") or "").lower()
-    if entry <= 0:
+    if entry <= 0 or not (side.startswith("buy") or side.startswith("sell")):
         return None
-    if side.startswith("buy"):
-        if sl >= entry:
-            return None
-    elif side.startswith("sell"):
-        if 0 < sl <= entry:
-            return None
-    else:
+    floating = position_floating_usd(position)
+    if floating is None:
+        return None  # never act blind on an unreadable PnL
+    if floating < 0:
+        return ("close", floating)
+    if side.startswith("buy") and sl >= entry:
         return None
-    return entry
+    if side.startswith("sell") and 0 < sl <= entry:
+        return None
+    return ("amend", entry)
 
 
 def _atr(bars: list[Bar], length: int) -> float:
