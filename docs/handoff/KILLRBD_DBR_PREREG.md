@@ -105,3 +105,48 @@ run further variants of this idea. On success: build as a canary lane
 broker deals in dollars like every other lane.
 
 Replay remains a FILTER, never a proof ([[feedback_live_wins_only]]).
+
+---
+
+# RESULT (measured 2026-08-07 ~10:10Z, spec frozen at commit `373d1db`)
+
+**VERDICT: FAIL — no lane will be built. Per the declared rule the idea is
+closed: no re-tuning of the score threshold, imbalance set, RR or exit.**
+
+| Cell | Segment | N | net | WR | PF |
+|---|---|---|---|---|---|
+| A (score >= 60) | derive | 6 | **-522.5** | 17% | 0.32 |
+| A (score >= 60) | validate | 4 | **-98.4** | 25% | 0.69 |
+| B (no score gate) | derive | 57 | **-614.3** | 28% | 0.88 |
+| B (no score gate) | validate | 39 | **-1250.9** | 23% | 0.64 |
+
+Cell A produced only **10 qualifying signals in 45 days** (N=6/4), so by the
+pre-declared contingency it is INCONCLUSIVE on sample size — and the
+contingency Cell B, evaluated exactly as declared, is **negative in BOTH
+segments**. Criterion 1 (net>0 both) fails outright.
+
+## Why it fails — mechanism, measured
+
+1. **The score gate almost never fires on USTEC M5: 10 of 330 pattern+imbalance
+   signals reached 60.** Typical arithmetic at a DBR: pattern 5 + OG/VI 8-12 +
+   RSI 7-12 (a DBR forms after a *base*, so RSI sits mid-range and rarely pays
+   the 20) + timing 10-20 = roughly 30-54. FVG (the 15-point component) is rare
+   on continuous M5 data. **This is why the owner's dashboard shows "No Signal"
+   most of the time — it is the formula, not a quiet market.**
+2. **Win rate 23-28% against a fixed 2R target, where breakeven is ~33% before
+   spread.** The geometry is the cause: the stop is
+   `min(lowest(low,20), entry - 1.5*ATR)`, i.e. at least 1.5xATR and usually the
+   whole 20-bar swing — a wide stop paired with a 2R target needs a large,
+   sustained move that a 2-bar rally after a 2-bar base does not reliably
+   deliver.
+3. The raw pattern is common (330 signals / 45 days ~ 7 per day); it is not
+   selectivity that is missing, it is edge.
+
+## Standing conclusion
+
+This was the 8th distinct family tested against the USTEC scalp problem
+(headroom, BRK blue-sky, wick-tip, dip-limits, VP thin-air, VP value-area,
+FVG retest, and now KillRBD DBR/RBD). **None has cleared the two-segment bar.**
+The board's converging read stands: on this instrument the difficulty is regime
+dependence, not entry placement or setup naming. The four live USTEC cells plus
+h3fade keep running and are judged on broker deals at N>=30.
