@@ -2190,10 +2190,17 @@ def run_symbol_cycle(
             # producer on the identical bars — the two lanes differ ONLY in
             # mscalp2's fast-tick dollar-take (_run_mscalp2_take_tick), so
             # the forward A/B isolates exactly one variable.
+            # DEXTER3_MSCALP_ENTRY=brk (owner 2026-08-07): the exit twins'
+            # entry stream switches to the blue-sky gate so the exit A/B is
+            # measured on the BRK population — the mscalp control lane
+            # never sets this env and keeps decide_mscalp byte-for-byte.
             from dexter3 import market_lens as _ml
 
             ms_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
-            decision = mscalp.decide_mscalp(symbol, prefix, spread_abs, session=ms_session)
+            if mscalp.mscalp_entry_is_brk():
+                decision = mscalp.decide_mscalp_brk(symbol, prefix, spread_abs, session=ms_session)
+            else:
+                decision = mscalp.decide_mscalp(symbol, prefix, spread_abs, session=ms_session)
         elif is_newest and _h3fade_producer_enabled():
             # H3FADE lane (pre-registered 2026-08-05): M1 streak-fade —
             # ``prefix`` IS the M1 window in this mode (see the fetch swap at

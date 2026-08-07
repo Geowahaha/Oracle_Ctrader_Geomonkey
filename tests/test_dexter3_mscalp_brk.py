@@ -122,3 +122,14 @@ def test_lane_tally_family_split():
     assert _lane_family("dexter3:mscalp-brk:canary") == "mscalp-brk"
     assert _lane_family("dexter3:mscalp-be:canary") == "mscalp-be"
     assert _lane_family("dexter3:mscalp:canary") == "mscalp"
+
+
+def test_entry_selector_env_default_off(monkeypatch):
+    # the exit twins switch entries with DEXTER3_MSCALP_ENTRY=brk; absent ->
+    # original decide_mscalp (the mscalp control lane never sets it)
+    monkeypatch.delenv(ms.ENV_MSCALP_ENTRY, raising=False)
+    assert ms.mscalp_entry_is_brk() is False
+    monkeypatch.setenv(ms.ENV_MSCALP_ENTRY, "brk")
+    assert ms.mscalp_entry_is_brk() is True
+    monkeypatch.setenv(ms.ENV_MSCALP_ENTRY, "base")
+    assert ms.mscalp_entry_is_brk() is False

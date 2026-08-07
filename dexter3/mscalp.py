@@ -100,6 +100,18 @@ MSCALP_BRK_LABEL = MSCALP_BRK_LABEL_FAMILY + ":canary"
 ENV_MSCALP_BRK_LOOK_M5 = "DEXTER3_MSCALP_BRK_LOOK_M5"    # M5 lookback bars (180)
 ENV_MSCALP_BRK_PIVOT_K = "DEXTER3_MSCALP_BRK_PIVOT_K"    # pivot wing width (2)
 
+# Entry selector for the EXIT twins (owner 2026-08-07 "Mscalp-BE และ Mscalp2
+# ให้ใช้ entry แบบใหม่ด้วย"): DEXTER3_MSCALP_ENTRY=brk switches a twin's
+# entry stream to decide_mscalp_brk so the exit A/B (T15 vs $5 vs BEW) is
+# measured ON the blue-sky population, judged against dexter3-mscalp-brk as
+# the T15 control. Default absent = the original decide_mscalp — the
+# dexter3-mscalp control lane never sets this.
+ENV_MSCALP_ENTRY = "DEXTER3_MSCALP_ENTRY"
+
+
+def mscalp_entry_is_brk() -> bool:
+    return os.environ.get(ENV_MSCALP_ENTRY, "").strip().lower() == "brk"
+
 ENV_ATR_LEN = "DEXTER3_MSCALP_ATR_LEN"                # ATR length (14)
 ENV_BODY_FRAC = "DEXTER3_MSCALP_IMPULSE_BODY_FRAC"    # impulse body > frac x range (0.6)
 ENV_RANGE_ATR = "DEXTER3_MSCALP_RANGE_ATR"            # impulse range > k x ATR (1.0)

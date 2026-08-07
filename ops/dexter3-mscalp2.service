@@ -58,6 +58,11 @@ Environment=DEXTER3_MSCALP_DRIFT_BARS=72
 Environment=DEXTER3_MSCALP_DRIFT_MIN_ATR=3.0
 Environment=DEXTER3_MSCALP_SL_ATR=1.3
 Environment=DEXTER3_MSCALP_TP_BACKSTOP_R=3.0
+# --- entry stream = the blue-sky gate (owner 2026-08-07; segment 2 of the
+#     exit A/B — judged vs dexter3-mscalp-brk as the T15 control) -----------
+Environment=DEXTER3_MSCALP_ENTRY=brk
+Environment=DEXTER3_MSCALP_BRK_LOOK_M5=180
+Environment=DEXTER3_MSCALP_BRK_PIVOT_K=2
 # --- exits: ORIGINAL mscalp exits + THE ONE ADDITION (the $5 dollar-take) ----
 Environment=DEXTER3_MSCALP2_TAKE_USD=5
 Environment=DEXTER3_OM_TRAIL_MODE=bank
