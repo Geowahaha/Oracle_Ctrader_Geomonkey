@@ -62,7 +62,7 @@ Environment=DEXTER3_MSCALP_TP_BACKSTOP_R=3.0
 # --- entry stream = the blue-sky gate (owner 2026-08-07; segment 2 of the
 #     exit A/B — judged vs dexter3-mscalp-brk as the T15 control) -----------
 Environment=DEXTER3_MSCALP_ENTRY=brk
-Environment=DEXTER3_MSCALP_BRK_LOOK_M5=180
+Environment=DEXTER3_MSCALP_BRK_LOOK_M5=288
 Environment=DEXTER3_MSCALP_BRK_PIVOT_K=2
 # --- THE twin-#3 exit: BE amend at 15 min; NO flatten (240m = fail-safe only)
 Environment=DEXTER3_MSCALP_BE_SEC=900
