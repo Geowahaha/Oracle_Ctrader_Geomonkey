@@ -114,6 +114,7 @@ SNIPER_STATE_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow_state.json
 MSCALP_STATE_FILE = RUNTIME / "dexter3_mscalp_shadow_state.json"
 MSCALP2_STATE_FILE = RUNTIME / "dexter3_mscalp2_shadow_state.json"
 MSCALP_BE_STATE_FILE = RUNTIME / "dexter3_mscalp_be_shadow_state.json"
+MSCALP_BRK_STATE_FILE = RUNTIME / "dexter3_mscalp_brk_shadow_state.json"
 H3FADE_STATE_FILE = RUNTIME / "dexter3_h3fade_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
@@ -131,6 +132,7 @@ SNIPER_LOG_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.log"
 MSCALP_LOG_FILE = RUNTIME / "dexter3_mscalp_shadow.log"
 MSCALP2_LOG_FILE = RUNTIME / "dexter3_mscalp2_shadow.log"
 MSCALP_BE_LOG_FILE = RUNTIME / "dexter3_mscalp_be_shadow.log"
+MSCALP_BRK_LOG_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.log"
 H3FADE_LOG_FILE = RUNTIME / "dexter3_h3fade_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 PAPER_LOCK_FILE = RUNTIME / "dexter3_fable_paper_loop.lock"
@@ -144,6 +146,7 @@ SNIPER_LOCK_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.lock"
 MSCALP_LOCK_FILE = RUNTIME / "dexter3_mscalp_shadow.lock"
 MSCALP2_LOCK_FILE = RUNTIME / "dexter3_mscalp2_shadow.lock"
 MSCALP_BE_LOCK_FILE = RUNTIME / "dexter3_mscalp_be_shadow.lock"
+MSCALP_BRK_LOCK_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.lock"
 H3FADE_LOCK_FILE = RUNTIME / "dexter3_h3fade_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
@@ -280,6 +283,14 @@ def _mscalp2_producer_enabled() -> bool:
     return mscalp.mscalp2_mode_enabled()
 
 
+def _mscalp_brk_producer_enabled() -> bool:
+    """MSCALP-BRK lane (owner observation 2026-08-07 'Buy ที่แนวต้าน Sell ที่
+    แนวรับ'): mscalp signals taken ONLY in M15 blue sky — dexter3/mscalp.py's
+    decide_mscalp_brk carries the evidence block. T15 exits identical to the
+    mscalp original so the A/B isolates the entry. DEFAULT OFF."""
+    return mscalp.mscalp_brk_mode_enabled()
+
+
 def _mscalp_be_producer_enabled() -> bool:
     """MSCALP-BE twin #3 (owner order 2026-08-06): SAME mscalp producer/
     entries; at the BE deadline the broker SL is amended to breakeven
@@ -313,7 +324,7 @@ def _alt_producer_enabled() -> bool:
             or _dpull_cs_producer_enabled() or _channelfade_producer_enabled()
             or _sniper_producer_enabled() or _mscalp_producer_enabled()
             or _mscalp2_producer_enabled() or _mscalp_be_producer_enabled()
-            or _h3fade_producer_enabled())
+            or _mscalp_brk_producer_enabled() or _h3fade_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -365,6 +376,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.mscalp import MSCALP_BE_LABEL
 
         return MSCALP_BE_LABEL
+    if current_mode == "mscalp-brk":
+        from dexter3.mscalp import MSCALP_BRK_LABEL
+
+        return MSCALP_BRK_LABEL
     if current_mode == "h3fade":
         from dexter3.h3fade import H3FADE_LABEL
 
@@ -429,6 +444,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.mscalp import MSCALP_BE_LABEL_FAMILY
 
         return MSCALP_BE_LABEL_FAMILY
+    if current_mode == "mscalp-brk":
+        from dexter3.mscalp import MSCALP_BRK_LABEL_FAMILY
+
+        return MSCALP_BRK_LABEL_FAMILY
     if current_mode == "h3fade":
         from dexter3.h3fade import H3FADE_LABEL_FAMILY
 
@@ -460,6 +479,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return MSCALP2_STATE_FILE
     if current_mode == "mscalp-be":
         return MSCALP_BE_STATE_FILE
+    if current_mode == "mscalp-brk":
+        return MSCALP_BRK_STATE_FILE
     if current_mode == "h3fade":
         return H3FADE_STATE_FILE
     return STATE_FILE
@@ -494,6 +515,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return MSCALP2_LOG_FILE
     if current_mode == "mscalp-be":
         return MSCALP_BE_LOG_FILE
+    if current_mode == "mscalp-brk":
+        return MSCALP_BRK_LOG_FILE
     if current_mode == "h3fade":
         return H3FADE_LOG_FILE
     return LOG_FILE
@@ -1610,6 +1633,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = MSCALP2_LOCK_FILE, "mscalp2-canary"
     elif mode == "mscalp-be":
         lock_file, lock_name = MSCALP_BE_LOCK_FILE, "mscalp-be-canary"
+    elif mode == "mscalp-brk":
+        lock_file, lock_name = MSCALP_BRK_LOCK_FILE, "mscalp-brk-canary"
     elif mode == "h3fade":
         lock_file, lock_name = H3FADE_LOCK_FILE, "h3fade-canary"
     else:
@@ -1653,6 +1678,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = MSCALP2_LOCK_FILE
     elif mode == "mscalp-be":
         lock_file = MSCALP_BE_LOCK_FILE
+    elif mode == "mscalp-brk":
+        lock_file = MSCALP_BRK_LOCK_FILE
     elif mode == "h3fade":
         lock_file = H3FADE_LOCK_FILE
     else:
@@ -2145,6 +2172,16 @@ def run_symbol_cycle(
 
             dp_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
             decision = _daytrend.decide_daytrend(symbol, prefix, spread_abs, session=dp_session)
+        elif is_newest and _mscalp_brk_producer_enabled():
+            # MSCALP-BRK lane (owner observation 2026-08-07): the same
+            # impulse signal taken ONLY in M15 blue sky — losers were
+            # entering 0.06xATR from the nearest level, winners had 4+xATR
+            # of air. Gate evidence in dexter3/mscalp.py; blocked signals
+            # journal as sr_wall skips.
+            from dexter3 import market_lens as _ml
+
+            mb_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = mscalp.decide_mscalp_brk(symbol, prefix, spread_abs, session=mb_session)
         elif is_newest and (_mscalp_producer_enabled() or _mscalp2_producer_enabled()
                             or _mscalp_be_producer_enabled()):
             # MSCALP lane (owner order 2026-08-05): impulse-continuation
@@ -5318,6 +5355,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_mscalp = mode == "mscalp"
     is_mscalp2 = mode == "mscalp2"
     is_mscalp_be = mode == "mscalp-be"
+    is_mscalp_brk = mode == "mscalp-brk"
     is_h3fade = mode == "h3fade"
 
     # VP canary lane (2026-07-11): same isolation pattern as grok — its own
@@ -5397,6 +5435,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _MSB_LABEL
         print(f"[MSCALP-BE] Forced executor LABEL to {_MSB_LABEL}", flush=True)
 
+    if is_mscalp_brk:
+        from dexter3.mscalp import MSCALP_BRK_LABEL as _MSK_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _MSK_LABEL
+        print(f"[MSCALP-BRK] Forced executor LABEL to {_MSK_LABEL}", flush=True)
+
     if is_h3fade:
         from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
 
@@ -5444,6 +5489,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.mscalp import MSCALP_BE_LABEL as _MSB_LABEL
 
         active_label = _MSB_LABEL
+    elif is_mscalp_brk:
+        from dexter3.mscalp import MSCALP_BRK_LABEL as _MSK_LABEL
+
+        active_label = _MSK_LABEL
     elif is_h3fade:
         from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
 
@@ -5632,6 +5681,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _MSB_LABEL
         print(f"[MSCALP-BE] Forced executor LABEL to {_MSB_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "mscalp-brk":
+        from dexter3.mscalp import MSCALP_BRK_LABEL as _MSK_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _MSK_LABEL
+        print(f"[MSCALP-BRK] Forced executor LABEL to {_MSK_LABEL}", flush=True)
 
     if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "h3fade":
         from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL

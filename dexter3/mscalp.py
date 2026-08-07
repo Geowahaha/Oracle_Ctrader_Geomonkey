@@ -79,6 +79,27 @@ MSCALP_BE_LABEL = MSCALP_BE_LABEL_FAMILY + ":canary"  # so no family overlap
 
 ENV_MSCALP_BE_SEC = "DEXTER3_MSCALP_BE_SEC"    # BE deadline seconds; <=0 = off
 
+# -- MSCALP-BRK (owner observation 2026-08-07 "Buy ที่แนวต้าน Sell ที่แนวรับ"
+# confirmed by data: the losing entries sat 0.06xATR from the nearest M15
+# level while winners had 4+xATR of air): the blue-sky entry twin. SAME
+# mscalp impulse signal, taken ONLY when the entry close has broken beyond
+# EVERY M15 pivot in the lookback on its own side — no structure overhead
+# for a buy, none underfoot for a sell. Binary gate, no tuned threshold.
+#
+# EVIDENCE (filter, NOT proof — 2026-08-07 sweep, 9000 real USTEC M5 bars /
+# 689 signals / T15 exits / spread charged / 60-40 split): BRK = the ONLY
+# both-segments-positive entry cell — derive +168 PF 1.10 / validate +364
+# PF 1.38 (N=106/71) vs BASE derive −1018 / validate +302; graded headroom
+# gates (0.5/1.0/1.5xATR) stayed derive-negative. M15 pivots are aggregated
+# FROM THE M5 PREFIX (complete 900s groups, pivot k=2) so replay and live
+# share the state model by construction. Judged at N>=30 broker deals vs
+# the mscalp original (identical T15 exits — the A/B isolates the entry).
+MSCALP_BRK_LABEL_FAMILY = "dexter3:mscalp-brk"  # '-brk' != '-v<d>': disjoint family
+MSCALP_BRK_LABEL = MSCALP_BRK_LABEL_FAMILY + ":canary"
+
+ENV_MSCALP_BRK_LOOK_M5 = "DEXTER3_MSCALP_BRK_LOOK_M5"    # M5 lookback bars (180)
+ENV_MSCALP_BRK_PIVOT_K = "DEXTER3_MSCALP_BRK_PIVOT_K"    # pivot wing width (2)
+
 ENV_ATR_LEN = "DEXTER3_MSCALP_ATR_LEN"                # ATR length (14)
 ENV_BODY_FRAC = "DEXTER3_MSCALP_IMPULSE_BODY_FRAC"    # impulse body > frac x range (0.6)
 ENV_RANGE_ATR = "DEXTER3_MSCALP_RANGE_ATR"            # impulse range > k x ATR (1.0)
@@ -130,6 +151,112 @@ def mscalp2_take_decision(agg_pnl_usd: float, take_usd: float) -> bool:
     The caller feeds broker-valued aggregate PnL (spread/commission already
     inside), so `>= take_usd` means the owner's "กำไร >$X จริง" in hand."""
     return take_usd > 0 and agg_pnl_usd >= take_usd
+
+
+def mscalp_brk_mode_enabled() -> bool:
+    if os.environ.get("DEXTER3_PRODUCER", "").strip().lower() == "mscalp-brk":
+        return True
+    return os.environ.get("DEXTER3_MODE", "").strip().lower() == "mscalp-brk"
+
+
+def _bar_epoch(bar: Bar) -> float:
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(
+            str(bar.get("ts") or "").replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def m15_pivots_from_m5(m5_bars: list[Bar], look_m5: int, pivot_k: int) -> tuple[list[float], list[float]]:
+    """(pivot_highs, pivot_lows) of M15 candles aggregated from the last
+    ``look_m5`` COMPLETED M5 bars — complete 900s groups only, the trailing
+    partial group dropped, classic k-wing pivots. Pure; identical to the
+    2026-08-07 sweep's construction so replay and live share the state
+    model by definition."""
+    lo = max(0, len(m5_bars) - look_m5)
+    groups: dict[int, list[int]] = {}
+    for idx in range(lo, len(m5_bars)):
+        e = _bar_epoch(m5_bars[idx])
+        if e <= 0:
+            continue
+        g = int(e // 900)
+        span = groups.setdefault(g, [idx, idx])
+        span[1] = idx
+    keys = sorted(groups)
+    m15: list[tuple[float, float]] = []
+    for g in keys[:-1]:  # drop the trailing (possibly partial) group
+        a, b = groups[g]
+        if b - a == 2:  # complete 3-bar group only
+            m15.append((
+                max(_f(m5_bars[k].get("high")) for k in range(a, b + 1)),
+                min(_f(m5_bars[k].get("low")) for k in range(a, b + 1)),
+            ))
+    piv_h: list[float] = []
+    piv_l: list[float] = []
+    for j in range(pivot_k, len(m15) - pivot_k):
+        hh, ll = m15[j]
+        if all(hh > m15[j + d][0] for d in range(-pivot_k, pivot_k + 1) if d != 0):
+            piv_h.append(hh)
+        if all(ll < m15[j + d][1] for d in range(-pivot_k, pivot_k + 1) if d != 0):
+            piv_l.append(ll)
+    return piv_h, piv_l
+
+
+def mscalp_brk_blue_sky(side: str, entry: float,
+                        piv_h: list[float], piv_l: list[float]) -> bool:
+    """Pure: True when the entry is in blue sky on its own side — a buy
+    above EVERY pivot high, a sell below EVERY pivot low (an empty pivot
+    list is blue sky by definition)."""
+    if side == "buy":
+        return not piv_h or entry > max(piv_h)
+    if side == "sell":
+        return not piv_l or entry < min(piv_l)
+    return False
+
+
+def decide_mscalp_brk(symbol: str, m5_bars: list[Bar], spread_abs: float,
+                      session: str = "unknown") -> Decision:
+    """The mscalp impulse decision gated by the M15 blue-sky check — an
+    'enter' survives only when it has broken past every pivot on its side;
+    otherwise it becomes a journaled skip (``sr_wall``) so the catalog can
+    keep scoring what the gate rejects."""
+    decision = decide_mscalp(symbol, m5_bars, spread_abs, session=session)
+    if decision.action != "enter":
+        return decision
+    look_m5 = max(30, _env_int(ENV_MSCALP_BRK_LOOK_M5, 180))
+    pivot_k = max(1, _env_int(ENV_MSCALP_BRK_PIVOT_K, 2))
+    piv_h, piv_l = m15_pivots_from_m5(m5_bars, look_m5, pivot_k)
+    entry = _f(decision.entry, 0.0)
+    if mscalp_brk_blue_sky(str(decision.side), entry, piv_h, piv_l):
+        return Decision(
+            ts_close=decision.ts_close, symbol=decision.symbol, action="enter",
+            side=decision.side, entry_type=decision.entry_type,
+            entry=decision.entry, sl=decision.sl, tp=decision.tp,
+            size_class=decision.size_class, leader_score=decision.leader_score,
+            p_win_est=decision.p_win_est, setup="mscalp_brk_bluesky",
+            reasons=decision.reasons + [
+                f"blue_sky {decision.side}: entry beyond all "
+                f"{len(piv_h) if decision.side == 'buy' else len(piv_l)} M15 pivots"],
+            features={**(decision.features or {}),
+                      "brk_piv_h": len(piv_h), "brk_piv_l": len(piv_l)},
+            session=session,
+        )
+    if decision.side == "buy":
+        wall = min((p for p in piv_h if p > entry), default=max(piv_h) if piv_h else 0.0)
+    else:
+        wall = max((p for p in piv_l if p < entry), default=min(piv_l) if piv_l else 0.0)
+    return Decision(
+        ts_close=decision.ts_close, symbol=symbol, action="skip", side=None,
+        entry_type=None, entry=None, sl=None, tp=None, size_class="none",
+        leader_score=0.0, p_win_est=0.0, setup="none",
+        reasons=[f"mscalp_brk_skip: sr_wall ({decision.side} at {entry} "
+                 f"vs M15 level {wall} — not blue sky)"],
+        features={"brk_wall": wall, "brk_side": decision.side},
+        session=session,
+    )
 
 
 def mscalp_be_mode_enabled() -> bool:
