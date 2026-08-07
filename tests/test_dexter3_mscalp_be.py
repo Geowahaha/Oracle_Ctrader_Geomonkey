@@ -114,3 +114,46 @@ def test_be_action_guards():
     # missing SL (0.0) on a WINNER after deadline still amends -> BE beats naked
     naked = _pos(sl=0.0)
     assert ms.mscalp_be_action(naked, _epoch("2026-08-06T02:00:00Z"), 900.0) == ("amend", 29800.0)
+
+
+def test_be_suffix_fork_families_stay_disjoint():
+    # 2026-08-07: the BASE+BEW unit forks the family with "-base"; that is NOT
+    # a "-v<digit>" version token, so neither family may claim the other's
+    # positions (the dpull vs dpull-cs contamination class).
+    from dexter3.executor import label_matches_family
+
+    assert label_matches_family("dexter3:mscalp-be-base:canary", "dexter3:mscalp-be-base") is True
+    assert label_matches_family("dexter3:mscalp-be-base:canary", "dexter3:mscalp-be") is False
+    assert label_matches_family("dexter3:mscalp-be:canary", "dexter3:mscalp-be-base") is False
+    assert label_matches_family("dexter3:mscalp-be-base:canary", "dexter3:mscalp") is False
+
+
+def test_be_suffix_env_forks_label_state_lock_log(monkeypatch):
+    import importlib
+
+    import dexter3.mscalp as m
+    import dexter3.shadow_runner as sr
+
+    monkeypatch.setenv("DEXTER3_MSCALP_BE_SUFFIX", "base")
+    try:
+        importlib.reload(m)
+        importlib.reload(sr)
+        assert m.MSCALP_BE_LABEL_FAMILY == "dexter3:mscalp-be-base"
+        assert m.MSCALP_BE_LABEL == "dexter3:mscalp-be-base:canary"
+        assert sr.MSCALP_BE_STATE_FILE.name == "dexter3_mscalp_be_base_shadow_state.json"
+        assert sr.MSCALP_BE_LOG_FILE.name == "dexter3_mscalp_be_base_shadow.log"
+        assert sr.MSCALP_BE_LOCK_FILE.name == "dexter3_mscalp_be_base_shadow.lock"
+    finally:
+        monkeypatch.delenv("DEXTER3_MSCALP_BE_SUFFIX", raising=False)
+        importlib.reload(m)
+        importlib.reload(sr)
+    # absent suffix restores the original lane's names byte-for-byte
+    assert m.MSCALP_BE_LABEL == "dexter3:mscalp-be:canary"
+    assert sr.MSCALP_BE_STATE_FILE.name == "dexter3_mscalp_be_shadow_state.json"
+
+
+def test_lane_tally_maps_the_be_fork():
+    from ops.dexter3_lane_tally import _lane_family
+
+    assert _lane_family("dexter3:mscalp-be-base:canary") == "mscalp-be-base"
+    assert _lane_family("dexter3:mscalp-be:canary") == "mscalp-be"

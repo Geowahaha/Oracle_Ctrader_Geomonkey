@@ -74,8 +74,18 @@ ENV_MSCALP2_TAKE_USD = "DEXTER3_MSCALP2_TAKE_USD"      # dollar take; <=0 = off
 # thrown runners 0 — vs the deployed T15's derive -1252 / validate +536 with
 # 61 of 257 time stops discarding a >=1R continuation. Judged at N>=30
 # broker deals vs mscalp/mscalp2 on the same signals.
-MSCALP_BE_LABEL_FAMILY = "dexter3:mscalp-be"   # '-be' is NOT a "-v<d>" token,
-MSCALP_BE_LABEL = MSCALP_BE_LABEL_FAMILY + ":canary"  # so no family overlap
+# 2026-08-07 owner order ("entry เดิม อันเก่า มา run parallel กับ mscalp-be
+# BRK BEW ด้วย"): the BE lane forks into TWO PROCESSES exactly the way the
+# sniper pair does. DEXTER3_MSCALP_BE_SUFFIX (set ONLY on the second unit)
+# suffixes the label family here, and shadow_runner suffixes state/log/lock
+# from the same env at import time. An ABSENT suffix leaves every name
+# byte-identical, so the running BRK+BEW trial is untouched. The families
+# stay disjoint because label_matches_family honours a hyphen only when a
+# "-v<digit>" version token follows it — "-base" does not qualify (pinned).
+_BE_SUFFIX_RAW = os.environ.get("DEXTER3_MSCALP_BE_SUFFIX", "").strip().lower()
+_BE_SUFFIX = f"-{_BE_SUFFIX_RAW}" if _BE_SUFFIX_RAW else ""
+MSCALP_BE_LABEL_FAMILY = "dexter3:mscalp-be" + _BE_SUFFIX   # '-be' is NOT a
+MSCALP_BE_LABEL = MSCALP_BE_LABEL_FAMILY + ":canary"        # "-v<d>" token
 
 ENV_MSCALP_BE_SEC = "DEXTER3_MSCALP_BE_SEC"    # BE deadline seconds; <=0 = off
 

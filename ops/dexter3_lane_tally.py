@@ -55,6 +55,7 @@ _LANE_FAMILIES: tuple[tuple[str, str], ...] = (
     ("dexter3:chf", "chf"),
     ("dexter3:sniper-ustec", "sniper-ustec"),
     ("dexter3:mscalp-brk", "mscalp-brk"),
+    ("dexter3:mscalp-be-base", "mscalp-be-base"),
     ("dexter3:mscalp-be", "mscalp-be"),
     ("dexter3:mscalp2", "mscalp2"),
     ("dexter3:mscalp", "mscalp"),

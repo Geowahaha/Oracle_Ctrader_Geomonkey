@@ -113,7 +113,14 @@ _SNIPER_SUFFIX = f"_{_SNIPER_SUFFIX_RAW}" if _SNIPER_SUFFIX_RAW else ""
 SNIPER_STATE_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow_state.json"
 MSCALP_STATE_FILE = RUNTIME / "dexter3_mscalp_shadow_state.json"
 MSCALP2_STATE_FILE = RUNTIME / "dexter3_mscalp2_shadow_state.json"
-MSCALP_BE_STATE_FILE = RUNTIME / "dexter3_mscalp_be_shadow_state.json"
+# MSCALP-BE fork (2026-08-07, same posture as the sniper pair): the BRK+BEW
+# and BASE+BEW units are two PROCESSES and must never share state, lock or
+# log. DEXTER3_MSCALP_BE_SUFFIX (set only on the BASE unit, mirroring
+# dexter3.mscalp's label fork) suffixes all three paths; read at import time
+# like the label itself. Absent -> byte-identical to the original lane.
+_MSCALP_BE_SUFFIX_RAW = os.environ.get("DEXTER3_MSCALP_BE_SUFFIX", "").strip().lower()
+_MSCALP_BE_SUFFIX = f"_{_MSCALP_BE_SUFFIX_RAW}" if _MSCALP_BE_SUFFIX_RAW else ""
+MSCALP_BE_STATE_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow_state.json"
 MSCALP_BRK_STATE_FILE = RUNTIME / "dexter3_mscalp_brk_shadow_state.json"
 H3FADE_STATE_FILE = RUNTIME / "dexter3_h3fade_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
@@ -131,7 +138,7 @@ CHF_LOG_FILE = RUNTIME / "dexter3_chf_shadow.log"
 SNIPER_LOG_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.log"
 MSCALP_LOG_FILE = RUNTIME / "dexter3_mscalp_shadow.log"
 MSCALP2_LOG_FILE = RUNTIME / "dexter3_mscalp2_shadow.log"
-MSCALP_BE_LOG_FILE = RUNTIME / "dexter3_mscalp_be_shadow.log"
+MSCALP_BE_LOG_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow.log"
 MSCALP_BRK_LOG_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.log"
 H3FADE_LOG_FILE = RUNTIME / "dexter3_h3fade_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
@@ -145,7 +152,7 @@ CHF_LOCK_FILE = RUNTIME / "dexter3_chf_shadow.lock"
 SNIPER_LOCK_FILE = RUNTIME / f"dexter3_sniper{_SNIPER_SUFFIX}_shadow.lock"
 MSCALP_LOCK_FILE = RUNTIME / "dexter3_mscalp_shadow.lock"
 MSCALP2_LOCK_FILE = RUNTIME / "dexter3_mscalp2_shadow.lock"
-MSCALP_BE_LOCK_FILE = RUNTIME / "dexter3_mscalp_be_shadow.lock"
+MSCALP_BE_LOCK_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow.lock"
 MSCALP_BRK_LOCK_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.lock"
 H3FADE_LOCK_FILE = RUNTIME / "dexter3_h3fade_shadow.lock"
 
@@ -1632,7 +1639,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
     elif mode == "mscalp2":
         lock_file, lock_name = MSCALP2_LOCK_FILE, "mscalp2-canary"
     elif mode == "mscalp-be":
-        lock_file, lock_name = MSCALP_BE_LOCK_FILE, "mscalp-be-canary"
+        lock_file = MSCALP_BE_LOCK_FILE
+        lock_name = f"mscalp-be{'-' + _MSCALP_BE_SUFFIX_RAW if _MSCALP_BE_SUFFIX_RAW else ''}-canary"
     elif mode == "mscalp-brk":
         lock_file, lock_name = MSCALP_BRK_LOCK_FILE, "mscalp-brk-canary"
     elif mode == "h3fade":
