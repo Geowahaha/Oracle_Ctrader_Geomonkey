@@ -1,0 +1,98 @@
+# Dexter3 XAUDAILY lane — the low-frequency XAU lane (owner order 2026-08-07:
+# "ทำข้อ 2 และ 3 live deploy new lane เลย ... เอาให้ชัวร์อย่าสรุปมั่วๆอีก").
+#
+# WHAT: ONE trade per day on XAUUSD. At 13:00Z (the highest-volatility hour
+# measured on the derive half: mean M5 range 8.61 vs 4-6 elsewhere — chosen
+# by VOLATILITY, never by backtest PnL, so the hour is not a fitted knob) the
+# lane takes the day-open bias (close vs the 00:00Z open), with a WIDE stop
+# (2.0xATR14) and a FAR fixed target (4.0xATR), and then does NOTHING: no
+# bank, no trail, no time stop other than the 8h basket fail-safe. Broker
+# SL/TP are the entire exit.
+#
+# WHY THIS SHAPE (from the 2026-08-07 measurement campaign, full record in
+# dexter3/xaudaily.py): USTEC and XAU M5 price paths carry no directional
+# information that 70 days of data can resolve — autocorrelation ~0, brackets
+# equal to a no-information control, 8 entry families dead, and not one
+# volume/regime/bias state exceeding 2 standard errors at any horizon from 30
+# minutes to 4 hours. When prediction is that weak the only remaining lever is
+# COST: spread is a fixed charge per trade, so trading ONCE a day for a
+# multi-ATR target shrinks its drag by an order of magnitude versus the
+# 7-19 trades/day USTEC fleet. The wide stop follows the 2026-07-25 audit's
+# most durable finding ("THE EDGE = SL >= 1.2xTR") and the unmanaged exit
+# follows its companion ("81% of profit = not managing"; fixed broker TP =
+# 66.5% of all live gross profit).
+#
+# EVIDENCE — STATED HONESTLY, NO EDGE IS CLAIMED: on 13,999 real XAU M5 bars
+# all four geometries tested were positive in BOTH halves and the INVERTED
+# control (fade the bias) was negative in BOTH halves, but N is only 30/19 and
+# NO cell reached 2 standard errors (best 1.38 SE). The validate half was
+# consumed by that same run, so no untouched hold-out remains. This lane is
+# therefore a FORWARD EXPERIMENT, not a proven edge. JUDGE: N>=30 broker deals
+# in DOLLARS; negative -> kill without ceremony, no tuning. At ~1 trade/day
+# that verdict is ~6 weeks away — do not judge it early on 3 trades.
+#
+# ACTIVATION (start ONLY this unit):
+#   sudo cp ops/dexter3-xaudaily.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-xaudaily
+[Unit]
+Description=Dexter3 XAUDAILY lane LIVE canary XAUUSD (one trade per day, day-open bias, wide stop, far TP, unmanaged)
+After=network-online.target dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexter_pro
+MemoryMax=200M
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+Environment=DEXTER3_LIVE=1
+Environment=DEXTER3_MODE=xaudaily
+Environment=DEXTER3_FAST_TICK_SEC=8
+Environment=DEXTER3_CAPITAL_USD=1000
+Environment=DEXTER3_MAX_VOLUME_UNITS=10
+Environment=DEXTER3_ACCOUNT_MAX_OPEN_RISK_USD=100000
+Environment=DEXTER3_MIN_VOLUME_RISK_RATIO_CAP=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_USD=0
+Environment=DEXTER3_MIN_VOLUME_RISK_ABS_CAP_MULT=1.6
+# --- trial tier, un-gated per the standing 2026-08-06 owner order.
+#     At one trade per day these caps are nearly inert anyway; restore real
+#     caps before ANY real-money promotion. -----------------------------------
+Environment=DEXTER3_DAILY_TARGET_USD=100000
+Environment=DEXTER3_DAILY_LOSS_USD=100000
+Environment=DEXTER3_BASE_RISK_FRAC=0.01
+Environment=DEXTER3_MAX_RISK_FRAC=0.02
+Environment=DEXTER3_MAX_ENTRIES_PER_DAY=2
+Environment=DEXTER3_DAILY_LOSS_BASKETS=999
+# --- the producer owns the stop; the generic SL floor would double-widen it --
+Environment=DEXTER3_SL_FLOOR_TR_MULT=0
+# --- producer knobs (dexter3/xaudaily.py) -----------------------------------
+Environment=DEXTER3_XAUDAILY_ATR_LEN=14
+Environment=DEXTER3_XAUDAILY_HOUR=13
+Environment=DEXTER3_XAUDAILY_ANCHOR_HOUR=0
+Environment=DEXTER3_XAUDAILY_SL_ATR=2.0
+Environment=DEXTER3_XAUDAILY_TP_ATR=4.0
+# --- exit: PLAIN. Broker SL/TP only; 8h basket cap is a fail-safe, never 0 ---
+Environment=DEXTER3_OM_TRAIL_MODE=plain
+Environment=DEXTER3_BASKET_TIME_STOP_MIN=480
+Environment=DEXTER3_V16_HOUSE_MONEY_ENABLED=0
+Environment=DEXTER3_ENTRY_CONFIRM=off
+# --- lane hygiene ------------------------------------------------------------
+Environment=DEXTER3_VP_DAYOPEN_BIAS=0
+Environment=DEXTER3_VP_NO_TRADE_UTC=
+Environment=DEXTER3_MAX_SPREAD_BPS=10000
+Environment=DEXTER3_V16_ENTRY_QUALITY_ENABLED=0
+Environment=DEXTER3_DAYREVERSAL=0
+Environment=DEXTER3_SDZONE=0
+Environment=DEXTER3_SMART_EXIT_ENABLED=0
+Environment=DEXTER3_REPAIR_HARVEST=off
+Environment=DEXTER3_PA_EYE=off
+Environment=DEXTER3_WEEKEND_FLATTEN_ENABLED=1
+Environment=DEXTER3_MARKET_STATE_GATE=1
+Environment=DEXTER3_CROSS_LANE_DEDUP=downsize
+ExecStart=/opt/dexter_pro/.venv/bin/python -X utf8 -m dexter3.shadow_runner --symbols XAUUSD --loop --poll-sec 20 --live
+
+[Install]
+WantedBy=multi-user.target

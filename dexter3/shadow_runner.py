@@ -81,6 +81,7 @@ from dexter3 import channelfade
 from dexter3 import sniper
 from dexter3 import mscalp
 from dexter3 import h3fade
+from dexter3 import xaudaily
 from dexter3.executor import LABEL as LIVE_ORDER_LABEL
 from dexter3.executor import VERSION as FABLE_VERSION
 from dexter3.executor import LABEL_FAMILY as FABLE_LABEL_FAMILY
@@ -123,6 +124,7 @@ _MSCALP_BE_SUFFIX = f"_{_MSCALP_BE_SUFFIX_RAW}" if _MSCALP_BE_SUFFIX_RAW else ""
 MSCALP_BE_STATE_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow_state.json"
 MSCALP_BRK_STATE_FILE = RUNTIME / "dexter3_mscalp_brk_shadow_state.json"
 H3FADE_STATE_FILE = RUNTIME / "dexter3_h3fade_shadow_state.json"
+XAUDAILY_STATE_FILE = RUNTIME / "dexter3_xaudaily_shadow_state.json"
 LOG_FILE = RUNTIME / "dexter3_shadow.log"
 # H5 (2026-07-15 cross-lane entanglement audit): per-lane log files. Fable's
 # path stays LOG_FILE unchanged (confirmed the only code reader,
@@ -141,6 +143,7 @@ MSCALP2_LOG_FILE = RUNTIME / "dexter3_mscalp2_shadow.log"
 MSCALP_BE_LOG_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow.log"
 MSCALP_BRK_LOG_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.log"
 H3FADE_LOG_FILE = RUNTIME / "dexter3_h3fade_shadow.log"
+XAUDAILY_LOG_FILE = RUNTIME / "dexter3_xaudaily_shadow.log"
 LOCK_FILE = RUNTIME / "dexter3_loop.lock"
 PAPER_LOCK_FILE = RUNTIME / "dexter3_fable_paper_loop.lock"
 VP_LOCK_FILE = RUNTIME / "dexter3_vp_loop.lock"
@@ -155,6 +158,7 @@ MSCALP2_LOCK_FILE = RUNTIME / "dexter3_mscalp2_shadow.lock"
 MSCALP_BE_LOCK_FILE = RUNTIME / f"dexter3_mscalp_be{_MSCALP_BE_SUFFIX}_shadow.lock"
 MSCALP_BRK_LOCK_FILE = RUNTIME / "dexter3_mscalp_brk_shadow.lock"
 H3FADE_LOCK_FILE = RUNTIME / "dexter3_h3fade_shadow.lock"
+XAUDAILY_LOCK_FILE = RUNTIME / "dexter3_xaudaily_shadow.lock"
 
 DEFAULT_SYMBOLS = ("XAUUSD", "BTCUSD")
 DEFAULT_POLL_SEC = 20
@@ -306,6 +310,14 @@ def _mscalp_be_producer_enabled() -> bool:
     return mscalp.mscalp_be_mode_enabled()
 
 
+def _xaudaily_producer_enabled() -> bool:
+    """XAUDAILY lane (owner order 2026-08-07): ONE trade per day on XAUUSD at
+    the highest-volatility hour, direction from the day-open bias, wide stop,
+    far fixed target, unmanaged — dexter3/xaudaily.py carries the full
+    measurement record and its honest no-edge-claimed caveat. DEFAULT OFF."""
+    return xaudaily.xaudaily_mode_enabled()
+
+
 def _h3fade_producer_enabled() -> bool:
     """H3FADE lane (pre-registered spec 2026-08-05, docs/handoff/
     H3_BUILD_BRIEF.md): M1 streak-fade on XAUUSD 13-16Z — dexter3/h3fade.py
@@ -331,7 +343,8 @@ def _alt_producer_enabled() -> bool:
             or _dpull_cs_producer_enabled() or _channelfade_producer_enabled()
             or _sniper_producer_enabled() or _mscalp_producer_enabled()
             or _mscalp2_producer_enabled() or _mscalp_be_producer_enabled()
-            or _mscalp_brk_producer_enabled() or _h3fade_producer_enabled())
+            or _mscalp_brk_producer_enabled() or _h3fade_producer_enabled()
+            or _xaudaily_producer_enabled())
 
 
 def _active_order_label(mode: str | None = None) -> str:
@@ -391,6 +404,10 @@ def _active_order_label(mode: str | None = None) -> str:
         from dexter3.h3fade import H3FADE_LABEL
 
         return H3FADE_LABEL
+    if current_mode == "xaudaily":
+        from dexter3.xaudaily import XAUDAILY_LABEL
+
+        return XAUDAILY_LABEL
     return LIVE_ORDER_LABEL
 
 
@@ -459,6 +476,10 @@ def _active_label_family(mode: str | None = None) -> str:
         from dexter3.h3fade import H3FADE_LABEL_FAMILY
 
         return H3FADE_LABEL_FAMILY
+    if current_mode == "xaudaily":
+        from dexter3.xaudaily import XAUDAILY_LABEL_FAMILY
+
+        return XAUDAILY_LABEL_FAMILY
     return FABLE_LABEL_FAMILY
 
 
@@ -490,6 +511,8 @@ def _active_state_file(mode: str | None = None) -> Path:
         return MSCALP_BRK_STATE_FILE
     if current_mode == "h3fade":
         return H3FADE_STATE_FILE
+    if current_mode == "xaudaily":
+        return XAUDAILY_STATE_FILE
     return STATE_FILE
 
 
@@ -526,6 +549,8 @@ def _active_log_file(mode: str | None = None) -> Path:
         return MSCALP_BRK_LOG_FILE
     if current_mode == "h3fade":
         return H3FADE_LOG_FILE
+    if current_mode == "xaudaily":
+        return XAUDAILY_LOG_FILE
     return LOG_FILE
 
 
@@ -1645,6 +1670,8 @@ def acquire_loop_lock(mode: str = "v16") -> None:
         lock_file, lock_name = MSCALP_BRK_LOCK_FILE, "mscalp-brk-canary"
     elif mode == "h3fade":
         lock_file, lock_name = H3FADE_LOCK_FILE, "h3fade-canary"
+    elif mode == "xaudaily":
+        lock_file, lock_name = XAUDAILY_LOCK_FILE, "xaudaily-canary"
     else:
         lock_file, lock_name = LOCK_FILE, "dexter3"
     if lock_file.exists():
@@ -1690,6 +1717,8 @@ def release_loop_lock(mode: str = "v16") -> None:
         lock_file = MSCALP_BRK_LOCK_FILE
     elif mode == "h3fade":
         lock_file = H3FADE_LOCK_FILE
+    elif mode == "xaudaily":
+        lock_file = XAUDAILY_LOCK_FILE
     else:
         lock_file = LOCK_FILE
     try:
@@ -2209,6 +2238,14 @@ def run_symbol_cycle(
                 decision = mscalp.decide_mscalp_brk(symbol, prefix, spread_abs, session=ms_session)
             else:
                 decision = mscalp.decide_mscalp(symbol, prefix, spread_abs, session=ms_session)
+        elif is_newest and _xaudaily_producer_enabled():
+            # XAUDAILY lane (owner order 2026-08-07): ONE decision per day at
+            # the entry hour; every other bar is a journaled skip. Direction
+            # from the day-open bias, wide stop, far fixed TP, unmanaged.
+            from dexter3 import market_lens as _ml
+
+            xd_session = str(_ml.session_context(bar_ts).get("value") or "unknown")
+            decision = xaudaily.decide_xaudaily(symbol, prefix, spread_abs, session=xd_session)
         elif is_newest and _h3fade_producer_enabled():
             # H3FADE lane (pre-registered 2026-08-05): M1 streak-fade —
             # ``prefix`` IS the M1 window in this mode (see the fetch swap at
@@ -5372,6 +5409,7 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
     is_mscalp_be = mode == "mscalp-be"
     is_mscalp_brk = mode == "mscalp-brk"
     is_h3fade = mode == "h3fade"
+    is_xaudaily = mode == "xaudaily"
 
     # VP canary lane (2026-07-11): same isolation pattern as grok — its own
     # broker label so fable/grok loops never touch VP positions and vice versa.
@@ -5464,6 +5502,13 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         _ex.LABEL = _H3_LABEL
         print(f"[H3FADE] Forced executor LABEL to {_H3_LABEL}", flush=True)
 
+    if is_xaudaily:
+        from dexter3.xaudaily import XAUDAILY_LABEL as _XD_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _XD_LABEL
+        print(f"[XAUDAILY] Forced executor LABEL to {_XD_LABEL}", flush=True)
+
     if is_vp:
         from dexter3.volume_profile import VP_LABEL as _VP_LABEL
 
@@ -5512,6 +5557,10 @@ def run_loop(symbols: list[str], poll_sec: int, live: bool = False) -> None:
         from dexter3.h3fade import H3FADE_LABEL as _H3_LABEL
 
         active_label = _H3_LABEL
+    elif is_xaudaily:
+        from dexter3.xaudaily import XAUDAILY_LABEL as _XD_LABEL
+
+        active_label = _XD_LABEL
     else:
         active_label = LIVE_ORDER_LABEL
     active_lock_name = "dexter3"
@@ -5710,6 +5759,13 @@ def main(argv: list[str] | None = None) -> int:
         import dexter3.executor as _ex
         _ex.LABEL = _H3_LABEL
         print(f"[H3FADE] Forced executor LABEL to {_H3_LABEL}", flush=True)
+
+    if os.environ.get("DEXTER3_MODE", "v16").lower().strip() == "xaudaily":
+        from dexter3.xaudaily import XAUDAILY_LABEL as _XD_LABEL
+
+        import dexter3.executor as _ex
+        _ex.LABEL = _XD_LABEL
+        print(f"[XAUDAILY] Forced executor LABEL to {_XD_LABEL}", flush=True)
 
     # --once: no lock required for a single pass, but still respect an
     # already-running loop's lock to avoid racing its state file.

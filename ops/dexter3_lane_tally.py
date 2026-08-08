@@ -60,6 +60,7 @@ _LANE_FAMILIES: tuple[tuple[str, str], ...] = (
     ("dexter3:mscalp2", "mscalp2"),
     ("dexter3:mscalp", "mscalp"),
     ("dexter3:h3fade", "h3fade"),
+    ("dexter3:xaudaily", "xaudaily"),
     ("dexter3:sniper-us30", "sniper-us30"),
     ("dexter3:sniper", "sniper"),
     (VP_LABEL_FAMILY, "vp"),
