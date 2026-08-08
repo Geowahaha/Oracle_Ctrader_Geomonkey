@@ -66,3 +66,43 @@ a fresh forward design (sizing via floor-risk arithmetic, own label/lane,
 N≥30 broker deals as the only proof) under owner sign-off.
 
 Replay = FILTER; broker deals = proof ([[feedback_live_wins_only]]).
+
+---
+
+# RESULT (measured 2026-08-08 ~09:30Z, spec frozen at `fcef957`)
+
+**VERDICT: FAIL — all four families. The ALWAYS-LONG drift gate (gate 2)
+eliminated every timing rule, exactly the trap this prereg was written to
+catch.** ORACLE +43..+63 SE (engine sane); RANDOM straddles zero.
+
+## P1 (signed next-day return, ATR units) vs the drift benchmark
+
+| family | derive | validate | holdout | gate 1 | gate 2 (beat LONG in d+v) |
+|---|---|---|---|---|---|
+| **ALWAYS-LONG** | **+0.0374 (+3.57 SE)** | +0.0068 (+0.47) | **+0.0491 (+2.74 SE)** | — | benchmark |
+| F1 TSMOM-20 | +0.0213 (+2.02) | +0.0064 | +0.0158 | pass | **FAIL** (0.0213 < 0.0374) |
+| F2 TSMOM-250 | +0.0257 (+2.35) | +0.0101 | +0.0304 | pass | **FAIL** |
+| F3 Donchian 20/10 | +0.0096 (+0.76) | +0.0104 | +0.0186 | FAIL | — |
+| F4 MA-200 | +0.0224 (+2.07) | +0.0137 | +0.0273 | pass | **FAIL** |
+
+P2 confirms the same ordering in dollars: ALWAYS-LONG nets **+4,041 points over
+28 years with ONE position change** (+1318 / +192 / +2531, PF positive in all
+three segments) while every timing overlay captures LESS (F2 +2,738, F4 +2,720,
+F1 +1,027, F3 +364) despite 186–701 flips each.
+
+## What this actually established
+
+1. **XAU D1 carries a real, large, positive DRIFT — and no measurable timing
+   signal on top of it.** F1/F2/F4's "+2 SE derive" passes are drift-loading
+   (they are 55–68% long); their timing component strictly subtracts from full
+   drift capture in every segment.
+2. Combined with test #1 (13Z bias = regime glow) and the entire M5 campaign:
+   at every horizon measured — M1, M5, H1, H4, D1, 50 days to 28 years —
+   **the direction of gold and indices has refused to be predicted by price
+   history in this repo's hands.** What exists: magnitude structure (08-07),
+   cost arithmetic (08-08), and drift (this test).
+3. Drift is an asset property, not a trading edge — harvesting it is a
+   portfolio decision that belongs to the owner, not to a trading lane, and
+   this document deliberately makes no recommendation about it.
+
+Per the frozen rule: no lookback sweeps, no new variants of these families.
