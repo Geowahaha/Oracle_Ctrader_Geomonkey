@@ -59,3 +59,36 @@ control Fridays.
 
 No re-tuning of the window hours, the coil definition, the TTL, the TP
 multiple, or the event set. Replay = FILTER; broker deals = proof.
+
+---
+
+# RESULT (measured 2026-08-08 ~08:40Z, spec frozen at `f319766`)
+
+**VERDICT BY THE FROZEN GATE: CLOSED — M1 fails by its own letter.**
+Ratio 1.47× (gate: ≥ 1.5×) with 2.74 SE separation (gate: ≥ 2, passed).
+1.47 < 1.5. The same discipline that killed eurusd's gate-2 miss by 0.0003
+applies here: no rounding up, no "close enough".
+
+| M1 (12–15Z range, ATR units) | derive | validate | holdout |
+|---|---|---|---|
+| NFP Fridays | N=14, 5.31 ±0.63 | N=9, 3.54 ±0.74 | N=5, 4.46 ±1.27 |
+| control Fridays | N=46, 3.24 ±0.22 | N=28, 2.98 ±0.38 | N=19, 2.97 ±0.23 |
+| **pooled d+v** | **NFP 4.62 vs ctrl 3.14 = 1.47× @ 2.74 SE** | | |
+
+M2 (coil→expansion): corr **+0.103** (z-SE 0.092) — the pre-event coil does
+NOT predict the expansion; the 08-07 design's core assumption is unsupported.
+
+M3 (bracket, reported but unclaimable per the gate): NFP +54.2/+129.9/+69.8
+(N=14/9/5) vs control-Fridays +8.6/+95.2/−97.2. Positive in all three NFP
+segments — and gated off. At N=28 events total, a per-event SD of ~30 points
+makes these means swing by ±$12/event; this is exactly the sample size the
+prereg pre-committed to distrust.
+
+## Honest reading
+
+NFP hours ARE more volatile (2.74 SE — real), by ~47%, not the pre-declared
+50%. The coil does not predict the expansion (M2 ≈ 0.1), so the magnitude is
+event-driven, not chart-forecastable — you cannot size the bracket from the
+chart. Per the frozen rule nothing is built and nothing re-tuned. **A future
+re-registration on NEW events only (they accrue ~1/month; ~12 fresh events by
+mid-2027) would be legitimate — this document has consumed the current set.**
