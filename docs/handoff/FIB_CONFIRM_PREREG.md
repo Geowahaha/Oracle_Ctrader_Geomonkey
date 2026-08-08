@@ -158,3 +158,57 @@ C3 0.472±0.059 / 0.423±0.069 · C4 0.500±0.144 / 0.556±0.166.
 
 Per the frozen rule: no re-tuning of the zone, the 24-bar window, the C
 thresholds, the stops or the TP; no further variants of the confirmation idea.
+
+---
+
+# ADDENDUM — owner-ordered E2 sweep: the mscalp2 $5 dollar-take on EVERY fib cell (2026-08-08 ~05:05Z)
+
+Owner order: *"เอาแต่ละอย่างที่ค้นพบมาแต่ต้น เอา Mscalp2 เข้าไปเก็บ $5 มีตัวไหน
+โดดเด่นชนะไหม"*. E2 was pre-specified in both v1 and v2 as conditional on an
+entry cell passing; the owner unlocked it directly. Same engine; the $5 take is
+approximated on M5 bar extremes, which can only **over**-state it.
+
+**ANSWER: no — not one cell wins.** Every population with a judgeable N is
+net-negative in at least two segments.
+
+| Cell + $5 take | derive | validate | holdout |
+|---|---|---|---|
+| A1 = A3 = A4 = BASE (identical: the take fires before any TP) | 229 / **−929** / WR 83% | 147 / −217 / 87% | 88 / −284 / 82% |
+| A2 (shallow zone) | 280 / −904 / 87% | 172 / −714 / 86% | 139 / −119 / 88% |
+| C1-A VP LVN | 44 / −380 | 30 / +27 | 21 / −30 |
+| C3-A PA rejection | 68 / −236 | 47 / −273 | 43 / +158 |
+| **C4-A confluence 2-of-3** | 12 / **+23** / 92% | 8 / **+40** / 100% | 7 / **+35** / 100% |
+| C4-A **invert** | 12 / −74 | 8 / −34 | 7 / +35 |
+| C4-**B** (same signal, tight stop) | 12 / **−9** | 8 / **−16** | 7 / +35 |
+| C1-B / C3-B (tight stop) | −354 / −221 | −152 / −331 | −67 / +49 |
+| RANDOM side control (seeds 7/11/23) | −619 / −1338 / −415 | −630 / −432 / −109 | −462 / −185 / +16 |
+
+### Why $5 cannot work on this population — the arithmetic, not an opinion
+
+Measured on the widest fib population, same signals, two exits:
+
+| exit | N | WR | avg win | avg loss | wins needed per loss |
+|---|---|---|---|---|---|
+| **$5 take** | 464 | **84%** | **+5.00** | **−44.99** | **9.0** |
+| plain (1.618 TP) | 257 | 30% | +154.54 | −59.13 | 0.4 |
+
+The $5 take produces a beautiful 84% win rate and loses money, because a fib
+lane's stop is **structural** (beyond the leg origin, ~45 points average loss),
+so break-even needs ~90% wins and it delivers 84%. **mscalp2's $5 take lives on
+mscalp's 1.3×ATR stop, not on a wide structural stop — the exit was never
+transplantable to this geometry.** Tightening the stop (SL-B) does not rescue
+it: C1-B/C3-B/C4-B are all net-negative in derive and validate.
+
+### The one standout, stated honestly
+
+**C4-A (2-of-3 confluence + $5 take) is positive in all three segments
+(+23/+40/+35) with its inverted arm negative in derive and validate** — the only
+cell in this entire two-day campaign to satisfy the inverted-arm criterion.
+**And it is unjudgeable: N = 12 / 8 / 7.** Its own tight-stop sibling (C4-B, the
+identical signal) is negative in derive and validate, which is evidence against
+the effect being real rather than for it. Total profit across all three
+segments is **+$98 over 27 trades in 50 trading days**.
+
+**No lane. No re-tune.** If this is ever to be resolved it needs forward N — a
+journal-only shadow that records the confluence signal without trading it —
+which is an owner decision, not a replay result.
