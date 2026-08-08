@@ -78,3 +78,59 @@ INCONCLUSIVE — it is reported for completeness, never as a build).
 **On failure:** record and stop. Do not re-tune k, the TP, the zone or the
 confirmations. The fib family is then closed for replay, and the only remaining
 honest route is forward N from a journal-only shadow.
+
+---
+
+# RESULT (measured 2026-08-08 ~05:55Z, spec frozen at commit before the run)
+
+**VERDICT: FAIL — no lane. The tight stop is a large, real improvement to the
+fib family, and it improves BOTH DIRECTIONS, so it is not an edge.**
+
+| Cell (k=1.04×ATR, plain 1.618 TP) | derive | validate | holdout |
+|---|---|---|---|
+| BASE real | 147 / +62 / 1.01 | 88 / **+1199** / 1.57 | 55 / +523 / 1.35 |
+| BASE **invert** | 136 / **+2387** / 1.60 | 91 / **+293** / 1.12 | 50 / −305 / 0.80 |
+| BASE random (seed 11) | 138 / **+2025** / 1.49 | 91 / −363 / 0.86 | 60 / −589 / 0.67 |
+| **C3-A real** | 59 / **+625** / 1.34 | 39 / **+371** / 1.38 | 30 / **+739** / 2.01 |
+| C3-A **invert** | 58 / **+1381** / 1.87 | 40 / **+715** / 1.78 | 34 / −729 / 0.34 |
+| C4-A real | 10 / −96 | 7 / +416 | 7 / −141 |
+
+k = 1.42 (the declared alternative): BASE real −455/+1215/+366, invert
++1450/+146/−508; C3-A real +197/+650/+590, invert +1025/+771/−522; C4-A
+−18/+372/−218. `$5` take on the tight stop: negative in derive AND validate for
+**every** population at both k values (BASE −772/−531, C3 −294/−434,
+C4 −100/−50) — the take fails even in the configuration built to rescue it.
+
+### What passed and what killed it
+
+**C3-A at k=1.04 clears criteria 1, 2, 3 and 5** — positive in all three
+segments (+625/+371/+739), PF 1.34/1.38/2.01, N=59/39/30, and it beats its own
+structural-stop version (+173/+177/+410) in derive and validate. Tightening the
+stop from ~43 points to ~1×ATR roughly **tripled** the family's take. That is
+the owner's "SL น้อย" instinct confirmed as a real effect.
+
+**It fails criterion 4, and not narrowly:** the inverted arm returns
++1381/+715, i.e. **selling the same signals makes more money than buying them.**
+BASE behaves the same way (real +62/+1199, invert +2387/+293, and a random-side
+control returns +2025 in derive). A tight stop under a far target is a **long-
+gamma straddle**: it risks ~1 ATR to reach a 1.618-extension target, so it pays
+whenever the market moves, in either direction. It is buying magnitude cheaply,
+and magnitude is the one quantity the 2026-08-07 information campaign found to
+be forecastable on this instrument. **The fib level contributes nothing to it —
+a random side captures the same payoff.**
+
+### Campaign conclusion (three pre-registrations, 2 days, ~30 cells)
+
+Every fib configuration that made money did so through geometry that a coin flip
+could have exploited (v1 A4 wide TP, v2 C3 PA-rejection, v3 tight stop), and
+every configuration where direction had to carry the result failed. Combined
+with 2026-08-07's null on USTEC M5 direction, this is now the same finding
+reached from four independent angles. **The fib family is closed for replay.**
+
+The constructive residue is a design note, not a lane: *if the only forecastable
+quantity is magnitude, the honest expression is an explicitly direction-agnostic
+structure (the `xaudaily` posture: rare, cheap, wide target, unmanaged), not a
+directional lane wearing a Fibonacci label.* C4 remains INCONCLUSIVE at N=28 and
+can only be resolved by forward journal evidence.
+
+Per the frozen rule: no re-tuning of k, TP, zone or confirmations.
