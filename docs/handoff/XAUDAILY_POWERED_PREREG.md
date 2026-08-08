@@ -87,3 +87,50 @@ require their own pre-registrations.
 
 Replay remains a FILTER; live broker deals remain the only proof
 ([[feedback_live_wins_only]]).
+
+---
+
+# RESULT (measured 2026-08-08 ~08:50Z, spec frozen at `f05be81`)
+
+**VERDICT BY THE DECLARED RULE: INCONCLUSIVE — status quo. The lane's forward
+trial continues unchanged and is judged on broker deals as registered.**
+(Primary P1 H4-derive = **−0.60 SE**: neither ≥+2 SE nor ≤−2 SE.)
+
+Harness: scratchpad `xaudaily_powered.py`. ORACLE controls passed everywhere
+(H1 +10.2/+10.6/+6.6 SE, H4 +28.1/+23.3/+19.1 SE); RANDOM arms straddle zero.
+
+## P1 — information (bias-signed continuation, ATR units)
+
+| arm | derive | validate | holdout |
+|---|---|---|---|
+| **H4 (9y, primary)** 13Z→21Z | N=601 **−0.028 (−0.60 SE)** | N=395 −0.013 (−0.23) | N=232 **+0.143 (+2.15 SE)** |
+| H4 13Z→next-13Z | N=753 −0.134 (−1.66) | +0.026 (+0.28) | +0.144 (+1.11) |
+| H1 (2.4y) 13Z→21Z | N=83 **+0.794 (+3.11 SE)** | N=69 −0.144 (−0.52) | N=13 +0.399 (+0.59) |
+| H1 13Z→next-13Z | N=304 +0.455 (+2.43 SE) | +0.284 (+1.08) | −0.214 (−0.65) |
+
+## P2 — trade expression (reported; cannot upgrade P1 per the frozen rule)
+
+G1 (SL 0.5/TP 1.0 ATR) is net-positive in all six segments (H1 +194/+144/+245;
+H4 +274/+366/+980, PF 1.14–1.35) — **but the random-side control is also
+positive on H4 in all three segments** (+81/+199/+207): an asymmetric 1:2
+bracket on an instrument in a secular uptrend makes money without any signal.
+The fib-week lesson, reproduced at daily scale on the first try.
+
+## The finding that matters more than the verdict
+
+The 13Z bias signal is **not a stable property of XAU — it is a property of
+2024-2025.** Over 9 years (H4) it is flat (−0.6 SE). It turns strongly positive
+exactly in the H1-derive window (2024-03→2025-05, +3.11 SE) and in H4's holdout
+(2024-09→, +2.15 SE) — the gold-bull regime — and decays toward zero in 2026
+(H1 validate −0.52, H1 holdout +0.59, next-13Z holdout −0.65). The live lane's
+own N=30/19 M5 evidence (May-Aug 2026) sits at the fading tail of that regime.
+
+Honest read: **the lane is not refuted (the rule requires ≤−2 SE and it never
+gets there), but its prior is weakened — its replay support was likely regime
+glow, not structure.** The forward trial (N≥30 broker deals) proceeds exactly
+as registered; this measurement changes no deployment and no config. What it
+DOES change: any future size-up must confront the 9-year flat line, and
+regime-stamping every verdict (the standing rule) is now mandatory here too.
+
+No re-tuning of hour/anchor/multiples/horizon. Next Daily-Laboratory tests
+(D1-native families on 28y, N2 meta-allocation) get their own pre-registrations.
