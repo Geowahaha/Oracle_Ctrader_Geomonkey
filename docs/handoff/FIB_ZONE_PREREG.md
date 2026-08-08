@@ -107,3 +107,53 @@ multiples, the TP, or the exit, and do not run further variants of this idea.
 exactly the specified geometry, judged on **N ≥ 30 broker deals in dollars**.
 
 Replay remains a FILTER, never a proof ([[feedback_live_wins_only]]).
+
+---
+
+# RESULT (measured 2026-08-08 ~03:40Z, spec frozen at commit `9df6c0a`)
+
+**VERDICT: FAIL — no Fibonacci lane will be built.** Per the declared rule the
+idea is closed: no re-tuning of the zone bounds, `k`, the ATR multiples, the TP
+or the exit, and no further variants. The exit twins (E1/E2) were never run —
+the spec makes them conditional on an entry cell passing first, and none did.
+
+Harness: scratchpad `fib_sweep.py` (+ `fib_b1.py` amendment), 13,999 real USTEC
+M5 bars, spread 1.5, exits from bar i+1, SL-first on both-touch, points = dollars.
+
+| Cell | derive (N/net/PF) | validate | holdout | verdict |
+|---|---|---|---|---|
+| **ORACLE** (engine positive control) | 105 / **+4984** / 2.42 | 66 / +1926 / 1.91 | 48 / +260 / 1.15 | engine sane ✅ |
+| **A1 real** (0.5–0.786 → TP 1.618) | 133 / **−351** / 0.95 | 78 / +787 / 1.29 | 46 / +607 / 1.39 | **FAIL crit-1** |
+| A1 invert | 117 / +1192 / 1.23 | 72 / −206 / 0.92 | 44 / −606 / 0.67 | mirrors A1 |
+| A1 random (coin-flip side) | 131 / −1456 / 0.78 | 84 / −826 / 0.75 | 43 / +295 / 1.18 | — |
+| A2 (0.382–0.618) | 130 / −492 / 0.94 | 77 / −873 / 0.78 | 55 / −179 / 0.93 | FAIL, all three negative |
+| A3 (TP = 1.0 level) | 147 / −2153 / 0.65 | 89 / −93 / 0.96 | 56 / +446 / 1.32 | FAIL |
+| **A4 (TP 2.618)** | 100 / **+689** / 1.13 | 64 / **+725** / 1.28 | 33 / **+1026** / 1.76 | passes 1–3, **FAILS crit-4** |
+| A4 **invert** | 89 / **+1885** / 1.43 | 58 / **+359** / 1.15 | 36 / **+329** / 1.21 | both directions win |
+| A4 random (seeds 7/11/23) | +2108 / −1947 / −2094 | +76 / −155 / +1124 | +1350 / −185 / +1275 | ±2000 swing per seed |
+| B1 fade 1.618 (amended) | 36 / −143 / 0.86 | 13 / +19 / 1.04 | 8 / −426 / 0.21 | INCONCLUSIVE (N<30) |
+| B2 continue through 1.618 (amended) | 36 / +35 / 1.04 | 13 / −58 / 0.88 | 8 / +402 / 4.34 | INCONCLUSIVE (N<30) |
+
+### The three findings worth keeping
+
+1. **A4 is the trap this pre-registration was written to catch.** Net-positive in
+   all three segments with N≥30 — it would have shipped under the old
+   two-segments bar. But its INVERT arm is positive in all three too, and
+   coin-flip sides swing ±2000 points across seeds. A TP at 2.618×leg with a
+   24h hold is a **wide bracket**, and a wide bracket on USTEC M5 pays out on
+   magnitude regardless of side — the 2026-08-07 "bracket ≈ control" result,
+   reproduced. Nothing about the Fibonacci level was doing the work.
+2. **A1 has the same regime signature as every other mscalp entry filter:**
+   derive (late May–early July) negative, validate + holdout (mid-July onward)
+   positive. This is now the 9th entry family showing it. The fib level does not
+   escape the regime dependence; it inherits it.
+3. **B1/B2 are unmeasurable, not disproven.** Closes beyond a 1.618 extension
+   happen ~57 times in 50 trading days — 13 and 8 trades in the later segments.
+   Any verdict at that N is noise (the 08-07 history-cap problem again).
+
+**Amendment disclosed:** B1 as originally frozen produced **zero** signals — the
+leg-validity rule voids a leg the moment price extends past `P1`, so a
+"close beyond the 1.618 extension" cannot coexist with a live leg. That is a
+defect in my spec, not a property of the market. The amendment (P1-extension
+voiding removed, everything else identical) was declared before the run and
+adds 2 exploratory comparisons; both landed under the N bar anyway.
