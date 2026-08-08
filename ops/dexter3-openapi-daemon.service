@@ -29,6 +29,11 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/dexter_pro/.venv/bin/python -m dexter3.openapi_daemon
 Restart=always
 RestartSec=10
+# fd-leak guard (2026-08-08 incident: reconnect storm leaked sockets until
+# EMFILE at the default 1024 soft limit wedged the daemon ~2h40m and every
+# lane's exit manager with it). Headroom so a burst can't starve accept();
+# the in-process EMFILE hard-exit + single-flight reconnect are the real fix.
+LimitNOFILE=65536
 StandardOutput=append:/var/log/dexter3-openapi-daemon.log
 StandardError=append:/var/log/dexter3-openapi-daemon.log
 

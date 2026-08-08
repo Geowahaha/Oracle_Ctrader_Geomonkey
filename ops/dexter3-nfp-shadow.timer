@@ -1,0 +1,12 @@
+# Fridays 15:20Z — after the prereg's 12-15Z window has fully closed.
+# The script itself checks "first Friday of the month" and exits otherwise.
+[Unit]
+Description=Dexter3 NFP forward shadow timer (Fri 15:20Z)
+
+[Timer]
+OnCalendar=Fri *-*-* 15:20:00 UTC
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+# Dexter3 daemon guard — one probe run; scheduling lives in the .timer.
+# See ops/dexter3-daemon-guard.sh for the wedge-detection policy.
+#
+# ACTIVATION:
+#   sudo cp ops/dexter3-daemon-guard.{service,timer} /etc/systemd/system/
+#   sudo cp ops/dexter3-daemon-guard.sh /opt/dexter_pro/ops/  (deploy step)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-daemon-guard.timer
+[Unit]
+Description=Dexter3 openapi daemon wedge guard (single probe)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/dexter_pro/ops/dexter3-daemon-guard.sh

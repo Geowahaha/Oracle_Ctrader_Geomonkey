@@ -399,6 +399,17 @@ def _account_id_from_payload(payload: dict) -> int:
     return 0
 
 
+def _is_fd_exhaustion_error(err: str) -> bool:
+    """Pure: does a connection-failure message indicate the process has run
+    out of file descriptors (EMFILE/ENFILE)? Matched on the strings Twisted
+    actually produced during the 2026-08-08 incident ("Couldn't bind: 24:
+    Too many open files.") plus the ENFILE sibling. When True, the daemon
+    hard-exits so systemd restarts it with a clean fd table — the wedged
+    alternative disabled every lane's exit manager for ~2h40m."""
+    text = str(err or "").lower()
+    return "too many open files" in text or "file table overflow" in text
+
+
 def _enum_name(enum_cls: Any, value: int) -> str:
     try:
         return str(enum_cls.Name(int(value)))
@@ -1006,6 +1017,15 @@ class OpenApiDaemon:
         # _on_push_message (which feeds the spot cache) must never be
         # displaced by a capture window.
         self._capture_listeners: list[Callable[[Any, Any], None]] = []
+        # Single-flight reconnect guard (2026-08-08 incident): with no guard,
+        # _on_connect_error AND _on_disconnected each scheduled their OWN
+        # reconnect chain, so one flaky connection multiplied into thousands
+        # of parallel chains (42k attempts logged), each leaking a socket
+        # until "Too many open files" wedged the whole daemon for ~2h40m
+        # while every lane's exit manager silently failed. True = a
+        # reactor.callLater(_connect) is already queued; set/cleared on the
+        # reactor thread only.
+        self._reconnect_pending = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1047,6 +1067,7 @@ class OpenApiDaemon:
     # -- connection lifecycle (cribbed from execution/ctrader_stream.py) --
 
     def _connect(self) -> None:
+        self._reconnect_pending = False   # the queued reconnect is now running
         if not self._running:
             return
         host, port, environment = _resolve_host()
@@ -1099,6 +1120,15 @@ class OpenApiDaemon:
         err = failure.getErrorMessage() if failure else "unknown"
         logger.warning("Connection failed: %s", err)
         self.state.last_error = f"connection failed: {err}"
+        if _is_fd_exhaustion_error(err):
+            # File descriptors are gone — no in-process recovery is possible
+            # (every further connect/accept fails, the HTTP listener starves,
+            # and the 2026-08-08 incident showed the process just wedges).
+            # Hard-exit so systemd Restart=always revives us with a clean fd
+            # table within seconds instead of hours.
+            logger.critical("fd exhaustion detected (%s) — hard-exiting for systemd restart", err)
+            os._exit(70)
+            return  # unreachable in production; keeps mocked-_exit tests honest
         self._schedule_reconnect()
 
     def _on_disconnected(self, _client, reason) -> None:
@@ -1127,6 +1157,12 @@ class OpenApiDaemon:
         self.state.app_authed = False
         _force_stop_client(self.client)
         self.client = None
+        if self._reconnect_pending:
+            # Single-flight (2026-08-08 incident): a reconnect is already
+            # queued — piling on another chain is how one flaky connection
+            # became 42k parallel attempts and an fd-exhaustion wedge.
+            return
+        self._reconnect_pending = True
         self.state.reconnect_count += 1
         delay = self.backoff.next_delay()
         logger.info("Reconnecting in %.0fs (attempt %d)...", delay, self.state.reconnect_count)

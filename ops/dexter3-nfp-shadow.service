@@ -1,0 +1,20 @@
+# Dexter3 NFP forward shadow — journal-only, NEVER trades (Daily Lab N4).
+# Runs one light computation after the NFP window closes; exits instantly on
+# non-first-Friday days. See ops/nfp_shadow.py for the full rationale.
+#
+# ACTIVATION:
+#   sudo cp ops/dexter3-nfp-shadow.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dexter3-nfp-shadow.timer
+[Unit]
+Description=Dexter3 NFP forward shadow (journal-only, no trades)
+After=dexter3-openapi-daemon.service
+Wants=dexter3-openapi-daemon.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/dexter_pro
+Environment=PYTHONUNBUFFERED=1
+Environment=DEXTER3_TRANSPORT=openapi
+Environment=DEXTER3_OPENAPI_DAEMON_URL=http://127.0.0.1:9877
+ExecStart=/opt/dexter_pro/.venv/bin/python ops/nfp_shadow.py

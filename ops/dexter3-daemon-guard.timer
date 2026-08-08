@@ -1,0 +1,12 @@
+# Dexter3 daemon guard timer — every 5 minutes. 3 consecutive unresponsive
+# probes (~15 min) -> restart the daemon. See dexter3-daemon-guard.sh.
+[Unit]
+Description=Dexter3 openapi daemon wedge guard (5-min cadence)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

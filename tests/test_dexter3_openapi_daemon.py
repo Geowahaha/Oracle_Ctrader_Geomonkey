@@ -627,10 +627,14 @@ def test_daemon_never_calls_token_refresh(monkeypatch):
 
 
 @pytestmark_daemon
-def test_reconnect_scheduling_uses_backoff_and_flags_state(monkeypatch):
-    """_schedule_reconnect: state goes disconnected, reconnect_count
-    increments, and reactor.callLater is asked for exactly the backoff's
-    next delay (reactor is monkeypatched — never actually running)."""
+def test_reconnect_scheduling_is_single_flight(monkeypatch):
+    """_schedule_reconnect: state goes disconnected and reactor.callLater is
+    asked for the backoff delay — but back-to-back calls while a reconnect
+    is already queued schedule NOTHING more. (2026-08-08 incident: without
+    this guard, _on_connect_error and _on_disconnected each spawned their
+    own chain and one flaky connection became 42k parallel attempts and an
+    fd-exhaustion wedge. The pre-incident version of this test asserted the
+    multi-chain behavior as correct — that assertion WAS the bug.)"""
     import dexter3.openapi_daemon as daemon_mod
 
     scheduled: list[tuple[float, Any]] = []
@@ -647,9 +651,64 @@ def test_reconnect_scheduling_uses_backoff_and_flags_state(monkeypatch):
 
     assert d.state.connected is False
     assert d.state.app_authed is False
-    assert d.state.reconnect_count == 3
-    assert [delay for delay, _fn in scheduled] == [5.0, 10.0, 20.0]
+    assert d.state.reconnect_count == 1          # one chain, not three
+    assert [delay for delay, _fn in scheduled] == [5.0]
     assert all(fn == d._connect for _delay, fn in scheduled)
+
+    # _connect marks the queued reconnect as consumed (then early-returns
+    # here because _running is False — no real socket is ever opened).
+    d._running = False
+    d._connect()
+    assert d._reconnect_pending is False
+    d._running = True
+    d._schedule_reconnect()                       # next failure schedules again
+    assert [delay for delay, _fn in scheduled] == [5.0, 10.0]
+    assert d.state.reconnect_count == 2
+
+
+@pytestmark_daemon
+def test_fd_exhaustion_error_detection():
+    """Pure classifier for the EMFILE/ENFILE wedge signature (matched on the
+    exact string Twisted produced in the 2026-08-08 incident)."""
+    from dexter3.openapi_daemon import _is_fd_exhaustion_error
+
+    assert _is_fd_exhaustion_error("Couldn't bind: 24: Too many open files.")
+    assert _is_fd_exhaustion_error("TOO MANY OPEN FILES")
+    assert _is_fd_exhaustion_error("file table overflow")
+    assert not _is_fd_exhaustion_error("Connection refused")
+    assert not _is_fd_exhaustion_error("")
+    assert not _is_fd_exhaustion_error(None)
+
+
+@pytestmark_daemon
+def test_connect_error_on_fd_exhaustion_hard_exits(monkeypatch):
+    """_on_connect_error: an EMFILE failure hard-exits (systemd revives with
+    a clean fd table) instead of scheduling yet another doomed reconnect."""
+    import dexter3.openapi_daemon as daemon_mod
+
+    exits: list[int] = []
+    monkeypatch.setattr(daemon_mod.os, "_exit", lambda code: exits.append(code))
+    d = _make_daemon()
+    d._running = True
+    d.client = None
+    scheduled: list[float] = []
+    monkeypatch.setattr(d, "_schedule_reconnect", lambda: scheduled.append(1))
+
+    class _Failure:
+        def getErrorMessage(self):
+            return "Couldn't bind: 24: Too many open files."
+
+    d._on_connect_error(_Failure())
+    assert exits == [70]
+    assert scheduled == []                        # never reached
+
+    class _Benign:
+        def getErrorMessage(self):
+            return "Connection refused"
+
+    d._on_connect_error(_Benign())
+    assert exits == [70]                          # no new exit
+    assert scheduled == [1]                       # normal path reconnects
 
 
 @pytestmark_daemon
